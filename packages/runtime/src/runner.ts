@@ -80,18 +80,27 @@ function ensureRuntimeLink(projectDir: string): void {
 function ensureProjectScaffold(projectDir: string): void {
   const pkgPath = join(projectDir, "package.json");
   if (existsSync(pkgPath)) {
+    let pkg: unknown;
     try {
-      const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
-      if (pkg.type !== "module") {
-        pkg.type = "module";
-        writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
-      }
+      pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
     } catch (err) {
       throw new Error(
         `Malformed package.json at ${pkgPath}. ` +
         `trama will not overwrite it automatically; fix or remove it and try again.\n` +
         `Parse error: ${err instanceof Error ? err.message : err}`
       );
+    }
+    if (typeof pkg !== "object" || pkg === null || Array.isArray(pkg)) {
+      throw new Error(
+        `Malformed package.json at ${pkgPath} — expected a JSON object but got ${
+          Array.isArray(pkg) ? "an array" : typeof pkg
+        }. trama will not overwrite it automatically; fix or remove it and try again.`
+      );
+    }
+    const pkgObj = pkg as Record<string, unknown>;
+    if (pkgObj.type !== "module") {
+      pkgObj.type = "module";
+      writeFileSync(pkgPath, JSON.stringify(pkgObj, null, 2));
     }
   } else {
     writeFileSync(pkgPath, JSON.stringify({ type: "module" }, null, 2));
@@ -179,15 +188,23 @@ export function loadConfig(): TramaConfig {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return defaults;
     throw err;
   }
-  let merged: TramaConfig;
+  let parsed: unknown;
   try {
-    merged = { ...defaults, ...JSON.parse(raw) };
+    parsed = JSON.parse(raw);
   } catch (err) {
     throw new Error(
       `Malformed config at ${configPath} — fix or delete it.\n` +
       `Parse error: ${err instanceof Error ? err.message : err}`
     );
   }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(
+      `Malformed config at ${configPath} — expected a JSON object but got ${
+        Array.isArray(parsed) ? "an array" : typeof parsed
+      }. Fix or delete it to proceed.`
+    );
+  }
+  const merged: TramaConfig = { ...defaults, ...(parsed as Record<string, unknown>) };
   const s = (v: unknown) => typeof v === "string" && v.length > 0;
   const pint = (v: unknown) => Number.isInteger(v) && (v as number) > 0;
   const checks: Array<[boolean, string]> = [
@@ -429,7 +446,7 @@ export function copyToHistory(projectDir: string, reason: string, detail?: strin
 // --- Helpers ---
 
 /** Run fn in a temp directory, clean up afterwards regardless of outcome. */
-async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
+export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), prefix));
   try {
     return await fn(dir);
@@ -482,99 +499,111 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
 
   writeFileSync(join(projectDir, "logs", "latest.jsonl"), "");
 
+  const originalSource = readFileSync(join(projectDir, "program.ts"), "utf-8");
   const repairErrors: string[] = [];
   const repairDetails = () => repairErrors.length > 0
     ? `\nRepair errors:\n${repairErrors.map((e, i) => `  [${i + 1}] ${e}`).join("\n")}` : "";
   let pendingRepair: { attempt: number; error: string } | null = null;
+  let programModified = false;
 
-  for (let attempt = 0; attempt <= maxRepairAttempts; attempt++) {
-    const abortController = new AbortController();
-    const { signal } = abortController;
-    const ctx = createContext(projectDir, loadState(projectDir), { maxIterations });
-    const agentImpl = createAgent(adapter, signal);
-    const toolsImpl = createTools(projectDir, signal);
+  try {
+    for (let attempt = 0; attempt <= maxRepairAttempts; attempt++) {
+      const abortController = new AbortController();
+      const { signal } = abortController;
+      const ctx = createContext(projectDir, loadState(projectDir), { maxIterations });
+      const agentImpl = createAgent(adapter, signal);
+      const toolsImpl = createTools(projectDir, signal);
 
-    const server = createIPCServer(ctx, agentImpl, toolsImpl);
+      const server = createIPCServer(ctx, agentImpl, toolsImpl);
 
-    // Phase A: Infrastructure setup — errors here are NOT program bugs,
-    // so they must NOT trigger the repair loop. (H1 fix)
-    let port: number;
-    try {
-      port = await startServer(server);
-    } catch (infraError) {
-      await forceCloseServer(server, toolsImpl, abortController);
-      throw infraError;
-    }
-
-    const child = spawn(process.execPath, [TSX_CLI, join(projectDir, "program.ts")], {
-      cwd: projectDir,
-      env: {
-        ...process.env,
-        TRAMA_PORT: String(port),
-        TRAMA_INPUT: JSON.stringify(ctx.input),
-        TRAMA_STATE: JSON.stringify(ctx.state),
-        TRAMA_ITERATION: String(ctx.iteration),
-        TRAMA_MAX_ITERATIONS: String(ctx.maxIterations),
-      },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-
-    // Phase B: Program execution.
-    // waitForChild rejects on spawn errors (ENOENT, EACCES) — those are
-    // infrastructure failures and must NOT trigger repair.
-    let result: ChildResult;
-    try {
-      result = await waitForChild(child, timeout, {
-        stdout: chunk => { process.stdout.write(chunk); },
-        stderr: chunk => { process.stderr.write(chunk); },
-      });
-    } catch (spawnError) {
-      // Child process failed to start — not a program bug.
-      await forceCloseServer(server, toolsImpl, abortController);
-      throw spawnError;
-    }
-
-    if (result.exitCode === 0) {
-      // Program succeeded. Server cleanup failure is not a program bug.
-      try { await closeServer(server); } catch { await forceCloseServer(server, toolsImpl, abortController); }
-      if (pendingRepair) {
-        options.onRepair?.(pendingRepair.attempt, maxRepairAttempts, pendingRepair.error);
+      // Phase A: Infrastructure setup — errors here are NOT program bugs,
+      // so they must NOT trigger the repair loop. (H1 fix)
+      let port: number;
+      try {
+        port = await startServer(server);
+      } catch (infraError) {
+        await forceCloseServer(server, toolsImpl, abortController);
+        throw infraError;
       }
-      return;
+
+      const child = spawn(process.execPath, [TSX_CLI, join(projectDir, "program.ts")], {
+        cwd: projectDir,
+        env: {
+          ...process.env,
+          TRAMA_PORT: String(port),
+          TRAMA_INPUT: JSON.stringify(ctx.input),
+          TRAMA_STATE: JSON.stringify(ctx.state),
+          TRAMA_ITERATION: String(ctx.iteration),
+          TRAMA_MAX_ITERATIONS: String(ctx.maxIterations),
+        },
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+
+      // Phase B: Program execution.
+      // waitForChild rejects on spawn errors (ENOENT, EACCES) — those are
+      // infrastructure failures and must NOT trigger repair.
+      let result: ChildResult;
+      try {
+        result = await waitForChild(child, timeout, {
+          stdout: chunk => { process.stdout.write(chunk); },
+          stderr: chunk => { process.stderr.write(chunk); },
+        });
+      } catch (spawnError) {
+        // Child process failed to start — not a program bug.
+        await forceCloseServer(server, toolsImpl, abortController);
+        throw spawnError;
+      }
+
+      if (result.exitCode === 0) {
+        // Repair is verified — program.ts is now the canonical source.
+        programModified = false;
+        // Program succeeded. Server cleanup failure is not a program bug.
+        try { await closeServer(server); } catch { await forceCloseServer(server, toolsImpl, abortController); }
+        if (pendingRepair) {
+          options.onRepair?.(pendingRepair.attempt, maxRepairAttempts, pendingRepair.error);
+        }
+        return;
+      }
+
+      // Program failed — this is the only path that may trigger repair.
+      try {
+        await forceCloseServer(server, toolsImpl, abortController);
+      } catch { /* best-effort cleanup */ }
+      const programError = new Error(
+        `program.ts exited with code ${result.exitCode}\n` +
+        `stdout: ${result.stdout}\n` +
+        `stderr: ${result.stderr}`
+      );
+
+      // Previous repair candidate failed — don't record it.
+      pendingRepair = null;
+
+      if (attempt === maxRepairAttempts) {
+        throw new Error(`Failed after ${maxRepairAttempts} repair attempts: ${programError}${repairDetails()}`);
+      }
+
+      const source = readFileSync(join(projectDir, "program.ts"), "utf-8");
+      const fixed = await repairWithTimeout(
+        adapter,
+        { programSource: source, error: String(programError), runtimeTypes: RUNTIME_TYPES },
+        timeout,
+        repairErrors,
+      );
+
+      if (fixed !== null) {
+        writeFileSync(join(projectDir, "program.ts"), fixed);
+        programModified = true;
+        pendingRepair = { attempt, error: String(programError) };
+      } else {
+        // Repair LLM call itself failed — don't re-run the same broken program.
+        throw new Error(`Failed after ${attempt + 1} repair attempt(s): ${programError}${repairDetails()}`);
+      }
     }
-
-    // Program failed — this is the only path that may trigger repair.
-    try {
-      await forceCloseServer(server, toolsImpl, abortController);
-    } catch { /* best-effort cleanup */ }
-    const programError = new Error(
-      `program.ts exited with code ${result.exitCode}\n` +
-      `stdout: ${result.stdout}\n` +
-      `stderr: ${result.stderr}`
-    );
-
-    // Previous repair candidate failed — don't record it.
-    pendingRepair = null;
-
-    if (attempt === maxRepairAttempts) {
-      throw new Error(`Failed after ${maxRepairAttempts} repair attempts: ${programError}${repairDetails()}`);
+  } catch (err) {
+    if (programModified) {
+      try { writeFileSync(join(projectDir, "program.ts"), originalSource); } catch { /* best-effort */ }
     }
-
-    const source = readFileSync(join(projectDir, "program.ts"), "utf-8");
-    const fixed = await repairWithTimeout(
-      adapter,
-      { programSource: source, error: String(programError), runtimeTypes: RUNTIME_TYPES },
-      timeout,
-      repairErrors,
-    );
-
-    if (fixed !== null) {
-      writeFileSync(join(projectDir, "program.ts"), fixed);
-      pendingRepair = { attempt, error: String(programError) };
-    } else {
-      // Repair LLM call itself failed — don't re-run the same broken program.
-      throw new Error(`Failed after ${attempt + 1} repair attempt(s): ${programError}${repairDetails()}`);
-    }
+    throw err;
   }
 }
 
@@ -600,7 +629,7 @@ export async function smokeRunAndRepair(
   projectDir: string,
   adapter: PiAdapter,
   reason: "create" | "update",
-  options?: { timeout?: number },
+  options?: { timeout?: number; maxRepairAttempts?: number; maxIterations?: number },
 ): Promise<void> {
   const smokeTimeout = options?.timeout ?? 30_000;
   // Run validation in a temp copy so side effects don't persist in the real project
@@ -612,9 +641,9 @@ export async function smokeRunAndRepair(
       await executeProgram({
         projectDir: smokeDir,
         adapter: smokeAdapter,
-        maxRepairAttempts: 3,
+        maxRepairAttempts: options?.maxRepairAttempts ?? 3,
         timeout: smokeTimeout,
-        maxIterations: 100,
+        maxIterations: options?.maxIterations ?? 100,
         onRepair(_attempt, _max, error) {
           appendFileSync(
             join(smokeDir, "history", "index.jsonl"),

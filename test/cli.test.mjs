@@ -95,3 +95,18 @@ PiAdapter.prototype.repair = async function repair() {
   assert.equal(result.exitCode, 0, result.stderr);
   assert.equal(readFileSync(observedModelPath, "utf-8"), "configured-model");
 });
+
+test("CLI run without --timeout uses config.defaultTimeout instead of a hardcoded default", async (t) => {
+  const fakeHome = makeTempDir("trama-cli-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  // Omitting --timeout should not error — it should fall through to config.defaultTimeout
+  const result = await runNodeCommand([CLI_ENTRY, "run", "missing"], {
+    cwd: REPO_ROOT,
+    env: { ...process.env, HOME: fakeHome },
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /not found/);
+  assert.doesNotMatch(result.stderr, /timeout must be a positive integer/i);
+});
