@@ -4,7 +4,7 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, copyFi
 import { join } from "path";
 import { homedir, tmpdir } from "os";
 import { PiAdapter } from "./pi-adapter.js";
-import { loadConfig, loadState, smokeRunAndRepair, copyToHistory, RUNTIME_TYPES, PI_VERSION } from "./runner.js";
+import { loadConfig, loadState, smokeRunAndRepair, copyToHistory, withTempDir, RUNTIME_TYPES, PI_VERSION } from "./runner.js";
 
 export { runProgram } from "./runner.js";
 
@@ -62,6 +62,14 @@ for (let i = ctx.iteration; i < ctx.maxIterations; i++) {
 await tools.write("target.ts", code);
 await ctx.done({ finalMetric: bestMetric });`;
 
+function stripCodeFences(text: string): string {
+  const trimmed = text.trim();
+  if (/^```/.test(trimmed) && /```$/.test(trimmed)) {
+    return trimmed.replace(/^```\w*\s*\n?/, "").replace(/\n?\s*```$/, "");
+  }
+  return text;
+}
+
 function getSystemPrompt(): string {
   return (
     `You are generating a TypeScript program for the trama runtime.\n\n` +
@@ -93,12 +101,7 @@ export function resolveProject(name: string): string {
 
 /** Run an LLM ask() in an isolated temp cwd so pi-coding-agent tools can't write into the real project. */
 async function isolatedAsk(adapter: PiAdapter, prompt: string, options?: { system?: string }): Promise<string> {
-  const dir = mkdtempSync(join(tmpdir(), "trama-gen-"));
-  try {
-    return await adapter.withCwd(dir).ask(prompt, options);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+  return withTempDir("trama-gen-", (dir) => adapter.withCwd(dir).ask(prompt, options));
 }
 
 /** Backup projectDir, run fn, restore on failure. Preserves new repair history entries across restore. */
@@ -170,16 +173,20 @@ export async function createProject(
     const adapter = new PiAdapter(config, projectDir);
 
     console.log(`Generating program for "${name}"...`);
-    const program = await isolatedAsk(adapter,
+    const program = stripCodeFences(await isolatedAsk(adapter,
       `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation.`,
       { system: getSystemPrompt() },
-    );
+    ));
 
     writeFileSync(join(projectDir, "program.ts"), program);
     keepProjectOnFailure = true;
 
     console.log("Validating program...");
-    await smokeRunAndRepair(projectDir, adapter, "create", { timeout: config.defaultTimeout });
+    await smokeRunAndRepair(projectDir, adapter, "create", {
+      timeout: config.defaultTimeout,
+      maxRepairAttempts: config.maxRepairAttempts,
+      maxIterations: config.defaultMaxIterations,
+    });
 
     copyFileSync(join(projectDir, "program.ts"), join(projectDir, "history", "0001.ts"));
     appendFileSync(
@@ -218,15 +225,19 @@ export async function updateProject(name: string, prompt: string): Promise<void>
       (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : "");
 
     console.log(`Updating "${name}"...`);
-    const updated = await isolatedAsk(adapter,
+    const updated = stripCodeFences(await isolatedAsk(adapter,
       `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
       { system: systemPrompt },
-    );
+    ));
 
     writeFileSync(programPath, updated);
 
     console.log("Validating updated program...");
-    await smokeRunAndRepair(projectDir, adapter, "update", { timeout: config.defaultTimeout });
+    await smokeRunAndRepair(projectDir, adapter, "update", {
+      timeout: config.defaultTimeout,
+      maxRepairAttempts: config.maxRepairAttempts,
+      maxIterations: config.defaultMaxIterations,
+    });
 
     copyToHistory(projectDir, "update", prompt);
 

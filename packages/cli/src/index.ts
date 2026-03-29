@@ -13,7 +13,7 @@ import {
 const cli = new Command()
   .name("trama")
   .description("A minimal runtime for agent-authored programs")
-  .version("0.1.0");
+  .version("0.1.1");
 
 cli
   .command("create <name> <prompt>")
@@ -31,13 +31,16 @@ cli
 cli
   .command("run <name>")
   .description("Execute a program")
-  .option("--timeout <ms>", "Execution timeout in ms", "300000")
-  .action(async (name: string, opts: { timeout: string }) => {
+  .option("--timeout <ms>", "Execution timeout in ms")
+  .action(async (name: string, opts: { timeout?: string }) => {
     try {
-      const timeout = Number(opts.timeout);
-      if (!Number.isInteger(timeout) || timeout <= 0) {
-        console.error(`Error: --timeout must be a positive integer (got "${opts.timeout}")`);
-        process.exit(1);
+      let timeout: number | undefined;
+      if (opts.timeout !== undefined) {
+        timeout = Number(opts.timeout);
+        if (!Number.isInteger(timeout) || timeout <= 0) {
+          console.error(`Error: --timeout must be a positive integer (got "${opts.timeout}")`);
+          process.exit(1);
+        }
       }
       const projectDir = resolveProject(name);
       await runProgram({ projectDir, timeout });

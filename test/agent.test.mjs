@@ -178,3 +178,20 @@ test("PiAdapter.ask calls session.dispose on abort during prompt", async () => {
   await assert.rejects(async () => promise, /disposed/i);
   assert.ok(disposeCalled > 0, "session.dispose should have been called");
 });
+
+test("PiAdapter.repair strips fenced TypeScript responses", async () => {
+  const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
+
+  const adapter = new PiAdapter({ provider: "anthropic", model: "test" }, "/tmp");
+  adapter.ask = async function ask() {
+    return "```typescript\nconst value = 1;\n```";
+  };
+
+  const result = await adapter.repair({
+    programSource: "throw new Error('boom');",
+    error: "boom",
+    runtimeTypes: "type Runtime = {};",
+  });
+
+  assert.equal(result, "const value = 1;");
+});

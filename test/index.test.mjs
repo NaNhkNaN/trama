@@ -12,6 +12,7 @@ import {
   makeTempDir,
   readJson,
   withEnv,
+  writeJson,
   writeText,
 } from "./helpers.mjs";
 
@@ -527,4 +528,101 @@ test("listProjects and showLogs print human-readable summaries", async (t) => {
     await showLogs("alpha");
   }));
   assert.deepEqual(shown.messages, ["[03:04:05] step  {\"count\":1}"]);
+});
+
+// --- Regression tests for consolidated bug fixes ---
+
+test("createProject strips code fences from LLM-generated program", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const originalAsk = PiAdapter.prototype.ask;
+  const originalRepair = PiAdapter.prototype.repair;
+
+  PiAdapter.prototype.ask = async function ask() {
+    return "```typescript\n" + DEFAULT_PROGRAM + "```";
+  };
+  PiAdapter.prototype.repair = async function repair() {
+    throw new Error("repair should not be called");
+  };
+
+  try {
+    await withEnv({ HOME: fakeHome }, async () => {
+      await createProject("fenced", "write something");
+    });
+  } finally {
+    PiAdapter.prototype.ask = originalAsk;
+    PiAdapter.prototype.repair = originalRepair;
+  }
+
+  const projectDir = join(fakeHome, ".trama", "projects", "fenced");
+  const written = readFileSync(join(projectDir, "program.ts"), "utf-8");
+  assert.doesNotMatch(written, /^```/m);
+  assert.match(written, /import.*@trama-dev\/runtime/);
+});
+
+test("updateProject strips code fences from LLM-updated program", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const projectDir = join(fakeHome, ".trama", "projects", "fenced-update");
+  createProjectFixture(projectDir, {
+    packageJson: { type: "module" },
+    programSource: DEFAULT_PROGRAM,
+  });
+
+  const originalAsk = PiAdapter.prototype.ask;
+  const originalRepair = PiAdapter.prototype.repair;
+
+  PiAdapter.prototype.ask = async function ask() {
+    return "```typescript\n" + UPDATED_PROGRAM + "```";
+  };
+  PiAdapter.prototype.repair = async function repair() {
+    throw new Error("repair should not be called");
+  };
+
+  try {
+    await withEnv({ HOME: fakeHome }, async () => {
+      await updateProject("fenced-update", "add an updated output");
+    });
+  } finally {
+    PiAdapter.prototype.ask = originalAsk;
+    PiAdapter.prototype.repair = originalRepair;
+  }
+
+  const written = readFileSync(join(projectDir, "program.ts"), "utf-8");
+  assert.doesNotMatch(written, /^```/m);
+  assert.equal(written, UPDATED_PROGRAM.trimEnd());
+});
+
+test("createProject smoke validation uses config maxRepairAttempts", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  writeJson(join(fakeHome, ".trama", "config.json"), { maxRepairAttempts: 0 });
+
+  const originalAsk = PiAdapter.prototype.ask;
+  const originalRepair = PiAdapter.prototype.repair;
+  let repairCalled = false;
+
+  PiAdapter.prototype.ask = async function ask() {
+    return 'throw new Error("broken");';
+  };
+  PiAdapter.prototype.repair = async function repair() {
+    repairCalled = true;
+    return 'throw new Error("still broken");';
+  };
+
+  try {
+    await withEnv({ HOME: fakeHome }, async () => {
+      await assert.rejects(
+        async () => createProject("no-repair", "make something"),
+        /Failed after 0 repair attempts/,
+      );
+    });
+    assert.equal(repairCalled, false, "repair should not be called when maxRepairAttempts is 0");
+  } finally {
+    PiAdapter.prototype.ask = originalAsk;
+    PiAdapter.prototype.repair = originalRepair;
+  }
 });

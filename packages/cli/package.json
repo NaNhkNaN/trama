@@ -1,6 +1,6 @@
 {
   "name": "@trama-dev/cli",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "bin": {
     "trama": "./dist/index.js"
@@ -26,7 +26,7 @@
     "LICENSE"
   ],
   "dependencies": {
-    "@trama-dev/runtime": "0.1.0",
+    "@trama-dev/runtime": "0.1.1",
     "commander": "^12.0.0"
   }
 }

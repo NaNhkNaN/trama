@@ -108,7 +108,7 @@ export class PiAdapter {
   }
 
   async repair(input: RepairInput, signal?: AbortSignal): Promise<string> {
-    return this.ask(
+    const response = await this.ask(
       `Fix this program so it runs.\n\n` +
       `Runtime types:\n${input.runtimeTypes}\n\n` +
       `Broken program:\n${input.programSource}\n\n` +
@@ -116,5 +116,10 @@ export class PiAdapter {
       `Output ONLY the fixed program. No explanation.`,
       { system: "You are a TypeScript repair tool.", signal }
     );
+    const trimmed = response.trim();
+    if (/^```/.test(trimmed) && /```$/.test(trimmed)) {
+      return trimmed.replace(/^```\w*\s*\n?/, "").replace(/\n?\s*```$/, "");
+    }
+    return response;
   }
 }

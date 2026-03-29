@@ -445,3 +445,150 @@ test("runProgram only records repair history after the repaired program succeeds
   const repairEntries = history.filter(e => e.reason === "repair");
   assert.equal(repairEntries.length, 1, "only 1 verified repair should be recorded");
 });
+
+// --- Regression tests for consolidated bug fixes ---
+
+test("runProgram restores original program.ts when all repair attempts produce broken code", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  const originalSource = 'throw new Error("original");';
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: originalSource,
+  });
+
+  const originalRepair = PiAdapter.prototype.repair;
+  PiAdapter.prototype.repair = async function repair() {
+    return 'throw new Error("still broken");';
+  };
+
+  try {
+    await assert.rejects(
+      async () => runProgram({ projectDir, maxRepairAttempts: 2, timeout: 5_000 }),
+      /Failed after 2 repair attempts/,
+    );
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
+  } finally {
+    PiAdapter.prototype.repair = originalRepair;
+  }
+});
+
+test("runProgram restores original program.ts when repair LLM call fails", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  const originalSource = 'throw new Error("original");';
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: originalSource,
+  });
+
+  const originalRepair = PiAdapter.prototype.repair;
+  PiAdapter.prototype.repair = async function repair() {
+    throw new Error("LLM unavailable");
+  };
+
+  try {
+    await assert.rejects(
+      async () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 }),
+      /Failed after 1 repair attempt/,
+    );
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
+  } finally {
+    PiAdapter.prototype.repair = originalRepair;
+  }
+});
+
+test("runProgram restores original program.ts when infrastructure fails after a repair candidate is written", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  const originalSource = 'throw new Error("original");';
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: originalSource,
+  });
+
+  const originalRepair = PiAdapter.prototype.repair;
+  // Repair returns code that corrupts state.json, causing loadState to throw
+  // on the next loop iteration (infrastructure failure after repair write).
+  PiAdapter.prototype.repair = async function repair() {
+    writeFileSync(join(projectDir, "state.json"), "{corrupt json");
+    return 'throw new Error("repaired but untested");';
+  };
+
+  try {
+    await assert.rejects(
+      async () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 }),
+      /Corrupt state\.json/,
+    );
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
+  } finally {
+    PiAdapter.prototype.repair = originalRepair;
+  }
+});
+
+test("runProgram keeps verified repair even when post-success bookkeeping (onRepair) fails", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: 'throw new Error("original");',
+  });
+
+  const fixedProgram = `import { ctx } from "@trama-dev/runtime";
+await ctx.done();
+`;
+
+  const originalRepair = PiAdapter.prototype.repair;
+  PiAdapter.prototype.repair = async function repair() {
+    // Make history/ unwritable so onRepair's copyToHistory throws
+    const { chmodSync } = await import("fs");
+    chmodSync(join(projectDir, "history"), 0o444);
+    return fixedProgram;
+  };
+
+  try {
+    await assert.rejects(
+      async () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 }),
+      /EACCES/,
+    );
+    // The repaired program ran successfully — program.ts must keep the verified repair
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram);
+  } finally {
+    PiAdapter.prototype.repair = originalRepair;
+    // Restore permissions for cleanup
+    const { chmodSync } = await import("fs");
+    try { chmodSync(join(projectDir, "history"), 0o755); } catch { /* may not exist */ }
+  }
+});
+
+test("loadConfig rejects non-object JSON values (array, string, number, null)", (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  for (const [label, content] of [["array", "[]"], ["string", '"openai"'], ["number", "42"], ["null", "null"]]) {
+    writeText(join(fakeHome, ".trama", "config.json"), content);
+    withEnv({ HOME: fakeHome }, () => {
+      assert.throws(
+        () => loadConfig(),
+        /Malformed config.*expected a JSON object/,
+        `should reject ${label}`,
+      );
+    });
+  }
+});
+
+test("runProgram rejects non-object package.json (array)", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false });
+  writeFileSync(join(projectDir, "package.json"), "[]");
+
+  await assert.rejects(
+    async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 }),
+    /Malformed package\.json.*expected a JSON object/,
+  );
+});
