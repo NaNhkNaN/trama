@@ -50,7 +50,8 @@ test("createProject writes scaffold, validates the generated program, and record
 
   const projectDir = join(fakeHome, ".trama", "projects", "alpha");
   assert.equal(existsSync(join(projectDir, "program.ts")), true);
-  assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "iteration:0");
+  // Smoke run side effects (output.txt) should NOT persist in the project dir
+  assert.equal(existsSync(join(projectDir, "output.txt")), false);
   assert.equal(readJson(join(projectDir, "package.json")).type, "module");
   assert.equal(existsSync(join(projectDir, "history", "0001.ts")), true);
 
@@ -61,6 +62,38 @@ test("createProject writes scaffold, validates the generated program, and record
   assert.equal(historyLines.at(-1).reason, "create");
   assert.equal(historyLines.at(-1).prompt, "write an output file");
   assert.match(prompts[0], /Runtime API:/);
+});
+
+test("createProject generation runs in a temp cwd and does not leak ask side effects", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const originalAsk = PiAdapter.prototype.ask;
+  const originalRepair = PiAdapter.prototype.repair;
+  let observedCwd = "";
+
+  PiAdapter.prototype.ask = async function ask() {
+    observedCwd = this.cwd;
+    writeText(join(this.cwd, "ask-side-effect.txt"), "temp-only");
+    return DEFAULT_PROGRAM;
+  };
+  PiAdapter.prototype.repair = async function repair() {
+    throw new Error("repair should not be called");
+  };
+
+  try {
+    await withEnv({ HOME: fakeHome }, async () => {
+      await createProject("alpha-temp-cwd", "write an output file");
+    });
+  } finally {
+    PiAdapter.prototype.ask = originalAsk;
+    PiAdapter.prototype.repair = originalRepair;
+  }
+
+  const projectDir = join(fakeHome, ".trama", "projects", "alpha-temp-cwd");
+  assert.match(observedCwd, /trama-gen-/);
+  assert.notEqual(observedCwd, projectDir);
+  assert.equal(existsSync(join(projectDir, "ask-side-effect.txt")), false);
 });
 
 test("createProject cleans up the project directory when generation fails before program.ts is written", async (t) => {
@@ -104,7 +137,7 @@ test("createProject keeps the generated project when validation fails after prog
     await withEnv({ HOME: fakeHome }, async () => {
       await assert.rejects(
         async () => createProject("broken-after-write", "make something"),
-        /Smoke run failed after 3 repair attempts/,
+        /Failed after 3 repair attempts/,
       );
     });
   } finally {
@@ -142,6 +175,49 @@ test("createProject smoke validation errors include buffered stdout", async (t) 
     PiAdapter.prototype.ask = originalAsk;
     PiAdapter.prototype.repair = originalRepair;
   }
+});
+
+test("createProject smoke repair runs in a temp cwd and records create-repair history", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const originalAsk = PiAdapter.prototype.ask;
+  const originalRepair = PiAdapter.prototype.repair;
+  let repairCwd = "";
+  const fixedProgram = `import { ctx, tools } from "@trama-dev/runtime";
+await tools.write("fixed.txt", "ok");
+await ctx.done();
+`;
+
+  PiAdapter.prototype.ask = async function ask() {
+    return 'throw new Error("boom");';
+  };
+  PiAdapter.prototype.repair = async function repair() {
+    repairCwd = this.cwd;
+    writeText(join(this.cwd, "repair-side-effect.txt"), "temp-only");
+    return fixedProgram;
+  };
+
+  try {
+    await withEnv({ HOME: fakeHome }, async () => {
+      await createProject("alpha-repair", "fix the generated program");
+    });
+  } finally {
+    PiAdapter.prototype.ask = originalAsk;
+    PiAdapter.prototype.repair = originalRepair;
+  }
+
+  const projectDir = join(fakeHome, ".trama", "projects", "alpha-repair");
+  assert.match(repairCwd, /trama-smoke-/);
+  assert.notEqual(repairCwd, projectDir);
+  assert.equal(existsSync(join(projectDir, "repair-side-effect.txt")), false);
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram);
+
+  const historyLines = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8")
+    .trim()
+    .split("\n")
+    .map(line => JSON.parse(line));
+  assert.equal(historyLines.some(entry => entry.reason === "create-repair"), true);
 });
 
 test("createProject rejects path-like project names before creating any directories", async (t) => {
@@ -192,7 +268,8 @@ test("updateProject rewrites the program and appends an update history entry", a
   }
 
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), UPDATED_PROGRAM);
-  assert.equal(readFileSync(join(projectDir, "updated.txt"), "utf-8"), "updated");
+  // Smoke run side effects (updated.txt) should NOT persist in the project dir
+  assert.equal(existsSync(join(projectDir, "updated.txt")), false);
   assert.match(systemPrompt, /Original prompt: test prompt/);
   assert.match(systemPrompt, /Current program\.ts:/);
   assert.match(systemPrompt, /Current state:/);
@@ -203,6 +280,44 @@ test("updateProject rewrites the program and appends an update history entry", a
     .map(line => JSON.parse(line));
   assert.equal(historyLines.at(-1).reason, "update");
   assert.equal(historyLines.at(-1).prompt, "add an updated output");
+});
+
+test("updateProject generation runs in a temp cwd and does not leak ask side effects", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const projectDir = join(fakeHome, ".trama", "projects", "beta-temp-cwd");
+  createProjectFixture(projectDir, {
+    state: { prior: "state" },
+    packageJson: { name: "beta-project" },
+    programSource: DEFAULT_PROGRAM,
+  });
+
+  const originalAsk = PiAdapter.prototype.ask;
+  const originalRepair = PiAdapter.prototype.repair;
+  let observedCwd = "";
+
+  PiAdapter.prototype.ask = async function ask() {
+    observedCwd = this.cwd;
+    writeText(join(this.cwd, "ask-side-effect.txt"), "temp-only");
+    return UPDATED_PROGRAM;
+  };
+  PiAdapter.prototype.repair = async function repair() {
+    throw new Error("repair should not be called");
+  };
+
+  try {
+    await withEnv({ HOME: fakeHome }, async () => {
+      await updateProject("beta-temp-cwd", "add an updated output");
+    });
+  } finally {
+    PiAdapter.prototype.ask = originalAsk;
+    PiAdapter.prototype.repair = originalRepair;
+  }
+
+  assert.match(observedCwd, /trama-gen-/);
+  assert.notEqual(observedCwd, projectDir);
+  assert.equal(existsSync(join(projectDir, "ask-side-effect.txt")), false);
 });
 
 test("updateProject restores original program.ts when validation fails", async (t) => {

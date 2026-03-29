@@ -2,8 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync } from "fs";
 import { join } from "path";
-import { loadState, runProgram } from "../packages/runtime/dist/runner.js";
-import { cleanupTempDir, createProjectFixture, makeTempDir, readJson, writeJson } from "./helpers.mjs";
+import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
+import { copyToHistory, loadState, runProgram } from "../packages/runtime/dist/runner.js";
+import { cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson, writeText } from "./helpers.mjs";
 
 test("loadState returns an empty object when state.json is missing", (t) => {
   const projectDir = makeTempDir("trama-runner-");
@@ -29,6 +30,27 @@ test("loadState throws a clear error for corrupt JSON", (t) => {
     () => loadState(projectDir),
     /Corrupt state\.json .*cannot safely continue/,
   );
+});
+
+test("copyToHistory continues numbering correctly past 9999", (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+
+  writeFileSync(join(projectDir, "history", "9999.ts"), "// old");
+  writeFileSync(join(projectDir, "history", "10000.ts"), "// newer");
+  writeFileSync(join(projectDir, "program.ts"), "// latest");
+
+  copyToHistory(projectDir, "update", "prompt");
+
+  assert.equal(existsSync(join(projectDir, "history", "10001.ts")), true);
+
+  const entries = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8")
+    .trim()
+    .split("\n")
+    .map(line => JSON.parse(line));
+  assert.equal(entries.at(-1).version, 10001);
+  assert.equal(entries.at(-1).reason, "update");
 });
 
 test("runProgram scaffolds and executes a minimal shared project", async (t) => {
@@ -123,6 +145,73 @@ throw new Error("boom");`,
   );
 });
 
+test("runProgram records successful repairs in history and logs the repair attempt", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: 'throw new Error("boom");',
+  });
+
+  const fixedProgram = `import { ctx, tools } from "@trama-dev/runtime";
+await tools.write("repaired.txt", "ok");
+await ctx.done();
+`;
+
+  const originalRepair = PiAdapter.prototype.repair;
+  PiAdapter.prototype.repair = async function repair(input) {
+    assert.match(input.error, /boom/);
+    return fixedProgram;
+  };
+
+  try {
+    await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 });
+  } finally {
+    PiAdapter.prototype.repair = originalRepair;
+  }
+
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram);
+  assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), fixedProgram);
+  assert.equal(readFileSync(join(projectDir, "repaired.txt"), "utf-8"), "ok");
+
+  const history = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8")
+    .trim()
+    .split("\n")
+    .map(line => JSON.parse(line));
+  assert.equal(history.at(-1).reason, "repair");
+  assert.match(history.at(-1).error, /boom/);
+
+  const logs = readFileSync(join(projectDir, "logs", "latest.jsonl"), "utf-8")
+    .trim()
+    .split("\n")
+    .map(line => JSON.parse(line));
+  assert.equal(logs.some(entry => entry.message === "Repair attempt 1/1"), true);
+  assert.equal(logs.some(entry => entry.message === "done"), true);
+});
+
+test("runProgram surfaces repair failures after retries are exhausted", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: 'throw new Error("boom");',
+  });
+
+  const originalRepair = PiAdapter.prototype.repair;
+  PiAdapter.prototype.repair = async function repair() {
+    throw new Error("repair blew up");
+  };
+
+  try {
+    await assert.rejects(
+      async () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 }),
+      /Repair errors:[\s\S]*repair blew up/s,
+    );
+  } finally {
+    PiAdapter.prototype.repair = originalRepair;
+  }
+});
+
 test("runProgram patches existing package.json that lacks type:module", async (t) => {
   const projectDir = makeTempDir("trama-runner-");
   t.after(() => cleanupTempDir(projectDir));
@@ -148,6 +237,22 @@ test("runProgram rejects invalid timeout values passed via the public API", asyn
     async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: Number.NaN }),
     /Invalid timeout: NaN/,
   );
+});
+
+test("runProgram surfaces malformed config.json instead of silently using defaults", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(projectDir));
+  t.after(() => cleanupTempDir(fakeHome));
+  createProjectFixture(projectDir, { scaffold: false });
+  writeText(join(fakeHome, ".trama", "config.json"), "{bad json");
+
+  await withEnv({ HOME: fakeHome }, async () => {
+    await assert.rejects(
+      async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 }),
+      /Malformed config/,
+    );
+  });
 });
 
 test("runProgram rejects invalid maxRepairAttempts values passed via the public API", async (t) => {

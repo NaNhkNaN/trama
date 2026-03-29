@@ -4,9 +4,10 @@ import {
   readFileSync, writeFileSync, appendFileSync,
   readdirSync, copyFileSync, mkdirSync, existsSync,
   symlinkSync, rmSync, lstatSync, readlinkSync,
+  cpSync, mkdtempSync,
 } from "fs";
 import { join, dirname } from "path";
-import { homedir } from "os";
+import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
 import type { Ctx, Agent, Tools, RunOptions, ChildResult, TramaConfig } from "./types.js";
 import { PiAdapter } from "./pi-adapter.js";
@@ -64,8 +65,7 @@ function ensureRuntimeLink(projectDir: string): void {
       );
     }
   } catch (err) {
-    // Re-throw if it's our own error (not ENOENT)
-    if (err instanceof Error && !("code" in err)) throw err;
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
     // ENOENT — path doesn't exist, proceed to create
   }
 
@@ -112,6 +112,13 @@ function ensureProjectScaffold(projectDir: string): void {
 
 // --- Runtime type definitions (included in system prompts) ---
 
+/**
+ * Simplified API reference for LLM system prompts.
+ * NOT the canonical type definitions (those live in types.ts).
+ * Kept as a readable string rather than auto-generated, because the LLM
+ * needs a concise reference, not the full implementation types.
+ * If types.ts changes, review whether this summary needs updating.
+ */
 export const RUNTIME_TYPES = `// @trama-dev/runtime - Complete API
 
 export interface Ctx {
@@ -165,10 +172,20 @@ export function loadConfig(): TramaConfig {
     defaultTimeout: 300_000,
     defaultMaxIterations: 100,
   };
+  let raw: string;
   try {
-    return { ...defaults, ...JSON.parse(readFileSync(configPath, "utf-8")) };
-  } catch {
-    return defaults;
+    raw = readFileSync(configPath, "utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return defaults;
+    throw err;
+  }
+  try {
+    return { ...defaults, ...JSON.parse(raw) };
+  } catch (err) {
+    throw new Error(
+      `Malformed config at ${configPath} — fix or delete it.\n` +
+      `Parse error: ${err instanceof Error ? err.message : err}`
+    );
   }
 }
 
@@ -232,7 +249,7 @@ function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
           case "/tools/shell":
             result = await toolsImpl.shell(data.command, { cwd: data.cwd, timeout: data.timeout });
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(result));
+            res.end(JSON.stringify({ result }));
             break;
 
           case "/tools/fetch":
@@ -240,7 +257,7 @@ function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
               method: data.method, headers: data.headers, body: data.body,
             });
             res.writeHead(200, { "Content-Type": "application/json" });
-            res.end(JSON.stringify(result));
+            res.end(JSON.stringify({ result }));
             break;
 
           case "/ctx/checkpoint":
@@ -291,12 +308,19 @@ function startServer(server: Server): Promise<number> {
 
 function closeServer(server: Server): Promise<void> {
   return new Promise((resolve, reject) => {
-    server.close(err => (err ? reject(err) : resolve()));
+    server.close(err => {
+      if (!err || (err as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") {
+        resolve();
+      } else {
+        reject(err);
+      }
+    });
   });
 }
 
-/** Kill orphan shell processes, drop all HTTP connections, then close. */
-function forceCloseServer(server: Server, toolsImpl: ToolsWithCleanup): Promise<void> {
+/** Abort in-flight operations, kill orphan shells, drop HTTP connections, then close. */
+function forceCloseServer(server: Server, toolsImpl: ToolsWithCleanup, abortController?: AbortController): Promise<void> {
+  abortController?.abort();
   toolsImpl.killActiveShells();
   server.closeAllConnections();
   return closeServer(server);
@@ -365,11 +389,11 @@ function waitForChild(
  */
 export function copyToHistory(projectDir: string, reason: string, detail?: string) {
   const historyDir = join(projectDir, "history");
-  const existing = readdirSync(historyDir).filter(f => /^\d{4}\.ts$/.test(f));
+  const existing = readdirSync(historyDir).filter(f => /^\d+\.ts$/.test(f));
 
   const nums = existing.map(f => parseInt(f.replace(".ts", ""), 10));
   const nextNum = nums.length > 0 ? Math.max(...nums) + 1 : 1;
-  const next = String(nextNum).padStart(4, "0");
+  const next = String(nextNum).padStart(Math.max(4, String(nextNum).length), "0");
 
   copyFileSync(join(projectDir, "program.ts"), join(historyDir, `${next}.ts`));
 
@@ -379,31 +403,75 @@ export function copyToHistory(projectDir: string, reason: string, detail?: strin
   appendFileSync(join(historyDir, "index.jsonl"), JSON.stringify(entry) + "\n");
 }
 
-// --- Smoke run (used by create and update) ---
+// --- Helpers ---
 
-export async function smokeRunAndRepair(
-  projectDir: string,
+/** Run fn in a temp directory, clean up afterwards regardless of outcome. */
+async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  try {
+    return await fn(dir);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Attempt a single repair call with its own timeout and cancellation.
+ * Returns true if repair succeeded, false if it failed (error is appended to repairErrors).
+ */
+async function repairWithTimeout(
   adapter: PiAdapter,
-  reason: "create" | "update",
-): Promise<void> {
+  input: { programSource: string; error: string; runtimeTypes: string },
+  timeout: number,
+  repairErrors: string[],
+): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    return await adapter.repair(input, controller.signal);
+  } catch (err) {
+    repairErrors.push(err instanceof Error ? err.message : String(err));
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// --- Shared execution core ---
+
+interface ExecuteOptions {
+  projectDir: string;
+  adapter: PiAdapter;
+  maxRepairAttempts: number;
+  timeout: number;
+  maxIterations: number;
+  /** Called after a successful repair. Receives attempt index and original error string. */
+  onRepair?: (attempt: number, maxAttempts: number, error: string) => void;
+}
+
+async function executeProgram(options: ExecuteOptions): Promise<void> {
+  const { projectDir, adapter, maxRepairAttempts, timeout, maxIterations } = options;
+
   mkdirSync(join(projectDir, "history"), { recursive: true });
   mkdirSync(join(projectDir, "logs"), { recursive: true });
   ensureProjectScaffold(projectDir);
   ensureRuntimeLink(projectDir);
 
-  const maxAttempts = 3;
+  writeFileSync(join(projectDir, "logs", "latest.jsonl"), "");
 
-  for (let attempt = 0; attempt <= maxAttempts; attempt++) {
-    const ctx = createContext(projectDir, loadState(projectDir));
-    const agentImpl = createAgent(adapter);
-    const toolsImpl = createTools(projectDir);
+  const repairErrors: string[] = [];
 
-    writeFileSync(join(projectDir, "logs", "latest.jsonl"), "");
+  for (let attempt = 0; attempt <= maxRepairAttempts; attempt++) {
+    const abortController = new AbortController();
+    const { signal } = abortController;
+    const ctx = createContext(projectDir, loadState(projectDir), { maxIterations });
+    const agentImpl = createAgent(adapter, signal);
+    const toolsImpl = createTools(projectDir, signal);
 
     const server = createIPCServer(ctx, agentImpl, toolsImpl);
-    const port = await startServer(server);
 
     try {
+      const port = await startServer(server);
       const meta = JSON.parse(readFileSync(join(projectDir, "meta.json"), "utf-8"));
 
       const child = spawn(process.execPath, [TSX_CLI, join(projectDir, "program.ts")], {
@@ -419,8 +487,9 @@ export async function smokeRunAndRepair(
         stdio: ["pipe", "pipe", "pipe"],
       });
 
-      const result = await waitForChild(child, 5000, {
+      const result = await waitForChild(child, timeout, {
         stdout: chunk => { process.stdout.write(chunk); },
+        stderr: chunk => { process.stderr.write(chunk); },
       });
 
       if (result.exitCode === 0) {
@@ -429,35 +498,86 @@ export async function smokeRunAndRepair(
       }
 
       throw new Error(
-        `Smoke run failed (exit ${result.exitCode})\nstdout: ${result.stdout}\nstderr: ${result.stderr}`
+        `program.ts exited with code ${result.exitCode}\n` +
+        `stdout: ${result.stdout}\n` +
+        `stderr: ${result.stderr}`
       );
 
     } catch (error) {
-      if (attempt === maxAttempts) {
-        await forceCloseServer(server, toolsImpl);
-        throw new Error(`Smoke run failed after ${maxAttempts} repair attempts: ${error}`);
+      await forceCloseServer(server, toolsImpl, abortController);
+
+      if (attempt === maxRepairAttempts) {
+        const details = repairErrors.length > 0
+          ? `\nRepair errors:\n${repairErrors.map((e, i) => `  [${i + 1}] ${e}`).join("\n")}`
+          : "";
+        throw new Error(`Failed after ${maxRepairAttempts} repair attempts: ${error}${details}`);
       }
 
-      appendFileSync(
-        join(projectDir, "history", "index.jsonl"),
-        JSON.stringify({
-          reason: `${reason}-repair`,
-          timestamp: new Date().toISOString(),
-          error: String(error),
-        }) + "\n"
+      const source = readFileSync(join(projectDir, "program.ts"), "utf-8");
+      const fixed = await repairWithTimeout(
+        adapter,
+        { programSource: source, error: String(error), runtimeTypes: RUNTIME_TYPES },
+        timeout,
+        repairErrors,
       );
 
-      const source = readFileSync(join(projectDir, "program.ts"), "utf-8");
-      const fixed = await adapter.repair({
-        programSource: source,
-        error: String(error),
-        runtimeTypes: RUNTIME_TYPES,
-      });
-      writeFileSync(join(projectDir, "program.ts"), fixed);
-
-      await forceCloseServer(server, toolsImpl);
+      if (fixed !== null) {
+        writeFileSync(join(projectDir, "program.ts"), fixed);
+        options.onRepair?.(attempt, maxRepairAttempts, String(error));
+      }
     }
   }
+}
+
+// --- Smoke run (used by create and update) ---
+
+/** Copy new history entries from src to dst (appends only entries added after the shared prefix). */
+function propagateHistoryEntries(srcDir: string, dstDir: string): void {
+  const srcPath = join(srcDir, "history", "index.jsonl");
+  const dstPath = join(dstDir, "history", "index.jsonl");
+  if (!existsSync(srcPath)) return;
+
+  const srcHistory = readFileSync(srcPath, "utf-8");
+  const dstHistory = existsSync(dstPath) ? readFileSync(dstPath, "utf-8") : "";
+  const newEntries = srcHistory.slice(dstHistory.length);
+  if (newEntries.length > 0) {
+    mkdirSync(join(dstDir, "history"), { recursive: true });
+    appendFileSync(dstPath, newEntries);
+  }
+}
+
+export async function smokeRunAndRepair(
+  projectDir: string,
+  adapter: PiAdapter,
+  reason: "create" | "update",
+): Promise<void> {
+  // Run validation in a temp copy so side effects don't persist in the real project
+  await withTempDir("trama-smoke-", async (smokeDir) => {
+    cpSync(projectDir, smokeDir, { recursive: true });
+    const smokeAdapter = adapter.withCwd(smokeDir);
+
+    try {
+      await executeProgram({
+        projectDir: smokeDir,
+        adapter: smokeAdapter,
+        maxRepairAttempts: 3,
+        timeout: 5000,
+        maxIterations: 100,
+        onRepair(_attempt, _max, error) {
+          appendFileSync(
+            join(smokeDir, "history", "index.jsonl"),
+            JSON.stringify({ reason: `${reason}-repair`, timestamp: new Date().toISOString(), error }) + "\n"
+          );
+        },
+      });
+
+      // Smoke passed — copy back program.ts (may have been repaired)
+      copyFileSync(join(smokeDir, "program.ts"), join(projectDir, "program.ts"));
+    } finally {
+      // Always propagate repair history, whether smoke passed or failed
+      propagateHistoryEntries(smokeDir, projectDir);
+    }
+  });
 }
 
 // --- Core execution ---
@@ -484,72 +604,22 @@ export async function runProgram(options: RunOptions) {
     throw new Error(`Invalid maxRepairAttempts: ${maxRepairAttempts}. Must be a non-negative integer.`);
   }
 
-  mkdirSync(join(projectDir, "history"), { recursive: true });
-  mkdirSync(join(projectDir, "logs"), { recursive: true });
-  ensureProjectScaffold(projectDir);
-  ensureRuntimeLink(projectDir);
-
   const adapter = new PiAdapter(config, projectDir);
 
-  for (let attempt = 0; attempt <= maxRepairAttempts; attempt++) {
-    const ctx = createContext(projectDir, loadState(projectDir), { maxIterations });
-    const agentImpl = createAgent(adapter);
-    const toolsImpl = createTools(projectDir);
+  await executeProgram({
+    projectDir,
+    adapter,
+    maxRepairAttempts,
+    timeout,
+    maxIterations,
+    onRepair(attempt, max, error) {
+      // Log repair attempts (appends to already-open logs file)
+      const logsPath = join(projectDir, "logs", "latest.jsonl");
+      const entry = { ts: Date.now(), message: `Repair attempt ${attempt + 1}/${max}`, data: { error } };
+      appendFileSync(logsPath, JSON.stringify(entry) + "\n");
+      console.log(`[trama] Repair attempt ${attempt + 1}/${max}`);
 
-    const logsPath = join(projectDir, "logs", "latest.jsonl");
-    writeFileSync(logsPath, "");
-
-    const server = createIPCServer(ctx, agentImpl, toolsImpl);
-    const port = await startServer(server);
-
-    try {
-      const meta = JSON.parse(readFileSync(join(projectDir, "meta.json"), "utf-8"));
-
-      const child = spawn(process.execPath, [TSX_CLI, join(projectDir, "program.ts")], {
-        cwd: projectDir,
-        env: {
-          ...process.env,
-          TRAMA_PORT: String(port),
-          TRAMA_INPUT: JSON.stringify(meta.input),
-          TRAMA_STATE: JSON.stringify(ctx.state),
-          TRAMA_ITERATION: String(ctx.iteration),
-          TRAMA_MAX_ITERATIONS: String(ctx.maxIterations),
-        },
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-
-      const result = await waitForChild(child, timeout, {
-        stdout: chunk => { process.stdout.write(chunk); },
-      });
-
-      if (result.exitCode === 0) {
-        await closeServer(server);
-        return;
-      }
-
-      throw new Error(
-        `program.ts exited with code ${result.exitCode}\n` +
-        `stdout: ${result.stdout}\n` +
-        `stderr: ${result.stderr}`
-      );
-
-    } catch (error) {
-      if (attempt === maxRepairAttempts) {
-        await forceCloseServer(server, toolsImpl);
-        throw new Error(`Failed after ${maxRepairAttempts} repair attempts: ${error}`);
-      }
-
-      await ctx.log(`Repair attempt ${attempt + 1}/${maxRepairAttempts}`, { error: String(error) });
-      const source = readFileSync(join(projectDir, "program.ts"), "utf-8");
-      const fixed = await adapter.repair({
-        programSource: source,
-        error: String(error),
-        runtimeTypes: RUNTIME_TYPES,
-      });
-      writeFileSync(join(projectDir, "program.ts"), fixed);
-      copyToHistory(projectDir, "repair", String(error));
-
-      await forceCloseServer(server, toolsImpl);
-    }
-  }
+      copyToHistory(projectDir, "repair", error);
+    },
+  });
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "http";
 import test from "node:test";
-import { mkdirSync, readFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { createTools } from "../packages/runtime/dist/tools.js";
 import { cleanupTempDir, makeTempDir } from "./helpers.mjs";
@@ -75,6 +75,38 @@ test("createTools killActiveShells terminates in-flight commands", async (t) => 
   assert.notEqual(result.exitCode, 0);
 });
 
+test("createTools killActiveShells terminates background processes in the same process group", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  const tools = createTools(projectDir);
+  const pending = tools.shell("(sleep 0.2; echo leaked > leaked.txt) & sleep 10");
+
+  await new Promise(resolve => setTimeout(resolve, 50));
+  tools.killActiveShells();
+
+  const result = await pending;
+  await new Promise(resolve => setTimeout(resolve, 400));
+
+  assert.notEqual(result.exitCode, 0);
+  assert.equal(existsSync(join(projectDir, "leaked.txt")), false);
+});
+
+test("createTools killActiveShells still terminates background processes after the shell has exited", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  const tools = createTools(projectDir);
+  const result = await tools.shell('nohup sh -c "sleep 0.2; echo leaked > leaked.txt" >/dev/null 2>&1 &');
+
+  assert.equal(result.exitCode, 0);
+
+  tools.killActiveShells();
+  await new Promise(resolve => setTimeout(resolve, 400));
+
+  assert.equal(existsSync(join(projectDir, "leaked.txt")), false);
+});
+
 test("createTools fetch returns status, body, and headers", async (t) => {
   const projectDir = makeTempDir("trama-tools-");
   t.after(() => cleanupTempDir(projectDir));
@@ -97,6 +129,33 @@ test("createTools fetch returns status, body, and headers", async (t) => {
   assert.equal(result.status, 201);
   assert.equal(result.body, "pong");
   assert.equal(result.headers["x-test-header"], "POST");
+});
+
+test("createTools fetch respects the provided abort signal", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  const server = createServer(() => {
+    // Intentionally never respond; the caller should abort first.
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  t.after(() => server.close());
+
+  const port = server.address().port;
+  const controller = new AbortController();
+  const tools = createTools(projectDir, controller.signal);
+  const pending = tools.fetch(`http://127.0.0.1:${port}/hang`);
+
+  setTimeout(() => controller.abort(), 20);
+
+  await assert.rejects(
+    async () => pending,
+    /Abort|aborted/i,
+  );
 });
 
 test("createTools path guard rejects prefix false-matches (spec §7.5)", async (t) => {

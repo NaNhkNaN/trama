@@ -73,6 +73,8 @@ Every other approach puts something between you and execution: a graph definitio
 
 trama removes that layer. Your intent becomes a program. The program is what runs. When you change your mind, the program changes. The history of your intent is the `git log` of a `.ts` file.
 
+Pulumi and CDK proved that real code beats DSLs and YAML for infrastructure. trama takes the same position for agent orchestration: **orchestration as code** — not as configuration, not as a graph, not as a prompt template. And it goes one step further: the code itself is written by the system, not by the human.
+
 This means:
 - **The control flow is always visible.** Open program.ts and you see exactly what will happen — every loop, branch, LLM call, and side effect. No framework internals to reverse-engineer.
 - **No framework lock-in.** The orchestration is TypeScript. If you outgrow trama, take your program.ts and run it however you want.

@@ -20,10 +20,10 @@ function validateShape(result: unknown, schema: Record<string, string>): string 
   return null;
 }
 
-export function createAgent(adapter: PiAdapter): Agent {
+export function createAgent(adapter: PiAdapter, signal?: AbortSignal): Agent {
   return {
     async ask(prompt, options) {
-      return adapter.ask(prompt, options);
+      return adapter.ask(prompt, signal ? { ...options, signal } : options);
     },
 
     async generate(input) {
@@ -34,7 +34,7 @@ export function createAgent(adapter: PiAdapter): Agent {
       const fullPrompt = `${input.prompt}\n\n${schemaInstruction}`;
 
       const attempt = async (p: string) => {
-        const response = await adapter.ask(p, { system: input.system });
+        const response = await adapter.ask(p, signal ? { system: input.system, signal } : { system: input.system });
         const cleaned = response
           .trim()
           .replace(/^```json\s*/i, "")
