@@ -9,13 +9,13 @@ import type { PiAdapter } from "./pi-adapter.js";
 function validateShape(result: unknown, schema: Record<string, string>): string | null {
   if (typeof result !== "object" || result === null) return "response is not an object";
   const obj = result as Record<string, unknown>;
+  const supportedTypes = new Set(["string", "number", "boolean"]);
   for (const [key, typeDesc] of Object.entries(schema)) {
     if (!(key in obj)) return `missing key: ${key}`;
     const expectedType = typeDesc.split(":")[0].trim();
+    if (!supportedTypes.has(expectedType)) return `unsupported schema type "${expectedType}" for key "${key}"`;
     const actual = typeof obj[key];
-    if (expectedType === "string" && actual !== "string") return `${key}: expected string, got ${actual}`;
-    if (expectedType === "number" && actual !== "number") return `${key}: expected number, got ${actual}`;
-    if (expectedType === "boolean" && actual !== "boolean") return `${key}: expected boolean, got ${actual}`;
+    if (actual !== expectedType) return `${key}: expected ${expectedType}, got ${actual}`;
   }
   return null;
 }

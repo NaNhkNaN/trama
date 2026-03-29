@@ -43,9 +43,12 @@ export function createContext(
 
       if (!doneLogged) {
         await this.log("done", result);
-        doneLogged = true;
       }
       await this.checkpoint();
+      // Only mark as complete after checkpoint succeeds.
+      // If checkpoint throws, a retry will re-log "done" (acceptable)
+      // and retry the checkpoint.
+      doneLogged = true;
       doneCalled = true;
     }
   };

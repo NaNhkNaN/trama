@@ -80,7 +80,7 @@ export function validateProjectName(name: string): void {
   }
 }
 
-function resolveProject(name: string): string {
+export function resolveProject(name: string): string {
   validateProjectName(name);
   const dir = join(projectsDir(), name);
   if (!existsSync(dir)) {
@@ -179,7 +179,7 @@ export async function createProject(
     keepProjectOnFailure = true;
 
     console.log("Validating program...");
-    await smokeRunAndRepair(projectDir, adapter, "create");
+    await smokeRunAndRepair(projectDir, adapter, "create", { timeout: config.defaultTimeout });
 
     copyFileSync(join(projectDir, "program.ts"), join(projectDir, "history", "0001.ts"));
     appendFileSync(
@@ -226,7 +226,7 @@ export async function updateProject(name: string, prompt: string): Promise<void>
     writeFileSync(programPath, updated);
 
     console.log("Validating updated program...");
-    await smokeRunAndRepair(projectDir, adapter, "update");
+    await smokeRunAndRepair(projectDir, adapter, "update", { timeout: config.defaultTimeout });
 
     copyToHistory(projectDir, "update", prompt);
 

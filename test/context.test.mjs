@@ -170,6 +170,31 @@ test("createContext extracts input from meta.json", async (t) => {
   assert.equal(ctx.input.args.file, "a.txt");
 });
 
+test("createContext done retries log and checkpoint after checkpoint failure", async (t) => {
+  const projectDir = makeTempDir("trama-context-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+
+  const ctx = createContext(projectDir, {});
+  ctx.state.bad = () => "nope"; // non-serializable
+
+  // First done() should throw because checkpoint fails on non-serializable state
+  await assert.rejects(
+    async () => ctx.done({ result: "ok" }),
+    /not JSON-serializable/,
+  );
+
+  // Fix state and retry — done() should succeed and re-log
+  ctx.state = { fixed: true };
+  await ctx.done({ result: "ok" });
+
+  const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
+  // "done" should appear twice (once from the failed attempt, once from the retry)
+  const doneLines = lines.filter(l => l.message === "done");
+  assert.equal(doneLines.length, 2, "done log should be emitted on both attempts");
+  assert.equal(readJson(join(projectDir, "state.json")).fixed, true);
+});
+
 function readJsonLines(path) {
   const content = readText(path).trim();
   if (!content) return [];
