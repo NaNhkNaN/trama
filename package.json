@@ -1,0 +1,16 @@
+{
+  "name": "trama",
+  "private": true,
+  "license": "MIT",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build -w @trama-dev/runtime && npm run build -w @trama-dev/cli",
+    "test": "npm run build && node --test --test-concurrency=1 test/*.test.mjs && npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.2"
+  }
+}

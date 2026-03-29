@@ -1,0 +1,40 @@
+{
+  "name": "@trama-dev/runtime",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/client.d.ts",
+      "import": "./dist/client.js"
+    },
+    "./runner": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "Runtime and client library for trama — an agentic runtime for agent-authored TypeScript programs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NaNhkNaN/trama.git",
+    "directory": "packages/runtime"
+  },
+  "homepage": "https://github.com/NaNhkNaN/trama",
+  "bugs": "https://github.com/NaNhkNaN/trama/issues",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@mariozechner/pi-coding-agent": "0.63.1",
+    "@mariozechner/pi-ai": "0.63.1",
+    "tsx": "^4.0.0"
+  }
+}
