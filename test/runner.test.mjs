@@ -1,0 +1,216 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync } from "fs";
+import { join } from "path";
+import { loadState, runProgram } from "../packages/runtime/dist/runner.js";
+import { cleanupTempDir, createProjectFixture, makeTempDir, readJson, writeJson } from "./helpers.mjs";
+
+test("loadState returns an empty object when state.json is missing", (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  assert.deepEqual(loadState(projectDir), {});
+});
+
+test("loadState parses valid JSON state", (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { state: { counter: 2 } });
+
+  assert.deepEqual(loadState(projectDir), { counter: 2 });
+});
+
+test("loadState throws a clear error for corrupt JSON", (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { state: "{broken json" });
+
+  assert.throws(
+    () => loadState(projectDir),
+    /Corrupt state\.json .*cannot safely continue/,
+  );
+});
+
+test("runProgram scaffolds and executes a minimal shared project", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false });
+
+  await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
+
+  assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "iteration:0");
+  assert.deepEqual(readJson(join(projectDir, "package.json")), { type: "module" });
+  assert.equal(existsSync(join(projectDir, ".gitignore")), true);
+  assert.equal(existsSync(join(projectDir, "logs", "latest.jsonl")), true);
+  assert.equal(existsSync(join(projectDir, "history")), true);
+
+  const state = readJson(join(projectDir, "state.json"));
+  assert.equal(state.status, "ok");
+  assert.equal(state.__trama_iteration, 1);
+
+  const logs = readFileSync(join(projectDir, "logs", "latest.jsonl"), "utf-8")
+    .trim()
+    .split("\n")
+    .map(line => JSON.parse(line));
+  assert.deepEqual(logs.map(entry => entry.message), ["ran", "done"]);
+});
+
+test("runProgram rejects missing projects before execution", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  await assert.rejects(
+    async () => runProgram({ projectDir: join(projectDir, "missing"), maxRepairAttempts: 0 }),
+    /Project not found/,
+  );
+});
+
+test("runProgram refuses to overwrite a real project-local runtime directory", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false });
+  mkdirSync(join(projectDir, "node_modules", "@trama-dev", "runtime"), { recursive: true });
+  writeFileSync(join(projectDir, "node_modules", "@trama-dev", "runtime", "marker.txt"), "user-owned");
+
+  await assert.rejects(
+    async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 }),
+    /exists and is not a symlink/,
+  );
+  assert.equal(existsSync(join(projectDir, "node_modules", "@trama-dev", "runtime", "marker.txt")), true);
+});
+
+test("runProgram stops immediately on corrupt state", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false, state: "{broken json" });
+
+  await assert.rejects(
+    async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 }),
+    /Corrupt state\.json/,
+  );
+});
+
+test("runProgram wall-clock timeout kills the child during tools.shell", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { tools } from "@trama-dev/runtime";
+await tools.shell("sleep 60");`,
+  });
+
+  const start = Date.now();
+  await assert.rejects(
+    async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 1_500 }),
+    /timeout/i,
+  );
+  const elapsed = Date.now() - start;
+  assert.ok(elapsed < 5_000, `Expected <5s, got ${elapsed}ms`);
+});
+
+test("runProgram includes buffered stdout in failure errors", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `console.log("stdout-hint");
+throw new Error("boom");`,
+  });
+
+  await assert.rejects(
+    async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 }),
+    /stdout: stdout-hint[\s\S]*stderr: .*boom/s,
+  );
+});
+
+test("runProgram patches existing package.json that lacks type:module", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    packageJson: { name: "user-pkg", version: "2.0.0" },
+  });
+
+  await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
+
+  const pkg = readJson(join(projectDir, "package.json"));
+  assert.equal(pkg.type, "module");
+  assert.equal(pkg.name, "user-pkg");
+  assert.equal(pkg.version, "2.0.0");
+});
+
+test("runProgram rejects invalid timeout values passed via the public API", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false });
+
+  await assert.rejects(
+    async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: Number.NaN }),
+    /Invalid timeout: NaN/,
+  );
+});
+
+test("runProgram rejects invalid maxRepairAttempts values passed via the public API", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false });
+
+  await assert.rejects(
+    async () => runProgram({ projectDir, maxRepairAttempts: -1, timeout: 5_000 }),
+    /Invalid maxRepairAttempts: -1/,
+  );
+  await assert.rejects(
+    async () => runProgram({ projectDir, maxRepairAttempts: 1.5, timeout: 5_000 }),
+    /Invalid maxRepairAttempts: 1.5/,
+  );
+});
+
+test("runProgram refuses to overwrite a malformed package.json", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    packageJson: { type: "module" },
+  });
+  const malformed = "{\n  \"name\": \"demo\",\n";
+  writeFileSync(join(projectDir, "package.json"), malformed);
+
+  await assert.rejects(
+    async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 }),
+    /Malformed package\.json .*will not overwrite it automatically/,
+  );
+  assert.equal(readFileSync(join(projectDir, "package.json"), "utf-8"), malformed);
+});
+
+test("runProgram appends missing trama exclusions to an existing .gitignore", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    packageJson: { type: "module" },
+  });
+  writeFileSync(join(projectDir, ".gitignore"), "README.md\n");
+
+  await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
+
+  const lines = readFileSync(join(projectDir, ".gitignore"), "utf-8").trim().split("\n");
+  assert.equal(lines.includes("README.md"), true);
+  assert.equal(lines.includes("node_modules/"), true);
+  assert.equal(lines.includes("state.json"), true);
+  assert.equal(lines.includes("logs/"), true);
+  assert.equal(lines.includes("history/"), true);
+});
+
+test("runProgram replaces a stale symlink with the correct target", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false });
+
+  // Create a stale symlink pointing to a nonexistent path
+  const linkDir = join(projectDir, "node_modules", "@trama-dev");
+  mkdirSync(linkDir, { recursive: true });
+  symlinkSync("/tmp/nonexistent-old-trama", join(linkDir, "runtime"), "dir");
+
+  await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
+  assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "iteration:0");
+});

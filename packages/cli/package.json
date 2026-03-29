@@ -1,0 +1,32 @@
+{
+  "name": "@trama-dev/cli",
+  "version": "0.1.0",
+  "type": "module",
+  "bin": {
+    "trama": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "CLI for trama — an agentic runtime for agent-authored TypeScript programs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NaNhkNaN/trama.git",
+    "directory": "packages/cli"
+  },
+  "homepage": "https://github.com/NaNhkNaN/trama",
+  "bugs": "https://github.com/NaNhkNaN/trama/issues",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@trama-dev/runtime": "0.1.0",
+    "commander": "^12.0.0"
+  }
+}
