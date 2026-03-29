@@ -13,7 +13,7 @@ import type { Ctx, Agent, Tools, RunOptions, ChildResult, TramaConfig } from "./
 import { PiAdapter } from "./pi-adapter.js";
 import { createContext } from "./context.js";
 import { createAgent } from "./agent.js";
-import { createTools, type ToolsWithCleanup } from "./tools.js";
+import { createTools, cappedBuffer, type ToolsWithCleanup } from "./tools.js";
 
 // --- Module resolution for child processes ---
 
@@ -179,29 +179,48 @@ export function loadConfig(): TramaConfig {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return defaults;
     throw err;
   }
+  let merged: TramaConfig;
   try {
-    return { ...defaults, ...JSON.parse(raw) };
+    merged = { ...defaults, ...JSON.parse(raw) };
   } catch (err) {
     throw new Error(
       `Malformed config at ${configPath} — fix or delete it.\n` +
       `Parse error: ${err instanceof Error ? err.message : err}`
     );
   }
+  const s = (v: unknown) => typeof v === "string" && v.length > 0;
+  const pint = (v: unknown) => Number.isInteger(v) && (v as number) > 0;
+  const checks: Array<[boolean, string]> = [
+    [s(merged.provider), `"provider" must be a non-empty string (got ${JSON.stringify(merged.provider)})`],
+    [s(merged.model), `"model" must be a non-empty string (got ${JSON.stringify(merged.model)})`],
+    [Number.isInteger(merged.maxRepairAttempts) && merged.maxRepairAttempts >= 0, `"maxRepairAttempts" must be a non-negative integer (got ${merged.maxRepairAttempts})`],
+    [Number.isFinite(merged.defaultTimeout) && merged.defaultTimeout > 0, `"defaultTimeout" must be a positive number (got ${merged.defaultTimeout})`],
+    [pint(merged.defaultMaxIterations), `"defaultMaxIterations" must be a positive integer (got ${merged.defaultMaxIterations})`],
+  ];
+  for (const [ok, msg] of checks) {
+    if (!ok) throw new Error(`Invalid config: ${msg}`);
+  }
+  return merged;
 }
 
 export function loadState(projectDir: string): Record<string, unknown> {
   const statePath = join(projectDir, "state.json");
   if (!existsSync(statePath)) return {};
   const raw = readFileSync(statePath, "utf-8");
-  try {
-    return JSON.parse(raw);
-  } catch (err) {
+  const fail = (reason: string): never => {
     throw new Error(
-      `Corrupt state.json in ${projectDir} — cannot safely continue.\n` +
-      `Parse error: ${err instanceof Error ? err.message : err}\n` +
+      `Corrupt state.json in ${projectDir} — cannot safely continue.\n${reason}\n` +
       `Back up or delete state.json to reset state.`
     );
+  };
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch (err) {
+    fail(`Parse error: ${err instanceof Error ? err.message : err}`);
   }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    fail(`Expected a JSON object but got ${Array.isArray(parsed) ? "array" : typeof parsed}.`);
+  }
+  return parsed as Record<string, unknown>;
 }
 
 // --- IPC Server ---
@@ -285,7 +304,7 @@ function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
             res.end("Not found");
         }
       } catch (err) {
-        res.writeHead(500);
+        if (!res.headersSent) res.writeHead(500);
         res.end(String(err));
       }
     });
@@ -338,42 +357,46 @@ function waitForChild(
   sinks?: { stdout?: (chunk: string) => void; stderr?: (chunk: string) => void },
 ): Promise<ChildResult> {
   return new Promise((resolve, reject) => {
-    let stdout = "";
-    let stderr = "";
+    const out = cappedBuffer();
+    const err = cappedBuffer();
     let timedOut = false;
     let exited = false;
+    let killFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
     child.stdout?.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
-      stdout += text;
+      out.append(text);
       sinks?.stdout?.(text);
     });
     child.stderr?.on("data", (chunk: Buffer) => {
       const text = chunk.toString();
-      stderr += text;
+      err.append(text);
       sinks?.stderr?.(text);
     });
 
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
-      setTimeout(() => {
+      killFallbackTimer = setTimeout(() => {
         if (!exited) child.kill("SIGKILL");
       }, 5000);
+      killFallbackTimer.unref?.();
     }, timeout);
 
     child.on("error", (err) => {
       clearTimeout(timer);
+      if (killFallbackTimer) clearTimeout(killFallbackTimer);
       reject(err);
     });
 
     child.on("close", (code) => {
       exited = true;
       clearTimeout(timer);
+      if (killFallbackTimer) clearTimeout(killFallbackTimer);
       if (timedOut) {
-        resolve({ exitCode: 1, stdout, stderr: stderr + "\n[trama] program killed: timeout" });
+        resolve({ exitCode: 1, stdout: out.value, stderr: err.value + "\n[trama] program killed: timeout" });
       } else {
-        resolve({ exitCode: code ?? 1, stdout, stderr });
+        resolve({ exitCode: code ?? 1, stdout: out.value, stderr: err.value });
       }
     });
   });
@@ -460,6 +483,9 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
   writeFileSync(join(projectDir, "logs", "latest.jsonl"), "");
 
   const repairErrors: string[] = [];
+  const repairDetails = () => repairErrors.length > 0
+    ? `\nRepair errors:\n${repairErrors.map((e, i) => `  [${i + 1}] ${e}`).join("\n")}` : "";
+  let pendingRepair: { attempt: number; error: string } | null = null;
 
   for (let attempt = 0; attempt <= maxRepairAttempts; attempt++) {
     const abortController = new AbortController();
@@ -470,61 +496,84 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
 
     const server = createIPCServer(ctx, agentImpl, toolsImpl);
 
+    // Phase A: Infrastructure setup — errors here are NOT program bugs,
+    // so they must NOT trigger the repair loop. (H1 fix)
+    let port: number;
     try {
-      const port = await startServer(server);
-      const meta = JSON.parse(readFileSync(join(projectDir, "meta.json"), "utf-8"));
+      port = await startServer(server);
+    } catch (infraError) {
+      await forceCloseServer(server, toolsImpl, abortController);
+      throw infraError;
+    }
 
-      const child = spawn(process.execPath, [TSX_CLI, join(projectDir, "program.ts")], {
-        cwd: projectDir,
-        env: {
-          ...process.env,
-          TRAMA_PORT: String(port),
-          TRAMA_INPUT: JSON.stringify(meta.input),
-          TRAMA_STATE: JSON.stringify(ctx.state),
-          TRAMA_ITERATION: String(ctx.iteration),
-          TRAMA_MAX_ITERATIONS: String(ctx.maxIterations),
-        },
-        stdio: ["pipe", "pipe", "pipe"],
-      });
+    const child = spawn(process.execPath, [TSX_CLI, join(projectDir, "program.ts")], {
+      cwd: projectDir,
+      env: {
+        ...process.env,
+        TRAMA_PORT: String(port),
+        TRAMA_INPUT: JSON.stringify(ctx.input),
+        TRAMA_STATE: JSON.stringify(ctx.state),
+        TRAMA_ITERATION: String(ctx.iteration),
+        TRAMA_MAX_ITERATIONS: String(ctx.maxIterations),
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
 
-      const result = await waitForChild(child, timeout, {
+    // Phase B: Program execution.
+    // waitForChild rejects on spawn errors (ENOENT, EACCES) — those are
+    // infrastructure failures and must NOT trigger repair.
+    let result: ChildResult;
+    try {
+      result = await waitForChild(child, timeout, {
         stdout: chunk => { process.stdout.write(chunk); },
         stderr: chunk => { process.stderr.write(chunk); },
       });
-
-      if (result.exitCode === 0) {
-        await closeServer(server);
-        return;
-      }
-
-      throw new Error(
-        `program.ts exited with code ${result.exitCode}\n` +
-        `stdout: ${result.stdout}\n` +
-        `stderr: ${result.stderr}`
-      );
-
-    } catch (error) {
+    } catch (spawnError) {
+      // Child process failed to start — not a program bug.
       await forceCloseServer(server, toolsImpl, abortController);
+      throw spawnError;
+    }
 
-      if (attempt === maxRepairAttempts) {
-        const details = repairErrors.length > 0
-          ? `\nRepair errors:\n${repairErrors.map((e, i) => `  [${i + 1}] ${e}`).join("\n")}`
-          : "";
-        throw new Error(`Failed after ${maxRepairAttempts} repair attempts: ${error}${details}`);
+    if (result.exitCode === 0) {
+      // Program succeeded. Server cleanup failure is not a program bug.
+      try { await closeServer(server); } catch { await forceCloseServer(server, toolsImpl, abortController); }
+      if (pendingRepair) {
+        options.onRepair?.(pendingRepair.attempt, maxRepairAttempts, pendingRepair.error);
       }
+      return;
+    }
 
-      const source = readFileSync(join(projectDir, "program.ts"), "utf-8");
-      const fixed = await repairWithTimeout(
-        adapter,
-        { programSource: source, error: String(error), runtimeTypes: RUNTIME_TYPES },
-        timeout,
-        repairErrors,
-      );
+    // Program failed — this is the only path that may trigger repair.
+    try {
+      await forceCloseServer(server, toolsImpl, abortController);
+    } catch { /* best-effort cleanup */ }
+    const programError = new Error(
+      `program.ts exited with code ${result.exitCode}\n` +
+      `stdout: ${result.stdout}\n` +
+      `stderr: ${result.stderr}`
+    );
 
-      if (fixed !== null) {
-        writeFileSync(join(projectDir, "program.ts"), fixed);
-        options.onRepair?.(attempt, maxRepairAttempts, String(error));
-      }
+    // Previous repair candidate failed — don't record it.
+    pendingRepair = null;
+
+    if (attempt === maxRepairAttempts) {
+      throw new Error(`Failed after ${maxRepairAttempts} repair attempts: ${programError}${repairDetails()}`);
+    }
+
+    const source = readFileSync(join(projectDir, "program.ts"), "utf-8");
+    const fixed = await repairWithTimeout(
+      adapter,
+      { programSource: source, error: String(programError), runtimeTypes: RUNTIME_TYPES },
+      timeout,
+      repairErrors,
+    );
+
+    if (fixed !== null) {
+      writeFileSync(join(projectDir, "program.ts"), fixed);
+      pendingRepair = { attempt, error: String(programError) };
+    } else {
+      // Repair LLM call itself failed — don't re-run the same broken program.
+      throw new Error(`Failed after ${attempt + 1} repair attempt(s): ${programError}${repairDetails()}`);
     }
   }
 }
@@ -539,6 +588,7 @@ function propagateHistoryEntries(srcDir: string, dstDir: string): void {
 
   const srcHistory = readFileSync(srcPath, "utf-8");
   const dstHistory = existsSync(dstPath) ? readFileSync(dstPath, "utf-8") : "";
+  if (!srcHistory.startsWith(dstHistory)) return; // History diverged — cannot safely propagate
   const newEntries = srcHistory.slice(dstHistory.length);
   if (newEntries.length > 0) {
     mkdirSync(join(dstDir, "history"), { recursive: true });
@@ -550,7 +600,9 @@ export async function smokeRunAndRepair(
   projectDir: string,
   adapter: PiAdapter,
   reason: "create" | "update",
+  options?: { timeout?: number },
 ): Promise<void> {
+  const smokeTimeout = options?.timeout ?? 30_000;
   // Run validation in a temp copy so side effects don't persist in the real project
   await withTempDir("trama-smoke-", async (smokeDir) => {
     cpSync(projectDir, smokeDir, { recursive: true });
@@ -561,7 +613,7 @@ export async function smokeRunAndRepair(
         projectDir: smokeDir,
         adapter: smokeAdapter,
         maxRepairAttempts: 3,
-        timeout: 5000,
+        timeout: smokeTimeout,
         maxIterations: 100,
         onRepair(_attempt, _max, error) {
           appendFileSync(

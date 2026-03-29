@@ -3,7 +3,7 @@ import test from "node:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync } from "fs";
 import { join } from "path";
 import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
-import { copyToHistory, loadState, runProgram } from "../packages/runtime/dist/runner.js";
+import { copyToHistory, loadConfig, loadState, runProgram } from "../packages/runtime/dist/runner.js";
 import { cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson, writeText } from "./helpers.mjs";
 
 test("loadState returns an empty object when state.json is missing", (t) => {
@@ -318,4 +318,130 @@ test("runProgram replaces a stale symlink with the correct target", async (t) =>
 
   await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
   assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "iteration:0");
+});
+
+// --- Regression tests ---
+
+test("loadState rejects non-object JSON values (string, array, null)", (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  for (const [label, content] of [["string", '"hello"'], ["array", "[1,2]"], ["null", "null"], ["number", "42"]]) {
+    createProjectFixture(projectDir, { state: content });
+    assert.throws(
+      () => loadState(projectDir),
+      /Corrupt state\.json/,
+      `should reject ${label}`,
+    );
+  }
+});
+
+test("loadConfig rejects invalid field values", (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const cases = [
+    [{ defaultMaxIterations: -1 }, /defaultMaxIterations/],
+    [{ defaultMaxIterations: 0 }, /defaultMaxIterations/],
+    [{ defaultTimeout: 0 }, /defaultTimeout/],
+    [{ defaultTimeout: -100 }, /defaultTimeout/],
+    [{ provider: 123 }, /provider/],
+    [{ model: "" }, /model/],
+  ];
+
+  for (const [override, pattern] of cases) {
+    writeJson(join(fakeHome, ".trama", "config.json"), override);
+    withEnv({ HOME: fakeHome }, () => {
+      assert.throws(() => loadConfig(), pattern, `should reject ${JSON.stringify(override)}`);
+    });
+  }
+});
+
+test("runProgram does not trigger repair when program succeeds", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false });
+
+  const originalRepair = PiAdapter.prototype.repair;
+  let repairCalled = false;
+  PiAdapter.prototype.repair = async function repair() {
+    repairCalled = true;
+    return 'throw new Error("repair should not run");';
+  };
+
+  try {
+    await runProgram({ projectDir, maxRepairAttempts: 3, timeout: 5_000 });
+    assert.equal(repairCalled, false, "repair should not be called when program succeeds");
+    assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "iteration:0");
+  } finally {
+    PiAdapter.prototype.repair = originalRepair;
+  }
+});
+
+test("runProgram throws immediately when repair LLM call fails (does not re-run broken program)", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { tools } from "@trama-dev/runtime";
+let runCount = 0;
+try {
+  runCount = parseInt(await tools.read("run-count.txt"), 10) || 0;
+} catch {
+  // First run: file does not exist yet.
+}
+await tools.write("run-count.txt", String(runCount + 1));
+throw new Error("boom");`,
+  });
+
+  const originalRepair = PiAdapter.prototype.repair;
+  PiAdapter.prototype.repair = async function repair() {
+    throw new Error("LLM unavailable");
+  };
+
+  try {
+    await assert.rejects(
+      async () => runProgram({ projectDir, maxRepairAttempts: 3, timeout: 5_000 }),
+      /Failed after 1 repair attempt\(s\)/,
+    );
+    assert.equal(readFileSync(join(projectDir, "run-count.txt"), "utf-8"), "1");
+  } finally {
+    PiAdapter.prototype.repair = originalRepair;
+  }
+});
+
+test("runProgram only records repair history after the repaired program succeeds", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: 'throw new Error("original");',
+  });
+
+  const originalRepair = PiAdapter.prototype.repair;
+  // First repair returns code that also fails, second repair returns working code
+  let repairAttempt = 0;
+  PiAdapter.prototype.repair = async function repair() {
+    repairAttempt++;
+    if (repairAttempt === 1) {
+      return 'throw new Error("still broken");';
+    }
+    return `import { ctx } from "@trama-dev/runtime"; await ctx.done();`;
+  };
+
+  try {
+    await runProgram({ projectDir, maxRepairAttempts: 3, timeout: 5_000 });
+  } finally {
+    PiAdapter.prototype.repair = originalRepair;
+  }
+
+  const history = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8")
+    .trim()
+    .split("\n")
+    .map(line => JSON.parse(line));
+
+  // Only the successful repair should be in history, not the failed one
+  const repairEntries = history.filter(e => e.reason === "repair");
+  assert.equal(repairEntries.length, 1, "only 1 verified repair should be recorded");
 });

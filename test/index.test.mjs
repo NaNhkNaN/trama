@@ -440,7 +440,7 @@ throw new Error("boom");
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), DEFAULT_PROGRAM);
 });
 
-test("updateProject preserves update-repair history entries when rollback happens", async (t) => {
+test("updateProject does not record unverified repair history entries on rollback", async (t) => {
   const fakeHome = makeTempDir("trama-home-");
   t.after(() => cleanupTempDir(fakeHome));
 
@@ -482,7 +482,8 @@ test("updateProject preserves update-repair history entries when rollback happen
     .split("\n")
     .map(line => JSON.parse(line));
   assert.equal(historyLines[0].reason, "create");
-  assert.equal(historyLines.some(entry => entry.reason === "update-repair"), true);
+  // Repairs that never produced a verified-working program should not appear in history
+  assert.equal(historyLines.some(entry => entry.reason === "update-repair"), false);
 });
 
 test("updateProject rejects path-like project names before resolving a directory", async (t) => {

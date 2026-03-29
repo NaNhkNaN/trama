@@ -1,15 +1,13 @@
 #!/usr/bin/env node
 
 import { Command } from "commander";
-import { join } from "path";
-import { homedir } from "os";
 import {
   createProject,
   runProgram,
   updateProject,
   listProjects,
   showLogs,
-  validateProjectName,
+  resolveProject,
 } from "@trama-dev/runtime/runner";
 
 const cli = new Command()
@@ -36,13 +34,12 @@ cli
   .option("--timeout <ms>", "Execution timeout in ms", "300000")
   .action(async (name: string, opts: { timeout: string }) => {
     try {
-      validateProjectName(name);
       const timeout = Number(opts.timeout);
       if (!Number.isInteger(timeout) || timeout <= 0) {
         console.error(`Error: --timeout must be a positive integer (got "${opts.timeout}")`);
         process.exit(1);
       }
-      const projectDir = join(homedir(), ".trama", "projects", name);
+      const projectDir = resolveProject(name);
       await runProgram({ projectDir, timeout });
     } catch (err) {
       console.error(`Error: ${err instanceof Error ? err.message : err}`);

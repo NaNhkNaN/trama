@@ -44,7 +44,7 @@ test("CLI run surfaces missing-project errors with exit code 1", async (t) => {
   });
 
   assert.equal(result.exitCode, 1);
-  assert.match(result.stderr, /Project not found at/);
+  assert.match(result.stderr, /not found/);
 });
 
 test("CLI run rejects path-like project names", async (t) => {

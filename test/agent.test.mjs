@@ -115,6 +115,24 @@ test("createAgent generate surfaces the second failure when retries are exhauste
   );
 });
 
+test("createAgent generate rejects unsupported schema types", async () => {
+  const adapter = {
+    async ask() {
+      return '{"items": [1,2,3]}';
+    },
+  };
+
+  const agent = createAgent(adapter);
+
+  await assert.rejects(
+    async () => agent.generate({
+      prompt: "list",
+      schema: { items: "array: list of numbers" },
+    }),
+    /unsupported schema type "array"/,
+  );
+});
+
 // --- PiAdapter abort wiring tests (mock session, no real LLM) ---
 
 test("PiAdapter.ask rejects immediately when signal is already aborted", async () => {

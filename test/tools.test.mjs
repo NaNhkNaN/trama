@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "http";
 import test from "node:test";
-import { existsSync, mkdirSync, readFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { createTools } from "../packages/runtime/dist/tools.js";
 import { cleanupTempDir, makeTempDir } from "./helpers.mjs";
@@ -183,4 +183,127 @@ test("createTools shell guards cwd against traversal", async (t) => {
     async () => tools.shell("pwd", { cwd: "../../" }),
     /Path escapes project directory/,
   );
+});
+
+test("createTools write rejects directory symlinks that escape the project", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  const outsideDir = makeTempDir("trama-outside-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(outsideDir); });
+
+  symlinkSync(outsideDir, join(projectDir, "escape"), "dir");
+
+  const tools = createTools(projectDir);
+  await assert.rejects(
+    async () => tools.write("escape/pwned.txt", "should not exist"),
+    /Path escapes project directory via symlink/,
+  );
+  assert.equal(existsSync(join(outsideDir, "pwned.txt")), false);
+});
+
+test("createTools write rejects file symlinks that point outside the project", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  const outsideDir = makeTempDir("trama-outside-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(outsideDir); });
+
+  // Create a file symlink inside project pointing to an outside file
+  writeFileSync(join(outsideDir, "victim.txt"), "original content");
+  symlinkSync(join(outsideDir, "victim.txt"), join(projectDir, "link.txt"));
+
+  const tools = createTools(projectDir);
+  await assert.rejects(
+    async () => tools.write("link.txt", "overwritten"),
+    /Path escapes project directory via symlink/,
+  );
+  // The outside file must NOT be modified
+  assert.equal(readFileSync(join(outsideDir, "victim.txt"), "utf-8"), "original content");
+});
+
+test("createTools write rejects dangling file symlinks that point outside the project", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  const outsideDir = makeTempDir("trama-outside-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(outsideDir); });
+
+  // Dangling symlink: target does not exist yet
+  symlinkSync(join(outsideDir, "newfile.txt"), join(projectDir, "link.txt"));
+
+  const tools = createTools(projectDir);
+  await assert.rejects(
+    async () => tools.write("link.txt", "pwned"),
+    /Path escapes project directory via symlink/,
+  );
+  assert.equal(existsSync(join(outsideDir, "newfile.txt")), false);
+});
+
+test("createTools write does not create directories outside the project before rejecting", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  const outsideDir = makeTempDir("trama-outside-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(outsideDir); });
+
+  symlinkSync(outsideDir, join(projectDir, "escape"), "dir");
+
+  const tools = createTools(projectDir);
+  await assert.rejects(
+    async () => tools.write("escape/newdir/pwned.txt", "should not exist"),
+    /Path escapes project directory via symlink/,
+  );
+  // mkdirSync must NOT have created the directory outside
+  assert.equal(existsSync(join(outsideDir, "newdir")), false);
+});
+
+test("createTools read rejects symlinks that escape the project directory", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  const outsideDir = makeTempDir("trama-outside-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(outsideDir); });
+
+  writeFileSync(join(outsideDir, "secret.txt"), "sensitive data");
+  symlinkSync(outsideDir, join(projectDir, "escape"), "dir");
+
+  const tools = createTools(projectDir);
+  await assert.rejects(
+    async () => tools.read("escape/secret.txt"),
+    /Path escapes project directory via symlink/,
+  );
+});
+
+test("createTools shell cwd rejects symlinks that escape the project directory", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  const outsideDir = makeTempDir("trama-outside-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(outsideDir); });
+
+  symlinkSync(outsideDir, join(projectDir, "escape"), "dir");
+
+  const tools = createTools(projectDir);
+  await assert.rejects(
+    async () => tools.shell("pwd", { cwd: "escape" }),
+    /Path escapes project directory via symlink/,
+  );
+});
+
+test("createTools allows symlinks that stay inside the project directory", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  mkdirSync(join(projectDir, "real"), { recursive: true });
+  writeFileSync(join(projectDir, "real", "data.txt"), "ok");
+  symlinkSync(join(projectDir, "real"), join(projectDir, "link"), "dir");
+
+  const tools = createTools(projectDir);
+  const content = await tools.read("link/data.txt");
+  assert.equal(content, "ok");
+
+  await tools.write("link/output.txt", "written");
+  assert.equal(readFileSync(join(projectDir, "real", "output.txt"), "utf-8"), "written");
+});
+
+test("createTools allows dangling file symlinks that point inside the project", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  mkdirSync(join(projectDir, "real"), { recursive: true });
+  // Dangling: real/newfile.txt does not exist yet
+  symlinkSync(join(projectDir, "real", "newfile.txt"), join(projectDir, "link.txt"));
+
+  const tools = createTools(projectDir);
+  await tools.write("link.txt", "created via dangling symlink");
+  assert.equal(readFileSync(join(projectDir, "real", "newfile.txt"), "utf-8"), "created via dangling symlink");
 });
