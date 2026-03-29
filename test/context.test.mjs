@@ -40,6 +40,21 @@ test("createContext done logs once and is idempotent", async (t) => {
   assert.equal(readJson(join(projectDir, "state.json")).__trama_iteration, 1);
 });
 
+test("createContext done logs completion even when no result is provided", async (t) => {
+  const projectDir = makeTempDir("trama-context-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+
+  const ctx = createContext(projectDir, {});
+  await ctx.done();
+
+  const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].message, "done");
+  assert.equal(lines[0].data, null);
+  assert.equal(readJson(join(projectDir, "state.json")).__trama_iteration, 1);
+});
+
 test("createContext checkpoint rejects non-serializable state with a useful path", async (t) => {
   const projectDir = makeTempDir("trama-context-");
   t.after(() => cleanupTempDir(projectDir));

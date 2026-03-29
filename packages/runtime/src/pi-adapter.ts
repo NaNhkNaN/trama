@@ -16,22 +16,52 @@ export class PiAdapter {
     this.cwd = cwd;
   }
 
-  private async createSession(systemPrompt?: string): Promise<AgentSession> {
+  /** Create a copy of this adapter that operates in a different working directory. */
+  withCwd(cwd: string): PiAdapter {
+    return new PiAdapter(this.config, cwd);
+  }
+
+  private async createSession(systemPrompt?: string, signal?: AbortSignal): Promise<AgentSession> {
+    if (signal?.aborted) throw new Error("Aborted");
+
     const resourceLoader = new DefaultResourceLoader({
       cwd: this.cwd,
       noExtensions: true,
       noSkills: true,
       ...(systemPrompt && { appendSystemPrompt: systemPrompt }),
     });
-    await resourceLoader.reload();
 
-    const { session } = await createAgentSession({
+    // Race an async step against the abort signal.
+    // Returns the result on success, or rejects with "Aborted" on abort.
+    const raceAbort = <T>(promise: Promise<T>): Promise<T> => {
+      if (!signal) return promise;
+      return Promise.race([
+        promise,
+        new Promise<never>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new Error("Aborted")), { once: true });
+        }),
+      ]);
+    };
+
+    await raceAbort(resourceLoader.reload());
+    if (signal?.aborted) throw new Error("Aborted");
+
+    // Keep a reference to the raw promise so we can clean up a late-arriving session
+    const sessionPromise = createAgentSession({
       cwd: this.cwd,
       model: (getModel as Function)(this.config.provider, this.config.model),
       sessionManager: SessionManager.inMemory(),
       resourceLoader,
     });
-    return session;
+
+    try {
+      const { session } = await raceAbort(sessionPromise);
+      return session;
+    } catch (err) {
+      // If abort won the race, the real promise may still resolve later — dispose it
+      sessionPromise.then(({ session }) => session.dispose()).catch(() => {});
+      throw err;
+    }
   }
 
   private extractText(session: AgentSession): string {
@@ -48,26 +78,43 @@ export class PiAdapter {
     return "";
   }
 
-  async ask(prompt: string, options?: { system?: string }): Promise<string> {
-    const session = await this.createSession(options?.system);
+  /**
+   * Abort cancellation relies on session.dispose() interrupting session.prompt().
+   * This is an upstream contract of pi-coding-agent — if dispose() does not
+   * actually reject the in-flight prompt, the abort signal will not terminate the call.
+   */
+  async ask(prompt: string, options?: { system?: string; signal?: AbortSignal }): Promise<string> {
+    const signal = options?.signal;
+    if (signal?.aborted) throw new Error("Aborted");
+
+    // Track session so abort can dispose it at any point — even during createSession
+    let session: AgentSession | null = null;
+    const onAbort = () => session?.dispose();
+    signal?.addEventListener("abort", onAbort, { once: true });
+
     try {
+      session = await this.createSession(options?.system, signal);
+      // Re-check: abort may have fired during createSession (before session existed)
+      if (signal?.aborted) throw new Error("Aborted");
+
       await session.prompt(prompt);
       const text = this.extractText(session);
       if (!text) throw new Error("Empty response from LLM");
       return text;
     } finally {
-      session.dispose();
+      signal?.removeEventListener("abort", onAbort);
+      session?.dispose();
     }
   }
 
-  async repair(input: RepairInput): Promise<string> {
+  async repair(input: RepairInput, signal?: AbortSignal): Promise<string> {
     return this.ask(
       `Fix this program so it runs.\n\n` +
       `Runtime types:\n${input.runtimeTypes}\n\n` +
       `Broken program:\n${input.programSource}\n\n` +
       `Error:\n${input.error}\n\n` +
       `Output ONLY the fixed program. No explanation.`,
-      { system: "You are a TypeScript repair tool." }
+      { system: "You are a TypeScript repair tool.", signal }
     );
   }
 }

@@ -2,6 +2,7 @@
 // Thin HTTP wrapper that calls the runner's IPC server.
 
 import type { Ctx, Agent, Tools } from "./types.js";
+import { assertSerializable } from "./serializable.js";
 
 const PORT = process.env.TRAMA_PORT;
 if (!PORT) {
@@ -41,11 +42,14 @@ export const ctx: Ctx = {
     await call("/ctx/log", { message: msg, data });
   },
   async checkpoint() {
+    assertSerializable(ctx.state, "ctx.state");
     await call("/ctx/checkpoint", { state: ctx.state });
     ctx.iteration += 1;
   },
   async done(result) {
     if (doneCalled) return;
+    assertSerializable(ctx.state, "ctx.state");
+    if (result !== undefined) assertSerializable(result, "ctx.done(result)");
     await call("/ctx/done", { state: ctx.state, result });
     doneCalled = true;
     ctx.iteration += 1;
@@ -60,6 +64,6 @@ export const agent: Agent = {
 export const tools: Tools = {
   read: (path) => call("/tools/read", { path }).then(r => r.result),
   write: (path, content) => call("/tools/write", { path, content }).then(r => r.result),
-  shell: (cmd, opts) => call("/tools/shell", { command: cmd, ...opts }),
-  fetch: (url, opts) => call("/tools/fetch", { url, ...opts }),
+  shell: (cmd, opts) => call("/tools/shell", { command: cmd, ...opts }).then(r => r.result),
+  fetch: (url, opts) => call("/tools/fetch", { url, ...opts }).then(r => r.result),
 };
