@@ -24,13 +24,13 @@ test("CLI run rejects invalid --timeout values", async (t) => {
   const fakeHome = makeTempDir("trama-cli-home-");
   t.after(() => cleanupTempDir(fakeHome));
 
-  for (const bad of ["nope", "0", "-5", "", "1.5", "10ms"]) {
+  for (const bad of ["nope", "0", "-5", "", "10ms"]) {
     const result = await runNodeCommand(
       [CLI_ENTRY, "run", "demo", "--timeout", bad],
       { cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome } },
     );
     assert.equal(result.exitCode, 1, `should reject --timeout ${JSON.stringify(bad)}`);
-    assert.match(result.stderr, /--timeout must be a positive integer/);
+    assert.match(result.stderr, /--timeout must be a positive number/);
   }
 });
 

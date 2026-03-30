@@ -3,8 +3,8 @@ import test from "node:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync } from "fs";
 import { join } from "path";
 import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
-import { copyToHistory, loadConfig, loadState, runProgram, withSnapshot } from "../packages/runtime/dist/runner.js";
-import { cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson, writeText } from "./helpers.mjs";
+import { copyToHistory, loadConfig, loadState, runProgram, RUNTIME_TYPES, withSnapshot } from "../packages/runtime/dist/runner.js";
+import { REPO_ROOT, cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson, writeText } from "./helpers.mjs";
 
 test("loadState returns an empty object when state.json is missing", (t) => {
   const projectDir = makeTempDir("trama-runner-");
@@ -628,11 +628,9 @@ await ctx.done();
   };
 
   try {
-    await assert.rejects(
-      async () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 }),
-      /EACCES/,
-    );
-    // The repaired program ran successfully — program.ts must keep the verified repair
+    // onRepair bookkeeping (history write) fails with EACCES, but program succeeded —
+    // runProgram should still return success, not propagate the bookkeeping error.
+    await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 });
     assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram);
   } finally {
     PiAdapter.prototype.repair = originalRepair;
@@ -796,4 +794,42 @@ await ctx.done();`,
 
   await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 10_000 });
   assert.equal(readFileSync(join(projectDir, "ipc-status.txt"), "utf-8"), "413");
+});
+
+test("RUNTIME_TYPES stays in sync with types.ts public interfaces", () => {
+  const typesSource = readFileSync(
+    join(REPO_ROOT, "packages", "runtime", "src", "types.ts"), "utf-8",
+  );
+  const extractInterface = (source, name, exported) => {
+    const pattern = new RegExp(`${exported ? "export\\s+" : ""}interface\\s+${name}\\b`);
+    const match = pattern.exec(source);
+    assert.ok(match, `${exported ? "types.ts" : "RUNTIME_TYPES"} missing interface ${name}`);
+
+    const openBrace = source.indexOf("{", match.index);
+    assert.notEqual(openBrace, -1, `missing opening brace for interface ${name}`);
+
+    let depth = 0;
+    for (let i = openBrace; i < source.length; i++) {
+      if (source[i] === "{") depth += 1;
+      if (source[i] === "}") depth -= 1;
+      if (depth === 0) {
+        return source.slice(match.index, i + 1);
+      }
+    }
+
+    throw new Error(`unterminated interface ${name}`);
+  };
+
+  const normalizeInterface = (source) => source
+    .replace(/\/\*\*[\s\S]*?\*\//g, "")
+    .replace(/\bexport\s+/g, "")
+    .replace(/;/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  for (const iface of ["Ctx", "Agent", "Tools", "ShellResult"]) {
+    const actual = normalizeInterface(extractInterface(typesSource, iface, true));
+    const promptSummary = normalizeInterface(extractInterface(RUNTIME_TYPES, iface, false));
+    assert.equal(promptSummary, actual, `RUNTIME_TYPES interface drift for ${iface}`);
+  }
 });

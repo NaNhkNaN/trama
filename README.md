@@ -17,6 +17,7 @@ You say what you want. trama writes a TypeScript program. trama runs it. When yo
             |              you can read it, diff it, edit it by hand.
         trama run          <- control flow is explicit in the code.
             |              LLM calls, shell commands, file I/O — all visible.
+            |              auto-repairs on failure (up to 3 attempts).
         trama update       <- natural language rewrites the program itself.
 ```
 
@@ -35,10 +36,10 @@ This is different from other agent frameworks:
 trama uses [pi](https://github.com/badlogic/pi-mono) for LLM calls. You need an API key for a supported provider.
 
 ```bash
-# Set your API key (Anthropic is the default provider)
+# Set your API key (Anthropic is the default provider, default model is claude-opus-4-6)
 export ANTHROPIC_API_KEY="sk-ant-..."
 
-# Or use OpenAI / other providers via config
+# Or use OpenAI / other providers via ~/.trama/config.json
 mkdir -p ~/.trama
 cat > ~/.trama/config.json << 'EOF'
 {
@@ -47,6 +48,24 @@ cat > ~/.trama/config.json << 'EOF'
 }
 EOF
 export OPENAI_API_KEY="sk-..."
+```
+
+You can also override the model per-project at creation time:
+
+```bash
+trama create my-task "do something" --model claude-opus-4-6
+```
+
+Full config options (all optional — defaults shown):
+
+```json
+{
+  "provider": "anthropic",
+  "model": "claude-opus-4-6",
+  "maxRepairAttempts": 3,
+  "defaultTimeout": 300000,
+  "defaultMaxIterations": 100
+}
 ```
 
 Supported providers: `anthropic`, `openai`, `google`, `amazon-bedrock`, `azure-openai-responses`, and others supported by [pi-ai](https://www.npmjs.com/package/@mariozechner/pi-ai). The API key is read from the standard environment variable for each provider (e.g. `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`).
@@ -63,7 +82,25 @@ trama list
 trama logs optimizer
 ```
 
-Five commands. `create` turns intent into code, `run` executes it, `update` rewrites it. `list` and `logs` for visibility.
+Five commands. `create` turns intent into code, `run` executes it, `update` rewrites it. `list` and `logs` for visibility. Projects are stored at `~/.trama/projects/{name}/`.
+
+### CLI options
+
+```bash
+trama create <name> <prompt> [--model <model>] [--arg key=value ...]
+trama run <name> [--timeout <ms>] [--arg key=value ...]
+trama update <name> <prompt>
+```
+
+- `--model` — override the LLM model for program generation (create only).
+- `--timeout` — per-phase timeout in milliseconds. Applies to each run and repair attempt separately. Default: `300000` (5 minutes).
+- `--arg` — pass key-value arguments to the program, accessible via `ctx.input.args`. Repeatable.
+
+```bash
+# Example: pass arguments that the program can read via ctx.input.args
+trama create summarizer "summarize the file given by ctx.input.args.file" --arg file=report.csv
+trama run summarizer --arg file=another-report.csv
+```
 
 ---
 
@@ -86,7 +123,11 @@ Note: programs can call LLMs (`agent.ask`), run shell commands (`tools.shell`), 
 
 ## Trust and safety
 
-trama does not sandbox generated programs. A program can do anything TypeScript can do: read/write files, run shell commands, make network requests. The underlying pi agent has its own tool set (bash, file I/O) that operates autonomously when `agent.ask()` is called.
+trama does not sandbox generated programs. A program can do anything TypeScript can do: read/write files, run shell commands, make network requests.
+
+**`create` and `update` execute the generated program.** After generating code, trama runs it once in a temporary directory to validate it works. If the program makes network requests, calls external APIs, or runs shell commands with side effects, those side effects happen during validation — before you ever run `trama run`. The temp directory isolates file-system changes, but external side effects (HTTP requests, database writes, deployments) cannot be rolled back.
+
+**`agent.ask()` gives the LLM autonomous tool access.** When your program calls `agent.ask()`, the underlying pi-coding-agent may autonomously read files, write files, and run shell commands to fulfill the request. This is not a simple text-in/text-out call — the LLM can take multi-step actions within the project directory.
 
 This is a deliberate design choice. trama is a power tool, not a managed service. If you need execution constraints, apply them at a layer below trama:
 - Run in a container or VM for filesystem/network isolation.
@@ -99,32 +140,65 @@ The only built-in guard is a path traversal check on `tools.read()` and `tools.w
 
 ## The runtime API
 
-trama exposes exactly 9 functions to generated programs:
+Every generated program imports three objects: `ctx`, `agent`, and `tools`.
 
 ```typescript
 import { ctx, agent, tools } from "@trama-dev/runtime";
-
-// ctx -- lifecycle and state
-ctx.input           // the user's original prompt + args
-ctx.state           // persistent JSON state (local working copy, synced on checkpoint/done)
-ctx.iteration       // committed progress counter (advances on checkpoint/done only)
-ctx.maxIterations   // hint for loop bounds (not enforced)
-ctx.log()           // structured logging (async)
-ctx.checkpoint()    // persist state to disk (async)
-ctx.done()          // signal completion, persist state (async, idempotent)
-
-// agent -- LLM calls (powered by pi-coding-agent)
-agent.ask()         // text in -> text out (pi may use bash/read/edit/write internally)
-agent.generate()    // text in -> typed JSON out (string, number, boolean fields)
-
-// tools -- I/O operations (read/write path-guarded to project dir)
-tools.read()        // read a file
-tools.write()       // write a file
-tools.shell()       // run a command -> { exitCode, stdout, stderr }
-tools.fetch()       // HTTP request
 ```
 
-A program that uses only these 9 functions can express anything from `console.log("hello")` to a multi-day [autoresearch](https://github.com/karpathy/autoresearch) optimization loop.
+### ctx — lifecycle and state
+
+```typescript
+ctx.input             // { prompt: string, args: Record<string, unknown> }
+ctx.state             // persistent JSON state (local working copy)
+ctx.iteration         // progress counter (advances only on checkpoint/done)
+ctx.maxIterations     // hint for loop bounds (not enforced by runtime)
+await ctx.log(msg)    // structured log entry (appears in `trama logs`)
+await ctx.checkpoint()// persist ctx.state to disk, advance iteration
+await ctx.done(result?)// signal completion — persists state, logs result, idempotent
+```
+
+**State constraints:** `ctx.state` must be strictly JSON-serializable. No `Date`, `Map`, `Set`, circular references, `NaN`, or `Infinity`. `checkpoint()` will throw with a path to the offending value if validation fails. Keys starting with `__trama_` are reserved for internal use.
+
+### agent — LLM calls
+
+```typescript
+await agent.ask(prompt, { system? })          // text in -> text out
+await agent.generate<T>({ prompt, schema })   // text in -> typed JSON out
+```
+
+`agent.ask()` is **not** a simple text completion. The underlying pi-coding-agent runs a full agent loop and may autonomously use its built-in tools (bash, file read/write/edit) to fulfill the request. What you get back is the final text response.
+
+`agent.generate()` returns a typed object. The schema maps field names to primitive types:
+
+```typescript
+const result = await agent.generate<{ score: number; reasoning: string }>({
+  prompt: "Rate this code",
+  schema: {
+    score: "number: 1-10 quality rating",      // "type: description" format
+    reasoning: "string: explain the rating",
+  },
+});
+// result.score is a number, result.reasoning is a string
+```
+
+Only `string`, `number`, and `boolean` are supported as schema types. The part after `:` is a description hint for the LLM (ignored during validation). Retries once on parse/validation failure.
+
+### tools — I/O operations
+
+```typescript
+await tools.read(path)                    // -> string (file contents)
+await tools.write(path, content)          // -> void
+await tools.shell(command, { cwd?, timeout? }) // -> { exitCode, stdout, stderr }
+await tools.fetch(url, { method?, headers?, body? })
+                                          // -> { status, body, headers }
+```
+
+`read` and `write` are path-guarded to the project directory (traversal attempts throw). `shell` defaults to a 30-second timeout; pass `{ timeout: 60000 }` for longer commands. `fetch` returns the response body as a string (capped at 10MB).
+
+---
+
+This API can express anything from `console.log("hello")` to a multi-day [autoresearch](https://github.com/karpathy/autoresearch) optimization loop.
 
 ---
 
@@ -228,7 +302,7 @@ trama's runtime is ~1000 lines of TypeScript. It loads, executes, and repairs pr
 There is no YAML, no JSON graph, no visual builder. The orchestration is a `.ts` file that you can read, diff, and `git log`.
 
 **3. The only built-in intelligence is repair.**
-If a generated program crashes, the runtime sends the error back to the agent and asks for a fix. Up to 3 attempts. This is the only "smart" behavior in the kernel.
+If a generated program crashes, the runtime sends the error (with stdout/stderr) back to the LLM and asks for a fix. The repair runs in an isolated temp directory — your real project is untouched until the fix is verified. If verification passes, the fixed program runs in the real project with a snapshot so the directory is restored cleanly if it fails there. Up to 3 attempts (configurable via `maxRepairAttempts`). This is the only "smart" behavior in the kernel.
 
 **4. Adapt trama to your workflow, not the other way around.**
 Minimal core, maximum extensibility through external tools and conventions rather than built-in features.
@@ -258,7 +332,7 @@ my-seo-optimizer/
 +-- brief.md            # input data
 ```
 
-Anyone with trama installed can clone it and run it:
+trama stores all projects at `~/.trama/projects/{name}/`. Anyone with trama installed can clone a project directly into that location and run it:
 
 ```bash
 git clone https://github.com/you/my-seo-optimizer ~/.trama/projects/my-seo-optimizer
@@ -269,10 +343,25 @@ On first run, the runtime creates scaffolding automatically — you don't need t
 
 - `package.json` — with `"type": "module"` (required for top-level await). If one already exists and is valid JSON, trama patches in the `type` field without touching the rest.
 - `node_modules/@trama-dev/runtime` — symlink to the installed runtime (recreated on every run).
-- `history/` and `logs/` — version history and run logs.
+- `history/` — version history (see below).
+- `logs/` — structured run logs (viewable via `trama logs`).
 - `.gitignore` — creates or appends exclusions for generated files.
 
 If the program calls `ctx.checkpoint()` or `ctx.done()`, trama also writes `state.json` to persist program state across runs.
+
+### Version history
+
+Every `create`, `update`, and successful `repair` saves a snapshot of program.ts to `history/`:
+
+```
+history/
++-- 0001.ts             # initial version from create
++-- 0002.ts             # after first repair
++-- 0003.ts             # after trama update
++-- index.jsonl         # metadata: version, reason, timestamp, prompt/error
+```
+
+You can diff any two versions to see how the program evolved: `diff history/0001.ts history/0003.ts`. The history directory is `.gitignore`d by default since it can be regenerated, but you can track it in git if you want a full audit trail.
 
 What you share is not a prompt or a workflow graph. It's a complete, readable, modifiable program. Recipients can read exactly what it does, adapt it with `trama update`, or edit `program.ts` directly.
 
@@ -280,4 +369,4 @@ What you share is not a prompt or a workflow graph. It's a complete, readable, m
 
 ## Status
 
-trama is in early development. The current scope is the minimum viable product: `create`, `run`, `update`, `list`, `logs`, and 9 runtime API functions.
+trama is in early development. The current scope is the minimum viable product: five CLI commands (`create`, `run`, `update`, `list`, `logs`) and the runtime API (`ctx`, `agent`, `tools`).

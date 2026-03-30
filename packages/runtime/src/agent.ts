@@ -35,13 +35,16 @@ export function createAgent(adapter: PiAdapter, signal?: AbortSignal): Agent {
       const askOptions = signal ? { system: input.system, signal } : { system: input.system };
 
       const parseAndValidate = (response: string): Record<string, unknown> => {
-        const cleaned = response
-          .trim()
-          .replace(/^```json\s*/i, "")
-          .replace(/^```\s*/, "")
-          .replace(/\s*```$/, "")
-          .trim();
-        const parsed = JSON.parse(cleaned);
+        const trimmed = response.trim();
+        // Try raw parse first — avoids mangling valid JSON that contains
+        // fenced code blocks inside string values.
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          const fenceMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+          parsed = JSON.parse(fenceMatch ? fenceMatch[1].trim() : trimmed);
+        }
         const error = validateShape(parsed, input.schema);
         if (error) throw new Error(`Schema validation failed: ${error}`);
         return stripToSchema(parsed as Record<string, unknown>, input.schema);
