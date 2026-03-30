@@ -4,7 +4,8 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, copyFi
 import { join } from "path";
 import { homedir, tmpdir } from "os";
 import { PiAdapter, stripCodeFences } from "./pi-adapter.js";
-import { loadConfig, loadState, smokeRunAndRepair, copyToHistory, withTempDir, RUNTIME_TYPES, PI_VERSION } from "./runner.js";
+import { loadConfig, loadState, smokeRunAndRepair, copyToHistory, withTempDir, ensureProjectScaffold, RUNTIME_TYPES, PI_VERSION } from "./runner.js";
+import { guardPath } from "./path-guard.js";
 
 export { runProgram } from "./runner.js";
 
@@ -146,7 +147,7 @@ async function withProjectBackup(
     if (failedHistory.startsWith(originalHistory)) {
       const repairEntries = failedHistory.slice(originalHistory.length);
       if (repairEntries.length > 0) {
-        appendFileSync(join(projectDir, "history", "index.jsonl"), repairEntries);
+        appendFileSync(guardPath(projectDir, join("history", "index.jsonl")), repairEntries);
       }
     }
     throw new Error(
@@ -178,19 +179,20 @@ export async function createProject(
   try {
     mkdirSync(join(projectDir, "history"), { recursive: true });
     mkdirSync(join(projectDir, "logs"), { recursive: true });
+    ensureProjectScaffold(projectDir);
 
-    writeFileSync(join(projectDir, "package.json"), JSON.stringify({ type: "module" }, null, 2));
-    writeFileSync(join(projectDir, ".gitignore"), "node_modules/\nstate.json\nlogs/\nhistory/\n");
+    const config = loadConfig();
+    if (options?.model) config.model = options.model;
 
     const meta = {
       input: { prompt, args: options?.args ?? {} },
       createdAt: new Date().toISOString(),
       piVersion: PI_VERSION,
+      model: config.model,
+      provider: config.provider,
     };
     writeFileSync(join(projectDir, "meta.json"), JSON.stringify(meta, null, 2));
 
-    const config = loadConfig();
-    if (options?.model) config.model = options.model;
     const adapter = new PiAdapter(config, projectDir);
 
     console.log(`Generating program for "${name}"...`);
@@ -227,14 +229,16 @@ export async function createProject(
 export async function updateProject(name: string, prompt: string): Promise<void> {
   const projectDir = resolveProject(name);
 
-  const programPath = join(projectDir, "program.ts");
+  const programPath = guardPath(projectDir, "program.ts");
   const originalSource = readFileSync(programPath, "utf-8");
   const state = loadState(projectDir);
-  const meta = JSON.parse(readFileSync(join(projectDir, "meta.json"), "utf-8"));
-  const historyIndexPath = join(projectDir, "history", "index.jsonl");
+  const meta = JSON.parse(readFileSync(guardPath(projectDir, "meta.json"), "utf-8"));
+  const historyIndexPath = guardPath(projectDir, join("history", "index.jsonl"));
   const originalHistory = existsSync(historyIndexPath) ? readFileSync(historyIndexPath, "utf-8") : "";
 
   const config = loadConfig();
+  if (meta.model) config.model = meta.model;
+  if (meta.provider) config.provider = meta.provider;
   const adapter = new PiAdapter(config, projectDir);
 
   // Backup before any LLM calls, restore on any failure
@@ -287,15 +291,15 @@ export async function listProjects(): Promise<void> {
     let modified = "";
 
     try {
-      const meta = JSON.parse(readFileSync(join(projectDir, "meta.json"), "utf-8"));
+      const meta = JSON.parse(readFileSync(guardPath(projectDir, "meta.json"), "utf-8"));
       prompt = meta.input?.prompt ?? "";
       if (prompt.length > 60) prompt = prompt.slice(0, 57) + "...";
-    } catch { /* no meta */ }
+    } catch { /* no meta or symlink escape */ }
 
     try {
-      const stat = statSync(join(projectDir, "program.ts"));
+      const stat = statSync(guardPath(projectDir, "program.ts"));
       modified = stat.mtime.toISOString().slice(0, 19).replace("T", " ");
-    } catch { /* no program.ts */ }
+    } catch { /* no program.ts or symlink escape */ }
 
     console.log(`  ${entry.name}  ${prompt}  ${modified}`);
   }
@@ -303,7 +307,7 @@ export async function listProjects(): Promise<void> {
 
 export async function showLogs(name: string): Promise<void> {
   const projectDir = resolveProject(name);
-  const logsPath = join(projectDir, "logs", "latest.jsonl");
+  const logsPath = guardPath(projectDir, join("logs", "latest.jsonl"));
 
   if (!existsSync(logsPath)) {
     console.log("No logs found.");

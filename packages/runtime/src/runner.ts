@@ -15,6 +15,8 @@ import { PiAdapter } from "./pi-adapter.js";
 import { createContext } from "./context.js";
 import { createAgent } from "./agent.js";
 import { createTools, cappedBuffer, type ToolsWithCleanup } from "./tools.js";
+import { guardPath } from "./path-guard.js";
+import { assertSerializable } from "./serializable.js";
 
 // --- Module resolution for child processes ---
 
@@ -43,10 +45,12 @@ export const PI_VERSION: string = JSON.parse(
 
 /**
  * Ensure the project directory has a node_modules symlink to @trama-dev/runtime.
- * Only replaces the path if it is a symlink (ours) or doesn't exist.
- * Refuses to touch a real directory to avoid destroying user content.
+ * Replaces any existing symlink whose target differs (including user-managed ones).
+ * Only refuses to touch a real directory/file to avoid destroying user content.
  */
 function ensureRuntimeLink(projectDir: string): void {
+  // node_modules/@trama-dev/runtime is deliberately a symlink pointing OUTSIDE
+  // the project (to the global trama install). Do not apply guardPath here.
   const linkDir = join(projectDir, "node_modules", "@trama-dev");
   const linkPath = join(linkDir, "runtime");
   const target = join(TRAMA_NODE_MODULES, "@trama-dev", "runtime");
@@ -54,7 +58,7 @@ function ensureRuntimeLink(projectDir: string): void {
   try {
     const stat = lstatSync(linkPath);
     if (stat.isSymbolicLink()) {
-      // Ours — check if already correct
+      // Symlink exists — replace if target doesn't match
       if (readlinkSync(linkPath) === target) return;
       rmSync(linkPath);
     } else {
@@ -78,8 +82,8 @@ function ensureRuntimeLink(projectDir: string): void {
  * Ensure project has ESM package.json and .gitignore.
  * If package.json exists but lacks "type": "module", patches it in.
  */
-function ensureProjectScaffold(projectDir: string): void {
-  const pkgPath = join(projectDir, "package.json");
+export function ensureProjectScaffold(projectDir: string): void {
+  const pkgPath = guardPath(projectDir, "package.json");
   if (existsSync(pkgPath)) {
     let pkg: unknown;
     try {
@@ -106,7 +110,7 @@ function ensureProjectScaffold(projectDir: string): void {
   } else {
     writeFileSync(pkgPath, JSON.stringify({ type: "module" }, null, 2));
   }
-  const giPath = join(projectDir, ".gitignore");
+  const giPath = guardPath(projectDir, ".gitignore");
   const requiredEntries = ["node_modules/", "state.json", "logs/", "history/"];
   if (existsSync(giPath)) {
     const existing = readFileSync(giPath, "utf-8");
@@ -223,7 +227,7 @@ export function loadConfig(): TramaConfig {
 }
 
 export function loadState(projectDir: string): Record<string, unknown> {
-  const statePath = join(projectDir, "state.json");
+  const statePath = guardPath(projectDir, "state.json");
   if (!existsSync(statePath)) return {};
   const raw = readFileSync(statePath, "utf-8");
   const fail = (reason: string): never => {
@@ -245,6 +249,21 @@ export function loadState(projectDir: string): Record<string, unknown> {
 // --- IPC Server ---
 
 const MAX_IPC_BODY = 50 * 1024 * 1024; // 50 MB
+
+/** Validate required fields in IPC request body. Returns error message or null. */
+function validateIPC(data: Record<string, unknown>, fields: Record<string, string>): string | null {
+  for (const [name, type] of Object.entries(fields)) {
+    const val = data[name];
+    if (type === "object") {
+      if (typeof val !== "object" || val === null || Array.isArray(val)) {
+        return `Missing or invalid field: ${name} (expected object)`;
+      }
+    } else if (typeof val !== type) {
+      return `Missing or invalid field: ${name} (expected ${type})`;
+    }
+  }
+  return null;
+}
 
 function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
   return createServer((req, res) => {
@@ -273,6 +292,28 @@ function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
       try {
         const data = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
         let result: unknown;
+
+        // Per-endpoint field validation
+        const validationRules: Record<string, Record<string, string>> = {
+          "/agent/ask": { prompt: "string" },
+          "/agent/generate": { prompt: "string", schema: "object" },
+          "/tools/read": { path: "string" },
+          "/tools/write": { path: "string", content: "string" },
+          "/tools/shell": { command: "string" },
+          "/tools/fetch": { url: "string" },
+          "/ctx/checkpoint": { state: "object" },
+          "/ctx/log": { message: "string" },
+          "/ctx/done": { state: "object" },
+        };
+        const rules = req.url ? validationRules[req.url] : undefined;
+        if (rules) {
+          const validationError = validateIPC(data, rules);
+          if (validationError) {
+            res.writeHead(400);
+            res.end(validationError);
+            return;
+          }
+        }
 
         switch (req.url) {
           case "/agent/ask":
@@ -314,6 +355,7 @@ function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
             break;
 
           case "/ctx/checkpoint":
+            assertSerializable(data.state, "ctx.state");
             ctx.state = data.state;
             await ctx.checkpoint();
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -327,12 +369,18 @@ function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
             break;
 
           case "/ctx/ready":
+            if (data.data !== undefined && (typeof data.data !== "object" || data.data === null || Array.isArray(data.data))) {
+              res.writeHead(400);
+              res.end("Invalid field: data (expected object or undefined)");
+              break;
+            }
             await ctx.ready(data.data);
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ result: null }));
             break;
 
           case "/ctx/done":
+            assertSerializable(data.state, "ctx.state");
             ctx.state = data.state;
             await ctx.done(data.result);
             res.writeHead(200, { "Content-Type": "application/json" });
@@ -406,6 +454,14 @@ function waitForChild(
     let stopRequested = false;
     let killFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
+    const killChild = (sig: NodeJS.Signals) => {
+      if (child.pid) {
+        try { process.kill(-child.pid, sig); } catch { /* already gone */ }
+      } else {
+        child.kill(sig);
+      }
+    };
+
     const scheduleKill = (reason: "timeout" | "stop-request") => {
       if (exited) return;
       if (reason === "timeout") {
@@ -415,10 +471,10 @@ function waitForChild(
       } else {
         stopRequested = true;
       }
-      child.kill("SIGTERM");
+      killChild("SIGTERM");
       if (killFallbackTimer) clearTimeout(killFallbackTimer);
       killFallbackTimer = setTimeout(() => {
-        if (!exited) child.kill("SIGKILL");
+        if (!exited) killChild("SIGKILL");
       }, 5000);
       killFallbackTimer.unref?.();
     };
@@ -477,19 +533,22 @@ function waitForChild(
  * Create-time repairs go to index.jsonl only (reason: "create-repair").
  */
 export function copyToHistory(projectDir: string, reason: string, detail?: string) {
-  const historyDir = join(projectDir, "history");
+  const historyDir = guardPath(projectDir, "history");
   const existing = readdirSync(historyDir).filter(f => /^\d+\.ts$/.test(f));
 
   const nums = existing.map(f => parseInt(f.replace(".ts", ""), 10));
   const nextNum = nums.length > 0 ? nums.reduce((a, b) => Math.max(a, b), 0) + 1 : 1;
   const next = String(nextNum).padStart(Math.max(4, String(nextNum).length), "0");
 
-  copyFileSync(join(projectDir, "program.ts"), join(historyDir, `${next}.ts`));
+  const srcPath = guardPath(projectDir, "program.ts");
+  const dstPath = guardPath(projectDir, join("history", `${next}.ts`));
+  copyFileSync(srcPath, dstPath);
 
   const entry: Record<string, unknown> = { version: nextNum, reason, timestamp: new Date().toISOString() };
   if (reason === "repair" && detail) entry.error = detail;
   if (reason === "update" && detail) entry.prompt = detail;
-  appendFileSync(join(historyDir, "index.jsonl"), JSON.stringify(entry) + "\n");
+  const indexPath = guardPath(projectDir, join("history", "index.jsonl"));
+  appendFileSync(indexPath, JSON.stringify(entry) + "\n");
 }
 
 // --- Helpers ---
@@ -588,13 +647,18 @@ async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
   const { signal } = abortController;
   let readyStopScheduled = false;
   let readyStopTimer: ReturnType<typeof setTimeout> | null = null;
+  // When set, the grace period is active — child exit should cancel the timer
+  // so that the natural exit code flows through instead of being masked by SIGTERM.
+  let graceActive = false;
   const ctx = createContext(projectDir, loadState(projectDir), {
     maxIterations,
     argsOverride,
     onReady: stopOnReady ? () => {
       if (readyStopScheduled) return;
       readyStopScheduled = true;
+      graceActive = true;
       readyStopTimer = setTimeout(() => {
+        graceActive = false;
         stopController.abort();
       }, stopOnReady.graceMs);
       readyStopTimer.unref?.();
@@ -602,7 +666,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
   });
   // Truncate logs only after preflight succeeds — preserves prior run's diagnostics
   // if scaffolding, state loading, or context creation fails.
-  writeFileSync(join(projectDir, "logs", "latest.jsonl"), "");
+  writeFileSync(guardPath(projectDir, join("logs", "latest.jsonl")), "");
   const agentImpl = createAgent(adapter, signal);
   const toolsImpl = createTools(projectDir, signal);
   const server = createIPCServer(ctx, agentImpl, toolsImpl);
@@ -632,15 +696,37 @@ async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
     closeSync(fd);
   }
 
-  const child = spawn(process.execPath, [TSX_CLI, join(projectDir, "program.ts")], {
-    cwd: projectDir,
-    env: {
-      ...process.env,
-      TRAMA_PORT: String(port),
-      TRAMA_INIT: initFile,
-    },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
+  let child: ChildProcess;
+  try {
+    child = spawn(process.execPath, [TSX_CLI, guardPath(projectDir, "program.ts")], {
+      cwd: projectDir,
+      env: {
+        ...process.env,
+        TRAMA_PORT: String(port),
+        TRAMA_INIT: initFile,
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    });
+  } catch (spawnError) {
+    if (readyStopTimer) clearTimeout(readyStopTimer);
+    await forceCloseServer(server, toolsImpl, abortController);
+    try { rmSync(initDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    throw spawnError;
+  }
+
+  // If the child exits on its own during the grace period (before we send
+  // SIGTERM), cancel the grace timer so the real exit code flows through
+  // waitForChild instead of being masked by a subsequent SIGTERM.
+  if (stopOnReady) {
+    child.on("close", () => {
+      if (graceActive && readyStopTimer) {
+        clearTimeout(readyStopTimer);
+        readyStopTimer = null;
+        graceActive = false;
+      }
+    });
+  }
 
   let result: ChildResult;
   try {
@@ -667,7 +753,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
   toolsImpl.killActiveShells();
 
   if (result.exitCode === 0) {
-    try { await closeServer(server); } catch { await forceCloseServer(server, toolsImpl, abortController); }
+    abortController.abort(); // cancel any in-flight LLM/fetch requests
+    try { await closeServer(server); } catch { await forceCloseServer(server, toolsImpl); }
   } else {
     try { await forceCloseServer(server, toolsImpl, abortController); } catch { /* best-effort */ }
   }
@@ -697,8 +784,8 @@ const formatError = (r: ChildResult) =>
 async function executeProgram(options: ExecuteOptions): Promise<void> {
   const { projectDir, adapter, maxRepairAttempts, timeout, maxIterations } = options;
 
-  mkdirSync(join(projectDir, "history"), { recursive: true });
-  mkdirSync(join(projectDir, "logs"), { recursive: true });
+  mkdirSync(guardPath(projectDir, "history"), { recursive: true });
+  mkdirSync(guardPath(projectDir, "logs"), { recursive: true });
 
   // Phase 1: Run in the real project directory.
   const result = await runProgramOnce({
@@ -710,13 +797,13 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
   if (result.exitCode === 0) return;
 
   if (maxRepairAttempts === 0) {
-    throw new Error(`Failed after 0 repair attempts: ${formatError(result)}`);
+    throw new Error(`Program failed (repair disabled): ${formatError(result)}`);
   }
 
   // Phase 2: Repair loop — both LLM repair call and verification run
   // are fully isolated in temp dirs to prevent side effects on the real project.
   let lastError = formatError(result);
-  const originalSource = readFileSync(join(projectDir, "program.ts"), "utf-8");
+  const originalSource = readFileSync(guardPath(projectDir, "program.ts"), "utf-8");
   let currentSource = originalSource;
   const repairErrors: string[] = [];
   const repairDetails = () => repairErrors.length > 0
@@ -735,7 +822,7 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
       );
       if (!fixed) return null;
 
-      writeFileSync(join(tempDir, "program.ts"), fixed);
+      writeFileSync(guardPath(tempDir, "program.ts"), fixed);
       const verifyResult = await runProgramOnce({
         projectDir: tempDir, adapter: tempAdapter, timeout, maxIterations,
         argsOverride: options.argsOverride,
@@ -753,7 +840,7 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
       // Repair verified in isolation — now run in the real project for actual output.
       // Snapshot first so we can restore cleanly if the real run fails.
       const realResult = await withSnapshot(projectDir, async () => {
-        writeFileSync(join(projectDir, "program.ts"), repairResult.fixed);
+        writeFileSync(guardPath(projectDir, "program.ts"), repairResult.fixed);
         const r = await runProgramOnce({
           projectDir, adapter, timeout, maxIterations,
           argsOverride: options.argsOverride,
@@ -790,8 +877,8 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
 
 /** Copy new history entries from src to dst (appends only entries added after the shared prefix). */
 function propagateHistoryEntries(srcDir: string, dstDir: string): void {
-  const srcPath = join(srcDir, "history", "index.jsonl");
-  const dstPath = join(dstDir, "history", "index.jsonl");
+  const srcPath = guardPath(srcDir, join("history", "index.jsonl"));
+  const dstPath = guardPath(dstDir, join("history", "index.jsonl"));
   if (!existsSync(srcPath)) return;
 
   const srcHistory = readFileSync(srcPath, "utf-8");
@@ -799,14 +886,17 @@ function propagateHistoryEntries(srcDir: string, dstDir: string): void {
   if (!srcHistory.startsWith(dstHistory)) return; // History diverged — cannot safely propagate
   const newEntries = srcHistory.slice(dstHistory.length);
   if (newEntries.length > 0) {
-    mkdirSync(join(dstDir, "history"), { recursive: true });
+    mkdirSync(guardPath(dstDir, "history"), { recursive: true });
     appendFileSync(dstPath, newEntries);
   }
 }
 
 const DEFAULT_SMOKE_TIMEOUT = 30_000;
-const MAX_SMOKE_TIMEOUT = 30_000;
-const SMOKE_READY_GRACE_MS = 250;
+const SMOKE_READY_GRACE_MS = 2_000;
+
+export function resolveSmokeTimeout(timeout?: number): number {
+  return timeout ?? DEFAULT_SMOKE_TIMEOUT;
+}
 
 export async function smokeRunAndRepair(
   projectDir: string,
@@ -814,8 +904,7 @@ export async function smokeRunAndRepair(
   reason: "create" | "update",
   options?: { timeout?: number; maxRepairAttempts?: number; maxIterations?: number },
 ): Promise<void> {
-  const requestedTimeout = options?.timeout ?? DEFAULT_SMOKE_TIMEOUT;
-  const smokeTimeout = Math.min(requestedTimeout, MAX_SMOKE_TIMEOUT);
+  const smokeTimeout = resolveSmokeTimeout(options?.timeout);
   // Run validation in a temp copy so side effects don't persist in the real project
   await withTempDir("trama-smoke-", async (smokeDir) => {
     cpSync(projectDir, smokeDir, { recursive: true });
@@ -833,14 +922,14 @@ export async function smokeRunAndRepair(
         },
         onRepair(_attempt, _max, error) {
           appendFileSync(
-            join(smokeDir, "history", "index.jsonl"),
+            guardPath(smokeDir, join("history", "index.jsonl")),
             JSON.stringify({ reason: `${reason}-repair`, timestamp: new Date().toISOString(), error }) + "\n"
           );
         },
       });
 
       // Smoke passed — copy back program.ts (may have been repaired)
-      copyFileSync(join(smokeDir, "program.ts"), join(projectDir, "program.ts"));
+      copyFileSync(guardPath(smokeDir, "program.ts"), guardPath(projectDir, "program.ts"));
     } finally {
       // Always propagate repair history, whether smoke passed or failed
       propagateHistoryEntries(smokeDir, projectDir);
@@ -861,6 +950,12 @@ export async function runProgram(options: RunOptions) {
   }
 
   const config = loadConfig();
+  // Use per-project model/provider if saved, else fall back to global config
+  const metaPath = guardPath(projectDir, "meta.json");
+  const meta = JSON.parse(readFileSync(metaPath, "utf-8"));
+  if (meta.model) config.model = meta.model;
+  if (meta.provider) config.provider = meta.provider;
+
   const maxRepairAttempts = options.maxRepairAttempts ?? config.maxRepairAttempts;
   const timeout = options.timeout ?? config.defaultTimeout;
   const maxIterations = config.defaultMaxIterations;
@@ -883,7 +978,7 @@ export async function runProgram(options: RunOptions) {
     argsOverride: options.args,
     onRepair(attempt, max, error) {
       // Log repair attempts (appends to already-open logs file)
-      const logsPath = join(projectDir, "logs", "latest.jsonl");
+      const logsPath = guardPath(projectDir, join("logs", "latest.jsonl"));
       const entry = { ts: Date.now(), message: `Repair attempt ${attempt + 1}/${max}`, data: { error } };
       appendFileSync(logsPath, JSON.stringify(entry) + "\n");
       console.log(`[trama] Repair attempt ${attempt + 1}/${max}`);

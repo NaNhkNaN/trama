@@ -342,3 +342,14 @@ test("createTools shell handles commands that exit with null code", async (t) =>
   assert.equal(typeof result.exitCode, "number");
   assert.notEqual(result.exitCode, 0);
 });
+
+test("createTools read gives clear error for missing files", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  const tools = createTools(projectDir);
+  await assert.rejects(
+    async () => tools.read("nonexistent.txt"),
+    /File not found: nonexistent\.txt/,
+  );
+});

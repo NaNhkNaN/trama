@@ -1,8 +1,9 @@
 import { spawn, type ChildProcess } from "child_process";
-import { readFileSync, writeFileSync, mkdirSync, realpathSync, readlinkSync, lstatSync, existsSync } from "fs";
-import { resolve, dirname, sep } from "path";
+import { readFileSync, writeFileSync, mkdirSync, realpathSync, lstatSync } from "fs";
+import { resolve, dirname } from "path";
 import { StringDecoder } from "string_decoder";
 import type { Tools, ShellResult } from "./types.js";
+import { resolveBounded, verifyRealPath, verifyNearestAncestor, verifySymlink } from "./path-guard.js";
 
 const MAX_OUTPUT = 10 * 1024 * 1024; // 10 MB
 
@@ -68,40 +69,13 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
     sessionReapers.set(sessionId, timer);
   };
 
-  /**
-   * Path traversal guard. Checks both logical path (.. segments) and
-   * real path (symlinks) to prevent escaping the project directory.
-   * Not a security sandbox — just a footgun guard.
-   */
-  const resolvePath = (p: string): string => {
-    const resolved = resolve(normalizedProjectDir, p);
-    if (resolved !== normalizedProjectDir && !resolved.startsWith(normalizedProjectDir + sep)) {
-      throw new Error(`Path escapes project directory: ${p}`);
-    }
-    return resolved;
-  };
+  const resolvePath = (p: string): string => resolveBounded(normalizedProjectDir, p);
 
-  /** Verify that an existing path's real location is inside the project dir. */
-  const verifyRealPath = (real: string, original: string): void => {
-    if (real !== realProjectDir && !real.startsWith(realProjectDir + sep)) {
-      throw new Error(`Path escapes project directory via symlink: ${original}`);
-    }
-  };
+  const checkRealPath = (real: string, original: string): void =>
+    verifyRealPath(real, realProjectDir, original);
 
-  /**
-   * Walk up from `resolved` to find the deepest existing ancestor,
-   * then verify its real path is inside the project dir.
-   * This catches symlink escapes BEFORE any mkdir side effects.
-   */
-  const verifyNearestAncestor = (resolved: string, original: string): void => {
-    let cur = resolved;
-    while (!existsSync(cur)) {
-      const parent = dirname(cur);
-      if (parent === cur) return; // reached filesystem root — nothing to verify
-      cur = parent;
-    }
-    verifyRealPath(realpathSync(cur), original);
-  };
+  const checkNearestAncestor = (resolved: string, original: string): void =>
+    verifyNearestAncestor(resolved, realProjectDir, original);
 
   return {
     killActiveShells() {
@@ -120,22 +94,24 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
 
     async read(path) {
       const target = resolvePath(path);
-      verifyRealPath(realpathSync(target), path);
+      let real: string;
+      try { real = realpathSync(target); } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ENOENT") {
+          throw new Error(`File not found: ${path}`);
+        }
+        throw e;
+      }
+      checkRealPath(real, path);
       return readFileSync(target, "utf-8");
     },
 
     async write(path, content) {
       const target = resolvePath(path);
-      verifyNearestAncestor(target, path);       // before mkdir — prevents side effects outside project
+      checkNearestAncestor(target, path);       // before mkdir — prevents side effects outside project
       mkdirSync(dirname(target), { recursive: true });
       try {
         if (lstatSync(target).isSymbolicLink()) {
-          try { verifyRealPath(realpathSync(target), path); }
-          catch (e) {
-            if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-            // Dangling symlink — resolve what we can via nearest existing ancestor
-            verifyNearestAncestor(resolve(dirname(target), readlinkSync(target)), path);
-          }
+          verifySymlink(target, realProjectDir, path);
         }
       } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
       writeFileSync(target, content);
@@ -145,7 +121,7 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
       const timeout = options.timeout ?? 30_000;
       const cwd = options.cwd ? resolvePath(options.cwd) : normalizedProjectDir;
       try {
-        if (options.cwd) verifyRealPath(realpathSync(cwd), options.cwd);
+        if (options.cwd) checkRealPath(realpathSync(cwd), options.cwd);
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         // cwd doesn't exist — spawn will fail with ENOENT on its own

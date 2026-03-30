@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, appendFileSync } from "fs";
 import { join } from "path";
 import type { Ctx } from "./types.js";
 import { assertSerializable } from "./serializable.js";
+import { guardPath } from "./path-guard.js";
 
 export function createContext(
   projectDir: string,
@@ -12,11 +13,11 @@ export function createContext(
     onReady?: (data?: Record<string, unknown>) => void;
   },
 ): Ctx {
-  const logsPath = join(projectDir, "logs", "latest.jsonl");
-  const statePath = join(projectDir, "state.json");
-  const meta = JSON.parse(readFileSync(join(projectDir, "meta.json"), "utf-8"));
+  const logsPath = guardPath(projectDir, join("logs", "latest.jsonl"));
+  const statePath = guardPath(projectDir, "state.json");
+  const meta = JSON.parse(readFileSync(guardPath(projectDir, "meta.json"), "utf-8"));
 
-  let doneCalled = false;
+  let donePromise: Promise<void> | null = null;
   let doneLogged = false;
   let readyCalled = false;
 
@@ -28,12 +29,17 @@ export function createContext(
     input,
     state: { ...initialState },
     iteration: typeof initialState.__trama_iteration === "number"
-      && Number.isFinite(initialState.__trama_iteration)
+      && Number.isInteger(initialState.__trama_iteration)
+      && initialState.__trama_iteration >= 0
       ? initialState.__trama_iteration : 0,
     maxIterations: options?.maxIterations ?? 100,
 
     async log(message, data) {
-      const entry = { ts: Date.now(), message, data: data ?? null };
+      let safeData = data ?? null;
+      try { JSON.stringify(safeData); } catch {
+        safeData = { __trama_unserializable: String(data) };
+      }
+      const entry = { ts: Date.now(), message, data: safeData };
       appendFileSync(logsPath, JSON.stringify(entry) + "\n");
       console.log(`[trama] ${message}`);
     },
@@ -55,17 +61,27 @@ export function createContext(
     },
 
     async done(result) {
-      if (doneCalled) return;
+      // If a previous done() completed successfully, no-op.
+      // If a previous done() is still in flight, coalesce onto it.
+      // If a previous done() failed (checkpoint threw), allow retry.
+      if (donePromise) return donePromise;
 
-      if (!doneLogged) {
-        await this.log("done", result);
+      const run = async () => {
+        if (!doneLogged) {
+          await this.log("done", result);
+        }
+        await this.checkpoint();
+        doneLogged = true;
+      };
+
+      donePromise = run();
+      try {
+        await donePromise;
+      } catch (err) {
+        // Checkpoint failed — clear promise so a retry is allowed.
+        donePromise = null;
+        throw err;
       }
-      await this.checkpoint();
-      // Only mark as complete after checkpoint succeeds.
-      // If checkpoint throws, a retry will re-log "done" (acceptable)
-      // and retry the checkpoint.
-      doneLogged = true;
-      doneCalled = true;
     }
   };
 }

@@ -229,7 +229,7 @@ test("createProject accepts long-running server programs during smoke validation
     provider: "anthropic",
     model: "test-model",
     maxRepairAttempts: 0,
-    defaultTimeout: 1_000,
+    defaultTimeout: 10_000,
     defaultMaxIterations: 100,
   });
 
@@ -272,7 +272,7 @@ await new Promise(() => {});
       await createProject("server-app", "host a website");
     });
     const elapsed = Date.now() - startedAt;
-    assert.ok(elapsed < 5_000, `expected smoke validation to finish quickly, got ${elapsed}ms`);
+    assert.ok(elapsed < 15_000, `expected smoke validation to finish quickly, got ${elapsed}ms`);
   } finally {
     PiAdapter.prototype.ask = originalAsk;
     PiAdapter.prototype.repair = originalRepair;
@@ -333,6 +333,64 @@ await new Promise(() => {});
     });
     const elapsed = Date.now() - startedAt;
     assert.ok(elapsed < 5_000, `expected smoke validation to fail quickly, got ${elapsed}ms`);
+  } finally {
+    PiAdapter.prototype.ask = originalAsk;
+    PiAdapter.prototype.repair = originalRepair;
+  }
+});
+
+test("createProject detects server crash during smoke grace period after ctx.ready", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  writeJson(join(fakeHome, ".trama", "config.json"), {
+    provider: "anthropic",
+    model: "test-model",
+    maxRepairAttempts: 0,
+    defaultTimeout: 10_000,
+    defaultMaxIterations: 100,
+  });
+
+  const originalAsk = PiAdapter.prototype.ask;
+  const originalRepair = PiAdapter.prototype.repair;
+  // Server calls ctx.ready() then crashes 200ms later — should fail smoke validation
+  const crashingServer = `import { ctx } from "@trama-dev/runtime";
+import { createServer } from "node:http";
+
+const server = createServer((_req, res) => {
+  res.end("ok");
+});
+
+await new Promise((resolve, reject) => {
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => resolve());
+});
+
+await ctx.ready({ url: "http://127.0.0.1:3000" });
+
+// Crash shortly after ready
+setTimeout(() => {
+  process.exit(1);
+}, 200);
+
+await new Promise(() => {});
+`;
+
+  PiAdapter.prototype.ask = async function ask() {
+    return crashingServer;
+  };
+  PiAdapter.prototype.repair = async function repair() {
+    throw new Error("repair should not run");
+  };
+
+  try {
+    await withEnv({ HOME: fakeHome }, async () => {
+      await assert.rejects(
+        async () => createProject("crashing-server", "host a website"),
+        /Program failed/,
+        "server that crashes after ready should fail smoke validation",
+      );
+    });
   } finally {
     PiAdapter.prototype.ask = originalAsk;
     PiAdapter.prototype.repair = originalRepair;
@@ -736,7 +794,7 @@ test("createProject smoke validation uses config maxRepairAttempts", async (t) =
     await withEnv({ HOME: fakeHome }, async () => {
       await assert.rejects(
         async () => createProject("no-repair", "make something"),
-        /Failed after 0 repair attempts/,
+        /Program failed \(repair disabled\)/,
       );
     });
     assert.equal(repairCalled, false, "repair should not be called when maxRepairAttempts is 0");

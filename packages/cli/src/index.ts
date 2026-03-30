@@ -30,7 +30,7 @@ function parseArgs(args: string[]): Record<string, unknown> {
 const cli = new Command()
   .name("trama")
   .description("A minimal runtime for agent-authored programs")
-  .version("0.1.2");
+  .version("0.1.3");
 
 cli
   .command("create <name> <prompt>")

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import test from "node:test";
 import { createAgent } from "../packages/runtime/dist/agent.js";
 
@@ -273,6 +274,33 @@ test("PiAdapter.ask calls session.dispose on abort during prompt", async () => {
   assert.ok(disposeCalled > 0, "session.dispose should have been called");
 });
 
+test("PiAdapter.ask cleans up abort listeners after successful calls", async () => {
+  const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
+
+  const adapter = new PiAdapter({ provider: "openai", model: "gpt-5.4" }, process.cwd());
+
+  const controller = new AbortController();
+
+  // Exercise the real createSession() path, which attaches two abort listeners
+  // via raceAbort(). They must be cleaned up after each successful call.
+  for (let i = 0; i < 5; i++) {
+    const session = await adapter.createSession?.(undefined, controller.signal);
+    assert.equal(
+      getEventListeners(controller.signal, "abort").length,
+      0,
+      `abort listeners should be cleaned up after successful createSession() call ${i + 1}`,
+    );
+    session.dispose();
+  }
+
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  controller.abort();
+  await assert.rejects(
+    async () => adapter.ask("after abort", { signal: controller.signal }),
+    /Aborted/,
+  );
+});
+
 test("PiAdapter.repair trims whitespace even without code fences", async () => {
   const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
 
@@ -288,6 +316,20 @@ test("PiAdapter.repair trims whitespace even without code fences", async () => {
   });
 
   assert.equal(result, "const value = 1;");
+});
+
+test("stripCodeFences extracts code from responses with leading text", async () => {
+  const { stripCodeFences } = await import("../packages/runtime/dist/pi-adapter.js");
+
+  const withPrefix = "Here is the fixed program:\n\n```typescript\nconst x = 1;\n```";
+  assert.equal(stripCodeFences(withPrefix), "const x = 1;");
+
+  const withMultipleBlocks = "Before:\n```typescript\nold code\n```\n\nAfter:\n```typescript\nnew code\n```";
+  assert.equal(stripCodeFences(withMultipleBlocks), "new code", "should extract the last fenced block");
+
+  // Plain unfenced code should pass through unchanged
+  const plain = "const y = 2;";
+  assert.equal(stripCodeFences(plain), "const y = 2;");
 });
 
 test("PiAdapter.repair strips fenced TypeScript responses", async () => {
