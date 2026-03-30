@@ -20,6 +20,8 @@ You describe what you want. trama generates a complete program — with control 
         trama update       <- natural language rewrites the program itself.
 ```
 
+trama has two faces. As **program.ts**, it is an artifact with a lifecycle — born (`create`), executed (`run`), evolved (`update`), self-healed (`repair`), and shared (`git clone`). As **a runtime**, it is the infrastructure that closes this loop — state persistence, auto-repair, version history, scaffolding, and the IPC bridge that lets programs call LLMs and tools without managing any of it themselves. The program is what you see. The runtime is what makes it live.
+
 This is different from other approaches:
 
 - **LangGraph, CrewAI, Temporal** — you write the orchestration, the agent fills in blanks. The human is the bottleneck, and you're locked into a framework.
@@ -105,7 +107,7 @@ trama is small — ~1000 lines of TypeScript, five CLI commands. But the thing i
 
 The upper bound of what trama can do is not defined by trama. It is defined by the LLM's ability to write TypeScript.
 
-LangGraph's ceiling is its graph abstraction. CrewAI's ceiling is its role/task model. trama has no abstraction between intent and code — whatever strategy the LLM can express as a program, trama can run. The [autoresearch](https://github.com/karpathy/autoresearch) loop in the examples is not a framework feature. It is a strategy the LLM invented and expressed as TypeScript. Tomorrow the LLM might invent a strategy you haven't thought of, and trama will run that too.
+LangGraph's ceiling is its graph abstraction. CrewAI's ceiling is its role/task model. trama has no abstraction between intent and code — whatever strategy the LLM can express as a program, trama can run. The autoresearch loop in the examples is not a framework feature. It is a strategy the LLM invented and expressed as TypeScript. Tomorrow the LLM might invent a strategy you haven't thought of, and trama will run that too.
 
 This also means trama gets more powerful automatically. As LLMs get better at writing code, trama's capability space expands — without a single line of framework change.
 
@@ -131,7 +133,7 @@ A trama program can generate other trama programs. `tools.shell("trama create su
 
 - A trama program can **decompose** a complex task into sub-programs, run them, and synthesize the results.
 - A trama program can **generate its own eval harness** — write a benchmark script, then use it to evaluate its own output.
-- The [autoresearch](https://github.com/karpathy/autoresearch) pattern can be applied to **trama programs themselves** — one program iteratively improving another program's `program.ts`.
+- The autoresearch pattern can be applied to **trama programs themselves** — one program iteratively improving another program's `program.ts`.
 
 trama is not just a tool that generates programs. It is a tool whose programs can generate programs. This is the same property that makes compilers and languages powerful: GCC compiles GCC. trama orchestrates trama.
 
@@ -164,6 +166,114 @@ The last point is what separates this from every agent marketplace and workflow 
 
 ---
 
+## Patterns
+
+trama's 9 API functions are primitives. The interesting things happen when programs combine them in ways the framework never anticipated.
+
+### Programs that build their own tools
+
+A trama program can generate the scripts it needs, then use them. The eval harness doesn't have to exist before the program runs:
+
+```typescript
+import { ctx, agent, tools } from "@trama-dev/runtime";
+
+// Step 1: generate a benchmark script tailored to the task
+const bench = await agent.ask(
+  "Write a Node.js script (benchmark.mjs) that measures the p50/p99 latency of the function exported from sort.ts. " +
+  "It should run 1000 iterations, print the p99 in milliseconds to stdout, and exit."
+);
+await tools.write("benchmark.mjs", bench);
+
+// Step 2: now use it in an optimization loop
+let code = await tools.read("sort.ts");
+for (let i = 0; i < ctx.maxIterations; i++) {
+  const result = await tools.shell("node benchmark.mjs");
+  const p99 = parseFloat(result.stdout.trim());
+  if (p99 < 5) break;
+
+  code = await agent.ask(`This sort function has p99=${p99}ms. Improve it:\n${code}`);
+  await tools.write("sort.ts", code);
+  await ctx.checkpoint();
+}
+await ctx.done();
+```
+
+The program creates its own measurement infrastructure, then uses it. No framework plugin needed.
+
+### Self-improving programs
+
+A trama program can read its own source and rewrite itself:
+
+```bash
+trama create improver "read your own program.ts from the current directory, \
+  benchmark how long you take to run with 'time trama run improver', \
+  then call 'trama update improver' with a suggestion to make yourself faster. \
+  repeat 3 times."
+trama run improver
+```
+
+This is not a thought experiment. `tools.shell("trama update improver '...'")` is a valid operation — the program rewrites its own orchestration through the same mechanism a human would use.
+
+### Any npm package, zero configuration
+
+program.ts is TypeScript. It can import anything:
+
+```typescript
+import { ctx, agent, tools } from "@trama-dev/runtime";
+import Anthropic from "@anthropic-ai/sdk";      // direct API access
+import { chromium } from "playwright";           // browser automation
+import { Client } from "pg";                     // database
+import sharp from "sharp";                       // image processing
+
+// the agent decides what to import — trama doesn't need to know
+```
+
+Other agent frameworks require you to register tools, write adapters, or use framework-specific wrappers. trama programs use the npm ecosystem directly. If the package exists on npm, the agent can use it.
+
+### Cross-language orchestration
+
+TypeScript is the orchestration layer. The work happens in whatever language fits:
+
+```typescript
+import { ctx, agent, tools } from "@trama-dev/runtime";
+
+// Generate and run a Python ML pipeline
+const pipeline = await agent.ask("Write a Python script that trains a classifier on data.csv...");
+await tools.write("train.py", pipeline);
+await tools.shell("pip install scikit-learn pandas && python3 train.py");
+
+// Generate and run a SQL migration
+const migration = await agent.ask("Write a PostgreSQL migration that adds an index on...");
+await tools.shell(`psql -d mydb -c "${migration}"`);
+
+// Generate and compile a Rust binary for the hot path
+const rustCode = await agent.ask("Write a Rust program that sorts this 10GB file...");
+await tools.write("sorter/src/main.rs", rustCode);
+await tools.shell("cd sorter && cargo build --release && ./target/release/sorter data.bin");
+```
+
+The agent picks the right language for each subtask. trama just runs it.
+
+### Parallel execution
+
+No framework feature needed — it's just TypeScript:
+
+```typescript
+import { ctx, agent, tools } from "@trama-dev/runtime";
+
+const urls = ["https://api.a.com/data", "https://api.b.com/data", "https://api.c.com/data"];
+
+const results = await Promise.all(
+  urls.map(url => tools.fetch(url).then(r => JSON.parse(r.body)))
+);
+
+const analysis = await agent.ask(`Compare these three datasets:\n${JSON.stringify(results, null, 2)}`);
+await tools.write("comparison.md", analysis);
+await ctx.done();
+```
+
+---
+
 ## Agent code as a medium
 
 trama generates TypeScript, but the goal is not to give TypeScript the ability to call agents. It's the reverse: **give agents the ability to express their work as code.**
@@ -191,6 +301,8 @@ The runtime is what makes agent programs **self-contained and shareable**:
 - **Scaffolding** — on first run, the runtime creates package.json, module symlinks, gitignore, and log directories. Recipients of a shared program don't need to set anything up.
 
 This is what separates trama from "give an LLM a prompt and run the output." The runtime is the contract between the generated program and the world — and it's what makes `git clone && trama run` work.
+
+And this is also what separates trama from "just write TypeScript yourself." You *can* write the same program.ts by hand — it's real TypeScript, not a proprietary format. But without the runtime, you'd be reimplementing state persistence, error recovery, version history, module scaffolding, and the generate → execute → evolve loop every time. trama is the infrastructure that turns a script into a living, shareable, self-healing agent.
 
 ---
 
