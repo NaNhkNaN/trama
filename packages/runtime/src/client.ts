@@ -35,6 +35,7 @@ async function call(endpoint: string, body: unknown) {
 }
 
 let doneCalled = false;
+let readyCalled = false;
 
 export const ctx: Ctx = {
   input: initData.input,
@@ -44,6 +45,11 @@ export const ctx: Ctx = {
 
   async log(msg, data) {
     await call("/ctx/log", { message: msg, data });
+  },
+  async ready(data) {
+    if (readyCalled) return;
+    await call("/ctx/ready", { data });
+    readyCalled = true;
   },
   async checkpoint() {
     assertSerializable(ctx.state, "ctx.state");

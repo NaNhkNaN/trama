@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { existsSync } from "fs";
 import { join } from "path";
 import { createContext } from "../packages/runtime/dist/context.js";
 import { cleanupTempDir, createProjectFixture, makeTempDir, readJson, readText } from "./helpers.mjs";
@@ -53,6 +54,30 @@ test("createContext done logs completion even when no result is provided", async
   assert.equal(lines[0].message, "done");
   assert.equal(lines[0].data, null);
   assert.equal(readJson(join(projectDir, "state.json")).__trama_iteration, 1);
+});
+
+test("createContext ready logs once, triggers onReady once, and does not checkpoint", async (t) => {
+  const projectDir = makeTempDir("trama-context-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+
+  const readyEvents = [];
+  const ctx = createContext(projectDir, { booted: false }, {
+    onReady(data) {
+      readyEvents.push(data);
+    },
+  });
+
+  await ctx.ready({ url: "http://127.0.0.1:3000" });
+  await ctx.ready({ url: "ignored" });
+
+  const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].message, "ready");
+  assert.deepEqual(lines[0].data, { url: "http://127.0.0.1:3000" });
+  assert.deepEqual(readyEvents, [{ url: "http://127.0.0.1:3000" }]);
+  assert.equal(ctx.iteration, 0);
+  assert.equal(existsSync(join(projectDir, "state.json")), false);
 });
 
 test("createContext checkpoint rejects non-serializable state with a useful path", async (t) => {

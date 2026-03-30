@@ -88,3 +88,58 @@ await ctx.done(new Map());`,
     try { rmSync(initFile); } catch {}
   }
 });
+
+test("client.ts ready forwards to /ctx/ready once and is idempotent", async () => {
+  const result = await runNodeCommand(
+    [
+      "--input-type=module",
+      "-e",
+      `import { createServer } from "node:http";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const events = [];
+const server = createServer((req, res) => {
+  let body = "";
+  req.on("data", chunk => { body += chunk; });
+  req.on("end", () => {
+    events.push({ url: req.url, body: JSON.parse(body || "{}") });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ result: null }));
+  });
+});
+
+await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+const addr = server.address();
+const initDir = mkdtempSync(join(tmpdir(), "trama-client-ready-"));
+const initFile = join(initDir, "init.json");
+writeFileSync(initFile, JSON.stringify({
+  input: { prompt: "test prompt", args: {} },
+  state: {},
+  iteration: 0,
+  maxIterations: 100,
+}));
+
+process.env.TRAMA_PORT = String(addr.port);
+process.env.TRAMA_INIT = initFile;
+
+try {
+  const { ctx } = await import(${JSON.stringify(CLIENT_MODULE_URL)});
+  await ctx.ready({ url: "http://127.0.0.1:3000" });
+  await ctx.ready({ url: "ignored" });
+  console.log(JSON.stringify(events));
+} finally {
+  await new Promise(resolve => server.close(resolve));
+  rmSync(initDir, { recursive: true, force: true });
+}`,
+    ],
+    { cwd: REPO_ROOT, env: { ...process.env } },
+  );
+
+  assert.equal(result.exitCode, 0, result.stderr);
+  const events = JSON.parse(result.stdout.trim());
+  assert.deepEqual(events, [
+    { url: "/ctx/ready", body: { data: { url: "http://127.0.0.1:3000" } } },
+  ]);
+});

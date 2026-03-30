@@ -23,6 +23,13 @@ export interface Ctx {
   /** Write a structured log entry */
   log(message: string, data?: Record<string, unknown>): Promise<void>;
 
+  /**
+   * Signal that a long-running program has finished startup and is now serving.
+   * Used by smoke validation to distinguish "started successfully" from "completed".
+   * Idempotent: second call is a no-op.
+   */
+  ready(data?: Record<string, unknown>): Promise<void>;
+
   /** Persist current ctx.state to disk */
   checkpoint(): Promise<void>;
 

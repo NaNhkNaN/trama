@@ -6,7 +6,11 @@ import { assertSerializable } from "./serializable.js";
 export function createContext(
   projectDir: string,
   initialState: Record<string, unknown>,
-  options?: { maxIterations?: number; argsOverride?: Record<string, unknown> },
+  options?: {
+    maxIterations?: number;
+    argsOverride?: Record<string, unknown>;
+    onReady?: (data?: Record<string, unknown>) => void;
+  },
 ): Ctx {
   const logsPath = join(projectDir, "logs", "latest.jsonl");
   const statePath = join(projectDir, "state.json");
@@ -14,6 +18,7 @@ export function createContext(
 
   let doneCalled = false;
   let doneLogged = false;
+  let readyCalled = false;
 
   const input = options?.argsOverride
     ? { ...meta.input, args: { ...(meta.input.args ?? {}), ...options.argsOverride } }
@@ -31,6 +36,13 @@ export function createContext(
       const entry = { ts: Date.now(), message, data: data ?? null };
       appendFileSync(logsPath, JSON.stringify(entry) + "\n");
       console.log(`[trama] ${message}`);
+    },
+
+    async ready(data) {
+      if (readyCalled) return;
+      await this.log("ready", data);
+      options?.onReady?.(data);
+      readyCalled = true;
     },
 
     async checkpoint() {
