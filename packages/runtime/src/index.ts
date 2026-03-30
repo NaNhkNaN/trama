@@ -3,7 +3,7 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, copyFileSync, appendFileSync, statSync, rmSync, cpSync, mkdtempSync } from "fs";
 import { join } from "path";
 import { homedir, tmpdir } from "os";
-import { PiAdapter } from "./pi-adapter.js";
+import { PiAdapter, stripCodeFences } from "./pi-adapter.js";
 import { loadConfig, loadState, smokeRunAndRepair, copyToHistory, withTempDir, RUNTIME_TYPES, PI_VERSION } from "./runner.js";
 
 export { runProgram } from "./runner.js";
@@ -61,14 +61,6 @@ for (let i = ctx.iteration; i < ctx.maxIterations; i++) {
 
 await tools.write("target.ts", code);
 await ctx.done({ finalMetric: bestMetric });`;
-
-function stripCodeFences(text: string): string {
-  const trimmed = text.trim();
-  if (/^```/.test(trimmed) && /```$/.test(trimmed)) {
-    return trimmed.replace(/^```\w*\s*\n?/, "").replace(/\n?\s*```$/, "");
-  }
-  return text;
-}
 
 function getSystemPrompt(): string {
   return (
@@ -142,7 +134,7 @@ async function withProjectBackup(
 export async function createProject(
   name: string,
   prompt: string,
-  options?: { model?: string },
+  options?: { model?: string; args?: Record<string, unknown> },
 ): Promise<void> {
   validateProjectName(name);
   const projectDir = join(projectsDir(), name);
@@ -162,7 +154,7 @@ export async function createProject(
     writeFileSync(join(projectDir, ".gitignore"), "node_modules/\nstate.json\nlogs/\nhistory/\n");
 
     const meta = {
-      input: { prompt, args: {} },
+      input: { prompt, args: options?.args ?? {} },
       createdAt: new Date().toISOString(),
       piVersion: PI_VERSION,
     };

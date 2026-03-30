@@ -133,6 +133,67 @@ test("createAgent generate rejects unsupported schema types", async () => {
   );
 });
 
+test("createAgent generate does NOT retry on adapter.ask() errors (network/auth)", async () => {
+  let askCallCount = 0;
+  const adapter = {
+    async ask() {
+      askCallCount++;
+      throw new Error("ECONNREFUSED: network error");
+    },
+  };
+
+  const agent = createAgent(adapter);
+
+  await assert.rejects(
+    async () => agent.generate({
+      prompt: "count",
+      schema: { count: "number: result count" },
+    }),
+    /ECONNREFUSED: network error/,
+  );
+  assert.equal(askCallCount, 1, "adapter.ask should only be called once for non-parse errors");
+});
+
+test("createAgent generate strips extra keys from LLM response", async () => {
+  const adapter = {
+    async ask() {
+      return '{"reasoning":"ok","success":true,"extraField":"surprise","another":42}';
+    },
+  };
+
+  const agent = createAgent(adapter);
+  const result = await agent.generate({
+    prompt: "analyze",
+    schema: { reasoning: "string", success: "boolean" },
+  });
+
+  assert.deepEqual(result, { reasoning: "ok", success: true });
+  assert.equal("extraField" in result, false, "extra keys should be stripped");
+  assert.equal("another" in result, false, "extra keys should be stripped");
+});
+
+test("createAgent generate retries on parse error from first ask but not adapter failure on retry", async () => {
+  let askCallCount = 0;
+  const adapter = {
+    async ask() {
+      askCallCount++;
+      if (askCallCount === 1) return "not json at all";
+      throw new Error("rate limit exceeded");
+    },
+  };
+
+  const agent = createAgent(adapter);
+
+  await assert.rejects(
+    async () => agent.generate({
+      prompt: "count",
+      schema: { count: "number" },
+    }),
+    /rate limit exceeded/,
+  );
+  assert.equal(askCallCount, 2, "should have retried once after parse failure");
+});
+
 // --- PiAdapter abort wiring tests (mock session, no real LLM) ---
 
 test("PiAdapter.ask rejects immediately when signal is already aborted", async () => {
@@ -177,6 +238,23 @@ test("PiAdapter.ask calls session.dispose on abort during prompt", async () => {
 
   await assert.rejects(async () => promise, /disposed/i);
   assert.ok(disposeCalled > 0, "session.dispose should have been called");
+});
+
+test("PiAdapter.repair trims whitespace even without code fences", async () => {
+  const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
+
+  const adapter = new PiAdapter({ provider: "anthropic", model: "test" }, "/tmp");
+  adapter.ask = async function ask() {
+    return "\n  const value = 1;\n\n";
+  };
+
+  const result = await adapter.repair({
+    programSource: "throw new Error('boom');",
+    error: "boom",
+    runtimeTypes: "type Runtime = {};",
+  });
+
+  assert.equal(result, "const value = 1;");
 });
 
 test("PiAdapter.repair strips fenced TypeScript responses", async () => {

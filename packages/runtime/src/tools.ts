@@ -195,7 +195,7 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
           killFallbackTimer.unref?.();
         }, timeout);
 
-        child.on("error", (err) => {
+        child.on("error", (spawnError) => {
           clearTimeout(timer);
           if (killFallbackTimer) clearTimeout(killFallbackTimer);
           activeShells.delete(child);
@@ -203,7 +203,7 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
             activeSessions.delete(child.pid);
             stopReapingSession(child.pid);
           }
-          resolve({ exitCode: 1, stdout: out.value, stderr: err.message });
+          resolve({ exitCode: 1, stdout: out.value, stderr: spawnError.message });
         });
 
         child.on("close", (code) => {
@@ -229,7 +229,11 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
         signal,
       });
 
-      const body = await response.text();
+      const raw = await response.text();
+      const body = raw.length > MAX_OUTPUT
+        ? raw.slice(0, MAX_OUTPUT) + "\n[trama] response body truncated at 10MB"
+        : raw;
+
       const headers: Record<string, string> = {};
       response.headers.forEach((v, k) => { headers[k] = v; });
 

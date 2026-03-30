@@ -6,7 +6,7 @@ import { assertSerializable } from "./serializable.js";
 export function createContext(
   projectDir: string,
   initialState: Record<string, unknown>,
-  options?: { maxIterations?: number },
+  options?: { maxIterations?: number; argsOverride?: Record<string, unknown> },
 ): Ctx {
   const logsPath = join(projectDir, "logs", "latest.jsonl");
   const statePath = join(projectDir, "state.json");
@@ -15,8 +15,12 @@ export function createContext(
   let doneCalled = false;
   let doneLogged = false;
 
+  const input = options?.argsOverride
+    ? { ...meta.input, args: { ...(meta.input.args ?? {}), ...options.argsOverride } }
+    : meta.input;
+
   return {
-    input: meta.input,
+    input,
     state: { ...initialState },
     iteration: typeof initialState.__trama_iteration === "number"
       && Number.isFinite(initialState.__trama_iteration)

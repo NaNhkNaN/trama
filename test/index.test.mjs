@@ -209,7 +209,7 @@ await ctx.done();
   }
 
   const projectDir = join(fakeHome, ".trama", "projects", "alpha-repair");
-  assert.match(repairCwd, /trama-smoke-/);
+  assert.match(repairCwd, /trama-repair-/);
   assert.notEqual(repairCwd, projectDir);
   assert.equal(existsSync(join(projectDir, "repair-side-effect.txt")), false);
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram);
@@ -268,7 +268,8 @@ test("updateProject rewrites the program and appends an update history entry", a
     PiAdapter.prototype.repair = originalRepair;
   }
 
-  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), UPDATED_PROGRAM);
+  // stripCodeFences trims the LLM response, so program.ts won't have trailing whitespace
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), UPDATED_PROGRAM.trim());
   // Smoke run side effects (updated.txt) should NOT persist in the project dir
   assert.equal(existsSync(join(projectDir, "updated.txt")), false);
   assert.match(systemPrompt, /Original prompt: test prompt/);

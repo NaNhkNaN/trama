@@ -1,6 +1,7 @@
 // @trama-dev/runtime client — this is what program.ts imports.
 // Thin HTTP wrapper that calls the runner's IPC server.
 
+import { readFileSync } from "fs";
 import type { Ctx, Agent, Tools } from "./types.js";
 import { assertSerializable } from "./serializable.js";
 
@@ -11,14 +12,17 @@ if (!PORT) {
     "Direct execution is not supported (TRAMA_PORT env var missing)."
   );
 }
-if (!process.env.TRAMA_INPUT) {
+
+const INIT_PATH = process.env.TRAMA_INIT;
+if (!INIT_PATH) {
   throw new Error(
-    "@trama-dev/runtime: TRAMA_INPUT env var missing. " +
+    "@trama-dev/runtime: TRAMA_INIT env var missing. " +
     "This program must be launched by the trama runner."
   );
 }
 
 const BASE = `http://127.0.0.1:${PORT}`;
+const initData = JSON.parse(readFileSync(INIT_PATH, "utf-8"));
 
 async function call(endpoint: string, body: unknown) {
   const res = await fetch(`${BASE}${endpoint}`, {
@@ -33,10 +37,10 @@ async function call(endpoint: string, body: unknown) {
 let doneCalled = false;
 
 export const ctx: Ctx = {
-  input: JSON.parse(process.env.TRAMA_INPUT!),
-  state: JSON.parse(process.env.TRAMA_STATE ?? "{}"),
-  iteration: parseInt(process.env.TRAMA_ITERATION ?? "0"),
-  maxIterations: parseInt(process.env.TRAMA_MAX_ITERATIONS ?? "100"),
+  input: initData.input,
+  state: initData.state,
+  iteration: initData.iteration,
+  maxIterations: initData.maxIterations,
 
   async log(msg, data) {
     await call("/ctx/log", { message: msg, data });

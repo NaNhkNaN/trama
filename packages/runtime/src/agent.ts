@@ -32,9 +32,9 @@ export function createAgent(adapter: PiAdapter, signal?: AbortSignal): Agent {
       }\nNo markdown. No explanation. Just the JSON.`;
 
       const fullPrompt = `${input.prompt}\n\n${schemaInstruction}`;
+      const askOptions = signal ? { system: input.system, signal } : { system: input.system };
 
-      const attempt = async (p: string) => {
-        const response = await adapter.ask(p, signal ? { system: input.system, signal } : { system: input.system });
+      const parseAndValidate = (response: string): Record<string, unknown> => {
         const cleaned = response
           .trim()
           .replace(/^```json\s*/i, "")
@@ -44,15 +44,28 @@ export function createAgent(adapter: PiAdapter, signal?: AbortSignal): Agent {
         const parsed = JSON.parse(cleaned);
         const error = validateShape(parsed, input.schema);
         if (error) throw new Error(`Schema validation failed: ${error}`);
-        return parsed;
+        return stripToSchema(parsed as Record<string, unknown>, input.schema);
       };
 
+      // First attempt — adapter errors (network/auth) propagate immediately.
+      // Only parse/validation failures trigger a retry.
+      const response = await adapter.ask(fullPrompt, askOptions);
       try {
-        return await attempt(fullPrompt);
+        return parseAndValidate(response) as any;
       } catch (firstError) {
         const retryPrompt = `Your previous response failed validation: ${firstError}.\nTry again.\n\n${fullPrompt}`;
-        return await attempt(retryPrompt);
+        const retryResponse = await adapter.ask(retryPrompt, askOptions);
+        return parseAndValidate(retryResponse) as any;
       }
     }
   };
+}
+
+/** Return a new object containing only the keys declared in the schema. */
+function stripToSchema(obj: Record<string, unknown>, schema: Record<string, string>): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const key of Object.keys(schema)) {
+    result[key] = obj[key];
+  }
+  return result;
 }
