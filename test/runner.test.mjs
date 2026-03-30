@@ -172,6 +172,7 @@ await ctx.done();
 
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram);
   assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), fixedProgram);
+  // After repair is verified in isolation, the repaired program runs in the real dir for actual output.
   assert.equal(readFileSync(join(projectDir, "repaired.txt"), "utf-8"), "ok");
 
   const history = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8")
@@ -500,7 +501,7 @@ test("runProgram restores original program.ts when repair LLM call fails", async
   }
 });
 
-test("runProgram restores original program.ts when infrastructure fails after a repair candidate is written", async (t) => {
+test("runProgram repair side effects are isolated from the real project directory", async (t) => {
   const projectDir = makeTempDir("trama-runner-");
   t.after(() => cleanupTempDir(projectDir));
 
@@ -511,19 +512,61 @@ test("runProgram restores original program.ts when infrastructure fails after a 
   });
 
   const originalRepair = PiAdapter.prototype.repair;
-  // Repair returns code that corrupts state.json, causing loadState to throw
-  // on the next loop iteration (infrastructure failure after repair write).
+  // Repair writes a side-effect file via this.cwd and returns code that also writes one.
+  // Both should stay in the temp dir, never touching the real project.
   PiAdapter.prototype.repair = async function repair() {
-    writeFileSync(join(projectDir, "state.json"), "{corrupt json");
-    return 'throw new Error("repaired but untested");';
+    writeFileSync(join(this.cwd, "repair-side-effect.txt"), "from-repair-llm");
+    return `import { tools } from "@trama-dev/runtime";
+await tools.write("program-side-effect.txt", "from-repaired-program");
+throw new Error("still broken");`;
   };
 
   try {
     await assert.rejects(
       async () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 }),
-      /Corrupt state\.json/,
+      /Failed after 1 repair attempt/,
     );
+    // program.ts is never modified since no repair was verified
     assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
+    // Side effects from repair LLM and repaired program must NOT leak to real dir
+    assert.equal(existsSync(join(projectDir, "repair-side-effect.txt")), false);
+    assert.equal(existsSync(join(projectDir, "program-side-effect.txt")), false);
+  } finally {
+    PiAdapter.prototype.repair = originalRepair;
+  }
+});
+
+test("runProgram fully restores project when repair passes in temp but fails in real dir", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  const originalSource = 'throw new Error("original");';
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: originalSource,
+  });
+
+  const originalRepair = PiAdapter.prototype.repair;
+  // Return code that succeeds in temp but writes a side-effect file and then fails in real dir.
+  PiAdapter.prototype.repair = async function repair() {
+    return `import { tools } from "@trama-dev/runtime";
+await tools.write("leaked.txt", "from-repair-rerun");
+if (!process.cwd().includes("trama-repair-")) {
+  throw new Error("fails in real dir");
+}
+import { ctx } from "@trama-dev/runtime";
+await ctx.done();`;
+  };
+
+  try {
+    await assert.rejects(
+      async () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 }),
+      /Failed after 1 repair attempt/,
+    );
+    // Full restore: both program.ts and side effects from the failed real rerun.
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
+    assert.equal(existsSync(join(projectDir, "leaked.txt")), false,
+      "side effects from the rolled-back repair rerun must not persist");
   } finally {
     PiAdapter.prototype.repair = originalRepair;
   }

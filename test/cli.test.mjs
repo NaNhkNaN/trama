@@ -96,6 +96,19 @@ PiAdapter.prototype.repair = async function repair() {
   assert.equal(readFileSync(observedModelPath, "utf-8"), "configured-model");
 });
 
+test("CLI create rejects malformed --arg values", async (t) => {
+  const fakeHome = makeTempDir("trama-cli-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const result = await runNodeCommand(
+    [CLI_ENTRY, "create", "demo", "make something", "--arg", "noequals"],
+    { cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome } },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /Invalid --arg format/);
+});
+
 test("CLI run without --timeout uses config.defaultTimeout instead of a hardcoded default", async (t) => {
   const fakeHome = makeTempDir("trama-cli-home-");
   t.after(() => cleanupTempDir(fakeHome));

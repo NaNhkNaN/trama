@@ -91,6 +91,7 @@ export interface RunOptions {
   projectDir: string;
   maxRepairAttempts?: number;
   timeout?: number;
+  args?: Record<string, unknown>;
 }
 
 export interface RepairInput {

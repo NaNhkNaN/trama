@@ -170,6 +170,17 @@ test("createContext extracts input from meta.json", async (t) => {
   assert.equal(ctx.input.args.file, "a.txt");
 });
 
+test("createContext argsOverride merges with meta.json args", async (t) => {
+  const projectDir = makeTempDir("trama-context-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { metaInput: { prompt: "prompt", args: { existing: "kept", overridden: "old" } } });
+
+  const ctx = createContext(projectDir, {}, { argsOverride: { overridden: "new", added: "extra" } });
+  assert.equal(ctx.input.args.existing, "kept");
+  assert.equal(ctx.input.args.overridden, "new");
+  assert.equal(ctx.input.args.added, "extra");
+});
+
 test("createContext done retries log and checkpoint after checkpoint failure", async (t) => {
   const projectDir = makeTempDir("trama-context-");
   t.after(() => cleanupTempDir(projectDir));

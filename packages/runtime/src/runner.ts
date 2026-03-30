@@ -432,7 +432,7 @@ export function copyToHistory(projectDir: string, reason: string, detail?: strin
   const existing = readdirSync(historyDir).filter(f => /^\d+\.ts$/.test(f));
 
   const nums = existing.map(f => parseInt(f.replace(".ts", ""), 10));
-  const nextNum = nums.length > 0 ? Math.max(...nums) + 1 : 1;
+  const nextNum = nums.length > 0 ? nums.reduce((a, b) => Math.max(a, b), 0) + 1 : 1;
   const next = String(nextNum).padStart(Math.max(4, String(nextNum).length), "0");
 
   copyFileSync(join(projectDir, "program.ts"), join(historyDir, `${next}.ts`));
@@ -444,6 +444,25 @@ export function copyToHistory(projectDir: string, reason: string, detail?: strin
 }
 
 // --- Helpers ---
+
+/**
+ * Snapshot a directory, run fn, restore from snapshot if fn returns false.
+ * Always cleans up the snapshot. Returns whatever fn returns.
+ */
+async function withSnapshot<T>(dir: string, fn: () => Promise<{ keep: boolean; value: T }>): Promise<T> {
+  const snap = mkdtempSync(join(tmpdir(), "trama-snapshot-"));
+  try {
+    cpSync(dir, snap, { recursive: true });
+    const result = await fn();
+    if (!result.keep) {
+      rmSync(dir, { recursive: true, force: true });
+      cpSync(snap, dir, { recursive: true });
+    }
+    return result.value;
+  } finally {
+    rmSync(snap, { recursive: true, force: true });
+  }
+}
 
 /** Run fn in a temp directory, clean up afterwards regardless of outcome. */
 export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
@@ -477,6 +496,87 @@ async function repairWithTimeout(
   }
 }
 
+// --- Single program execution ---
+
+interface RunOnceOptions {
+  projectDir: string;
+  adapter: PiAdapter;
+  timeout: number;
+  maxIterations: number;
+  argsOverride?: Record<string, unknown>;
+  streamOutput?: boolean;
+}
+
+/**
+ * Run program.ts once in the given directory. Sets up scaffolding, IPC server,
+ * writes init file, spawns child, waits for result, and cleans up.
+ * Returns the child process result — does NOT throw on non-zero exit.
+ */
+async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
+  const { projectDir, adapter, timeout, maxIterations, argsOverride, streamOutput } = options;
+
+  ensureProjectScaffold(projectDir);
+  ensureRuntimeLink(projectDir);
+  writeFileSync(join(projectDir, "logs", "latest.jsonl"), "");
+
+  const abortController = new AbortController();
+  const { signal } = abortController;
+  const ctx = createContext(projectDir, loadState(projectDir), { maxIterations, argsOverride });
+  const agentImpl = createAgent(adapter, signal);
+  const toolsImpl = createTools(projectDir, signal);
+  const server = createIPCServer(ctx, agentImpl, toolsImpl);
+
+  // Infrastructure setup — errors here are NOT program bugs.
+  let port: number;
+  try {
+    port = await startServer(server);
+  } catch (infraError) {
+    await forceCloseServer(server, toolsImpl, abortController);
+    throw infraError;
+  }
+
+  // Write init data to a temp file instead of env vars to avoid OS size limits.
+  const initFile = join(tmpdir(), `trama-init-${port}.json`);
+  writeFileSync(initFile, JSON.stringify({
+    input: ctx.input,
+    state: ctx.state,
+    iteration: ctx.iteration,
+    maxIterations: ctx.maxIterations,
+  }));
+
+  const child = spawn(process.execPath, [TSX_CLI, join(projectDir, "program.ts")], {
+    cwd: projectDir,
+    env: {
+      ...process.env,
+      TRAMA_PORT: String(port),
+      TRAMA_INIT: initFile,
+    },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  let result: ChildResult;
+  try {
+    result = await waitForChild(child, timeout, streamOutput ? {
+      stdout: chunk => { process.stdout.write(chunk); },
+      stderr: chunk => { process.stderr.write(chunk); },
+    } : undefined);
+  } catch (spawnError) {
+    await forceCloseServer(server, toolsImpl, abortController);
+    try { rmSync(initFile); } catch { /* best-effort */ }
+    throw spawnError;
+  }
+
+  try { rmSync(initFile); } catch { /* best-effort */ }
+
+  if (result.exitCode === 0) {
+    try { await closeServer(server); } catch { await forceCloseServer(server, toolsImpl, abortController); }
+  } else {
+    try { await forceCloseServer(server, toolsImpl, abortController); } catch { /* best-effort */ }
+  }
+
+  return result;
+}
+
 // --- Shared execution core ---
 
 interface ExecuteOptions {
@@ -485,126 +585,95 @@ interface ExecuteOptions {
   maxRepairAttempts: number;
   timeout: number;
   maxIterations: number;
+  argsOverride?: Record<string, unknown>;
   /** Called after a successful repair. Receives attempt index and original error string. */
   onRepair?: (attempt: number, maxAttempts: number, error: string) => void;
 }
+
+const formatError = (r: ChildResult) =>
+  `program.ts exited with code ${r.exitCode}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`;
 
 async function executeProgram(options: ExecuteOptions): Promise<void> {
   const { projectDir, adapter, maxRepairAttempts, timeout, maxIterations } = options;
 
   mkdirSync(join(projectDir, "history"), { recursive: true });
   mkdirSync(join(projectDir, "logs"), { recursive: true });
-  ensureProjectScaffold(projectDir);
-  ensureRuntimeLink(projectDir);
 
-  writeFileSync(join(projectDir, "logs", "latest.jsonl"), "");
+  // Phase 1: Run in the real project directory.
+  const result = await runProgramOnce({
+    projectDir, adapter, timeout, maxIterations,
+    argsOverride: options.argsOverride,
+    streamOutput: true,
+  });
+  if (result.exitCode === 0) return;
 
+  if (maxRepairAttempts === 0) {
+    throw new Error(`Failed after 0 repair attempts: ${formatError(result)}`);
+  }
+
+  // Phase 2: Repair loop — both LLM repair call and verification run
+  // are fully isolated in temp dirs to prevent side effects on the real project.
+  let lastError = formatError(result);
   const originalSource = readFileSync(join(projectDir, "program.ts"), "utf-8");
+  let currentSource = originalSource;
   const repairErrors: string[] = [];
   const repairDetails = () => repairErrors.length > 0
     ? `\nRepair errors:\n${repairErrors.map((e, i) => `  [${i + 1}] ${e}`).join("\n")}` : "";
-  let pendingRepair: { attempt: number; error: string } | null = null;
-  let programModified = false;
 
-  try {
-    for (let attempt = 0; attempt <= maxRepairAttempts; attempt++) {
-      const abortController = new AbortController();
-      const { signal } = abortController;
-      const ctx = createContext(projectDir, loadState(projectDir), { maxIterations });
-      const agentImpl = createAgent(adapter, signal);
-      const toolsImpl = createTools(projectDir, signal);
+  for (let attempt = 0; attempt < maxRepairAttempts; attempt++) {
+    const repairResult = await withTempDir("trama-repair-", async (tempDir) => {
+      cpSync(projectDir, tempDir, { recursive: true });
+      const tempAdapter = adapter.withCwd(tempDir);
 
-      const server = createIPCServer(ctx, agentImpl, toolsImpl);
-
-      // Phase A: Infrastructure setup — errors here are NOT program bugs,
-      // so they must NOT trigger the repair loop. (H1 fix)
-      let port: number;
-      try {
-        port = await startServer(server);
-      } catch (infraError) {
-        await forceCloseServer(server, toolsImpl, abortController);
-        throw infraError;
-      }
-
-      const child = spawn(process.execPath, [TSX_CLI, join(projectDir, "program.ts")], {
-        cwd: projectDir,
-        env: {
-          ...process.env,
-          TRAMA_PORT: String(port),
-          TRAMA_INPUT: JSON.stringify(ctx.input),
-          TRAMA_STATE: JSON.stringify(ctx.state),
-          TRAMA_ITERATION: String(ctx.iteration),
-          TRAMA_MAX_ITERATIONS: String(ctx.maxIterations),
-        },
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-
-      // Phase B: Program execution.
-      // waitForChild rejects on spawn errors (ENOENT, EACCES) — those are
-      // infrastructure failures and must NOT trigger repair.
-      let result: ChildResult;
-      try {
-        result = await waitForChild(child, timeout, {
-          stdout: chunk => { process.stdout.write(chunk); },
-          stderr: chunk => { process.stderr.write(chunk); },
-        });
-      } catch (spawnError) {
-        // Child process failed to start — not a program bug.
-        await forceCloseServer(server, toolsImpl, abortController);
-        throw spawnError;
-      }
-
-      if (result.exitCode === 0) {
-        // Repair is verified — program.ts is now the canonical source.
-        programModified = false;
-        // Program succeeded. Server cleanup failure is not a program bug.
-        try { await closeServer(server); } catch { await forceCloseServer(server, toolsImpl, abortController); }
-        if (pendingRepair) {
-          options.onRepair?.(pendingRepair.attempt, maxRepairAttempts, pendingRepair.error);
-        }
-        return;
-      }
-
-      // Program failed — this is the only path that may trigger repair.
-      try {
-        await forceCloseServer(server, toolsImpl, abortController);
-      } catch { /* best-effort cleanup */ }
-      const programError = new Error(
-        `program.ts exited with code ${result.exitCode}\n` +
-        `stdout: ${result.stdout}\n` +
-        `stderr: ${result.stderr}`
-      );
-
-      // Previous repair candidate failed — don't record it.
-      pendingRepair = null;
-
-      if (attempt === maxRepairAttempts) {
-        throw new Error(`Failed after ${maxRepairAttempts} repair attempts: ${programError}${repairDetails()}`);
-      }
-
-      const source = readFileSync(join(projectDir, "program.ts"), "utf-8");
       const fixed = await repairWithTimeout(
-        adapter,
-        { programSource: source, error: String(programError), runtimeTypes: RUNTIME_TYPES },
+        tempAdapter,
+        { programSource: currentSource, error: lastError, runtimeTypes: RUNTIME_TYPES },
         timeout,
         repairErrors,
       );
+      if (!fixed) return null;
 
-      if (fixed !== null) {
-        writeFileSync(join(projectDir, "program.ts"), fixed);
-        programModified = true;
-        pendingRepair = { attempt, error: String(programError) };
-      } else {
-        // Repair LLM call itself failed — don't re-run the same broken program.
-        throw new Error(`Failed after ${attempt + 1} repair attempt(s): ${programError}${repairDetails()}`);
+      writeFileSync(join(tempDir, "program.ts"), fixed);
+      const verifyResult = await runProgramOnce({
+        projectDir: tempDir, adapter: tempAdapter, timeout, maxIterations,
+        argsOverride: options.argsOverride,
+      });
+      return { fixed, verifyResult };
+    });
+
+    if (!repairResult) {
+      // Repair LLM call itself failed — don't re-run the same broken program.
+      throw new Error(`Failed after ${attempt + 1} repair attempt(s): ${lastError}${repairDetails()}`);
+    }
+
+    if (repairResult.verifyResult.exitCode === 0) {
+      // Repair verified in isolation — now run in the real project for actual output.
+      // Snapshot first so we can restore cleanly if the real run fails.
+      const realResult = await withSnapshot(projectDir, async () => {
+        writeFileSync(join(projectDir, "program.ts"), repairResult.fixed);
+        const r = await runProgramOnce({
+          projectDir, adapter, timeout, maxIterations,
+          argsOverride: options.argsOverride,
+          streamOutput: true,
+        });
+        return { keep: r.exitCode === 0, value: r };
+      });
+      if (realResult.exitCode === 0) {
+        options.onRepair?.(attempt, maxRepairAttempts, lastError);
+        return;
       }
+      // Passed in isolation but failed in real dir — project already restored by withSnapshot.
+      currentSource = repairResult.fixed;
+      lastError = formatError(realResult);
+      continue;
     }
-  } catch (err) {
-    if (programModified) {
-      try { writeFileSync(join(projectDir, "program.ts"), originalSource); } catch { /* best-effort */ }
-    }
-    throw err;
+
+    // Repair produced broken code — update context for next attempt.
+    currentSource = repairResult.fixed;
+    lastError = formatError(repairResult.verifyResult);
   }
+
+  throw new Error(`Failed after ${maxRepairAttempts} repair attempts: ${lastError}${repairDetails()}`);
 }
 
 // --- Smoke run (used by create and update) ---
@@ -693,6 +762,7 @@ export async function runProgram(options: RunOptions) {
     maxRepairAttempts,
     timeout,
     maxIterations,
+    argsOverride: options.args,
     onRepair(attempt, max, error) {
       // Log repair attempts (appends to already-open logs file)
       const logsPath = join(projectDir, "logs", "latest.jsonl");

@@ -7,6 +7,15 @@ import {
 import { getModel } from "@mariozechner/pi-ai";
 import type { PiAdapterConfig, RepairInput } from "./types.js";
 
+/** Strip markdown code fences and trim whitespace. */
+export function stripCodeFences(text: string): string {
+  const trimmed = text.trim();
+  if (/^```/.test(trimmed) && /```$/.test(trimmed)) {
+    return trimmed.replace(/^```\w*\s*\n?/, "").replace(/\n?\s*```$/, "");
+  }
+  return trimmed;
+}
+
 export class PiAdapter {
   private config: PiAdapterConfig;
   private cwd: string;
@@ -116,10 +125,6 @@ export class PiAdapter {
       `Output ONLY the fixed program. No explanation.`,
       { system: "You are a TypeScript repair tool.", signal }
     );
-    const trimmed = response.trim();
-    if (/^```/.test(trimmed) && /```$/.test(trimmed)) {
-      return trimmed.replace(/^```\w*\s*\n?/, "").replace(/\n?\s*```$/, "");
-    }
-    return response;
+    return stripCodeFences(response);
   }
 }

@@ -10,6 +10,23 @@ import {
   resolveProject,
 } from "@trama-dev/runtime/runner";
 
+function collectArg(value: string, previous: string[]) {
+  return [...previous, value];
+}
+
+function parseArgs(args: string[]): Record<string, unknown> {
+  if (args.length === 0) return {};
+  const result: Record<string, unknown> = {};
+  for (const arg of args) {
+    const eq = arg.indexOf("=");
+    if (eq === -1) {
+      throw new Error(`Invalid --arg format: "${arg}". Expected key=value.`);
+    }
+    result[arg.slice(0, eq)] = arg.slice(eq + 1);
+  }
+  return result;
+}
+
 const cli = new Command()
   .name("trama")
   .description("A minimal runtime for agent-authored programs")
@@ -19,9 +36,14 @@ cli
   .command("create <name> <prompt>")
   .description("Generate a new program from a natural language prompt")
   .option("--model <model>", "LLM model to use")
-  .action(async (name: string, prompt: string, opts: { model?: string }) => {
+  .option("--arg <key=value>", "Pass argument to the program (repeatable)", collectArg, [])
+  .action(async (name: string, prompt: string, opts: { model?: string; arg: string[] }) => {
     try {
-      await createProject(name, prompt, opts.model ? { model: opts.model } : undefined);
+      const args = parseArgs(opts.arg);
+      await createProject(name, prompt, {
+        model: opts.model,
+        args: Object.keys(args).length > 0 ? args : undefined,
+      });
     } catch (err) {
       console.error(`Error: ${err instanceof Error ? err.message : err}`);
       process.exit(1);
@@ -32,7 +54,8 @@ cli
   .command("run <name>")
   .description("Execute a program")
   .option("--timeout <ms>", "Execution timeout in ms")
-  .action(async (name: string, opts: { timeout?: string }) => {
+  .option("--arg <key=value>", "Pass argument to the program (repeatable)", collectArg, [])
+  .action(async (name: string, opts: { timeout?: string; arg: string[] }) => {
     try {
       let timeout: number | undefined;
       if (opts.timeout !== undefined) {
@@ -42,8 +65,13 @@ cli
           process.exit(1);
         }
       }
+      const args = parseArgs(opts.arg);
       const projectDir = resolveProject(name);
-      await runProgram({ projectDir, timeout });
+      await runProgram({
+        projectDir,
+        timeout,
+        args: Object.keys(args).length > 0 ? args : undefined,
+      });
     } catch (err) {
       console.error(`Error: ${err instanceof Error ? err.message : err}`);
       process.exit(1);
