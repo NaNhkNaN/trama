@@ -2,6 +2,15 @@
 
 > Agents don't need frameworks. They need a runtime.
 
+```bash
+npm install -g @trama-dev/cli
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+trama create hello "fetch the top 5 Hacker News stories and write a summary to digest.md"
+trama run hello
+cat ~/.trama/projects/hello/digest.md
+```
+
 ---
 
 ## What is trama?
@@ -20,14 +29,14 @@ You describe what you want. trama generates a complete program — with control 
         trama update       <- natural language rewrites the program itself.
 ```
 
-trama has two faces. As **program.ts**, it is an artifact with a lifecycle — born (`create`), executed (`run`), evolved (`update`), self-healed (`repair`), and shared (`git clone`). As **a runtime**, it is the infrastructure that closes this loop — state persistence, auto-repair, version history, scaffolding, and the IPC bridge that lets programs call LLMs and tools without managing any of it themselves. The program is what you see. The runtime is what makes it live.
-
 This is different from other approaches:
 
 - **LangGraph, CrewAI, Temporal** — you write the orchestration, the agent fills in blanks. The human is the bottleneck, and you're locked into a framework.
 - **ReAct loops, tool-calling chains** — the agent improvises every step. Flexible, but no stable artifact. Nothing to inspect, share, or iterate on.
 - **Cursor, Claude Code, Codex** — the agent writes code, but you orchestrate the agent. The intent → execution loop is manual.
 - **trama** — the agent writes *the orchestration itself*, and the runtime executes it end-to-end. The output is a complete, runnable program that anyone can clone and run. No framework to learn. No prompts to optimize. Just code with a runtime.
+
+trama has two faces. As **program.ts**, it is an artifact with a lifecycle — born (`create`), executed (`run`), evolved (`update`), self-healed (`repair`), and shared (`git clone`). As **a runtime**, it is the infrastructure that closes this loop — state persistence, auto-repair, version history, scaffolding, and the IPC bridge that lets programs call LLMs and tools without managing any of it themselves. The program is what you see. The runtime is what makes it live.
 
 ---
 
