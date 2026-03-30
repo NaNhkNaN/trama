@@ -109,6 +109,32 @@ test("CLI create rejects malformed --arg values", async (t) => {
   assert.match(result.stderr, /Invalid --arg format/);
 });
 
+test("CLI update surfaces missing-project errors with exit code 1", async (t) => {
+  const fakeHome = makeTempDir("trama-cli-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const result = await runNodeCommand(
+    [CLI_ENTRY, "update", "missing", "new requirements"],
+    { cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome } },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /not found/);
+});
+
+test("CLI logs surfaces missing-project errors with exit code 1", async (t) => {
+  const fakeHome = makeTempDir("trama-cli-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const result = await runNodeCommand(
+    [CLI_ENTRY, "logs", "missing"],
+    { cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome } },
+  );
+
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /not found/);
+});
+
 test("CLI run without --timeout uses config.defaultTimeout instead of a hardcoded default", async (t) => {
   const fakeHome = makeTempDir("trama-cli-home-");
   t.after(() => cleanupTempDir(fakeHome));

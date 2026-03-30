@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { join } from "path";
-import { existsSync, readFileSync } from "fs";
-import { createProject, listProjects, showLogs, updateProject } from "../packages/runtime/dist/index.js";
+import { existsSync, mkdirSync, readFileSync } from "fs";
+import { createProject, listProjects, showLogs, updateProject, validateProjectName } from "../packages/runtime/dist/index.js";
 import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
 import {
   DEFAULT_PROGRAM,
@@ -626,4 +626,140 @@ test("createProject smoke validation uses config maxRepairAttempts", async (t) =
     PiAdapter.prototype.ask = originalAsk;
     PiAdapter.prototype.repair = originalRepair;
   }
+});
+
+// --- Additional coverage tests ---
+
+test("createProject rejects duplicate project names", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  // Pre-create the project directory
+  mkdirSync(join(fakeHome, ".trama", "projects", "dupe"), { recursive: true });
+
+  const originalAsk = PiAdapter.prototype.ask;
+  PiAdapter.prototype.ask = async function ask() { return DEFAULT_PROGRAM; };
+
+  try {
+    await withEnv({ HOME: fakeHome }, async () => {
+      await assert.rejects(
+        async () => createProject("dupe", "anything"),
+        /already exists/,
+      );
+    });
+  } finally {
+    PiAdapter.prototype.ask = originalAsk;
+  }
+});
+
+test("validateProjectName rejects empty, dot, and slash names", () => {
+  assert.throws(() => validateProjectName(""), /Invalid project name/);
+  assert.throws(() => validateProjectName("."), /Invalid project name/);
+  assert.throws(() => validateProjectName(".."), /Invalid project name/);
+  assert.throws(() => validateProjectName("a/b"), /Invalid project name/);
+  assert.throws(() => validateProjectName("a\\b"), /Invalid project name/);
+});
+
+test("listProjects prints nothing when projects dir exists but is empty", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+  mkdirSync(join(fakeHome, ".trama", "projects"), { recursive: true });
+
+  const { messages } = await withEnv({ HOME: fakeHome }, () =>
+    captureConsole("log", () => listProjects()),
+  );
+  assert.equal(messages.some(m => m.includes("No projects found")), true);
+});
+
+test("showLogs reports no logs when logs file is missing", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const projectDir = join(fakeHome, ".trama", "projects", "nologs");
+  createProjectFixture(projectDir);
+  // Delete the logs file
+  const { rmSync } = await import("fs");
+  try { rmSync(join(projectDir, "logs", "latest.jsonl")); } catch {}
+
+  const { messages } = await withEnv({ HOME: fakeHome }, () =>
+    captureConsole("log", () => showLogs("nologs")),
+  );
+  assert.equal(messages.some(m => m.includes("No logs found")), true);
+});
+
+test("showLogs reports no entries when logs file is empty", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const projectDir = join(fakeHome, ".trama", "projects", "emptylogs");
+  createProjectFixture(projectDir);
+  writeText(join(projectDir, "logs", "latest.jsonl"), "");
+
+  const { messages } = await withEnv({ HOME: fakeHome }, () =>
+    captureConsole("log", () => showLogs("emptylogs")),
+  );
+  assert.equal(messages.some(m => m.includes("No log entries")), true);
+});
+
+test("showLogs handles malformed JSON lines gracefully", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const projectDir = join(fakeHome, ".trama", "projects", "badlogs");
+  createProjectFixture(projectDir);
+  writeText(join(projectDir, "logs", "latest.jsonl"),
+    `${JSON.stringify({ ts: Date.parse("2024-01-01T00:00:00Z"), message: "good" })}\nnot valid json\n`);
+
+  const { messages } = await withEnv({ HOME: fakeHome }, () =>
+    captureConsole("log", () => showLogs("badlogs")),
+  );
+  assert.equal(messages[0], "[00:00:00] good");
+  assert.equal(messages[1], "not valid json");
+});
+
+test("showLogs omits data suffix when log entry has no data", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const projectDir = join(fakeHome, ".trama", "projects", "nodata");
+  createProjectFixture(projectDir);
+  writeText(join(projectDir, "logs", "latest.jsonl"),
+    `${JSON.stringify({ ts: Date.parse("2024-06-15T12:30:00Z"), message: "step" })}\n`);
+
+  const { messages } = await withEnv({ HOME: fakeHome }, () =>
+    captureConsole("log", () => showLogs("nodata")),
+  );
+  assert.equal(messages[0], "[12:30:00] step");
+});
+
+test("listProjects shows projects without meta.json or program.ts gracefully", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  // Create a project dir with no meta.json and no program.ts
+  mkdirSync(join(fakeHome, ".trama", "projects", "bare"), { recursive: true });
+
+  const { messages } = await withEnv({ HOME: fakeHome }, () =>
+    captureConsole("log", () => listProjects()),
+  );
+  assert.equal(messages.some(m => m.includes("bare")), true);
+});
+
+test("listProjects truncates long prompts at 60 characters", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const projectDir = join(fakeHome, ".trama", "projects", "longprompt");
+  createProjectFixture(projectDir, {
+    metaInput: { prompt: "a".repeat(100), args: {} },
+  });
+
+  const { messages } = await withEnv({ HOME: fakeHome }, () =>
+    captureConsole("log", () => listProjects()),
+  );
+  const line = messages.find(m => m.includes("longprompt"));
+  assert.ok(line);
+  assert.match(line, /\.\.\./, "long prompt should be truncated with ...");
+  // Should not contain the full 100 chars
+  assert.ok(!line.includes("a".repeat(100)));
 });
