@@ -60,11 +60,40 @@ for (let i = ctx.iteration; i < ctx.maxIterations; i++) {
 }
 
 await tools.write("target.ts", code);
-await ctx.done({ finalMetric: bestMetric });`;
+await ctx.done({ finalMetric: bestMetric });
+
+// Example D: Long-running server.
+// Call ctx.ready() only after the server is actually listening.
+// Handle SIGTERM/SIGINT so smoke validation can shut it down cleanly.
+import { ctx } from "@trama-dev/runtime";
+import { createServer } from "node:http";
+
+const server = createServer((_req, res) => {
+  res.end("ok");
+});
+
+await new Promise<void>((resolve, reject) => {
+  server.once("error", reject);
+  server.listen(3000, "127.0.0.1", () => resolve());
+});
+
+await ctx.ready({ url: "http://127.0.0.1:3000" });
+
+process.on("SIGTERM", () => {
+  server.close();
+  process.exit(0);
+});
+process.on("SIGINT", () => {
+  server.close();
+  process.exit(0);
+});
+
+await new Promise<void>(() => {});`;
 
 function getSystemPrompt(): string {
   return (
     `You are generating a TypeScript program for the trama runtime.\n\n` +
+    `If the program is long-running (for example an HTTP server), call ctx.ready(...) after startup completes and handle SIGTERM/SIGINT for clean shutdown.\n\n` +
     `Runtime API:\n${RUNTIME_TYPES}\n\n` +
     `Examples:\n${EXAMPLE_PROGRAMS}`
   );

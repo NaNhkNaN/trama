@@ -104,6 +104,42 @@ trama run summarizer --arg file=another-report.csv
 
 ---
 
+## Try it yourself
+
+These examples work out of the box. Each one generates a complete program from a single sentence.
+
+**Persistent state** — a number that remembers your changes across runs:
+
+```bash
+trama create counter "print number 1, and every time I run this program, the number should +1"
+trama run counter    # prints 1
+trama run counter    # prints 2
+```
+
+**Long-running server with live editing** — a web app that persists state:
+
+```bash
+trama create editor "print a number, and host a website at localhost:1111, \
+  in this website I can modify the number and next time I run this program, \
+  you will first print the number I modified, and host the same website"
+trama run editor     # open http://localhost:1111
+```
+
+Long-running programs should call `ctx.ready()` once startup completes so `create`/`update` validation can treat "server is up" as success instead of waiting for process exit.
+
+**Behavioral rewrite** — change how the program behaves without starting over:
+
+```bash
+trama create chatbot "host a website at localhost:1234 to show a chat window \
+  that I can continuously chat with AI, the AI should always reply sadly"
+trama run chatbot    # open http://localhost:1234, talk to a sad AI
+
+trama update chatbot "now reply always happy"
+trama run chatbot    # same app, same URL, but now the AI is happy
+```
+
+---
+
 ## Why trama matters
 
 Every other approach puts something between you and execution: a graph definition, a prompt chain, a state machine, a YAML file. That middle layer is where complexity hides and debugging gets hard.
@@ -126,6 +162,8 @@ Note: programs can call LLMs (`agent.ask`), run shell commands (`tools.shell`), 
 trama does not sandbox generated programs. A program can do anything TypeScript can do: read/write files, run shell commands, make network requests.
 
 **`create` and `update` execute the generated program.** After generating code, trama runs it once in a temporary directory to validate it works. If the program makes network requests, calls external APIs, or runs shell commands with side effects, those side effects happen during validation — before you ever run `trama run`. The temp directory isolates file-system changes, but external side effects (HTTP requests, database writes, deployments) cannot be rolled back.
+
+For long-running programs such as HTTP servers, call `await ctx.ready(...)` once startup completes. This tells smoke validation that the program started successfully and can be shut down cleanly instead of waiting for it to exit on its own.
 
 **`agent.ask()` gives the LLM autonomous tool access.** When your program calls `agent.ask()`, the underlying pi-coding-agent may autonomously read files, write files, and run shell commands to fulfill the request. This is not a simple text-in/text-out call — the LLM can take multi-step actions within the project directory.
 
@@ -154,6 +192,7 @@ ctx.state             // persistent JSON state (local working copy)
 ctx.iteration         // progress counter (advances only on checkpoint/done)
 ctx.maxIterations     // hint for loop bounds (not enforced by runtime)
 await ctx.log(msg)    // structured log entry (appears in `trama logs`)
+await ctx.ready(data?)// signal startup complete for long-running programs, idempotent
 await ctx.checkpoint()// persist ctx.state to disk, advance iteration
 await ctx.done(result?)// signal completion — persists state, logs result, idempotent
 ```
@@ -369,4 +408,4 @@ What you share is not a prompt or a workflow graph. It's a complete, readable, m
 
 ## Status
 
-trama is in early development. The current scope is the minimum viable product: five CLI commands (`create`, `run`, `update`, `list`, `logs`) and the runtime API (`ctx`, `agent`, `tools`).
+trama is in early development. The current scope is the minimum viable product: five CLI commands (`create`, `run`, `update`, `list`, `logs`) and the runtime API (`ctx`, `agent`, `tools`), including `ctx.ready()` for long-running programs.

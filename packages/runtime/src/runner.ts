@@ -137,6 +137,7 @@ export interface Ctx {
   iteration: number;
   maxIterations: number;
   log(message: string, data?: Record<string, unknown>): Promise<void>;
+  ready(data?: Record<string, unknown>): Promise<void>;
   checkpoint(): Promise<void>;
   done(result?: Record<string, unknown>): Promise<void>;
 }
@@ -321,6 +322,12 @@ function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
 
           case "/ctx/log":
             await ctx.log(data.message, data.data);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ result: null }));
+            break;
+
+          case "/ctx/ready":
+            await ctx.ready(data.data);
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ result: null }));
             break;
@@ -554,8 +561,7 @@ interface RunOnceOptions {
   maxIterations: number;
   argsOverride?: Record<string, unknown>;
   streamOutput?: boolean;
-  stopAfterReady?: {
-    logPattern: RegExp;
+  stopOnReady?: {
     graceMs: number;
   };
 }
@@ -572,7 +578,7 @@ interface WaitForChildOptions {
  * Returns the child process result — does NOT throw on non-zero exit.
  */
 async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
-  const { projectDir, adapter, timeout, maxIterations, argsOverride, streamOutput, stopAfterReady } = options;
+  const { projectDir, adapter, timeout, maxIterations, argsOverride, streamOutput, stopOnReady } = options;
 
   ensureProjectScaffold(projectDir);
   ensureRuntimeLink(projectDir);
@@ -580,21 +586,20 @@ async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
   const abortController = new AbortController();
   const stopController = new AbortController();
   const { signal } = abortController;
-  const ctx = createContext(projectDir, loadState(projectDir), { maxIterations, argsOverride });
   let readyStopScheduled = false;
   let readyStopTimer: ReturnType<typeof setTimeout> | null = null;
-  if (stopAfterReady) {
-    const baseLog = ctx.log.bind(ctx);
-    ctx.log = async (message, data) => {
-      await baseLog(message, data);
-      if (readyStopScheduled || !stopAfterReady.logPattern.test(message)) return;
+  const ctx = createContext(projectDir, loadState(projectDir), {
+    maxIterations,
+    argsOverride,
+    onReady: stopOnReady ? () => {
+      if (readyStopScheduled) return;
       readyStopScheduled = true;
       readyStopTimer = setTimeout(() => {
         stopController.abort();
-      }, stopAfterReady.graceMs);
+      }, stopOnReady.graceMs);
       readyStopTimer.unref?.();
-    };
-  }
+    } : undefined,
+  });
   // Truncate logs only after preflight succeeds — preserves prior run's diagnostics
   // if scaffolding, state loading, or context creation fails.
   writeFileSync(join(projectDir, "logs", "latest.jsonl"), "");
@@ -641,7 +646,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
   try {
     result = await waitForChild(child, {
       timeout,
-      stopSignal: stopAfterReady ? stopController.signal : undefined,
+      stopSignal: stopOnReady ? stopController.signal : undefined,
       sinks: streamOutput ? {
         stdout: chunk => { process.stdout.write(chunk); },
         stderr: chunk => { process.stderr.write(chunk); },
@@ -679,8 +684,7 @@ interface ExecuteOptions {
   timeout: number;
   maxIterations: number;
   argsOverride?: Record<string, unknown>;
-  stopAfterReady?: {
-    logPattern: RegExp;
+  stopOnReady?: {
     graceMs: number;
   };
   /** Called after a successful repair. Receives attempt index and original error string. */
@@ -701,7 +705,7 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
     projectDir, adapter, timeout, maxIterations,
     argsOverride: options.argsOverride,
     streamOutput: true,
-    stopAfterReady: options.stopAfterReady,
+    stopOnReady: options.stopOnReady,
   });
   if (result.exitCode === 0) return;
 
@@ -735,7 +739,7 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
       const verifyResult = await runProgramOnce({
         projectDir: tempDir, adapter: tempAdapter, timeout, maxIterations,
         argsOverride: options.argsOverride,
-        stopAfterReady: options.stopAfterReady,
+        stopOnReady: options.stopOnReady,
       });
       return { fixed, verifyResult };
     });
@@ -754,7 +758,7 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
           projectDir, adapter, timeout, maxIterations,
           argsOverride: options.argsOverride,
           streamOutput: true,
-          stopAfterReady: options.stopAfterReady,
+          stopOnReady: options.stopOnReady,
         });
         return { keep: r.exitCode === 0, value: r };
       });
@@ -803,7 +807,6 @@ function propagateHistoryEntries(srcDir: string, dstDir: string): void {
 const DEFAULT_SMOKE_TIMEOUT = 30_000;
 const MAX_SMOKE_TIMEOUT = 30_000;
 const SMOKE_READY_GRACE_MS = 250;
-const SMOKE_READY_LOG_PATTERN = /\b(started|ready|listening|serving|hosting|hosted)\b/i;
 
 export async function smokeRunAndRepair(
   projectDir: string,
@@ -825,8 +828,7 @@ export async function smokeRunAndRepair(
         maxRepairAttempts: options?.maxRepairAttempts ?? 3,
         timeout: smokeTimeout,
         maxIterations: options?.maxIterations ?? 100,
-        stopAfterReady: {
-          logPattern: SMOKE_READY_LOG_PATTERN,
+        stopOnReady: {
           graceMs: SMOKE_READY_GRACE_MS,
         },
         onRepair(_attempt, _max, error) {
