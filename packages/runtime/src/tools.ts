@@ -1,6 +1,7 @@
-import { spawn, spawnSync, type ChildProcess } from "child_process";
+import { spawn, type ChildProcess } from "child_process";
 import { readFileSync, writeFileSync, mkdirSync, realpathSync, readlinkSync, lstatSync, existsSync } from "fs";
 import { resolve, dirname, sep } from "path";
+import { StringDecoder } from "string_decoder";
 import type { Tools, ShellResult } from "./types.js";
 
 const MAX_OUTPUT = 10 * 1024 * 1024; // 10 MB
@@ -42,35 +43,21 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
     }
   };
 
-  const listSessionPids = (sessionId: number): number[] => {
-    const result = spawnSync("ps", ["-o", "pid=", "-s", String(sessionId)], {
-      encoding: "utf-8",
-    });
-    if (result.error) return [];
-    return result.stdout
-      .split("\n")
-      .map(line => parseInt(line.trim(), 10))
-      .filter(pid => Number.isInteger(pid) && pid > 0);
-  };
-
   const killSession = (sessionId: number, signal: NodeJS.Signals): void => {
-    const pids = listSessionPids(sessionId);
-    if (pids.length > 0) {
-      for (const pid of pids) {
-        try { process.kill(pid, signal); } catch { /* already exited */ }
-      }
-      return;
-    }
     try {
       process.kill(-sessionId, signal);
     } catch { /* already exited */ }
   };
 
+  /** Poll until the process group is gone, then remove from tracking. */
   const reapSessionWhenGone = (sessionId: number): void => {
     stopReapingSession(sessionId);
     const timer = setTimeout(() => {
       if (!activeSessions.has(sessionId)) return;
-      if (listSessionPids(sessionId).length === 0) {
+      try {
+        process.kill(-sessionId, 0); // signal 0: check if process group still exists
+      } catch {
+        // ESRCH — process group gone
         activeSessions.delete(sessionId);
         sessionReapers.delete(sessionId);
         return;
@@ -175,12 +162,14 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
 
         const out = cappedBuffer();
         const err = cappedBuffer();
+        const outDecoder = new StringDecoder("utf-8");
+        const errDecoder = new StringDecoder("utf-8");
         let timedOut = false;
         let exited = false;
         let killFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
-        child.stdout.on("data", (chunk: Buffer) => { out.append(String(chunk)); });
-        child.stderr.on("data", (chunk: Buffer) => { err.append(String(chunk)); });
+        child.stdout.on("data", (chunk: Buffer) => { out.append(outDecoder.write(chunk)); });
+        child.stderr.on("data", (chunk: Buffer) => { err.append(errDecoder.write(chunk)); });
 
         const timer = setTimeout(() => {
           timedOut = true;
@@ -212,6 +201,10 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
           clearTimeout(timer);
           if (killFallbackTimer) clearTimeout(killFallbackTimer);
           if (child.pid) reapSessionWhenGone(child.pid);
+          const outFlush = outDecoder.end();
+          const errFlush = errDecoder.end();
+          if (outFlush) out.append(outFlush);
+          if (errFlush) err.append(errFlush);
           resolve({
             exitCode: timedOut ? 1 : (code ?? 1),
             stdout: out.value,

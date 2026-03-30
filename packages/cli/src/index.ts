@@ -60,8 +60,8 @@ cli
       let timeout: number | undefined;
       if (opts.timeout !== undefined) {
         timeout = Number(opts.timeout);
-        if (!Number.isInteger(timeout) || timeout <= 0) {
-          console.error(`Error: --timeout must be a positive integer (got "${opts.timeout}")`);
+        if (!Number.isFinite(timeout) || timeout <= 0) {
+          console.error(`Error: --timeout must be a positive number (got "${opts.timeout}")`);
           process.exit(1);
         }
       }

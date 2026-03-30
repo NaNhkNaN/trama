@@ -9,6 +9,7 @@ import {
 import { join, dirname } from "path";
 import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
+import { StringDecoder } from "string_decoder";
 import type { Ctx, Agent, Tools, RunOptions, ChildResult, TramaConfig } from "./types.js";
 import { PiAdapter } from "./pi-adapter.js";
 import { createContext } from "./context.js";
@@ -176,7 +177,7 @@ export function loadConfig(): TramaConfig {
   const configPath = join(homedir(), ".trama", "config.json");
   const defaults: TramaConfig = {
     provider: "anthropic",
-    model: "claude-sonnet-4-20250514",
+    model: "claude-opus-4-6",
     maxRepairAttempts: 3,
     defaultTimeout: 300_000,
     defaultMaxIterations: 100,
@@ -252,12 +253,14 @@ function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
       return;
     }
 
-    let body = "";
+    const chunks: Buffer[] = [];
+    let byteCount = 0;
     let overflow = false;
     req.on("data", (chunk: Buffer) => {
       if (overflow) return;
-      body += chunk;
-      if (body.length > MAX_IPC_BODY) {
+      chunks.push(chunk);
+      byteCount += chunk.length;
+      if (byteCount > MAX_IPC_BODY) {
         overflow = true;
         res.writeHead(413);
         res.end("IPC request body exceeds 50MB limit");
@@ -267,7 +270,7 @@ function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
     req.on("end", async () => {
       if (overflow) return;
       try {
-        const data = JSON.parse(body);
+        const data = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
         let result: unknown;
 
         switch (req.url) {
@@ -383,48 +386,74 @@ function forceCloseServer(server: Server, toolsImpl: ToolsWithCleanup, abortCont
  */
 function waitForChild(
   child: ChildProcess,
-  timeout: number,
-  sinks?: { stdout?: (chunk: string) => void; stderr?: (chunk: string) => void },
+  options: WaitForChildOptions,
 ): Promise<ChildResult> {
+  const { timeout, sinks, stopSignal } = options;
   return new Promise((resolve, reject) => {
     const out = cappedBuffer();
     const err = cappedBuffer();
+    const outDecoder = new StringDecoder("utf-8");
+    const errDecoder = new StringDecoder("utf-8");
     let timedOut = false;
     let exited = false;
+    let stopRequested = false;
     let killFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
+    const scheduleKill = (reason: "timeout" | "stop-request") => {
+      if (exited) return;
+      if (reason === "timeout") {
+        timedOut = true;
+      } else if (stopRequested || timedOut) {
+        return;
+      } else {
+        stopRequested = true;
+      }
+      child.kill("SIGTERM");
+      if (killFallbackTimer) clearTimeout(killFallbackTimer);
+      killFallbackTimer = setTimeout(() => {
+        if (!exited) child.kill("SIGKILL");
+      }, 5000);
+      killFallbackTimer.unref?.();
+    };
+
+    const onStopRequest = () => scheduleKill("stop-request");
+    stopSignal?.addEventListener("abort", onStopRequest, { once: true });
+
     child.stdout?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString();
+      const text = outDecoder.write(chunk);
       out.append(text);
       sinks?.stdout?.(text);
     });
     child.stderr?.on("data", (chunk: Buffer) => {
-      const text = chunk.toString();
+      const text = errDecoder.write(chunk);
       err.append(text);
       sinks?.stderr?.(text);
     });
 
     const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      killFallbackTimer = setTimeout(() => {
-        if (!exited) child.kill("SIGKILL");
-      }, 5000);
-      killFallbackTimer.unref?.();
+      scheduleKill("timeout");
     }, timeout);
 
     child.on("error", (err) => {
       clearTimeout(timer);
       if (killFallbackTimer) clearTimeout(killFallbackTimer);
+      stopSignal?.removeEventListener("abort", onStopRequest);
       reject(err);
     });
 
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       exited = true;
       clearTimeout(timer);
       if (killFallbackTimer) clearTimeout(killFallbackTimer);
+      stopSignal?.removeEventListener("abort", onStopRequest);
+      const outFlush = outDecoder.end();
+      const errFlush = errDecoder.end();
+      if (outFlush) { out.append(outFlush); sinks?.stdout?.(outFlush); }
+      if (errFlush) { err.append(errFlush); sinks?.stderr?.(errFlush); }
       if (timedOut) {
         resolve({ exitCode: 1, stdout: out.value, stderr: err.value + "\n[trama] program killed: timeout" });
+      } else if (stopRequested && (code === 0 || signal === "SIGTERM")) {
+        resolve({ exitCode: 0, stdout: out.value, stderr: err.value });
       } else {
         resolve({ exitCode: code ?? 1, stdout: out.value, stderr: err.value });
       }
@@ -525,6 +554,16 @@ interface RunOnceOptions {
   maxIterations: number;
   argsOverride?: Record<string, unknown>;
   streamOutput?: boolean;
+  stopAfterReady?: {
+    logPattern: RegExp;
+    graceMs: number;
+  };
+}
+
+interface WaitForChildOptions {
+  timeout: number;
+  sinks?: { stdout?: (chunk: string) => void; stderr?: (chunk: string) => void };
+  stopSignal?: AbortSignal;
 }
 
 /**
@@ -533,15 +572,32 @@ interface RunOnceOptions {
  * Returns the child process result — does NOT throw on non-zero exit.
  */
 async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
-  const { projectDir, adapter, timeout, maxIterations, argsOverride, streamOutput } = options;
+  const { projectDir, adapter, timeout, maxIterations, argsOverride, streamOutput, stopAfterReady } = options;
 
   ensureProjectScaffold(projectDir);
   ensureRuntimeLink(projectDir);
-  writeFileSync(join(projectDir, "logs", "latest.jsonl"), "");
 
   const abortController = new AbortController();
+  const stopController = new AbortController();
   const { signal } = abortController;
   const ctx = createContext(projectDir, loadState(projectDir), { maxIterations, argsOverride });
+  let readyStopScheduled = false;
+  let readyStopTimer: ReturnType<typeof setTimeout> | null = null;
+  if (stopAfterReady) {
+    const baseLog = ctx.log.bind(ctx);
+    ctx.log = async (message, data) => {
+      await baseLog(message, data);
+      if (readyStopScheduled || !stopAfterReady.logPattern.test(message)) return;
+      readyStopScheduled = true;
+      readyStopTimer = setTimeout(() => {
+        stopController.abort();
+      }, stopAfterReady.graceMs);
+      readyStopTimer.unref?.();
+    };
+  }
+  // Truncate logs only after preflight succeeds — preserves prior run's diagnostics
+  // if scaffolding, state loading, or context creation fails.
+  writeFileSync(join(projectDir, "logs", "latest.jsonl"), "");
   const agentImpl = createAgent(adapter, signal);
   const toolsImpl = createTools(projectDir, signal);
   const server = createIPCServer(ctx, agentImpl, toolsImpl);
@@ -583,16 +639,22 @@ async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
 
   let result: ChildResult;
   try {
-    result = await waitForChild(child, timeout, streamOutput ? {
-      stdout: chunk => { process.stdout.write(chunk); },
-      stderr: chunk => { process.stderr.write(chunk); },
-    } : undefined);
+    result = await waitForChild(child, {
+      timeout,
+      stopSignal: stopAfterReady ? stopController.signal : undefined,
+      sinks: streamOutput ? {
+        stdout: chunk => { process.stdout.write(chunk); },
+        stderr: chunk => { process.stderr.write(chunk); },
+      } : undefined,
+    });
   } catch (spawnError) {
+    if (readyStopTimer) clearTimeout(readyStopTimer);
     await forceCloseServer(server, toolsImpl, abortController);
     try { rmSync(initDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     throw spawnError;
   }
 
+  if (readyStopTimer) clearTimeout(readyStopTimer);
   try { rmSync(initDir, { recursive: true, force: true }); } catch { /* best-effort */ }
 
   // Always kill background shells — even on success, spawned background
@@ -617,6 +679,10 @@ interface ExecuteOptions {
   timeout: number;
   maxIterations: number;
   argsOverride?: Record<string, unknown>;
+  stopAfterReady?: {
+    logPattern: RegExp;
+    graceMs: number;
+  };
   /** Called after a successful repair. Receives attempt index and original error string. */
   onRepair?: (attempt: number, maxAttempts: number, error: string) => void;
 }
@@ -635,6 +701,7 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
     projectDir, adapter, timeout, maxIterations,
     argsOverride: options.argsOverride,
     streamOutput: true,
+    stopAfterReady: options.stopAfterReady,
   });
   if (result.exitCode === 0) return;
 
@@ -668,6 +735,7 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
       const verifyResult = await runProgramOnce({
         projectDir: tempDir, adapter: tempAdapter, timeout, maxIterations,
         argsOverride: options.argsOverride,
+        stopAfterReady: options.stopAfterReady,
       });
       return { fixed, verifyResult };
     });
@@ -686,11 +754,18 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
           projectDir, adapter, timeout, maxIterations,
           argsOverride: options.argsOverride,
           streamOutput: true,
+          stopAfterReady: options.stopAfterReady,
         });
         return { keep: r.exitCode === 0, value: r };
       });
       if (realResult.exitCode === 0) {
-        options.onRepair?.(attempt, maxRepairAttempts, lastError);
+        // Bookkeeping is best-effort — program already succeeded and side effects
+        // are committed. Don't mask success with a history/log write failure.
+        try {
+          options.onRepair?.(attempt, maxRepairAttempts, lastError);
+        } catch (bookkeepingErr) {
+          console.warn(`[trama] repair bookkeeping failed: ${bookkeepingErr instanceof Error ? bookkeepingErr.message : bookkeepingErr}`);
+        }
         return;
       }
       // Passed in isolation but failed in real dir — project already restored by withSnapshot.
@@ -725,13 +800,19 @@ function propagateHistoryEntries(srcDir: string, dstDir: string): void {
   }
 }
 
+const DEFAULT_SMOKE_TIMEOUT = 30_000;
+const MAX_SMOKE_TIMEOUT = 30_000;
+const SMOKE_READY_GRACE_MS = 250;
+const SMOKE_READY_LOG_PATTERN = /\b(started|ready|listening|serving|hosting|hosted)\b/i;
+
 export async function smokeRunAndRepair(
   projectDir: string,
   adapter: PiAdapter,
   reason: "create" | "update",
   options?: { timeout?: number; maxRepairAttempts?: number; maxIterations?: number },
 ): Promise<void> {
-  const smokeTimeout = options?.timeout ?? 30_000;
+  const requestedTimeout = options?.timeout ?? DEFAULT_SMOKE_TIMEOUT;
+  const smokeTimeout = Math.min(requestedTimeout, MAX_SMOKE_TIMEOUT);
   // Run validation in a temp copy so side effects don't persist in the real project
   await withTempDir("trama-smoke-", async (smokeDir) => {
     cpSync(projectDir, smokeDir, { recursive: true });
@@ -744,6 +825,10 @@ export async function smokeRunAndRepair(
         maxRepairAttempts: options?.maxRepairAttempts ?? 3,
         timeout: smokeTimeout,
         maxIterations: options?.maxIterations ?? 100,
+        stopAfterReady: {
+          logPattern: SMOKE_READY_LOG_PATTERN,
+          graceMs: SMOKE_READY_GRACE_MS,
+        },
         onRepair(_attempt, _max, error) {
           appendFileSync(
             join(smokeDir, "history", "index.jsonl"),

@@ -221,6 +221,68 @@ await ctx.done();
   assert.equal(historyLines.some(entry => entry.reason === "create-repair"), true);
 });
 
+test("createProject accepts long-running server programs during smoke validation after readiness log", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  writeJson(join(fakeHome, ".trama", "config.json"), {
+    provider: "anthropic",
+    model: "test-model",
+    maxRepairAttempts: 0,
+    defaultTimeout: 1_000,
+    defaultMaxIterations: 100,
+  });
+
+  const originalAsk = PiAdapter.prototype.ask;
+  const originalRepair = PiAdapter.prototype.repair;
+  let repairCalled = false;
+  const serverProgram = `import { ctx } from "@trama-dev/runtime";
+import { createServer } from "node:http";
+
+const server = createServer((_req, res) => {
+  res.end("ok");
+});
+
+await new Promise((resolve, reject) => {
+  server.once("error", reject);
+  server.listen(0, "127.0.0.1", () => resolve());
+});
+
+await ctx.log("server started", { mode: "smoke-ready" });
+
+process.on("SIGTERM", () => {
+  server.close();
+  process.exit(0);
+});
+
+await new Promise(() => {});
+`;
+
+  PiAdapter.prototype.ask = async function ask() {
+    return serverProgram;
+  };
+  PiAdapter.prototype.repair = async function repair() {
+    repairCalled = true;
+    throw new Error("repair should not run");
+  };
+
+  try {
+    const startedAt = Date.now();
+    await withEnv({ HOME: fakeHome }, async () => {
+      await createProject("server-app", "host a website");
+    });
+    const elapsed = Date.now() - startedAt;
+    assert.ok(elapsed < 5_000, `expected smoke validation to finish quickly, got ${elapsed}ms`);
+  } finally {
+    PiAdapter.prototype.ask = originalAsk;
+    PiAdapter.prototype.repair = originalRepair;
+  }
+
+  const projectDir = join(fakeHome, ".trama", "projects", "server-app");
+  assert.equal(repairCalled, false);
+  assert.equal(existsSync(join(projectDir, "program.ts")), true);
+});
+
 test("createProject rejects path-like project names before creating any directories", async (t) => {
   const fakeHome = makeTempDir("trama-home-");
   t.after(() => cleanupTempDir(fakeHome));

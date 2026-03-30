@@ -194,6 +194,39 @@ test("createAgent generate retries on parse error from first ask but not adapter
   assert.equal(askCallCount, 2, "should have retried once after parse failure");
 });
 
+test("createAgent generate parses valid JSON containing fenced code in string values", async () => {
+  const adapter = {
+    async ask() {
+      return '{"summary":"Use this:\\n```json\\n{\\"a\\":1}\\n```","ok":true}';
+    },
+  };
+
+  const agent = createAgent(adapter);
+  const result = await agent.generate({
+    prompt: "summarize",
+    schema: { summary: "string: the summary", ok: "boolean: success" },
+  });
+
+  assert.equal(result.ok, true);
+  assert.match(result.summary, /```json/);
+});
+
+test("createAgent generate extracts JSON from fenced response with leading text", async () => {
+  const adapter = {
+    async ask() {
+      return 'Here is the result:\n```json\n{"count":42}\n```\nHope that helps!';
+    },
+  };
+
+  const agent = createAgent(adapter);
+  const result = await agent.generate({
+    prompt: "count",
+    schema: { count: "number: the count" },
+  });
+
+  assert.deepEqual(result, { count: 42 });
+});
+
 // --- PiAdapter abort wiring tests (mock session, no real LLM) ---
 
 test("PiAdapter.ask rejects immediately when signal is already aborted", async () => {
