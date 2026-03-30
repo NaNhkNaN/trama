@@ -206,6 +206,72 @@ test("createContext argsOverride merges with meta.json args", async (t) => {
   assert.equal(ctx.input.args.added, "extra");
 });
 
+test("createContext resets negative and fractional __trama_iteration to zero", async (t) => {
+  const projectDir = makeTempDir("trama-context-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+
+  for (const bad of [-1, -3.5, 0.5]) {
+    const ctx = createContext(projectDir, { __trama_iteration: bad });
+    assert.equal(ctx.iteration, 0, `should reset to 0 for ${bad}`);
+  }
+
+  // Positive integers should still be accepted
+  const ctx = createContext(projectDir, { __trama_iteration: 3 });
+  assert.equal(ctx.iteration, 3);
+});
+
+test("createContext done coalesces concurrent unawaited calls", async (t) => {
+  const projectDir = makeTempDir("trama-context-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+
+  const ctx = createContext(projectDir, {});
+
+  // Fire two done() calls without awaiting the first — both should resolve
+  // to the same operation (one log entry, one checkpoint).
+  const a = ctx.done({ result: "first" });
+  const b = ctx.done({ result: "second" });
+  await Promise.all([a, b]);
+
+  const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
+  const doneLines = lines.filter(l => l.message === "done");
+  assert.equal(doneLines.length, 1, "done should be logged exactly once");
+  assert.deepEqual(doneLines[0].data, { result: "first" }, "first call's result wins");
+  assert.equal(readJson(join(projectDir, "state.json")).__trama_iteration, 1);
+});
+
+test("createContext done coalesces concurrent failures and still allows retry", async (t) => {
+  const projectDir = makeTempDir("trama-context-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+
+  const ctx = createContext(projectDir, {});
+  ctx.state.bad = () => "nope";
+
+  const a = ctx.done({ result: "first" }).catch(err => err.message);
+  const b = ctx.done({ result: "second" }).catch(err => err.message);
+  const [firstError, secondError] = await Promise.all([a, b]);
+
+  assert.match(firstError, /not JSON-serializable/);
+  assert.equal(secondError, firstError, "concurrent callers should observe the same failure");
+
+  let doneLines = readJsonLines(join(projectDir, "logs", "latest.jsonl"))
+    .filter(line => line.message === "done");
+  assert.equal(doneLines.length, 1, "failed concurrent done() calls should log only once");
+  assert.deepEqual(doneLines[0].data, { result: "first" }, "first failed call's result wins");
+
+  ctx.state = { fixed: true };
+  await ctx.done({ result: "retry" });
+
+  doneLines = readJsonLines(join(projectDir, "logs", "latest.jsonl"))
+    .filter(line => line.message === "done");
+  assert.equal(doneLines.length, 2, "retry should emit a fresh done log after failure");
+  assert.deepEqual(doneLines[1].data, { result: "retry" });
+  assert.equal(readJson(join(projectDir, "state.json")).__trama_iteration, 1);
+  assert.equal(readJson(join(projectDir, "state.json")).fixed, true);
+});
+
 test("createContext done retries log and checkpoint after checkpoint failure", async (t) => {
   const projectDir = makeTempDir("trama-context-");
   t.after(() => cleanupTempDir(projectDir));
@@ -229,6 +295,39 @@ test("createContext done retries log and checkpoint after checkpoint failure", a
   const doneLines = lines.filter(l => l.message === "done");
   assert.equal(doneLines.length, 2, "done log should be emitted on both attempts");
   assert.equal(readJson(join(projectDir, "state.json")).fixed, true);
+});
+
+test("createContext log does not throw on non-serializable data", async (t) => {
+  const projectDir = makeTempDir("trama-context-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+
+  const ctx = createContext(projectDir, {});
+  const circular = {};
+  circular.self = circular;
+
+  // Should not throw — log should be a safe API
+  await ctx.log("test", circular);
+
+  const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].message, "test");
+  assert.ok(lines[0].data.__trama_unserializable);
+});
+
+test("createContext checkpoint accepts null-prototype objects", async (t) => {
+  const projectDir = makeTempDir("trama-context-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+
+  const ctx = createContext(projectDir, {});
+  const nullProto = Object.create(null);
+  nullProto.key = "value";
+  ctx.state.data = nullProto;
+
+  await ctx.checkpoint();
+
+  assert.deepEqual(readJson(join(projectDir, "state.json")).data, { key: "value" });
 });
 
 function readJsonLines(path) {

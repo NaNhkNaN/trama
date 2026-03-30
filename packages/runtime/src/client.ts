@@ -34,7 +34,7 @@ async function call(endpoint: string, body: unknown) {
   return res.json();
 }
 
-let doneCalled = false;
+let donePromise: Promise<void> | null = null;
 let readyCalled = false;
 
 export const ctx: Ctx = {
@@ -44,11 +44,15 @@ export const ctx: Ctx = {
   maxIterations: initData.maxIterations,
 
   async log(msg, data) {
-    await call("/ctx/log", { message: msg, data });
+    let safeData = data;
+    try { JSON.stringify(safeData); } catch { safeData = { __trama_unserializable: String(data) }; }
+    await call("/ctx/log", { message: msg, data: safeData });
   },
   async ready(data) {
     if (readyCalled) return;
-    await call("/ctx/ready", { data });
+    let safeData = data;
+    try { JSON.stringify(safeData); } catch { safeData = { __trama_unserializable: String(data) }; }
+    await call("/ctx/ready", { data: safeData });
     readyCalled = true;
   },
   async checkpoint() {
@@ -57,12 +61,24 @@ export const ctx: Ctx = {
     ctx.iteration += 1;
   },
   async done(result) {
-    if (doneCalled) return;
-    assertSerializable(ctx.state, "ctx.state");
-    if (result !== undefined) assertSerializable(result, "ctx.done(result)");
-    await call("/ctx/done", { state: ctx.state, result });
-    doneCalled = true;
-    ctx.iteration += 1;
+    // If a previous done() completed or is in flight, coalesce onto it.
+    // If a previous done() failed, allow retry (promise was cleared).
+    if (donePromise) return donePromise;
+
+    const run = async () => {
+      assertSerializable(ctx.state, "ctx.state");
+      if (result !== undefined) assertSerializable(result, "ctx.done(result)");
+      await call("/ctx/done", { state: ctx.state, result });
+      ctx.iteration += 1;
+    };
+
+    donePromise = run();
+    try {
+      await donePromise;
+    } catch (err) {
+      donePromise = null;
+      throw err;
+    }
   },
 };
 

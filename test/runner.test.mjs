@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
 import { join } from "path";
 import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
-import { copyToHistory, loadConfig, loadState, runProgram, RUNTIME_TYPES, withSnapshot } from "../packages/runtime/dist/runner.js";
+import { copyToHistory, loadConfig, loadState, resolveSmokeTimeout, runProgram, RUNTIME_TYPES, withSnapshot } from "../packages/runtime/dist/runner.js";
 import { REPO_ROOT, cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson, writeText } from "./helpers.mjs";
 
 test("loadState returns an empty object when state.json is missing", (t) => {
@@ -355,6 +355,50 @@ test("runProgram replaces a stale symlink with the correct target", async (t) =>
   assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "iteration:0");
 });
 
+test("runProgram rejects symlinked meta.json that points outside the project", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  const outsideDir = makeTempDir("trama-outside-");
+  t.after(() => {
+    cleanupTempDir(projectDir);
+    cleanupTempDir(outsideDir);
+  });
+  createProjectFixture(projectDir, { scaffold: false });
+
+  writeJson(join(outsideDir, "meta.json"), {
+    input: { prompt: "outside prompt", args: {} },
+    createdAt: "2026-03-28T00:00:00.000Z",
+    piVersion: "0.63.1",
+  });
+  rmSync(join(projectDir, "meta.json"));
+  symlinkSync(join(outsideDir, "meta.json"), join(projectDir, "meta.json"));
+
+  await assert.rejects(
+    async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 }),
+    /Path escapes project directory via symlink: meta\.json/,
+  );
+});
+
+test("runProgram rejects symlinked program.ts that points outside the project", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  const outsideDir = makeTempDir("trama-outside-");
+  t.after(() => {
+    cleanupTempDir(projectDir);
+    cleanupTempDir(outsideDir);
+  });
+  createProjectFixture(projectDir, { scaffold: false });
+
+  const outsideProgram = `console.log("outside");`;
+  writeText(join(outsideDir, "program.ts"), outsideProgram);
+  rmSync(join(projectDir, "program.ts"));
+  symlinkSync(join(outsideDir, "program.ts"), join(projectDir, "program.ts"));
+
+  await assert.rejects(
+    async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 }),
+    /Path escapes project directory via symlink: program\.ts/,
+  );
+  assert.equal(readFileSync(join(outsideDir, "program.ts"), "utf-8"), outsideProgram);
+});
+
 // --- Regression tests ---
 
 test("loadState rejects non-object JSON values (string, array, null)", (t) => {
@@ -390,6 +434,12 @@ test("loadConfig rejects invalid field values", (t) => {
       assert.throws(() => loadConfig(), pattern, `should reject ${JSON.stringify(override)}`);
     });
   }
+});
+
+test("resolveSmokeTimeout uses the provided timeout without applying a 30s cap", () => {
+  assert.equal(resolveSmokeTimeout(undefined), 30_000);
+  assert.equal(resolveSmokeTimeout(1_500), 1_500);
+  assert.equal(resolveSmokeTimeout(45_000), 45_000);
 });
 
 test("runProgram does not trigger repair when program succeeds", async (t) => {

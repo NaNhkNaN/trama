@@ -1,6 +1,6 @@
 {
   "name": "@trama-dev/runtime",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "type": "module",
   "exports": {
     ".": {
@@ -32,6 +32,7 @@
     "README.md",
     "LICENSE"
   ],
+  "os": ["darwin", "linux"],
   "dependencies": {
     "@mariozechner/pi-coding-agent": "0.64.0",
     "@mariozechner/pi-ai": "0.64.0",

@@ -29,7 +29,8 @@ export function assertSerializable(value: unknown, path: string, ancestors = new
     ancestors.delete(value);
     return;
   }
-  if (Object.getPrototypeOf(value) !== Object.prototype) {
+  const proto = Object.getPrototypeOf(value);
+  if (proto !== Object.prototype && proto !== null) {
     const name = (value as object).constructor?.name ?? "unknown";
     throw new TypeError(`${path} is not a plain object (${name})`);
   }

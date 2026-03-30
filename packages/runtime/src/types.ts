@@ -26,6 +26,7 @@ export interface Ctx {
   /**
    * Signal that a long-running program has finished startup and is now serving.
    * Used by smoke validation to distinguish "started successfully" from "completed".
+   * This marks startup success only; it is not a guarantee about long-term health.
    * Idempotent: second call is a no-op.
    */
   ready(data?: Record<string, unknown>): Promise<void>;

@@ -10,8 +10,10 @@ import type { PiAdapterConfig, RepairInput } from "./types.js";
 /** Strip markdown code fences and trim whitespace. */
 export function stripCodeFences(text: string): string {
   const trimmed = text.trim();
-  if (/^```/.test(trimmed) && /```$/.test(trimmed)) {
-    return trimmed.replace(/^```\w*\s*\n?/, "").replace(/\n?\s*```$/, "");
+  // Extract the last fenced code block (LLMs may prepend explanation or emit multiple blocks)
+  const matches = [...trimmed.matchAll(/```(?:\w*)\s*\n([\s\S]*?)\n\s*```/g)];
+  if (matches.length > 0) {
+    return matches[matches.length - 1][1].trim();
   }
   return trimmed;
 }
@@ -44,10 +46,15 @@ export class PiAdapter {
     // Returns the result on success, or rejects with "Aborted" on abort.
     const raceAbort = <T>(promise: Promise<T>): Promise<T> => {
       if (!signal) return promise;
+      let onAbort: (() => void) | null = null;
+      const cleanup = () => {
+        if (onAbort) { signal.removeEventListener("abort", onAbort); onAbort = null; }
+      };
       return Promise.race([
-        promise,
+        promise.finally(cleanup),
         new Promise<never>((_resolve, reject) => {
-          signal.addEventListener("abort", () => reject(new Error("Aborted")), { once: true });
+          onAbort = () => reject(new Error("Aborted"));
+          signal.addEventListener("abort", onAbort, { once: true });
         }),
       ]);
     };
