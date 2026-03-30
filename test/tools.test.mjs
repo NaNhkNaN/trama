@@ -3,7 +3,7 @@ import { createServer } from "http";
 import test from "node:test";
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
-import { createTools } from "../packages/runtime/dist/tools.js";
+import { createTools, cappedBuffer } from "../packages/runtime/dist/tools.js";
 import { cleanupTempDir, makeTempDir } from "./helpers.mjs";
 
 test("createTools read and write operate inside the project directory", async (t) => {
@@ -306,4 +306,39 @@ test("createTools allows dangling file symlinks that point inside the project", 
   const tools = createTools(projectDir);
   await tools.write("link.txt", "created via dangling symlink");
   assert.equal(readFileSync(join(projectDir, "real", "newfile.txt"), "utf-8"), "created via dangling symlink");
+});
+
+// --- cappedBuffer tests ---
+
+test("cappedBuffer truncates output beyond 10MB", () => {
+  const buf = cappedBuffer();
+  // Write 11MB in chunks
+  const chunk = "x".repeat(1024 * 1024); // 1MB
+  for (let i = 0; i < 11; i++) {
+    buf.append(chunk);
+  }
+  assert.ok(buf.value.length <= 10 * 1024 * 1024 + 100, "buffer should be capped near 10MB");
+  assert.match(buf.value, /\[trama\] output truncated at 10MB/);
+});
+
+test("cappedBuffer ignores appends after truncation", () => {
+  const buf = cappedBuffer();
+  const chunk = "x".repeat(10 * 1024 * 1024 + 1);
+  buf.append(chunk);
+  const lengthAfterCap = buf.value.length;
+  buf.append("more data");
+  assert.equal(buf.value.length, lengthAfterCap, "length should not change after truncation");
+});
+
+// --- shell edge cases ---
+
+test("createTools shell handles commands that exit with null code", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  const tools = createTools(projectDir);
+  // kill -9 causes null exit code in Node
+  const result = await tools.shell("kill -9 $$");
+  assert.equal(typeof result.exitCode, "number");
+  assert.notEqual(result.exitCode, 0);
 });

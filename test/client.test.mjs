@@ -36,6 +36,16 @@ test("client.ts throws a clear error when run directly without trama", async () 
   assert.match(result.stderr, /TRAMA_PORT/);
 });
 
+test("client.ts throws a clear error when TRAMA_INIT is missing", async () => {
+  const result = await runNodeCommand(
+    ["-e", `import "@trama-dev/runtime";`],
+    { cwd: REPO_ROOT, env: { ...process.env, TRAMA_PORT: "12345", TRAMA_INIT: undefined } },
+  );
+
+  assert.notEqual(result.exitCode, 0);
+  assert.match(result.stderr, /TRAMA_INIT/);
+});
+
 test("client.ts checkpoint rejects non-serializable state before attempting IPC", async () => {
   const { env, initFile } = runtimeEnv();
   try {

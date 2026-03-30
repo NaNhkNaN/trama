@@ -53,7 +53,7 @@ cli
 cli
   .command("run <name>")
   .description("Execute a program")
-  .option("--timeout <ms>", "Execution timeout in ms")
+  .option("--timeout <ms>", "Per-phase timeout in ms (applies to each run and repair attempt separately)")
   .option("--arg <key=value>", "Pass argument to the program (repeatable)", collectArg, [])
   .action(async (name: string, opts: { timeout?: string; arg: string[] }) => {
     try {

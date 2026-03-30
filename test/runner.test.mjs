@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync } from "fs";
 import { join } from "path";
 import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
-import { copyToHistory, loadConfig, loadState, runProgram } from "../packages/runtime/dist/runner.js";
+import { copyToHistory, loadConfig, loadState, runProgram, withSnapshot } from "../packages/runtime/dist/runner.js";
 import { cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson, writeText } from "./helpers.mjs";
 
 test("loadState returns an empty object when state.json is missing", (t) => {
@@ -51,6 +51,40 @@ test("copyToHistory continues numbering correctly past 9999", (t) => {
     .map(line => JSON.parse(line));
   assert.equal(entries.at(-1).version, 10001);
   assert.equal(entries.at(-1).reason, "update");
+});
+
+test("copyToHistory creates 0001.ts as the first entry when history is empty", (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+  writeFileSync(join(projectDir, "program.ts"), "// first");
+
+  copyToHistory(projectDir, "create");
+
+  assert.equal(existsSync(join(projectDir, "history", "0001.ts")), true);
+  assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), "// first");
+
+  const entries = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8")
+    .trim().split("\n").map(l => JSON.parse(l));
+  assert.equal(entries.at(-1).version, 1);
+  assert.equal(entries.at(-1).reason, "create");
+  // "create" without detail should not have error or prompt keys
+  assert.equal("error" in entries.at(-1), false);
+  assert.equal("prompt" in entries.at(-1), false);
+});
+
+test("copyToHistory records error detail for repair entries", (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+  writeFileSync(join(projectDir, "program.ts"), "// repaired");
+
+  copyToHistory(projectDir, "repair", "something broke");
+
+  const entries = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8")
+    .trim().split("\n").map(l => JSON.parse(l));
+  assert.equal(entries.at(-1).reason, "repair");
+  assert.equal(entries.at(-1).error, "something broke");
 });
 
 test("runProgram scaffolds and executes a minimal shared project", async (t) => {
@@ -634,4 +668,132 @@ test("runProgram rejects non-object package.json (array)", async (t) => {
     async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 }),
     /Malformed package\.json.*expected a JSON object/,
   );
+});
+
+// --- Tests for consolidated bug fixes (withSnapshot, process leak, init file security) ---
+
+test("withSnapshot keeps directory when fn() returns keep:true", async (t) => {
+  const dir = makeTempDir("trama-snapshot-");
+  t.after(() => cleanupTempDir(dir));
+
+  writeText(join(dir, "original.txt"), "before");
+
+  const value = await withSnapshot(dir, async () => {
+    writeFileSync(join(dir, "original.txt"), "after");
+    writeFileSync(join(dir, "new.txt"), "created");
+    return { keep: true, value: "ok" };
+  });
+
+  assert.equal(value, "ok");
+  assert.equal(readFileSync(join(dir, "original.txt"), "utf-8"), "after",
+    "mutations should persist when keep:true");
+  assert.equal(existsSync(join(dir, "new.txt")), true);
+});
+
+test("withSnapshot restores directory when fn() returns keep:false", async (t) => {
+  const dir = makeTempDir("trama-snapshot-");
+  t.after(() => cleanupTempDir(dir));
+
+  writeText(join(dir, "original.txt"), "before");
+
+  const value = await withSnapshot(dir, async () => {
+    writeFileSync(join(dir, "original.txt"), "after");
+    writeFileSync(join(dir, "side-effect.txt"), "leaked");
+    return { keep: false, value: 42 };
+  });
+
+  assert.equal(value, 42);
+  assert.equal(readFileSync(join(dir, "original.txt"), "utf-8"), "before",
+    "mutations should be reverted when keep:false");
+  assert.equal(existsSync(join(dir, "side-effect.txt")), false);
+});
+
+test("withSnapshot restores directory when fn() throws after mutating it", async (t) => {
+  const dir = makeTempDir("trama-snapshot-");
+  t.after(() => cleanupTempDir(dir));
+
+  // Set up original state
+  writeText(join(dir, "program.ts"), "original");
+  writeText(join(dir, "keep.txt"), "untouched");
+
+  await assert.rejects(
+    () => withSnapshot(dir, async () => {
+      // Simulate the real-rerun path: overwrite program.ts, write side effects, then throw
+      writeFileSync(join(dir, "program.ts"), "repaired");
+      writeFileSync(join(dir, "side-effect.txt"), "leaked");
+      throw new Error("infrastructure failure");
+    }),
+    /infrastructure failure/,
+  );
+
+  // Directory must be fully restored to pre-fn state
+  assert.equal(readFileSync(join(dir, "program.ts"), "utf-8"), "original",
+    "program.ts must be restored after fn() throws");
+  assert.equal(readFileSync(join(dir, "keep.txt"), "utf-8"), "untouched",
+    "pre-existing files must survive");
+  assert.equal(existsSync(join(dir, "side-effect.txt")), false,
+    "side effects from fn() must not persist after throw");
+});
+
+test("runProgram cleans up background processes even on successful runs", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+await tools.shell('nohup sh -c "sleep 0.3; echo leaked > leaked.txt" >/dev/null 2>&1 &');
+await ctx.done();`,
+  });
+
+  await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
+  // Wait long enough for the background process to have written if it were alive
+  await new Promise(resolve => setTimeout(resolve, 600));
+  assert.equal(existsSync(join(projectDir, "leaked.txt")), false,
+    "background processes must be killed even on successful runs");
+});
+
+test("runProgram init payload is not world-readable", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  // Use a program that reads and saves the init file path and mode before it's cleaned up
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+import { statSync } from "fs";
+const initPath = process.env.TRAMA_INIT;
+const stat = statSync(initPath);
+const mode = (stat.mode & 0o777).toString(8);
+await tools.write("init-mode.txt", mode);
+await ctx.done();`,
+  });
+
+  await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
+  const mode = readFileSync(join(projectDir, "init-mode.txt"), "utf-8").trim();
+  assert.equal(mode, "600", "init file must be mode 0600, not world-readable");
+});
+
+test("IPC server rejects oversized request bodies with 413", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  // Program sends a raw HTTP request to the IPC server with a body exceeding 50MB.
+  // It reads the status code and writes it to a file so we can assert from the test.
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+const port = process.env.TRAMA_PORT;
+const big = "x".repeat(51 * 1024 * 1024);
+const res = await fetch("http://127.0.0.1:" + port + "/ctx/log", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: big,
+});
+await tools.write("ipc-status.txt", String(res.status));
+await ctx.done();`,
+  });
+
+  await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 10_000 });
+  assert.equal(readFileSync(join(projectDir, "ipc-status.txt"), "utf-8"), "413");
 });

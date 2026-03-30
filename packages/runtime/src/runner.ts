@@ -4,7 +4,7 @@ import {
   readFileSync, writeFileSync, appendFileSync,
   readdirSync, copyFileSync, mkdirSync, existsSync,
   symlinkSync, rmSync, lstatSync, readlinkSync,
-  cpSync, mkdtempSync,
+  cpSync, mkdtempSync, openSync, closeSync,
 } from "fs";
 import { join, dirname } from "path";
 import { homedir, tmpdir } from "os";
@@ -242,6 +242,8 @@ export function loadState(projectDir: string): Record<string, unknown> {
 
 // --- IPC Server ---
 
+const MAX_IPC_BODY = 50 * 1024 * 1024; // 50 MB
+
 function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
   return createServer((req, res) => {
     if (req.method !== "POST") {
@@ -251,8 +253,19 @@ function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
     }
 
     let body = "";
-    req.on("data", (chunk: Buffer) => { body += chunk; });
+    let overflow = false;
+    req.on("data", (chunk: Buffer) => {
+      if (overflow) return;
+      body += chunk;
+      if (body.length > MAX_IPC_BODY) {
+        overflow = true;
+        res.writeHead(413);
+        res.end("IPC request body exceeds 50MB limit");
+        req.destroy();
+      }
+    });
     req.on("end", async () => {
+      if (overflow) return;
       try {
         const data = JSON.parse(body);
         let result: unknown;
@@ -446,18 +459,25 @@ export function copyToHistory(projectDir: string, reason: string, detail?: strin
 // --- Helpers ---
 
 /**
- * Snapshot a directory, run fn, restore from snapshot if fn returns false.
- * Always cleans up the snapshot. Returns whatever fn returns.
+ * Snapshot a directory, run fn, restore from snapshot if fn returns false
+ * or if fn throws. Always cleans up the snapshot. Returns whatever fn returns.
  */
-async function withSnapshot<T>(dir: string, fn: () => Promise<{ keep: boolean; value: T }>): Promise<T> {
+export async function withSnapshot<T>(dir: string, fn: () => Promise<{ keep: boolean; value: T }>): Promise<T> {
   const snap = mkdtempSync(join(tmpdir(), "trama-snapshot-"));
+  const restore = () => {
+    rmSync(dir, { recursive: true, force: true });
+    cpSync(snap, dir, { recursive: true });
+  };
   try {
     cpSync(dir, snap, { recursive: true });
-    const result = await fn();
-    if (!result.keep) {
-      rmSync(dir, { recursive: true, force: true });
-      cpSync(snap, dir, { recursive: true });
+    let result: { keep: boolean; value: T };
+    try {
+      result = await fn();
+    } catch (err) {
+      restore();
+      throw err;
     }
+    if (!result.keep) restore();
     return result.value;
   } finally {
     rmSync(snap, { recursive: true, force: true });
@@ -536,13 +556,20 @@ async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
   }
 
   // Write init data to a temp file instead of env vars to avoid OS size limits.
-  const initFile = join(tmpdir(), `trama-init-${port}.json`);
-  writeFileSync(initFile, JSON.stringify({
-    input: ctx.input,
-    state: ctx.state,
-    iteration: ctx.iteration,
-    maxIterations: ctx.maxIterations,
-  }));
+  // Use mkdtempSync for an unpredictable path and mode 0o600 to prevent local disclosure.
+  const initDir = mkdtempSync(join(tmpdir(), "trama-init-"));
+  const initFile = join(initDir, "init.json");
+  const fd = openSync(initFile, "w", 0o600);
+  try {
+    writeFileSync(fd, JSON.stringify({
+      input: ctx.input,
+      state: ctx.state,
+      iteration: ctx.iteration,
+      maxIterations: ctx.maxIterations,
+    }));
+  } finally {
+    closeSync(fd);
+  }
 
   const child = spawn(process.execPath, [TSX_CLI, join(projectDir, "program.ts")], {
     cwd: projectDir,
@@ -562,11 +589,15 @@ async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
     } : undefined);
   } catch (spawnError) {
     await forceCloseServer(server, toolsImpl, abortController);
-    try { rmSync(initFile); } catch { /* best-effort */ }
+    try { rmSync(initDir, { recursive: true, force: true }); } catch { /* best-effort */ }
     throw spawnError;
   }
 
-  try { rmSync(initFile); } catch { /* best-effort */ }
+  try { rmSync(initDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+
+  // Always kill background shells — even on success, spawned background
+  // processes would otherwise outlive the runner and leak.
+  toolsImpl.killActiveShells();
 
   if (result.exitCode === 0) {
     try { await closeServer(server); } catch { await forceCloseServer(server, toolsImpl, abortController); }
