@@ -15,30 +15,41 @@ cat ~/.trama/projects/hello/digest.md
 
 ## What is trama?
 
-trama is an agentic runtime — the execution layer where agent-authored programs come to life.
+trama is a runtime for programs that contain agent behavior.
 
-You describe what you want. trama generates a complete program — with control flow, LLM calls, tool use, and state management — then executes it, monitors it, and repairs it when things break. The program is real code: readable, diffable, shareable, and editable. When requirements change, trama rewrites the program itself.
+A trama program is a TypeScript file that can mix deterministic operations (read files, run commands, make HTTP requests) with autonomous agent calls (let an LLM reason, write code, take multi-step actions). The runtime handles everything around it: execution, state persistence, auto-repair, version history, structured logging.
+
+The program can come from anywhere:
 
 ```
-"research competitors and produce a pricing comparison"
-            |
-        program.ts        <- a complete agent program.
-            |              real TypeScript — read it, diff it, edit it.
-        trama run          <- the runtime executes, monitors, and auto-repairs.
-            |
-        trama update       <- natural language rewrites the program itself.
+trama create optimizer "..."     <- the LLM writes the whole program
+trama run optimizer              <- the runtime executes it
+
+# or: you write program.ts yourself, use trama as the runtime
+mkdir -p ~/.trama/projects/my-task
+echo '{"input":{"prompt":"","args":{}}}' > ~/.trama/projects/my-task/meta.json
+cat > ~/.trama/projects/my-task/program.ts << 'EOF'
+import { ctx, agent, tools } from "@trama-dev/runtime";
+await agent.ask("Add auth to the codebase at /path/to/myproject. Write tests.");
+const tests = await tools.shell("cd /path/to/myproject && npm test");
+if (tests.exitCode !== 0) await agent.ask("Tests failed, fix:\n" + tests.stderr);
+await ctx.done({ testsPass: tests.exitCode === 0 });
+EOF
+trama run my-task                <- same runtime, same state/logging/repair
 ```
+
+`trama create` is a convenient entry point — the LLM generates the entire program from a prompt. But the core of trama is the runtime, not code generation. You can hand-write the orchestration and let `agent.ask()` deploy a full autonomous coding agent for the actual work. You can write pure automation that never calls an LLM at all. You can generate a skeleton with `trama create` and then edit it by hand. The runtime doesn't care who wrote the program.
 
 This is different from other approaches:
 
 - **LangGraph, CrewAI, Temporal** — you write the orchestration, the agent fills in blanks. The human is the bottleneck, and you're locked into a framework.
 - **ReAct loops, tool-calling chains** — the agent improvises every step. Flexible, but no stable artifact. Nothing to inspect, share, or iterate on.
 - **Cursor, Claude Code, Codex** — the agent writes code, but you orchestrate the agent. The intent → execution loop is manual.
-- **trama** — the agent writes *the orchestration itself*, and the runtime executes it end-to-end. The output is a complete, runnable program that anyone can clone and run. No framework to learn. No prompts to optimize. Just code with a runtime.
+- **trama** — the orchestration is a program. The agent can write it, you can write it, or both. The runtime executes it end-to-end — with state persistence, auto-repair, and version history. The result is a complete, runnable artifact that anyone can clone and run.
 
-trama has two faces. As **program.ts**, it is an artifact with a lifecycle — born (`create`), executed (`run`), evolved (`update`), self-healed (`repair`), and shared (`git clone`). As **a runtime**, it is the infrastructure that closes this loop — state persistence, auto-repair, version history, scaffolding, and the IPC bridge that lets programs call LLMs and tools without managing any of it themselves. The program is what you see. The runtime is what makes it live.
+In trama, the orchestration, the program, and the runtime converge into one unit. As **program.ts**, it is an artifact with a lifecycle — born (`create`), executed (`run`), evolved (`update`), self-healed (`repair`), and shared (`git clone`). As **a runtime**, it is the infrastructure that closes this loop. The program is what you see. The runtime is what makes it live.
 
-What trama produces is not traditional automation — where every step is predetermined — and not an agent conversation — where nothing is reproducible. It is a program that can contain arbitrarily complex agent behavior (LLM reasoning, multi-step tool use, autonomous decisions) while remaining a readable, diffable, version-tracked artifact. Your intent goes in as a sentence. What comes out is something you can reproduce, hand to a teammate, and evolve over time.
+What trama produces is not traditional automation — where every step is predetermined — and not an agent conversation — where nothing is reproducible. It is a program that can contain arbitrarily complex agent behavior (LLM reasoning, multi-step tool use, autonomous decisions) while remaining a readable, diffable, version-tracked artifact. Your intent goes in as a sentence or as hand-written code. What comes out is something you can reproduce, hand to a teammate, and evolve over time.
 
 ---
 
@@ -180,6 +191,39 @@ The last point is what separates this from every agent marketplace and workflow 
 ## Patterns
 
 trama's 9 API functions are primitives. The interesting things happen when programs combine them in ways the framework never anticipated.
+
+### Hand-written orchestration against your codebase
+
+You don't need `trama create` to use trama. Write the orchestration yourself and let `agent.ask()` deploy a full autonomous coding agent for the actual work:
+
+```typescript
+import { ctx, agent, tools } from "@trama-dev/runtime";
+
+// You define the workflow — what to do, in what order, how to validate
+const feature = ctx.input.args.feature as string;
+
+await agent.ask(
+  `Add ${feature} to the codebase at /home/user/myproject. ` +
+  "Create the necessary modules, update routes, and write tests."
+);
+
+const tests = await tools.shell("cd /home/user/myproject && npm test", { timeout: 60000 });
+await ctx.log("tests", { exitCode: tests.exitCode });
+
+if (tests.exitCode !== 0) {
+  await agent.ask(`Tests failed after adding ${feature}. Fix the issues:\n${tests.stderr}`);
+  const retry = await tools.shell("cd /home/user/myproject && npm test", { timeout: 60000 });
+  await ctx.log("retry", { exitCode: retry.exitCode });
+}
+
+await ctx.done();
+```
+
+```bash
+trama run my-task --arg feature="user authentication"
+```
+
+trama provides the runtime — state, logging, repair, history. `agent.ask()` provides a free agent that reads files, writes code, and runs commands autonomously. You control the strategy; the agent does the work.
 
 ### Programs that build their own tools
 
