@@ -38,6 +38,8 @@ This is different from other approaches:
 
 trama has two faces. As **program.ts**, it is an artifact with a lifecycle — born (`create`), executed (`run`), evolved (`update`), self-healed (`repair`), and shared (`git clone`). As **a runtime**, it is the infrastructure that closes this loop — state persistence, auto-repair, version history, scaffolding, and the IPC bridge that lets programs call LLMs and tools without managing any of it themselves. The program is what you see. The runtime is what makes it live.
 
+What trama produces is not traditional automation — where every step is predetermined — and not an agent conversation — where nothing is reproducible. It is a program that can contain arbitrarily complex agent behavior (LLM reasoning, multi-step tool use, autonomous decisions) while remaining a readable, diffable, version-tracked artifact. Your intent goes in as a sentence. What comes out is something you can reproduce, hand to a teammate, and evolve over time.
+
 ---
 
 ## See it in action
