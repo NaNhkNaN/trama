@@ -12,7 +12,7 @@ The runtime behind [trama](https://github.com/NaNhkNaN/trama) — execution, sta
 import { ctx, agent, tools } from "@trama-dev/runtime";
 
 const data = await tools.read("input.csv");
-const report = await agent.ask(`Analyze this:\n${data}`);
+const report = await agent.instruct(`Analyze this:\n${data}`);
 await tools.write("report.md", report);
 await ctx.done();
 ```
