@@ -44,9 +44,13 @@ export interface Ctx {
 
 export interface Agent {
   /**
-   * LLM call via pi-coding-agent. Returns plain text.
-   * The underlying pi agent may use its built-in tools autonomously.
+   * Instruct the pi-coding-agent to perform a task. Returns plain text.
+   * The underlying agent may autonomously use its built-in tools
+   * (bash, file read/write/edit) to fulfill the instruction.
    */
+  instruct(prompt: string, options?: { system?: string }): Promise<string>;
+
+  /** @deprecated Use instruct() instead. Alias kept for backwards compatibility. */
   ask(prompt: string, options?: { system?: string }): Promise<string>;
 
   /**

@@ -147,6 +147,8 @@ export interface Ctx {
 }
 
 export interface Agent {
+  instruct(prompt: string, options?: { system?: string }): Promise<string>;
+  /** @deprecated Use instruct() instead */
   ask(prompt: string, options?: { system?: string }): Promise<string>;
   generate<T>(input: {
     prompt: string;

@@ -30,15 +30,15 @@ mkdir -p ~/.trama/projects/my-task
 echo '{"input":{"prompt":"","args":{}}}' > ~/.trama/projects/my-task/meta.json
 cat > ~/.trama/projects/my-task/program.ts << 'EOF'
 import { ctx, agent, tools } from "@trama-dev/runtime";
-await agent.ask("Add auth to the codebase at /path/to/myproject. Write tests.");
+await agent.instruct("Add auth to the codebase at /path/to/myproject. Write tests.");
 const tests = await tools.shell("cd /path/to/myproject && npm test");
-if (tests.exitCode !== 0) await agent.ask("Tests failed, fix:\n" + tests.stderr);
+if (tests.exitCode !== 0) await agent.instruct("Tests failed, fix:\n" + tests.stderr);
 await ctx.done({ testsPass: tests.exitCode === 0 });
 EOF
 trama run my-task                <- same runtime, same state/logging/repair
 ```
 
-`trama create` is a convenient entry point — the LLM generates the entire program from a prompt. But the core of trama is the runtime, not code generation. You can hand-write the orchestration and let `agent.ask()` deploy a full autonomous coding agent for the actual work. You can write pure automation that never calls an LLM at all. You can generate a skeleton with `trama create` and then edit it by hand. The runtime doesn't care who wrote the program.
+`trama create` is a convenient entry point — the LLM generates the entire program from a prompt. But the core of trama is the runtime, not code generation. You can hand-write the orchestration and let `agent.instruct()` deploy a full autonomous coding agent for the actual work. You can write pure automation that never calls an LLM at all. You can generate a skeleton with `trama create` and then edit it by hand. The runtime doesn't care who wrote the program.
 
 This is different from other approaches:
 
@@ -166,7 +166,7 @@ TypeScript is the orchestration language. It is not the execution boundary.
 A trama program can generate and run code in any language — Python, SQL, Rust, shell scripts — through `tools.write()` and `tools.shell()`. The orchestration stays in TypeScript; the work happens wherever it needs to:
 
 ```typescript
-const script = await agent.ask("Write a Python script that analyzes this dataset...");
+const script = await agent.instruct("Write a Python script that analyzes this dataset...");
 await tools.write("analyze.py", script);
 const result = await tools.shell("python3 analyze.py");
 ```
@@ -194,7 +194,7 @@ trama's 9 API functions are primitives. The interesting things happen when progr
 
 ### Hand-written orchestration against your codebase
 
-You don't need `trama create` to use trama. Write the orchestration yourself and let `agent.ask()` deploy a full autonomous coding agent for the actual work:
+You don't need `trama create` to use trama. Write the orchestration yourself and let `agent.instruct()` deploy a full autonomous coding agent for the actual work:
 
 ```typescript
 import { ctx, agent, tools } from "@trama-dev/runtime";
@@ -202,7 +202,7 @@ import { ctx, agent, tools } from "@trama-dev/runtime";
 // You define the workflow — what to do, in what order, how to validate
 const feature = ctx.input.args.feature as string;
 
-await agent.ask(
+await agent.instruct(
   `Add ${feature} to the codebase at /home/user/myproject. ` +
   "Create the necessary modules, update routes, and write tests."
 );
@@ -211,7 +211,7 @@ const tests = await tools.shell("cd /home/user/myproject && npm test", { timeout
 await ctx.log("tests", { exitCode: tests.exitCode });
 
 if (tests.exitCode !== 0) {
-  await agent.ask(`Tests failed after adding ${feature}. Fix the issues:\n${tests.stderr}`);
+  await agent.instruct(`Tests failed after adding ${feature}. Fix the issues:\n${tests.stderr}`);
   const retry = await tools.shell("cd /home/user/myproject && npm test", { timeout: 60000 });
   await ctx.log("retry", { exitCode: retry.exitCode });
 }
@@ -223,7 +223,7 @@ await ctx.done();
 trama run my-task --arg feature="user authentication"
 ```
 
-trama provides the runtime — state, logging, repair, history. `agent.ask()` provides a free agent that reads files, writes code, and runs commands autonomously. You control the strategy; the agent does the work.
+trama provides the runtime — state, logging, repair, history. `agent.instruct()` provides a free agent that reads files, writes code, and runs commands autonomously. You control the strategy; the agent does the work.
 
 ### Programs that build their own tools
 
@@ -233,7 +233,7 @@ A trama program can generate the scripts it needs, then use them. The eval harne
 import { ctx, agent, tools } from "@trama-dev/runtime";
 
 // Step 1: generate a benchmark script tailored to the task
-const bench = await agent.ask(
+const bench = await agent.instruct(
   "Write a Node.js script (benchmark.mjs) that measures the p50/p99 latency of the function exported from sort.ts. " +
   "It should run 1000 iterations, print the p99 in milliseconds to stdout, and exit."
 );
@@ -246,7 +246,7 @@ for (let i = 0; i < ctx.maxIterations; i++) {
   const p99 = parseFloat(result.stdout.trim());
   if (p99 < 5) break;
 
-  code = await agent.ask(`This sort function has p99=${p99}ms. Improve it:\n${code}`);
+  code = await agent.instruct(`This sort function has p99=${p99}ms. Improve it:\n${code}`);
   await tools.write("sort.ts", code);
   await ctx.checkpoint();
 }
@@ -293,16 +293,16 @@ TypeScript is the orchestration layer. The work happens in whatever language fit
 import { ctx, agent, tools } from "@trama-dev/runtime";
 
 // Generate and run a Python ML pipeline
-const pipeline = await agent.ask("Write a Python script that trains a classifier on data.csv...");
+const pipeline = await agent.instruct("Write a Python script that trains a classifier on data.csv...");
 await tools.write("train.py", pipeline);
 await tools.shell("pip install scikit-learn pandas && python3 train.py");
 
 // Generate and run a SQL migration
-const migration = await agent.ask("Write a PostgreSQL migration that adds an index on...");
+const migration = await agent.instruct("Write a PostgreSQL migration that adds an index on...");
 await tools.shell(`psql -d mydb -c "${migration}"`);
 
 // Generate and compile a Rust binary for the hot path
-const rustCode = await agent.ask("Write a Rust program that sorts this 10GB file...");
+const rustCode = await agent.instruct("Write a Rust program that sorts this 10GB file...");
 await tools.write("sorter/src/main.rs", rustCode);
 await tools.shell("cd sorter && cargo build --release && ./target/release/sorter data.bin");
 ```
@@ -322,7 +322,7 @@ const results = await Promise.all(
   urls.map(url => tools.fetch(url).then(r => JSON.parse(r.body)))
 );
 
-const analysis = await agent.ask(`Compare these three datasets:\n${JSON.stringify(results, null, 2)}`);
+const analysis = await agent.instruct(`Compare these three datasets:\n${JSON.stringify(results, null, 2)}`);
 await tools.write("comparison.md", analysis);
 await ctx.done();
 ```
@@ -392,7 +392,7 @@ Here's what program.ts actually looks like:
 import { ctx, agent, tools } from "@trama-dev/runtime";
 
 const data = await tools.read("input.csv");
-const report = await agent.ask(`Analyze this data and write a report:\n${data}`);
+const report = await agent.instruct(`Analyze this data and write a report:\n${data}`);
 await tools.write("report.md", report);
 await ctx.done({ summaryLength: report.length });
 ```
@@ -403,7 +403,7 @@ await ctx.done({ summaryLength: report.length });
 import { ctx, agent, tools } from "@trama-dev/runtime";
 
 const brief = await tools.read("brief.md");
-let copy = await agent.ask(`Write SEO-optimized landing page copy based on this brief:\n${brief}`);
+let copy = await agent.instruct(`Write SEO-optimized landing page copy based on this brief:\n${brief}`);
 
 for (let i = 0; i < ctx.maxIterations; i++) {
   const result = await tools.shell(`node eval-seo.mjs`);
@@ -412,7 +412,7 @@ for (let i = 0; i < ctx.maxIterations; i++) {
   await ctx.log("evaluated", { iteration: i, score });
   if (score >= 0.9) break;
 
-  copy = await agent.ask(
+  copy = await agent.instruct(
     `This copy scored ${score} on SEO eval. Improve it.\n\nBrief:\n${brief}\n\nCurrent copy:\n${copy}`
   );
 
@@ -491,7 +491,7 @@ for (const [i, question] of questions.entries()) {
   await ctx.log("sub-research complete", { question, name });
 }
 
-const report = await agent.ask(
+const report = await agent.instruct(
   `Synthesize these research findings into a cohesive report:\n\n${findings.join("\n\n")}`,
 );
 
@@ -584,11 +584,13 @@ await ctx.done(result?)// signal completion — persists state, logs result, ide
 ### agent — LLM calls
 
 ```typescript
-await agent.ask(prompt, { system? })          // text in -> text out
+await agent.instruct(prompt, { system? })     // instruct the agent — may use tools autonomously
 await agent.generate<T>({ prompt, schema })   // text in -> typed JSON out
 ```
 
-`agent.ask()` is **not** a simple text completion. The underlying pi-coding-agent runs a full agent loop and may autonomously use its built-in tools (bash, file read/write/edit) to fulfill the request. What you get back is the final text response.
+`agent.instruct()` is **not** a simple text completion. The underlying pi-coding-agent runs a full agent loop and may autonomously use its built-in tools (bash, file read/write/edit) to fulfill the instruction. What you get back is the final text response.
+
+`agent.ask()` is available as a deprecated alias for `agent.instruct()`.
 
 `agent.generate()` returns a typed object. The schema maps field names to primitive types:
 
@@ -652,7 +654,7 @@ trama does not sandbox generated programs. A program can do anything TypeScript 
 
 **`create` and `update` execute the generated program.** After generating code, trama runs it once to validate it works. If the program makes network requests, calls external APIs, or runs shell commands with side effects, those side effects happen during validation — before you ever run `trama run`.
 
-**`agent.ask()` gives the LLM autonomous tool access.** When your program calls `agent.ask()`, the underlying pi-coding-agent may autonomously read files, write files, and run shell commands to fulfill the request. This is not a simple text-in/text-out call — the LLM can take multi-step actions within the project directory.
+**`agent.instruct()` gives the LLM autonomous tool access.** When your program calls `agent.instruct()`, the underlying pi-coding-agent may autonomously read files, write files, and run shell commands to fulfill the request. This is not a simple text-in/text-out call — the LLM can take multi-step actions within the project directory.
 
 This is a deliberate design choice. trama is a power tool, not a managed service. If you need execution constraints, apply them below trama: containers, VM isolation, or pi's tool-level configuration. The only built-in guard is a path traversal check on `tools.read()` and `tools.write()` — a footgun guard, not a security boundary.
 
@@ -676,7 +678,7 @@ No plugin system, no middleware, no hooks. Extend trama by editing program.ts or
 
 ## Relationship to pi
 
-trama uses [pi](https://github.com/badlogic/pi-mono) as its intelligence substrate. All LLM calls go through [`@mariozechner/pi-coding-agent`](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) — trama does not implement its own agent loop, tool calling, or provider abstraction. When `agent.ask()` runs, pi handles the full agent loop (bash, file I/O, multi-step reasoning). trama benefits from pi's evolution automatically.
+trama uses [pi](https://github.com/badlogic/pi-mono) as its intelligence substrate. All LLM calls go through [`@mariozechner/pi-coding-agent`](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) — trama does not implement its own agent loop, tool calling, or provider abstraction. When `agent.instruct()` runs, pi handles the full agent loop (bash, file I/O, multi-step reasoning). trama benefits from pi's evolution automatically.
 
 ---
 

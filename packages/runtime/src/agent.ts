@@ -21,10 +21,12 @@ function validateShape(result: unknown, schema: Record<string, string>): string 
 }
 
 export function createAgent(adapter: PiAdapter, signal?: AbortSignal): Agent {
+  const instructImpl = async (prompt: string, options?: { system?: string }) =>
+    adapter.ask(prompt, signal ? { ...options, signal } : options);
+
   return {
-    async ask(prompt, options) {
-      return adapter.ask(prompt, signal ? { ...options, signal } : options);
-    },
+    instruct: instructImpl,
+    ask: instructImpl,
 
     async generate(input) {
       const schemaInstruction = `Respond with ONLY a JSON object matching this shape:\n${

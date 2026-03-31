@@ -23,7 +23,7 @@ await ctx.done();
 import { ctx, agent, tools } from "@trama-dev/runtime";
 
 const data = await tools.read(ctx.input.args.file as string);
-const summary = await agent.ask("Summarize this data concisely:\\n" + data);
+const summary = await agent.instruct("Summarize this data concisely:\\n" + data);
 await tools.write("summary.md", summary);
 await ctx.done({ summaryLength: summary.length });
 
@@ -121,7 +121,7 @@ export function resolveProject(name: string): string {
 
 // --- Helpers ---
 
-/** Run an LLM ask() in an isolated temp cwd so pi-coding-agent tools can't write into the real project. */
+/** Run an LLM instruction in an isolated temp cwd so pi-coding-agent tools can't write into the real project. */
 async function isolatedAsk(adapter: PiAdapter, prompt: string, options?: { system?: string }): Promise<string> {
   return withTempDir("trama-gen-", (dir) => adapter.withCwd(dir).ask(prompt, options));
 }

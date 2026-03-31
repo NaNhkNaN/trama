@@ -82,8 +82,12 @@ export const ctx: Ctx = {
   },
 };
 
+const instructImpl = (prompt: string, opts?: { system?: string }) =>
+  call("/agent/ask", { prompt, ...opts }).then(r => r.result);
+
 export const agent: Agent = {
-  ask: (prompt, opts) => call("/agent/ask", { prompt, ...opts }).then(r => r.result),
+  instruct: instructImpl,
+  ask: instructImpl,
   generate: (input) => call("/agent/generate", input).then(r => r.result),
 };
 

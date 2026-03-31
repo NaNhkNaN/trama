@@ -3,7 +3,7 @@ import { getEventListeners } from "node:events";
 import test from "node:test";
 import { createAgent } from "../packages/runtime/dist/agent.js";
 
-test("createAgent ask delegates prompt and options to the adapter", async () => {
+test("createAgent instruct delegates prompt and options to the adapter", async () => {
   const calls = [];
   const adapter = {
     async ask(prompt, options) {
@@ -13,10 +13,20 @@ test("createAgent ask delegates prompt and options to the adapter", async () => 
   };
 
   const agent = createAgent(adapter);
-  const result = await agent.ask("hello", { system: "sys" });
+  const result = await agent.instruct("hello", { system: "sys" });
 
   assert.equal(result, "adapter reply");
   assert.deepEqual(calls, [{ prompt: "hello", options: { system: "sys" } }]);
+});
+
+test("createAgent ask still works as deprecated alias", async () => {
+  const adapter = {
+    async ask(prompt) { return "reply"; },
+  };
+
+  const agent = createAgent(adapter);
+  const result = await agent.ask("hello");
+  assert.equal(result, "reply");
 });
 
 test("createAgent generate strips fenced JSON and validates the requested shape", async () => {
@@ -64,7 +74,7 @@ test("createAgent generate retries once after a validation failure", async () =>
   assert.match(prompts[1], /failed validation/);
 });
 
-test("createAgent ask passes abort signal to adapter", async () => {
+test("createAgent instruct passes abort signal to adapter", async () => {
   const calls = [];
   const adapter = {
     async ask(prompt, options) {
@@ -75,13 +85,13 @@ test("createAgent ask passes abort signal to adapter", async () => {
 
   const controller = new AbortController();
   const agent = createAgent(adapter, controller.signal);
-  await agent.ask("hello");
+  await agent.instruct("hello");
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].signal, controller.signal);
 });
 
-test("createAgent ask works without a signal", async () => {
+test("createAgent instruct works without a signal", async () => {
   const calls = [];
   const adapter = {
     async ask(prompt, options) {
@@ -91,7 +101,7 @@ test("createAgent ask works without a signal", async () => {
   };
 
   const agent = createAgent(adapter);
-  await agent.ask("hello", { system: "sys" });
+  await agent.instruct("hello", { system: "sys" });
 
   assert.equal(calls.length, 1);
   assert.equal(calls[0].system, "sys");
