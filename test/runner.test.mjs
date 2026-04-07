@@ -156,10 +156,9 @@ await tools.shell("sleep 60");`,
   });
 
   const start = Date.now();
-  await assert.rejects(
-    async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 1_500 }),
-    /timeout/i,
-  );
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 1_500 });
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /timeout/i);
   const elapsed = Date.now() - start;
   assert.ok(elapsed < 5_000, `Expected <5s, got ${elapsed}ms`);
 });
@@ -173,10 +172,9 @@ test("runProgram includes buffered stdout in failure errors", async (t) => {
 throw new Error("boom");`,
   });
 
-  await assert.rejects(
-    async () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 }),
-    /stdout: stdout-hint[\s\S]*stderr: .*boom/s,
-  );
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /stdout: stdout-hint[\s\S]*stderr: .*boom/s);
 });
 
 test("runProgram records successful repairs in history and logs the repair attempt", async (t) => {
@@ -238,10 +236,9 @@ test("runProgram surfaces repair failures after retries are exhausted", async (t
   };
 
   try {
-    await assert.rejects(
-      async () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 }),
-      /Repair errors:[\s\S]*repair blew up/s,
-    );
+    const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 });
+    assert.equal(result.status, "failed");
+    assert.match(result.reason, /Repair errors:[\s\S]*repair blew up/s);
   } finally {
     PiAdapter.prototype.repair = originalRepair;
   }
@@ -486,10 +483,9 @@ throw new Error("boom");`,
   };
 
   try {
-    await assert.rejects(
-      async () => runProgram({ projectDir, maxRepairAttempts: 3, timeout: 5_000 }),
-      /Failed after 1 repair attempt\(s\)/,
-    );
+    const result = await runProgram({ projectDir, maxRepairAttempts: 3, timeout: 5_000 });
+    assert.equal(result.status, "failed");
+    assert.match(result.reason, /Failed after 1 repair attempt\(s\)/);
     assert.equal(readFileSync(join(projectDir, "run-count.txt"), "utf-8"), "1");
   } finally {
     PiAdapter.prototype.repair = originalRepair;
@@ -549,10 +545,9 @@ test("runProgram restores original program.ts when all repair attempts produce b
   };
 
   try {
-    await assert.rejects(
-      async () => runProgram({ projectDir, maxRepairAttempts: 2, timeout: 5_000 }),
-      /Failed after 2 repair attempts/,
-    );
+    const result = await runProgram({ projectDir, maxRepairAttempts: 2, timeout: 5_000 });
+    assert.equal(result.status, "failed");
+    assert.match(result.reason, /Failed after 2 repair attempts/);
     assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
   } finally {
     PiAdapter.prototype.repair = originalRepair;
@@ -575,10 +570,9 @@ test("runProgram restores original program.ts when repair LLM call fails", async
   };
 
   try {
-    await assert.rejects(
-      async () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 }),
-      /Failed after 1 repair attempt/,
-    );
+    const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 });
+    assert.equal(result.status, "failed");
+    assert.match(result.reason, /Failed after 1 repair attempt/);
     assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
   } finally {
     PiAdapter.prototype.repair = originalRepair;
@@ -606,10 +600,9 @@ throw new Error("still broken");`;
   };
 
   try {
-    await assert.rejects(
-      async () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 }),
-      /Failed after 1 repair attempt/,
-    );
+    const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 });
+    assert.equal(result.status, "failed");
+    assert.match(result.reason, /Failed after 1 repair attempt/);
     // program.ts is never modified since no repair was verified
     assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
     // Side effects from repair LLM and repaired program must NOT leak to real dir
@@ -643,10 +636,9 @@ await ctx.done();`;
   };
 
   try {
-    await assert.rejects(
-      async () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 }),
-      /Failed after 1 repair attempt/,
-    );
+    const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 });
+    assert.equal(result.status, "failed");
+    assert.match(result.reason, /Failed after 1 repair attempt/);
     // Full restore: both program.ts and side effects from the failed real rerun.
     assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
     assert.equal(existsSync(join(projectDir, "leaked.txt")), false,

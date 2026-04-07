@@ -1,22 +1,25 @@
 {
-  "name": "@trama-dev/cli",
+  "name": "@trama-dev/session",
   "version": "0.1.5",
   "type": "module",
-  "bin": {
-    "trama": "./dist/index.js"
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "scripts": {
-    "build": "tsc && chmod +x dist/index.js"
+    "build": "tsc"
   },
   "publishConfig": {
     "access": "public"
   },
-  "description": "CLI for trama — an agentic runtime for agent-authored TypeScript programs",
+  "description": "Agent session protocol for trama — multi-agent coordination with shared workspace",
   "license": "MIT",
   "repository": {
     "type": "git",
     "url": "https://github.com/NaNhkNaN/trama.git",
-    "directory": "packages/cli"
+    "directory": "packages/session"
   },
   "homepage": "https://github.com/NaNhkNaN/trama",
   "bugs": "https://github.com/NaNhkNaN/trama/issues",
@@ -27,7 +30,9 @@
   ],
   "os": ["darwin", "linux"],
   "dependencies": {
-    "@trama-dev/runtime": "0.1.5",
-    "commander": "^14.0.0"
+    "@trama-dev/runtime": "0.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0"
   }
 }

@@ -20,10 +20,17 @@ export function createContext(
   let donePromise: Promise<void> | null = null;
   let doneLogged = false;
   let readyCalled = false;
+  // Track terminal signal: null, "done", or "yielded"
+  let terminalSignal: "done" | "yielded" | null = null;
 
   const input = options?.argsOverride
     ? { ...meta.input, args: { ...(meta.input.args ?? {}), ...options.argsOverride } }
     : meta.input;
+
+  // Detect yield marker from previous run
+  const yieldMarker = initialState.__trama_yield as { reason: string } | undefined;
+  const resumed = yieldMarker != null;
+  const yieldReason = yieldMarker?.reason ?? null;
 
   return {
     input,
@@ -33,6 +40,8 @@ export function createContext(
       && initialState.__trama_iteration >= 0
       ? initialState.__trama_iteration : 0,
     maxIterations: options?.maxIterations ?? 100,
+    resumed,
+    yieldReason,
 
     async log(message, data) {
       let safeData = data ?? null;
@@ -54,6 +63,9 @@ export function createContext(
     async checkpoint() {
       assertSerializable(this.state, "ctx.state");
 
+      // Clear yield marker on checkpoint (explicit state advancement)
+      delete this.state.__trama_yield;
+
       const nextIteration = this.iteration + 1;
       this.state.__trama_iteration = nextIteration;
       writeFileSync(statePath, JSON.stringify(this.state, null, 2));
@@ -61,17 +73,31 @@ export function createContext(
     },
 
     async done(result) {
+      // Mutual exclusivity: yield() was already called
+      if (terminalSignal === "yielded") {
+        throw new Error("Cannot call ctx.done() after ctx.yield() — yield already signaled.");
+      }
+
       // If a previous done() completed successfully, no-op.
       // If a previous done() is still in flight, coalesce onto it.
       // If a previous done() failed (checkpoint threw), allow retry.
       if (donePromise) return donePromise;
 
+      terminalSignal = "done";
+
       const run = async () => {
-        if (!doneLogged) {
-          await this.log("done", result);
-        }
+        // Persist first — this is the critical action
+        this.state.__trama_done = { result: result ?? null };
+        // Clear any stale yield marker
+        delete this.state.__trama_yield;
         await this.checkpoint();
-        doneLogged = true;
+        // Log is best-effort: persistence already succeeded.
+        // Matches yield()'s pattern — log failure must not
+        // prevent the IPC handler from acknowledging the signal.
+        if (!doneLogged) {
+          try { await this.log("done", result); } catch { /* best-effort */ }
+          doneLogged = true;
+        }
       };
 
       donePromise = run();
@@ -82,6 +108,45 @@ export function createContext(
         donePromise = null;
         throw err;
       }
-    }
+    },
+
+    async yield(reason) {
+      // Mutual exclusivity: done() was already called
+      if (terminalSignal === "done") {
+        throw new Error("Cannot call ctx.yield() after ctx.done() — done already signaled.");
+      }
+
+      // Idempotent: second yield after successful persistence is a no-op
+      if (terminalSignal === "yielded") {
+        // In server-side context, just return (won't actually reach here
+        // in IPC mode since the client exits after the first yield)
+        return undefined as never;
+      }
+
+      assertSerializable(this.state, "ctx.state");
+
+      // Persist yield marker
+      this.state.__trama_yield = { reason };
+      // Clear done marker if somehow present
+      delete this.state.__trama_done;
+
+      const nextIteration = this.iteration + 1;
+      this.state.__trama_iteration = nextIteration;
+      writeFileSync(statePath, JSON.stringify(this.state, null, 2));
+
+      // Set terminalSignal only after persistence succeeds,
+      // so a failed yield can be retried (mirrors done()'s pattern).
+      terminalSignal = "yielded";
+
+      // Log is best-effort: the critical action (state persistence) already
+      // succeeded. A log failure must not prevent the IPC handler from
+      // acknowledging the yield to the signal tracker.
+      try { await this.log("yield", { reason }); } catch { /* best-effort */ }
+
+      // In IPC mode, the client handles process.exit(0).
+      // Return never — the caller (IPC handler) responds to the client,
+      // and the client exits the child process.
+      return undefined as never;
+    },
   };
 }

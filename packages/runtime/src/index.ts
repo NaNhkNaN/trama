@@ -8,6 +8,7 @@ import { loadConfig, loadState, smokeRunAndRepair, copyToHistory, withTempDir, e
 import { guardPath } from "./path-guard.js";
 
 export { runProgram } from "./runner.js";
+export type { ProgramResult, RunOptions } from "./types.js";
 
 // --- Example programs (included in system prompt during create/update) ---
 
@@ -95,6 +96,9 @@ function getSystemPrompt(): string {
   return (
     `You are generating a TypeScript program for the trama runtime.\n\n` +
     `If the program is long-running (for example an HTTP server), call ctx.ready(...) after startup completes and handle SIGTERM/SIGINT for clean shutdown.\n\n` +
+    `The workspace object is available when running in a session (shared artifact I/O between agents). ` +
+    `ctx.yield(reason) suspends the program cooperatively — persists state and exits. ` +
+    `ctx.resumed is true if this run follows a yield; ctx.yieldReason has the reason.\n\n` +
     `Runtime API:\n${RUNTIME_TYPES}\n\n` +
     `Examples:\n${EXAMPLE_PROGRAMS}`
   );

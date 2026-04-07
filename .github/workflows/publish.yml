@@ -22,18 +22,25 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
           RT_VER=$(node -p "require('./packages/runtime/package.json').version")
+          SS_VER=$(node -p "require('./packages/session/package.json').version")
           CLI_VER=$(node -p "require('./packages/cli/package.json').version")
           CLI_DEP=$(node -p "require('./packages/cli/package.json').dependencies['@trama-dev/runtime']")
-          echo "tag=$TAG runtime=$RT_VER cli=$CLI_VER cli->runtime=$CLI_DEP"
+          SS_DEP=$(node -p "require('./packages/session/package.json').dependencies['@trama-dev/runtime']")
+          echo "tag=$TAG runtime=$RT_VER session=$SS_VER cli=$CLI_VER cli->runtime=$CLI_DEP session->runtime=$SS_DEP"
           FAIL=0
           [ "$RT_VER" != "$TAG" ] && echo "::error::runtime version $RT_VER != tag $TAG" && FAIL=1
+          [ "$SS_VER" != "$TAG" ] && echo "::error::session version $SS_VER != tag $TAG" && FAIL=1
           [ "$CLI_VER" != "$TAG" ] && echo "::error::cli version $CLI_VER != tag $TAG" && FAIL=1
           [ "$CLI_DEP" != "$TAG" ] && echo "::error::cli depends on runtime $CLI_DEP != tag $TAG" && FAIL=1
+          [ "$SS_DEP" != "$TAG" ] && echo "::error::session depends on runtime $SS_DEP != tag $TAG" && FAIL=1
           exit $FAIL
 
       - run: npm ci
       - run: npm test
       - run: npm publish -w @trama-dev/runtime --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish -w @trama-dev/session --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - run: npm publish -w @trama-dev/cli --provenance --access public

@@ -6,7 +6,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build -w @trama-dev/runtime && npm run build -w @trama-dev/cli",
+    "build": "npm run build -w @trama-dev/runtime && npm run build -w @trama-dev/session && npm run build -w @trama-dev/cli",
     "test": "npm run build && node --test --test-concurrency=1 test/*.test.mjs && npm run test --workspaces --if-present"
   },
   "devDependencies": {

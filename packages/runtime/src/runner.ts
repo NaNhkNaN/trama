@@ -2,7 +2,7 @@ import { createServer, type Server } from "http";
 import { spawn, type ChildProcess } from "child_process";
 import {
   readFileSync, writeFileSync, appendFileSync,
-  readdirSync, copyFileSync, mkdirSync, existsSync,
+  readdirSync, copyFileSync, mkdirSync, existsSync, statSync,
   symlinkSync, rmSync, lstatSync, readlinkSync,
   cpSync, mkdtempSync, openSync, closeSync,
 } from "fs";
@@ -10,13 +10,14 @@ import { join, dirname } from "path";
 import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { StringDecoder } from "string_decoder";
-import type { Ctx, Agent, Tools, RunOptions, ChildResult, TramaConfig } from "./types.js";
+import type { Ctx, Agent, Tools, Workspace, RunOptions, ChildResult, TramaConfig, ProgramResult } from "./types.js";
 import { PiAdapter } from "./pi-adapter.js";
 import { createContext } from "./context.js";
 import { createAgent } from "./agent.js";
 import { createTools, cappedBuffer, type ToolsWithCleanup } from "./tools.js";
 import { guardPath } from "./path-guard.js";
 import { assertSerializable } from "./serializable.js";
+import { createWorkspace } from "./workspace.js";
 
 // --- Module resolution for child processes ---
 
@@ -140,10 +141,13 @@ export interface Ctx {
   state: Record<string, unknown>;
   iteration: number;
   maxIterations: number;
+  readonly resumed: boolean;
+  readonly yieldReason: string | null;
   log(message: string, data?: Record<string, unknown>): Promise<void>;
   ready(data?: Record<string, unknown>): Promise<void>;
   checkpoint(): Promise<void>;
   done(result?: Record<string, unknown>): Promise<void>;
+  yield(reason: string): Promise<never>;
 }
 
 export interface Agent {
@@ -174,9 +178,19 @@ export interface Tools {
   }): Promise<{ status: number; body: string; headers: Record<string, string> }>;
 }
 
+export type ObserveResult = string | Array<{ path: string; content: string }>;
+
+export interface Workspace {
+  read(path: string): Promise<string>;
+  write(path: string, content: string): Promise<void>;
+  list(pattern: string): Promise<string[]>;
+  observe(pattern: string, options?: { expect?: number; timeout?: number }): Promise<ObserveResult>;
+}
+
 export declare const ctx: Ctx;
 export declare const agent: Agent;
-export declare const tools: Tools;`;
+export declare const tools: Tools;
+export declare const workspace: Workspace;`;
 
 // --- Config & state loaders ---
 
@@ -267,7 +281,13 @@ function validateIPC(data: Record<string, unknown>, fields: Record<string, strin
   return null;
 }
 
-function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
+/** Tracks which terminal signals were received via IPC during a single run. */
+interface TerminalSignalTracker {
+  doneCalled: boolean;
+  yieldCalled: boolean;
+}
+
+function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools, workspaceImpl: Workspace | null, signalTracker?: TerminalSignalTracker): Server {
   return createServer((req, res) => {
     if (req.method !== "POST") {
       res.writeHead(405);
@@ -306,6 +326,11 @@ function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
           "/ctx/checkpoint": { state: "object" },
           "/ctx/log": { message: "string" },
           "/ctx/done": { state: "object" },
+          "/ctx/yield": { state: "object", reason: "string" },
+          "/workspace/read": { path: "string" },
+          "/workspace/write": { path: "string", content: "string" },
+          "/workspace/list": { pattern: "string" },
+          "/workspace/observe": { pattern: "string" },
         };
         const rules = req.url ? validationRules[req.url] : undefined;
         if (rules) {
@@ -385,8 +410,50 @@ function createIPCServer(ctx: Ctx, agentImpl: Agent, toolsImpl: Tools): Server {
             assertSerializable(data.state, "ctx.state");
             ctx.state = data.state;
             await ctx.done(data.result);
+            if (signalTracker) signalTracker.doneCalled = true;
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ result: null }));
+            break;
+
+          case "/ctx/yield":
+            assertSerializable(data.state, "ctx.state");
+            ctx.state = data.state;
+            await ctx.yield(data.reason);
+            if (signalTracker) signalTracker.yieldCalled = true;
+            // yield() calls process.exit(0) on the server-side context,
+            // but in IPC mode we just persist and respond — the client exits.
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ result: null }));
+            break;
+
+          case "/workspace/read":
+            if (!workspaceImpl) { res.writeHead(400); res.end("Workspace is only available when running in a session"); break; }
+            result = await workspaceImpl.read(data.path);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ result }));
+            break;
+
+          case "/workspace/write":
+            if (!workspaceImpl) { res.writeHead(400); res.end("Workspace is only available when running in a session"); break; }
+            await workspaceImpl.write(data.path, data.content);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ result: null }));
+            break;
+
+          case "/workspace/list":
+            if (!workspaceImpl) { res.writeHead(400); res.end("Workspace is only available when running in a session"); break; }
+            result = await workspaceImpl.list(data.pattern);
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ result }));
+            break;
+
+          case "/workspace/observe":
+            if (!workspaceImpl) { res.writeHead(400); res.end("Workspace is only available when running in a session"); break; }
+            result = await workspaceImpl.observe(data.pattern, {
+              expect: data.expect, timeout: data.timeout,
+            });
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ result }));
             break;
 
           default:
@@ -555,6 +622,107 @@ export function copyToHistory(projectDir: string, reason: string, detail?: strin
 
 // --- Helpers ---
 
+/** Record all files in a directory with their size and mtime for change detection. */
+export function snapshotDir(dir: string, prefix = ""): Map<string, { size: number; mtimeMs: number }> {
+  const result = new Map<string, { size: number; mtimeMs: number }>();
+  let entries;
+  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return result; }
+  for (const entry of entries) {
+    const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+    const fullPath = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      for (const [k, v] of snapshotDir(fullPath, relPath)) result.set(k, v);
+    } else if (entry.isFile()) {
+      try {
+        const st = statSync(fullPath);
+        result.set(relPath, { size: st.size, mtimeMs: st.mtimeMs });
+      } catch { /* skip */ }
+    }
+  }
+  return result;
+}
+
+/**
+ * Commit workspace changes from a temp workspace back to the real workspace,
+ * using a three-way check to avoid overwriting concurrent updates by other participants.
+ *
+ * @param tempDir - temp workspace after the rerun (source of changes)
+ * @param realDir - real shared workspace (destination)
+ * @param tempBefore - temp workspace snapshot before the rerun (detects what the rerun changed)
+ * @param realSeed - real workspace snapshot at seed time (detects concurrent changes)
+ *
+ * For each file changed in the temp workspace during the rerun:
+ * - New file (not in tempBefore): always copy to real workspace.
+ * - Modified file: only copy if the real workspace's current state still matches
+ *   realSeed. If it doesn't, another participant changed it concurrently — skip.
+ */
+export function commitWorkspaceChanges(
+  tempDir: string,
+  realDir: string,
+  tempBefore: Map<string, { size: number; mtimeMs: number }>,
+  realSeed: Map<string, { size: number; mtimeMs: number }>,
+): void {
+  const tempAfter = snapshotDir(tempDir);
+  for (const [relPath, afterStat] of tempAfter) {
+    const beforeStat = tempBefore.get(relPath);
+    // Was this file created or modified by the rerun?
+    if (beforeStat && beforeStat.size === afterStat.size && beforeStat.mtimeMs === afterStat.mtimeMs) {
+      continue; // Unchanged in temp — nothing to commit
+    }
+
+    const dstPath = join(realDir, relPath);
+
+    // Verify the path resolves inside the workspace root before any stat/write.
+    // A concurrent participant could have placed a symlink at this path or in
+    // a parent directory, pointing outside the workspace.
+    try {
+      guardPath(realDir, relPath);
+    } catch {
+      continue; // Path escapes workspace via symlink — skip
+    }
+
+    if (beforeStat) {
+      // File existed before the rerun — three-way check against the real workspace.
+      // If the real workspace's version no longer matches the seed, another
+      // participant modified it concurrently — skip to preserve their update.
+      const seedStat = realSeed.get(relPath);
+      if (seedStat) {
+        try {
+          const realNow = statSync(dstPath);
+          if (realNow.size !== seedStat.size || realNow.mtimeMs !== seedStat.mtimeMs) {
+            continue; // Concurrent modification — preserve other participant's version
+          }
+        } catch {
+          continue; // File removed concurrently — don't resurrect
+        }
+      }
+    } else {
+      // New file created by the rerun — check if another participant also
+      // created the same path concurrently in the real workspace.
+      try {
+        statSync(dstPath);
+        continue; // Path already exists in real workspace — preserve other participant's version
+      } catch {
+        // ENOENT — path doesn't exist in real workspace, safe to create
+      }
+    }
+
+    // Best-effort commit with path-guard enforcement.
+    // Verify the destination resolves inside the workspace root before writing.
+    // A concurrent participant could have placed a symlink pointing outside
+    // the workspace — guardPath catches that. Any other filesystem conflict
+    // (path-shape, permissions) is also caught and skipped.
+    try {
+      guardPath(realDir, relPath);
+      const srcPath = join(tempDir, relPath);
+      mkdirSync(dirname(dstPath), { recursive: true });
+      copyFileSync(srcPath, dstPath);
+    } catch {
+      // Path escapes workspace via symlink, path-shape conflict, or other error — skip
+    }
+  }
+}
+
 /**
  * Snapshot a directory, run fn, restore from snapshot if fn returns false
  * or if fn throws. Always cleans up the snapshot. Returns whatever fn returns.
@@ -625,6 +793,14 @@ interface RunOnceOptions {
   stopOnReady?: {
     graceMs: number;
   };
+  /** Shared workspace directory. When set, workspace.* IPC endpoints are enabled. */
+  workspaceDir?: string;
+}
+
+interface RunOnceResult {
+  child: ChildResult;
+  /** Whether ctx.done() or ctx.yield() was called via IPC during this run. */
+  signals: TerminalSignalTracker;
 }
 
 interface WaitForChildOptions {
@@ -638,8 +814,9 @@ interface WaitForChildOptions {
  * writes init file, spawns child, waits for result, and cleans up.
  * Returns the child process result — does NOT throw on non-zero exit.
  */
-async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
-  const { projectDir, adapter, timeout, maxIterations, argsOverride, streamOutput, stopOnReady } = options;
+async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
+  const { projectDir, adapter, timeout, maxIterations, argsOverride, streamOutput, stopOnReady, workspaceDir } = options;
+  const signalTracker: TerminalSignalTracker = { doneCalled: false, yieldCalled: false };
 
   ensureProjectScaffold(projectDir);
   ensureRuntimeLink(projectDir);
@@ -671,7 +848,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
   writeFileSync(guardPath(projectDir, join("logs", "latest.jsonl")), "");
   const agentImpl = createAgent(adapter, signal);
   const toolsImpl = createTools(projectDir, signal);
-  const server = createIPCServer(ctx, agentImpl, toolsImpl);
+  const workspaceImpl = workspaceDir ? createWorkspace(workspaceDir, signal) : null;
+  const server = createIPCServer(ctx, agentImpl, toolsImpl, workspaceImpl, signalTracker);
 
   // Infrastructure setup — errors here are NOT program bugs.
   let port: number;
@@ -693,6 +871,9 @@ async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
       state: ctx.state,
       iteration: ctx.iteration,
       maxIterations: ctx.maxIterations,
+      workspace: workspaceDir ?? null,
+      resumed: ctx.resumed,
+      yieldReason: ctx.yieldReason,
     }));
   } finally {
     closeSync(fd);
@@ -761,7 +942,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<ChildResult> {
     try { await forceCloseServer(server, toolsImpl, abortController); } catch { /* best-effort */ }
   }
 
-  return result;
+  return { child: result, signals: signalTracker };
 }
 
 // --- Shared execution core ---
@@ -776,6 +957,8 @@ interface ExecuteOptions {
   stopOnReady?: {
     graceMs: number;
   };
+  /** Shared workspace directory. When set, workspace.* IPC endpoints are enabled. */
+  workspaceDir?: string;
   /** Called after a successful repair. Receives attempt index and original error string. */
   onRepair?: (attempt: number, maxAttempts: number, error: string) => void;
 }
@@ -783,28 +966,82 @@ interface ExecuteOptions {
 const formatError = (r: ChildResult) =>
   `program.ts exited with code ${r.exitCode}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`;
 
-async function executeProgram(options: ExecuteOptions): Promise<void> {
+/**
+ * Read persisted terminal signals from state.json after a program exits.
+ * Uses the IPC signal tracker to distinguish "called during this run" from
+ * "stale marker from a previous run".
+ * Returns a ProgramResult based on markers and exit code, or null if no
+ * terminal signal was found and exit code is non-zero (needs repair).
+ */
+function readTerminalSignal(projectDir: string, childResult: ChildResult, signals: TerminalSignalTracker): ProgramResult | null {
+  const state = loadState(projectDir);
+
+  // Check done marker first — only if done was actually called this run
+  if (signals.doneCalled) {
+    const doneMarker = state.__trama_done as { result?: unknown } | undefined;
+    if (doneMarker != null) {
+      return { status: "done", result: doneMarker.result ?? undefined };
+    }
+  }
+
+  // Check yield marker — only if yield was actually called this run
+  if (signals.yieldCalled) {
+    const yieldMarker = state.__trama_yield as { reason: string } | undefined;
+    if (yieldMarker != null) {
+      return { status: "yielded", reason: yieldMarker.reason };
+    }
+  }
+
+  // No terminal signal called during this run
+  if (childResult.exitCode === 0) {
+    // Natural success — clear any stale yield marker
+    clearStaleYieldMarker(projectDir, state);
+    return { status: "done" };
+  }
+
+  // Non-zero exit, no terminal signal → needs repair
+  return null;
+}
+
+/**
+ * Clear stale yield marker from state.json when program exits normally without
+ * calling any terminal signal. Prevents stale yield state from polluting future runs.
+ */
+function clearStaleYieldMarker(projectDir: string, state: Record<string, unknown>): void {
+  if (state.__trama_yield != null) {
+    delete state.__trama_yield;
+    const statePath = guardPath(projectDir, "state.json");
+    writeFileSync(statePath, JSON.stringify(state, null, 2));
+  }
+}
+
+async function executeProgram(options: ExecuteOptions): Promise<ProgramResult> {
   const { projectDir, adapter, maxRepairAttempts, timeout, maxIterations } = options;
 
   mkdirSync(guardPath(projectDir, "history"), { recursive: true });
   mkdirSync(guardPath(projectDir, "logs"), { recursive: true });
 
   // Phase 1: Run in the real project directory.
-  const result = await runProgramOnce({
+  const runResult = await runProgramOnce({
     projectDir, adapter, timeout, maxIterations,
     argsOverride: options.argsOverride,
     streamOutput: true,
     stopOnReady: options.stopOnReady,
+    workspaceDir: options.workspaceDir,
   });
-  if (result.exitCode === 0) return;
 
+  // Check for persisted terminal signals before checking exit code
+  const termSignal = readTerminalSignal(projectDir, runResult.child, runResult.signals);
+  if (termSignal) return termSignal;
+
+  // Non-zero exit with no terminal signal → attempt repair
   if (maxRepairAttempts === 0) {
-    throw new Error(`Program failed (repair disabled): ${formatError(result)}`);
+    return { status: "failed", reason: `Program failed (repair disabled): ${formatError(runResult.child)}` };
   }
 
   // Phase 2: Repair loop — both LLM repair call and verification run
   // are fully isolated in temp dirs to prevent side effects on the real project.
-  let lastError = formatError(result);
+  let lastError = formatError(runResult.child);
   const originalSource = readFileSync(guardPath(projectDir, "program.ts"), "utf-8");
   let currentSource = originalSource;
   const repairErrors: string[] = [];
@@ -825,54 +1062,96 @@ async function executeProgram(options: ExecuteOptions): Promise<void> {
       if (!fixed) return null;
 
       writeFileSync(guardPath(tempDir, "program.ts"), fixed);
-      const verifyResult = await runProgramOnce({
-        projectDir: tempDir, adapter: tempAdapter, timeout, maxIterations,
-        argsOverride: options.argsOverride,
-        stopOnReady: options.stopOnReady,
-      });
-      return { fixed, verifyResult };
+      // Verification runs use a temp workspace seeded from the real one,
+      // so the repair can read existing artifacts but writes don't leak.
+      let tempWorkspaceDir: string | undefined;
+      if (options.workspaceDir) {
+        tempWorkspaceDir = mkdtempSync(join(tmpdir(), "trama-repair-ws-"));
+        cpSync(options.workspaceDir, tempWorkspaceDir, { recursive: true });
+      }
+      try {
+        const verifyResult = await runProgramOnce({
+          projectDir: tempDir, adapter: tempAdapter, timeout, maxIterations,
+          argsOverride: options.argsOverride,
+          stopOnReady: options.stopOnReady,
+          workspaceDir: tempWorkspaceDir,
+        });
+        // Read terminal signal while tempDir still exists
+        const verifySignal = readTerminalSignal(tempDir, verifyResult.child, verifyResult.signals);
+        return { fixed, verifyResult, verifySignal, tempDir };
+      } finally {
+        if (tempWorkspaceDir) {
+          try { rmSync(tempWorkspaceDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+        }
+      }
     });
 
     if (!repairResult) {
-      // Repair LLM call itself failed — don't re-run the same broken program.
-      throw new Error(`Failed after ${attempt + 1} repair attempt(s): ${lastError}${repairDetails()}`);
+      return { status: "failed", reason: `Failed after ${attempt + 1} repair attempt(s): ${lastError}${repairDetails()}` };
     }
 
-    if (repairResult.verifyResult.exitCode === 0) {
+    // Terminal signal was read inside withTempDir while state.json still existed
+    const verifySignal = repairResult.verifySignal;
+    if (verifySignal && verifySignal.status !== "failed") {
       // Repair verified in isolation — now run in the real project for actual output.
-      // Snapshot first so we can restore cleanly if the real run fails.
-      const realResult = await withSnapshot(projectDir, async () => {
+      // For workspace: run against a temp workspace seeded from the real one.
+      // On success, commit new/changed artifacts back. On failure, discard the
+      // temp workspace — the real workspace is never touched, so concurrent
+      // writes from other participants are preserved.
+      let realRerunWsDir: string | undefined;
+      // Two snapshots for workspace three-way merge:
+      // - realSeedSnapshot: real workspace at seed time (for detecting concurrent changes)
+      // - tempBeforeSnapshot: temp workspace before rerun (for detecting rerun's changes)
+      let realSeedSnapshot: Map<string, { size: number; mtimeMs: number }> | undefined;
+      let tempBeforeSnapshot: Map<string, { size: number; mtimeMs: number }> | undefined;
+      if (options.workspaceDir) {
+        realSeedSnapshot = snapshotDir(options.workspaceDir);
+        realRerunWsDir = mkdtempSync(join(tmpdir(), "trama-repair-realws-"));
+        cpSync(options.workspaceDir, realRerunWsDir, { recursive: true });
+        tempBeforeSnapshot = snapshotDir(realRerunWsDir);
+      }
+
+      const { run: realRun, signal: realSignal } = await withSnapshot(projectDir, async () => {
         writeFileSync(guardPath(projectDir, "program.ts"), repairResult.fixed);
         const r = await runProgramOnce({
           projectDir, adapter, timeout, maxIterations,
           argsOverride: options.argsOverride,
           streamOutput: true,
           stopOnReady: options.stopOnReady,
+          workspaceDir: realRerunWsDir ?? options.workspaceDir,
         });
-        return { keep: r.exitCode === 0, value: r };
+        const sig = readTerminalSignal(projectDir, r.child, r.signals);
+        return { keep: sig != null && sig.status !== "failed", value: { run: r, signal: sig } };
       });
-      if (realResult.exitCode === 0) {
-        // Bookkeeping is best-effort — program already succeeded and side effects
-        // are committed. Don't mask success with a history/log write failure.
+
+      if (realSignal && realSignal.status !== "failed") {
+        // Success — commit only files that were created or modified during the
+        // rerun, with a three-way check to avoid overwriting concurrent updates.
+        if (realRerunWsDir && options.workspaceDir && tempBeforeSnapshot && realSeedSnapshot) {
+          commitWorkspaceChanges(realRerunWsDir, options.workspaceDir, tempBeforeSnapshot, realSeedSnapshot);
+        }
+      }
+      if (realRerunWsDir) {
+        try { rmSync(realRerunWsDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+      }
+      if (realSignal && realSignal.status !== "failed") {
         try {
           options.onRepair?.(attempt, maxRepairAttempts, lastError);
         } catch (bookkeepingErr) {
           console.warn(`[trama] repair bookkeeping failed: ${bookkeepingErr instanceof Error ? bookkeepingErr.message : bookkeepingErr}`);
         }
-        return;
+        return realSignal;
       }
-      // Passed in isolation but failed in real dir — project already restored by withSnapshot.
       currentSource = repairResult.fixed;
-      lastError = formatError(realResult);
+      lastError = realSignal?.reason ?? formatError(realRun.child);
       continue;
     }
 
-    // Repair produced broken code — update context for next attempt.
     currentSource = repairResult.fixed;
-    lastError = formatError(repairResult.verifyResult);
+    lastError = formatError(repairResult.verifyResult.child);
   }
 
-  throw new Error(`Failed after ${maxRepairAttempts} repair attempts: ${lastError}${repairDetails()}`);
+  return { status: "failed", reason: `Failed after ${maxRepairAttempts} repair attempts: ${lastError}${repairDetails()}` };
 }
 
 // --- Smoke run (used by create and update) ---
@@ -913,7 +1192,7 @@ export async function smokeRunAndRepair(
     const smokeAdapter = adapter.withCwd(smokeDir);
 
     try {
-      await executeProgram({
+      const smokeResult = await executeProgram({
         projectDir: smokeDir,
         adapter: smokeAdapter,
         maxRepairAttempts: options?.maxRepairAttempts ?? 3,
@@ -930,6 +1209,10 @@ export async function smokeRunAndRepair(
         },
       });
 
+      if (smokeResult.status === "failed") {
+        throw new Error(`Program failed: ${smokeResult.reason}`);
+      }
+
       // Smoke passed — copy back program.ts (may have been repaired)
       copyFileSync(guardPath(smokeDir, "program.ts"), guardPath(projectDir, "program.ts"));
     } finally {
@@ -941,7 +1224,7 @@ export async function smokeRunAndRepair(
 
 // --- Core execution ---
 
-export async function runProgram(options: RunOptions) {
+export async function runProgram(options: RunOptions): Promise<ProgramResult> {
   const { projectDir } = options;
 
   if (!existsSync(join(projectDir, "meta.json"))) {
@@ -971,13 +1254,14 @@ export async function runProgram(options: RunOptions) {
 
   const adapter = new PiAdapter(config, projectDir);
 
-  await executeProgram({
+  return executeProgram({
     projectDir,
     adapter,
     maxRepairAttempts,
     timeout,
     maxIterations,
     argsOverride: options.args,
+    workspaceDir: options.workspaceDir,
     onRepair(attempt, max, error) {
       // Log repair attempts (appends to already-open logs file)
       const logsPath = guardPath(projectDir, join("logs", "latest.jsonl"));

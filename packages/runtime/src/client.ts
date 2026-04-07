@@ -2,7 +2,7 @@
 // Thin HTTP wrapper that calls the runner's IPC server.
 
 import { readFileSync } from "fs";
-import type { Ctx, Agent, Tools } from "./types.js";
+import type { Ctx, Agent, Tools, Workspace } from "./types.js";
 import { assertSerializable } from "./serializable.js";
 
 const PORT = process.env.TRAMA_PORT;
@@ -36,12 +36,15 @@ async function call(endpoint: string, body: unknown) {
 
 let donePromise: Promise<void> | null = null;
 let readyCalled = false;
+let terminalSignal: "done" | "yielded" | null = null;
 
 export const ctx: Ctx = {
   input: initData.input,
   state: initData.state,
   iteration: initData.iteration,
   maxIterations: initData.maxIterations,
+  resumed: initData.resumed ?? false,
+  yieldReason: initData.yieldReason ?? null,
 
   async log(msg, data) {
     let safeData = data;
@@ -61,9 +64,16 @@ export const ctx: Ctx = {
     ctx.iteration += 1;
   },
   async done(result) {
+    // Mutual exclusivity: yield() was already called
+    if (terminalSignal === "yielded") {
+      throw new Error("Cannot call ctx.done() after ctx.yield() — yield already signaled.");
+    }
+
     // If a previous done() completed or is in flight, coalesce onto it.
     // If a previous done() failed, allow retry (promise was cleared).
     if (donePromise) return donePromise;
+
+    terminalSignal = "done";
 
     const run = async () => {
       assertSerializable(ctx.state, "ctx.state");
@@ -79,6 +89,27 @@ export const ctx: Ctx = {
       donePromise = null;
       throw err;
     }
+  },
+  async yield(reason) {
+    // Mutual exclusivity: done() was already called
+    if (terminalSignal === "done") {
+      throw new Error("Cannot call ctx.yield() after ctx.done() — done already signaled.");
+    }
+
+    // Idempotent: second yield after successful persistence is a no-op
+    if (terminalSignal === "yielded") {
+      process.exit(0);
+    }
+
+    assertSerializable(ctx.state, "ctx.state");
+
+    // Set terminalSignal only after validation and HTTP call succeed,
+    // so a failed yield can be retried (mirrors done()'s retry pattern).
+    await call("/ctx/yield", { state: ctx.state, reason });
+    terminalSignal = "yielded";
+
+    // Structured exit — the runner detects the yield marker in state.json
+    process.exit(0);
   },
 };
 
@@ -97,3 +128,33 @@ export const tools: Tools = {
   shell: (cmd, opts) => call("/tools/shell", { command: cmd, ...opts }).then(r => r.result),
   fetch: (url, opts) => call("/tools/fetch", { url, ...opts }).then(r => r.result),
 };
+
+// Workspace — available only when running in a session (workspace path is in init data)
+function createWorkspaceClient(): Workspace {
+  const throwIfNoWorkspace = () => {
+    if (!initData.workspace) {
+      throw new Error("workspace is only available when running in a session");
+    }
+  };
+
+  return {
+    async read(path) {
+      throwIfNoWorkspace();
+      return call("/workspace/read", { path }).then(r => r.result);
+    },
+    async write(path, content) {
+      throwIfNoWorkspace();
+      return call("/workspace/write", { path, content }).then(r => r.result);
+    },
+    async list(pattern) {
+      throwIfNoWorkspace();
+      return call("/workspace/list", { pattern }).then(r => r.result);
+    },
+    async observe(pattern, options) {
+      throwIfNoWorkspace();
+      return call("/workspace/observe", { pattern, ...options }).then(r => r.result);
+    },
+  };
+}
+
+export const workspace: Workspace = createWorkspaceClient();

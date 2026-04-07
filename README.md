@@ -17,7 +17,7 @@ cat ~/.trama/projects/hello/digest.md
 
 trama is a runtime for programs that contain agent behavior.
 
-A trama program is a TypeScript file that can mix deterministic operations (read files, run commands, make HTTP requests) with autonomous agent calls (let an LLM reason, write code, take multi-step actions). The runtime handles everything around it: execution, state persistence, auto-repair, version history, structured logging.
+A trama program is a TypeScript file that can mix deterministic operations (read files, run commands, make HTTP requests) with autonomous agent calls (let an LLM reason, write code, take multi-step actions). The runtime handles everything around it: execution, state persistence, auto-repair, version history, structured logging. When programs need to collaborate, a shared workspace and cooperative suspension let multiple agents coordinate through artifacts — without a task graph DSL or orchestration framework.
 
 The program can come from anywhere:
 
@@ -80,21 +80,18 @@ trama logs sort-optimizer   # watch the optimization iterations
 
 This is the [autoresearch](https://github.com/karpathy/autoresearch) pattern — propose, eval, keep-or-discard, repeat — but trama writes the loop for you.
 
-### Self-orchestration — trama composes trama
+### Multi-agent coordination
 
-A trama program can create and run other trama programs. The parent program decomposes a complex task, spawns sub-programs for each part, and synthesizes the results:
+Multiple trama programs share a workspace and coordinate through artifacts. The entry program spawns participants, they write results, and everyone can observe what others produce:
 
 ```bash
-trama create research-lead "given a research topic in ctx.input.args.topic, \
-  use the LLM to break it into 3-5 sub-questions, \
-  for each sub-question create a trama sub-program that researches it independently, \
-  run each sub-program, read their outputs, \
-  and synthesize everything into a final report at report.md"
-trama run research-lead --arg topic="impact of LLMs on software engineering productivity"
-trama logs research-lead
+trama create guardian "coordinate multiple check agents: fan out diff analysis \
+  to sql-injection, xss, and auth-bypass checkers via shared workspace, \
+  observe their result artifacts, and synthesize a final security report"
+trama run guardian
 ```
 
-No orchestration framework needed. The generated program calls `trama create` and `trama run` through `tools.shell()` — trama programs are the unit of composition, and trama itself is the scheduler.
+No task graph. No message bus. The guardian is a TypeScript program that creates a `Session`, spawns check agents, and calls `workspace.observe()` to wait for their results. Each check agent is its own trama program with its own lifecycle, repair loop, and state. See [Session API](#session--multi-agent-coordination) below.
 
 ### Long-running service with live rewrite
 
@@ -123,7 +120,7 @@ trama run counter         # prints 3
 
 ## The bigger picture
 
-trama is small — ~1000 lines of TypeScript, five CLI commands. But the thing it enables is not small.
+trama is small — five CLI commands, three packages. But the thing it enables is not small.
 
 ### No ceiling
 
@@ -149,11 +146,11 @@ When you say `trama update optimizer "also track memory usage"`, the agent reads
 
 This means orchestration is a living thing with a version history. The `history/` directory is a record of how your agent's behavior evolved, in a format anyone can read.
 
-### Self-bootstrapping
+### Self-bootstrapping and composition
 
-A trama program can generate other trama programs. `tools.shell("trama create sub-task '...'")` is a valid operation. This means:
+A trama program can spawn other trama programs — either via `tools.shell("trama create/run ...")` or through the session layer (`Session.create()` + `session.spawn()`). The session layer adds shared workspace and structured lifecycle management; shell composition still works for simpler cases. This means:
 
-- A trama program can **decompose** a complex task into sub-programs, run them, and synthesize the results.
+- A trama program can **decompose** a complex task into sub-programs, run them, and synthesize the results — with shared workspace for artifact exchange.
 - A trama program can **generate its own eval harness** — write a benchmark script, then use it to evaluate its own output.
 - The autoresearch pattern can be applied to **trama programs themselves** — one program iteratively improving another program's `program.ts`.
 
@@ -309,6 +306,57 @@ await tools.shell("cd sorter && cargo build --release && ./target/release/sorter
 
 The agent picks the right language for each subtask. trama just runs it.
 
+### Cooperative yield and resume
+
+A program can suspend itself and resume later with new input:
+
+```typescript
+import { ctx, agent, tools } from "@trama-dev/runtime";
+
+if (ctx.resumed && ctx.yieldReason === "awaiting_review") {
+  const feedback = ctx.input.args.feedback as string;
+  const revised = await agent.instruct(`Revise based on feedback:\n${feedback}\n\nOriginal:\n${ctx.state.draft}`);
+  await tools.write("final.md", revised);
+  await ctx.done();
+} else {
+  const draft = await agent.instruct("Write a technical proposal for...");
+  await tools.write("draft.md", draft);
+  ctx.state.draft = draft;
+  await ctx.yield("awaiting_review");
+}
+```
+
+```bash
+trama run proposal                           # writes draft.md, yields
+# human reviews draft.md
+trama run proposal --arg feedback="expand the security section"  # resumes, writes final.md
+```
+
+### Multi-agent session
+
+Multiple programs coordinate through a shared workspace — no shell hacks, no polling for files:
+
+```typescript
+import { ctx, agent, tools } from "@trama-dev/runtime";
+import { Session } from "@trama-dev/session";
+
+const session = await Session.createTemp();
+const checks = ["sql-injection", "xss", "auth-bypass"];
+
+// Spawn check agents — each is a full trama program
+const handles = checks.map(check =>
+  session.spawn(check, { projectDir: `~/.trama/projects/check-${check}` })
+);
+
+// Wait for all to complete
+const results = await Promise.all(handles.map(h => h.wait()));
+const report = await agent.instruct(`Synthesize:\n${JSON.stringify(results)}`);
+await tools.write("security-report.md", report);
+await ctx.done();
+```
+
+Each participant has its own lifecycle, state, and repair loop. The session layer handles coordination; trama handles execution.
+
 ### Parallel execution
 
 No framework feature needed — it's just TypeScript:
@@ -350,7 +398,8 @@ The runtime is what makes agent programs **self-contained and shareable**:
 
 - **Execution** — spawns programs as child processes with streaming stdout/stderr, manages timeouts, and handles cleanup of background processes and process groups.
 - **IPC bridge** — programs communicate with the runtime through a local HTTP server. LLM calls, file I/O, and shell commands all go through this bridge, which means the runtime can monitor, log, and control every operation.
-- **State persistence** — `ctx.state` survives across runs via `checkpoint()` and `done()`. Programs can be long-running, interruptible, and resumable.
+- **State persistence** — `ctx.state` survives across runs via `checkpoint()` and `done()`. Programs can be long-running, interruptible, and resumable. `ctx.yield()` suspends a program cooperatively — persists state and exits, ready for the session layer to resume it later.
+- **Shared workspace** — when programs run in a session, they share a workspace for artifact I/O. Atomic writes, path guarding, and level-triggered observation (`workspace.observe()`) — without a message bus or coordination framework.
 - **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, validates it, and applies it with snapshot protection. Up to 3 attempts.
 - **Version history** — every create, update, and repair saves a snapshot. You can diff any two versions to see how the program evolved.
 - **Scaffolding** — on first run, the runtime creates package.json, module symlinks, gitignore, and log directories. Recipients of a shared program don't need to set anything up.
@@ -460,43 +509,27 @@ await tools.write("target.ts", code);
 await ctx.done({ finalMetric: best });
 ```
 
-**Self-orchestration — trama composes trama:**
+**Cooperative yield/resume:**
 
-A trama program that decomposes a task, creates sub-programs, runs them, and synthesizes the results:
+A program that pauses for human review, then continues with feedback:
 
 ```typescript
 import { ctx, agent, tools } from "@trama-dev/runtime";
 
-const topic = ctx.input.args.topic as string;
-
-const plan = await agent.generate<{ questions: string }>({
-  prompt: `Break this research topic into 3-5 independent sub-questions:\n${topic}`,
-  schema: { questions: "string: newline-separated list of questions" },
-});
-
-const questions = plan.questions.split("\n").filter(q => q.trim());
-const findings: string[] = [];
-
-for (const [i, question] of questions.entries()) {
-  const name = `research-${Date.now()}-${i}`;
-
-  await tools.shell(
-    `trama create ${name} "research this question and write findings to findings.md: ${question}"`,
-    { timeout: 120000 },
+if (ctx.resumed) {
+  const feedback = ctx.input.args.feedback as string;
+  const final = await agent.instruct(
+    `Revise this analysis based on feedback:\n${feedback}\n\n${ctx.state.analysis}`
   );
-  await tools.shell(`trama run ${name}`, { timeout: 300000 });
-
-  const result = await tools.shell(`cat ~/.trama/projects/${name}/findings.md`);
-  findings.push(`## ${question}\n${result.stdout}`);
-  await ctx.log("sub-research complete", { question, name });
+  await tools.write("final-analysis.md", final);
+  await ctx.done();
+} else {
+  const data = await tools.read("data.csv");
+  const analysis = await agent.instruct(`Analyze this dataset:\n${data}`);
+  await tools.write("draft-analysis.md", analysis);
+  ctx.state.analysis = analysis;
+  await ctx.yield("awaiting_human_feedback");
 }
-
-const report = await agent.instruct(
-  `Synthesize these research findings into a cohesive report:\n\n${findings.join("\n\n")}`,
-);
-
-await tools.write("report.md", report);
-await ctx.done({ subPrograms: questions.length });
 ```
 
 ---
@@ -560,10 +593,12 @@ trama run summarizer --arg file=another-report.csv
 
 ## The runtime API
 
-Every generated program imports three objects: `ctx`, `agent`, and `tools`.
+Every program imports `ctx`, `agent`, and `tools`. Programs in a session also get `workspace`.
 
 ```typescript
 import { ctx, agent, tools } from "@trama-dev/runtime";
+// in a session:
+import { ctx, agent, tools, workspace } from "@trama-dev/runtime";
 ```
 
 ### ctx — lifecycle and state
@@ -573,11 +608,16 @@ ctx.input             // { prompt: string, args: Record<string, unknown> }
 ctx.state             // persistent JSON state (local working copy)
 ctx.iteration         // progress counter (advances only on checkpoint/done)
 ctx.maxIterations     // hint for loop bounds (not enforced by runtime)
+ctx.resumed           // boolean — true if this run follows a yield
+ctx.yieldReason       // string | null — reason from previous yield
 await ctx.log(msg)    // structured log entry (appears in `trama logs`)
 await ctx.ready(data?)// signal startup complete for long-running programs, idempotent
 await ctx.checkpoint()// persist ctx.state to disk, advance iteration
-await ctx.done(result?)// signal completion — persists state, logs result, idempotent
+await ctx.done(result?)// signal completion — persists state, idempotent
+await ctx.yield(reason)// cooperative suspension — persists state, exits process
 ```
+
+`done()` and `yield()` are **mutually exclusive** terminal signals. The first one called wins; a conflicting later call throws. `done()` locks the terminal choice on first attempt (even if it fails — retry `done()`, don't switch to `yield()`). `yield()` locks only after successful persistence, so a failed `yield()` leaves both options open.
 
 **State constraints:** `ctx.state` must be strictly JSON-serializable. No `Date`, `Map`, `Set`, circular references, `NaN`, or `Infinity`. `checkpoint()` will throw with a path to the offending value if validation fails. Keys starting with `__trama_` are reserved for internal use.
 
@@ -621,6 +661,62 @@ await tools.fetch(url, { method?, headers?, body? })
 
 Long-running programs should call `ctx.ready()` once startup completes so `create`/`update` smoke validation can treat "server is up" as success instead of waiting for process exit.
 
+### workspace — shared artifact I/O
+
+Available when running in a session. Path-guarded to the workspace root (independent of the project directory).
+
+```typescript
+await workspace.read(path)                           // -> string
+await workspace.write(path, content)                 // -> void (atomic: temp + fsync + rename)
+await workspace.list(pattern)                        // -> string[] (glob match, sorted)
+await workspace.observe(pattern, { expect?, timeout? })
+  // level-triggered: existing matches are included immediately
+  // single-file: returns string; glob/expect>1: returns [{path, content}, ...]
+```
+
+`workspace.write()` is **atomic** — writes to a temp file, fsyncs, then renames. Concurrent readers via `observe()` or `read()` never see partial content. `workspace.observe()` counts unique paths, not write events. The same path written twice counts as one.
+
+If `workspace` is not available (program not running in a session), all calls throw with a clear message.
+
+### Session — multi-agent coordination
+
+`@trama-dev/session` provides the session layer for coordinating multiple trama programs through a shared workspace.
+
+```typescript
+import { Session } from "@trama-dev/session";
+
+const session = await Session.create({ workspace: "/tmp/my-session" });
+// or: const session = await Session.createTemp();
+
+const handle = session.spawn("check-sql", {
+  projectDir: "~/.trama/projects/check-sql",
+  args: { target: "src/" },
+});
+
+const result = await handle.wait();
+// result: { status: "done" | "yielded" | "failed", reason?, result? }
+
+// Resume a yielded participant with new args:
+if (result.status === "yielded") {
+  const resumed = await handle.resume({ feedback: "approved" });
+  await resumed.wait();
+}
+```
+
+Each participant is a full trama program with its own lifecycle, repair loop, and state. The session layer does not manage execution — trama does. The session manages coordination: who participates, when to resume, and what the shared workspace contains.
+
+`runProgram()` returns a structured `ProgramResult` instead of void:
+
+```typescript
+interface ProgramResult {
+  status: "done" | "yielded" | "failed";
+  reason?: string;      // yield reason, or error summary for failed
+  result?: unknown;     // from ctx.done(result), if provided
+}
+```
+
+The runner determines status by checking **persisted terminal signals first, then exit code**. A persisted `done()` or `yield()` marker takes precedence over a non-zero exit code.
+
 ### Version history
 
 Every `create`, `update`, and successful `repair` saves a snapshot of program.ts to `history/`:
@@ -640,7 +736,7 @@ You can diff any two versions to see how the program evolved: `diff history/0001
 trama stores all projects at `~/.trama/projects/{name}/`. On first run, the runtime creates scaffolding automatically:
 
 - `package.json` — with `"type": "module"` (required for top-level await). If one already exists and is valid JSON, trama patches in the `type` field without touching the rest.
-- `node_modules/@trama-dev/runtime` — symlink to the installed runtime (recreated on every run).
+- `node_modules/@trama-dev/runtime` — symlink to the installed runtime (recreated on every run). (`@trama-dev/session` link is planned for a future release.)
 - `history/` — version snapshots and metadata.
 - `logs/` — structured run logs (viewable via `trama logs`).
 - `.gitignore` — creates or appends exclusions for generated files.
@@ -663,7 +759,7 @@ This is a deliberate design choice. trama is a power tool, not a managed service
 ## Design principles
 
 **1. The kernel does less, so the program can do more.**
-trama's runtime is ~1000 lines of TypeScript. It loads, executes, and repairs programs. Everything else — loops, strategies, optimization logic, self-improvement — lives in the generated program.
+trama's runtime is minimal. It loads, executes, and repairs programs. Everything else — loops, strategies, optimization logic, multi-agent coordination — lives in the generated program or the session layer above it.
 
 **2. Orchestration is code, not configuration.**
 There is no YAML, no JSON graph, no visual builder. The orchestration is a `.ts` file that you can read, diff, and `git log`.
@@ -684,4 +780,4 @@ trama uses [pi](https://github.com/badlogic/pi-mono) as its intelligence substra
 
 ## Status
 
-Early development. Five commands, three runtime objects, ~1000 lines of kernel. The foundation is stable — what comes next is shaped by what people build with it.
+Early development. Three packages (`runtime`, `session`, `cli`), five CLI commands, four runtime objects (`ctx`, `agent`, `tools`, `workspace`). The single-agent runtime is stable. The session layer (`@trama-dev/session`) for multi-agent coordination is functional — workspace I/O, cooperative yield/resume, and structured program results are implemented and tested. What comes next is shaped by what people build with it.

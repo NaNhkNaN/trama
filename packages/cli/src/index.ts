@@ -67,11 +67,15 @@ cli
       }
       const args = parseArgs(opts.arg);
       const projectDir = resolveProject(name);
-      await runProgram({
+      const result = await runProgram({
         projectDir,
         timeout,
         args: Object.keys(args).length > 0 ? args : undefined,
       });
+      if (result.status === "failed") {
+        console.error(`Error: Program failed: ${result.reason}`);
+        process.exit(1);
+      }
     } catch (err) {
       console.error(`Error: ${err instanceof Error ? err.message : err}`);
       process.exit(1);
