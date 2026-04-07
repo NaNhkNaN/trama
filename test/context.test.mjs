@@ -256,23 +256,25 @@ test("createContext done coalesces concurrent failures and still allows retry", 
   assert.match(firstError, /not JSON-serializable/);
   assert.equal(secondError, firstError, "concurrent callers should observe the same failure");
 
-  let doneLines = readJsonLines(join(projectDir, "logs", "latest.jsonl"))
-    .filter(line => line.message === "done");
-  assert.equal(doneLines.length, 1, "failed concurrent done() calls should log only once");
-  assert.deepEqual(doneLines[0].data, { result: "first" }, "first failed call's result wins");
+  // Persistence happens before logging — failed checkpoint means no log entries
+  const logPath = join(projectDir, "logs", "latest.jsonl");
+  const logExists = existsSync(logPath);
+  if (logExists) {
+    const doneLinesBefore = readJsonLines(logPath).filter(line => line.message === "done");
+    assert.equal(doneLinesBefore.length, 0, "failed done() should not log (persistence failed first)");
+  }
 
   ctx.state = { fixed: true };
   await ctx.done({ result: "retry" });
 
-  doneLines = readJsonLines(join(projectDir, "logs", "latest.jsonl"))
-    .filter(line => line.message === "done");
-  assert.equal(doneLines.length, 2, "retry should emit a fresh done log after failure");
-  assert.deepEqual(doneLines[1].data, { result: "retry" });
+  const doneLines = readJsonLines(logPath).filter(line => line.message === "done");
+  assert.equal(doneLines.length, 1, "successful retry should emit done log");
+  assert.deepEqual(doneLines[0].data, { result: "retry" });
   assert.equal(readJson(join(projectDir, "state.json")).__trama_iteration, 1);
   assert.equal(readJson(join(projectDir, "state.json")).fixed, true);
 });
 
-test("createContext done retries log and checkpoint after checkpoint failure", async (t) => {
+test("createContext done retries after checkpoint failure", async (t) => {
   const projectDir = makeTempDir("trama-context-");
   t.after(() => cleanupTempDir(projectDir));
   createProjectFixture(projectDir);
@@ -286,14 +288,15 @@ test("createContext done retries log and checkpoint after checkpoint failure", a
     /not JSON-serializable/,
   );
 
-  // Fix state and retry — done() should succeed and re-log
+  // Fix state and retry — done() should succeed
   ctx.state = { fixed: true };
   await ctx.done({ result: "ok" });
 
   const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
-  // "done" should appear twice (once from the failed attempt, once from the retry)
+  // Persistence happens before logging — first attempt fails at checkpoint,
+  // so only the successful retry produces a log entry.
   const doneLines = lines.filter(l => l.message === "done");
-  assert.equal(doneLines.length, 2, "done log should be emitted on both attempts");
+  assert.equal(doneLines.length, 1, "done log should be emitted on successful retry");
   assert.equal(readJson(join(projectDir, "state.json")).fixed, true);
 });
 

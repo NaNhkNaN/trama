@@ -1,0 +1,38 @@
+{
+  "name": "@trama-dev/session",
+  "version": "0.1.5",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "description": "Agent session protocol for trama — multi-agent coordination with shared workspace",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/NaNhkNaN/trama.git",
+    "directory": "packages/session"
+  },
+  "homepage": "https://github.com/NaNhkNaN/trama",
+  "bugs": "https://github.com/NaNhkNaN/trama/issues",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "os": ["darwin", "linux"],
+  "dependencies": {
+    "@trama-dev/runtime": "0.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0"
+  }
+}
