@@ -187,7 +187,7 @@ The last point is what separates this from every agent marketplace and workflow 
 
 ## Patterns
 
-trama's 9 API functions are primitives. The interesting things happen when programs combine them in ways the framework never anticipated.
+trama's API is four objects and fifteen functions. They are primitives — the interesting things happen when programs combine them in ways the framework never anticipated.
 
 ### Hand-written orchestration against your codebase
 
@@ -397,12 +397,12 @@ trama could have stopped at code generation. But generated code without an execu
 The runtime is what makes agent programs **self-contained and shareable**:
 
 - **Execution** — spawns programs as child processes with streaming stdout/stderr, manages timeouts, and handles cleanup of background processes and process groups.
-- **IPC bridge** — programs communicate with the runtime through a local HTTP server. LLM calls, file I/O, and shell commands all go through this bridge, which means the runtime can monitor, log, and control every operation.
+- **IPC bridge** — programs communicate with the runtime through a local HTTP server. Every `ctx`, `agent`, `tools` and `workspace` call goes through this bridge, which gives the runtime a single point where it validates each request and can cancel work in flight when a run ends.
 - **State persistence** — `ctx.state` survives across runs via `checkpoint()` and `done()`. Programs can be long-running, interruptible, and resumable. `ctx.yield()` suspends a program cooperatively — persists state and exits, ready for the session layer to resume it later.
 - **Shared workspace** — when programs run in a session, they share a workspace for artifact I/O. Atomic writes, path guarding, and level-triggered observation (`workspace.observe()`) — without a message bus or coordination framework.
-- **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, validates it, and applies it with snapshot protection. Up to 3 attempts.
+- **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, proves it on a throwaway copy of the project, and then runs it for real with snapshot protection. Up to 3 attempts.
 - **Version history** — every create, update, and repair saves a snapshot. You can diff any two versions to see how the program evolved.
-- **Scaffolding** — on first run, the runtime creates package.json, module symlinks, gitignore, and log directories. Recipients of a shared program don't need to set anything up.
+- **Scaffolding** — the runtime creates package.json, the module symlink, gitignore, and the history and log directories, and checks them before every run. Recipients of a shared program don't need to set anything up.
 
 This is what separates trama from "give an LLM a prompt and run the output." The runtime is the contract between the generated program and the world — and it's what makes `git clone && trama run` work.
 
@@ -431,7 +431,7 @@ git clone https://github.com/you/my-optimizer ~/.trama/projects/my-optimizer
 trama run my-optimizer
 ```
 
-Prompts generate different code each time. A trama program is deterministic — same control flow, every run. Recipients can read exactly what it does before running it, and rewrite it with `trama update`.
+Prompts generate different code each time. A trama program is the same code every run — the orchestration is fixed and readable, even though the agent calls inside it are not deterministic. Recipients can read exactly what it does before running it, and rewrite it with `trama update`.
 
 Here's what program.ts actually looks like:
 
@@ -538,6 +538,8 @@ if (ctx.resumed) {
 
 ### Prerequisites
 
+Node.js 22.19 or newer, on macOS or Linux.
+
 trama uses [pi](https://github.com/earendil-works/pi) for LLM calls. Set an API key for any supported provider:
 
 ```bash
@@ -617,7 +619,7 @@ await ctx.done(result?)// signal completion — persists state, idempotent
 await ctx.yield(reason)// cooperative suspension — persists state, exits process
 ```
 
-`done()` and `yield()` are **mutually exclusive** terminal signals. The first one called wins; a conflicting later call throws. `done()` locks the terminal choice on first attempt (even if it fails — retry `done()`, don't switch to `yield()`). `yield()` locks only after successful persistence, so a failed `yield()` leaves both options open.
+`done()` and `yield()` are **mutually exclusive** terminal signals. The first one to succeed wins; a conflicting later call throws. A call that fails (for example because `ctx.state` isn't serializable) settles nothing — fix the problem and call either one.
 
 **State constraints:** `ctx.state` must be strictly JSON-serializable. No `Date`, `Map`, `Set`, circular references, `NaN`, or `Infinity`. `checkpoint()` will throw with a path to the offending value if validation fails. Keys starting with `__trama_` are reserved for internal use.
 
@@ -629,8 +631,6 @@ await agent.generate<T>({ prompt, schema })   // text in -> typed JSON out
 ```
 
 `agent.instruct()` is **not** a simple text completion. The underlying pi-coding-agent runs a full agent loop and may autonomously use its built-in tools (bash, file read/write/edit) to fulfill the instruction. What you get back is the final text response.
-
-`agent.ask()` is available as a deprecated alias for `agent.instruct()`.
 
 `agent.generate()` returns a typed object. The schema maps field names to primitive types:
 
@@ -705,7 +705,7 @@ if (result.status === "yielded") {
 
 Each participant is a full trama program with its own lifecycle, repair loop, and state. The session layer does not manage execution — trama does. The session manages coordination: who participates, when to resume, and what the shared workspace contains.
 
-`runProgram()` returns a structured `ProgramResult` instead of void:
+`runProgram()` (and so `handle.wait()`) returns a structured `ProgramResult`:
 
 ```typescript
 interface ProgramResult {
@@ -715,7 +715,7 @@ interface ProgramResult {
 }
 ```
 
-The runner determines status by checking **persisted terminal signals first, then exit code**. A persisted `done()` or `yield()` marker takes precedence over a non-zero exit code.
+The runner determines status by checking **terminal signals first, then exit code**. A `done()` or `yield()` the program completed takes precedence over a non-zero exit code.
 
 ### Version history
 
@@ -733,14 +733,14 @@ You can diff any two versions to see how the program evolved: `diff history/0001
 
 ### Project scaffolding
 
-trama stores all projects at `~/.trama/projects/{name}/`. On first run, the runtime creates scaffolding automatically:
+trama stores all projects at `~/.trama/projects/{name}/`. The runtime creates the scaffolding around `program.ts` automatically — at `create`, and again before every run, so a hand-written or freshly cloned project needs no setup:
 
 - `package.json` — with `"type": "module"` (required for top-level await). If one already exists and is valid JSON, trama patches in the `type` field without touching the rest.
-- `node_modules/@trama-dev/runtime` — symlink to the installed runtime (recreated on every run). (`@trama-dev/session` link is planned for a future release.)
+- `node_modules/@trama-dev/runtime` — symlink to the installed runtime (re-pointed if it has moved). (`@trama-dev/session` link is planned for a future release.)
 - `history/` — version snapshots and metadata.
 - `logs/` — structured run logs (viewable via `trama logs`).
 - `.gitignore` — creates or appends exclusions for generated files.
-- `state.json` — written when the program calls `ctx.checkpoint()` or `ctx.done()`.
+- `state.json` — written when the program calls `ctx.checkpoint()`, `ctx.done()` or `ctx.yield()`.
 
 ---
 
@@ -752,7 +752,7 @@ trama does not sandbox generated programs. A program can do anything TypeScript 
 
 **`agent.instruct()` gives the LLM autonomous tool access.** When your program calls `agent.instruct()`, the underlying pi-coding-agent may autonomously read files, write files, and run shell commands to fulfill the request. This is not a simple text-in/text-out call — the LLM can take multi-step actions within the project directory.
 
-This is a deliberate design choice. trama is a power tool, not a managed service. If you need execution constraints, apply them below trama: containers, VM isolation, or pi's tool-level configuration. The only built-in guard is a path traversal check on `tools.read()` and `tools.write()` — a footgun guard, not a security boundary.
+This is a deliberate design choice. trama is a power tool, not a managed service. If you need execution constraints, apply them below trama: containers, VM isolation, or pi's tool-level configuration. The only built-in guard is a path check on `tools` and `workspace` file access (traversal and symlink escapes) — a footgun guard, not a security boundary.
 
 ---
 
