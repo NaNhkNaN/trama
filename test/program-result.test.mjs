@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, readFileSync } from "fs";
+import { existsSync, readdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
 import { runProgram } from "../packages/runtime/dist/runner.js";
@@ -276,62 +276,28 @@ await tools.write("iterations.txt", seen.join(","));
 // --- Repair workspace isolation ---
 
 // Several tests below need "another participant" to touch the shared workspace
-// while a repaired program is being re-run for real — after the runner has
-// staged the workspace, before it commits. Rather than guess when that is, the
-// repaired program announces that the real rerun has begun and waits to be
-// released, and the test acts in between.
+// while a repaired program is running — after the runner has staged the
+// workspace, before it commits. Rather than guess when that is, the repaired
+// program announces that it has started and waits to be released, and the test
+// acts in between.
 
-/** Source for a repaired program: pause the real rerun (not the verification run) until released. */
-function pauseDuringRealRerun(projectDir) {
-  return `import { existsSync, realpathSync, writeFileSync } from "fs";
-const inRealProject = realpathSync(process.cwd()) === realpathSync(${JSON.stringify(projectDir)});
-if (inRealProject) {
-  writeFileSync("rerun-started.txt", "");
-  while (!existsSync("rerun-proceed.txt")) await new Promise(r => setTimeout(r, 20));
-}`;
-}
+/** Source for a repaired program: announce the run and pause until released. */
+const PAUSE_REPAIR_RUN = `import { existsSync, writeFileSync } from "fs";
+writeFileSync("repair-run-started.txt", "");
+while (!existsSync("repair-run-proceed.txt")) await new Promise(r => setTimeout(r, 20));`;
 
-/** Wait for the real rerun to pause, run `act`, then let the rerun continue. */
-async function duringRealRerun(projectDir, act) {
+/** Wait for the repaired program to pause, run `act`, then let it continue. */
+async function duringRepairRun(projectDir, act) {
   const deadline = Date.now() + 9_000;
-  while (!existsSync(join(projectDir, "rerun-started.txt"))) {
-    if (Date.now() > deadline) throw new Error("the real rerun never started");
+  while (!existsSync(join(projectDir, "repair-run-started.txt"))) {
+    if (Date.now() > deadline) throw new Error("the repaired program never started");
     await new Promise(r => setTimeout(r, 20));
   }
   act();
-  writeText(join(projectDir, "rerun-proceed.txt"), "");
+  writeText(join(projectDir, "repair-run-proceed.txt"), "");
 }
 
-test("repair verification does not leak workspace artifacts", async (t) => {
-  const projectDir = makeTempDir("trama-result-");
-  const wsDir = makeTempDir("trama-ws-");
-  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
-  createProjectFixture(projectDir, {
-    programSource: `throw new Error("original failure");`,
-  });
-
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair() {
-    // Repaired program writes to workspace then fails
-    return `import { workspace } from "@trama-dev/runtime";
-await workspace.write("leak.txt", "should not persist");
-throw new Error("repair also fails");`;
-  };
-
-  try {
-    const result = await runProgram({
-      projectDir, maxRepairAttempts: 1, timeout: 5_000, workspaceDir: wsDir,
-    });
-    assert.equal(result.status, "failed");
-    // The failed repair's workspace write must NOT appear in the real workspace
-    assert.equal(existsSync(join(wsDir, "leak.txt")), false,
-      "repair verification must not leak artifacts into the real workspace");
-  } finally {
-    PiAdapter.prototype.repair = originalRepair;
-  }
-});
-
-test("failed real rerun does not leave workspace artifacts", async (t) => {
+test("a repair that fails leaves the shared workspace as it was", async (t) => {
   const projectDir = makeTempDir("trama-result-");
   const wsDir = makeTempDir("trama-ws-");
   t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
@@ -345,18 +311,10 @@ test("failed real rerun does not leave workspace artifacts", async (t) => {
 
   const originalRepair = PiAdapter.prototype.repair;
   PiAdapter.prototype.repair = async function repair() {
-    // Use process.cwd() to distinguish temp verification from real rerun.
-    // Temp verification runs in a temp dir copy; real rerun runs in the actual projectDir.
-    const realProjectDir = JSON.stringify(projectDir);
-    return `import { ctx, workspace } from "@trama-dev/runtime";
-import { realpathSync } from "fs";
+    // The repaired program writes an artifact and then fails as well.
+    return `import { workspace } from "@trama-dev/runtime";
 await workspace.write("artifact.txt", "from repair");
-const cwd = realpathSync(process.cwd());
-const realDir = realpathSync(${realProjectDir});
-if (cwd === realDir) {
-  throw new Error("crash in real dir");
-}
-await ctx.done();`;
+throw new Error("repair also fails");`;
   };
 
   try {
@@ -364,9 +322,9 @@ await ctx.done();`;
       projectDir, maxRepairAttempts: 1, timeout: 5_000, workspaceDir: wsDir,
     });
     assert.equal(result.status, "failed");
-    // Workspace artifacts from the failed real rerun must not persist
+    // What the failed repair wrote must not reach the shared workspace
     assert.equal(existsSync(join(wsDir, "artifact.txt")), false,
-      "failed real rerun must not leave workspace artifacts");
+      "a failed repair must not leave workspace artifacts");
     // Pre-existing artifacts must survive
     assert.equal(readFileSync(join(wsDir, "existing.txt"), "utf-8"), "keep me");
   } finally {
@@ -374,7 +332,7 @@ await ctx.done();`;
   }
 });
 
-test("failed real rerun preserves concurrent workspace writes from other participants", async (t) => {
+test("a failed repair run preserves concurrent workspace writes from other participants", async (t) => {
   const projectDir = makeTempDir("trama-result-");
   const wsDir = makeTempDir("trama-ws-");
   t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
@@ -385,12 +343,9 @@ test("failed real rerun preserves concurrent workspace writes from other partici
 
   const originalRepair = PiAdapter.prototype.repair;
   PiAdapter.prototype.repair = async function repair() {
-    // Passes in the verification copy; in the real project it waits for the
-    // concurrent write and then crashes.
-    return `import { ctx } from "@trama-dev/runtime";
-${pauseDuringRealRerun(projectDir)}
-if (inRealProject) throw new Error("crash after concurrent write window");
-await ctx.done();`;
+    // The repaired program waits for the concurrent write and then crashes.
+    return `${PAUSE_REPAIR_RUN}
+throw new Error("crash after concurrent write window");`;
   };
 
   try {
@@ -398,7 +353,7 @@ await ctx.done();`;
       projectDir, maxRepairAttempts: 1, timeout: 10_000, workspaceDir: wsDir,
     });
 
-    await duringRealRerun(projectDir, () => {
+    await duringRepairRun(projectDir, () => {
       writeText(join(wsDir, "concurrent.txt"), "from another participant");
     });
 
@@ -426,7 +381,7 @@ test("successful repair commit does not overwrite concurrent workspace updates (
   const originalRepair = PiAdapter.prototype.repair;
   PiAdapter.prototype.repair = async function repair() {
     return `import { ctx, workspace } from "@trama-dev/runtime";
-${pauseDuringRealRerun(projectDir)}
+${PAUSE_REPAIR_RUN}
 await workspace.write("new-artifact.txt", "from repair");
 await ctx.done();`;
   };
@@ -436,7 +391,7 @@ await ctx.done();`;
       projectDir, maxRepairAttempts: 1, timeout: 10_000, workspaceDir: wsDir,
     });
 
-    await duringRealRerun(projectDir, () => {
+    await duringRepairRun(projectDir, () => {
       writeText(join(wsDir, "shared.txt"), "updated-by-other");
     });
 
@@ -465,7 +420,7 @@ test("successful repair commit does not overwrite concurrent update on same path
   PiAdapter.prototype.repair = async function repair() {
     // Repaired program modifies shared.txt (same file another participant will update)
     return `import { ctx, workspace } from "@trama-dev/runtime";
-${pauseDuringRealRerun(projectDir)}
+${PAUSE_REPAIR_RUN}
 await workspace.write("shared.txt", "from-repair");
 await ctx.done();`;
   };
@@ -476,7 +431,7 @@ await ctx.done();`;
     });
 
     // While the rerun holds its staged copy, another participant updates shared.txt
-    await duringRealRerun(projectDir, () => {
+    await duringRepairRun(projectDir, () => {
       writeText(join(wsDir, "shared.txt"), "updated-by-other");
     });
 
@@ -502,7 +457,7 @@ test("successful repair commit does not overwrite concurrently created new path"
   const originalRepair = PiAdapter.prototype.repair;
   PiAdapter.prototype.repair = async function repair() {
     return `import { ctx, workspace } from "@trama-dev/runtime";
-${pauseDuringRealRerun(projectDir)}
+${PAUSE_REPAIR_RUN}
 await workspace.write("shared-new.txt", "from-repair");
 await ctx.done();`;
   };
@@ -513,7 +468,7 @@ await ctx.done();`;
     });
 
     // While the rerun holds its staged copy, another participant creates the same new path
-    await duringRealRerun(projectDir, () => {
+    await duringRepairRun(projectDir, () => {
       writeText(join(wsDir, "shared-new.txt"), "from-other");
     });
 
@@ -612,7 +567,42 @@ test("repair commit does not follow symlinked parent directory escaping workspac
   assert.equal(existsSync(join(outsideDir, "data.txt")), false);
 });
 
-test("repair verification can read existing workspace artifacts", async (t) => {
+test("a successful repair runs the fixed program exactly once", async (t) => {
+  const projectDir = makeTempDir("trama-result-");
+  const wsDir = makeTempDir("trama-ws-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
+  createProjectFixture(projectDir, {
+    programSource: `throw new Error("original failure");`,
+  });
+
+  const originalRepair = PiAdapter.prototype.repair;
+  let repairCalls = 0;
+  PiAdapter.prototype.repair = async function repair() {
+    repairCalls += 1;
+    // Each execution leaves one line behind, in the project and in the workspace.
+    return `import { ctx, workspace } from "@trama-dev/runtime";
+import { appendFileSync } from "fs";
+appendFileSync("executions.txt", "ran\\n");
+const seen = await workspace.list("run-*.txt");
+await workspace.write("run-" + seen.length + ".txt", "");
+await ctx.done();`;
+  };
+
+  try {
+    const result = await runProgram({
+      projectDir, maxRepairAttempts: 3, timeout: 5_000, workspaceDir: wsDir,
+    });
+    assert.equal(result.status, "done");
+    assert.equal(repairCalls, 1);
+    // No trial run first: the fix is run once, for real, and its effects kept.
+    assert.equal(readFileSync(join(projectDir, "executions.txt"), "utf-8"), "ran\n");
+    assert.deepEqual(readdirSync(wsDir).sort(), ["run-0.txt"]);
+  } finally {
+    PiAdapter.prototype.repair = originalRepair;
+  }
+});
+
+test("a repaired program sees the workspace's existing artifacts", async (t) => {
   const projectDir = makeTempDir("trama-result-");
   const wsDir = makeTempDir("trama-ws-");
   t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });

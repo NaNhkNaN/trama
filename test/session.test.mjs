@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { existsSync, readFileSync } from "fs";
 import { join } from "path";
+import { runProgram } from "../packages/runtime/dist/runner.js";
 import { Session } from "../packages/session/dist/index.js";
-import { cleanupTempDir, createProjectFixture, makeTempDir } from "./helpers.mjs";
+import { cleanupTempDir, createProjectFixture, makeTempDir, withEnv } from "./helpers.mjs";
 
 test("Session.spawn returns done ProgramResult", async (t) => {
   const projectDir = makeTempDir("trama-session-");
@@ -190,4 +192,103 @@ await ctx.done();
 
   const { readFileSync } = await import("fs");
   assert.equal(readFileSync(join(wsDir, "from-agent2.txt"), "utf-8"), "got: hello from agent 1");
+});
+
+test("Session.workspace lets the session's creator exchange artifacts with participants", async (t) => {
+  const projectDir = makeTempDir("trama-session-");
+  const wsDir = makeTempDir("trama-session-ws-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
+
+  createProjectFixture(projectDir, {
+    programSource: `import { ctx, workspace } from "@trama-dev/runtime";
+const question = await workspace.observe("question.txt", { timeout: 5000 });
+await workspace.write("answer.txt", question.toUpperCase());
+await ctx.done();`,
+  });
+
+  const session = await Session.create({ workspace: wsDir });
+  assert.equal(session.workspaceDir, wsDir);
+
+  const handle = session.spawn("echo", { projectDir, maxRepairAttempts: 0, timeout: 10_000 });
+  await session.workspace.write("question.txt", "hello");
+  const answer = await session.workspace.observe("answer.txt", { timeout: 10_000 });
+
+  assert.equal(answer, "HELLO");
+  assert.equal((await handle.wait()).status, "done");
+  assert.deepEqual(await session.workspace.list("*.txt"), ["answer.txt", "question.txt"]);
+});
+
+test("Session expands a leading ~ in projectDir and workspace", async (t) => {
+  const fakeHome = makeTempDir("trama-session-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  createProjectFixture(join(fakeHome, "projects", "tilde"), {
+    programSource: `import { ctx, workspace } from "@trama-dev/runtime";
+await workspace.write("seen.txt", "ok");
+await ctx.done();`,
+  });
+
+  await withEnv({ HOME: fakeHome }, async () => {
+    const session = await Session.create({ workspace: "~/shared" });
+    assert.equal(session.workspaceDir, join(fakeHome, "shared"));
+
+    const result = await session
+      .spawn("tilde", { projectDir: "~/projects/tilde", maxRepairAttempts: 0, timeout: 10_000 })
+      .wait();
+    assert.equal(result.status, "done");
+    assert.equal(readFileSync(join(fakeHome, "shared", "seen.txt"), "utf-8"), "ok");
+  });
+});
+
+test("a program run by the runner can create a session and coordinate participants", async (t) => {
+  const entryDir = makeTempDir("trama-session-entry-");
+  const workerDir = makeTempDir("trama-session-worker-");
+  let sessionWorkspace;
+  t.after(() => {
+    cleanupTempDir(entryDir);
+    cleanupTempDir(workerDir);
+    if (sessionWorkspace) cleanupTempDir(sessionWorkspace);
+  });
+
+  // The participant: reads the brief, writes its finding.
+  createProjectFixture(workerDir, {
+    programSource: `import { ctx, workspace } from "@trama-dev/runtime";
+const brief = await workspace.observe("brief.txt", { timeout: 10000 });
+await workspace.write("findings/" + ctx.input.args.check + ".txt", ctx.input.args.check + " checked: " + brief);
+await ctx.done();`,
+  });
+
+  // The entry program: an ordinary program.ts that imports the session layer,
+  // fans out to participants, and gathers what they wrote — no host code involved.
+  createProjectFixture(entryDir, {
+    scaffold: false,
+    programSource: `import { ctx } from "@trama-dev/runtime";
+import { Session } from "@trama-dev/session";
+
+const session = await Session.createTemp();
+const checks = ["sql", "xss"];
+const handles = checks.map(check => session.spawn(check, {
+  projectDir: ctx.input.args.workerDir,
+  args: { check },
+  maxRepairAttempts: 0,
+  timeout: 20000,
+}));
+await session.workspace.write("brief.txt", "diff-42");
+const findings = await session.workspace.observe("findings/*.txt", { expect: checks.length, timeout: 20000 });
+const statuses = (await Promise.all(handles.map(h => h.wait()))).map(r => r.status);
+await ctx.done({ workspaceDir: session.workspaceDir, statuses, findings });`,
+  });
+
+  const result = await runProgram({
+    projectDir: entryDir, maxRepairAttempts: 0, timeout: 40_000, args: { workerDir },
+  });
+
+  assert.equal(result.status, "done", result.reason);
+  sessionWorkspace = result.result.workspaceDir;
+  assert.deepEqual(result.result.statuses, ["done", "done"]);
+  assert.deepEqual(result.result.findings, [
+    { path: "findings/sql.txt", content: "sql checked: diff-42" },
+    { path: "findings/xss.txt", content: "xss checked: diff-42" },
+  ]);
+  assert.equal(existsSync(join(entryDir, "node_modules", "@trama-dev", "session")), true);
 });

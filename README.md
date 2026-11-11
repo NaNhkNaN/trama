@@ -91,7 +91,7 @@ trama create guardian "coordinate multiple check agents: fan out diff analysis \
 trama run guardian
 ```
 
-No task graph. No message bus. The guardian is a TypeScript program that creates a `Session`, spawns check agents, and calls `workspace.observe()` to wait for their results. Each check agent is its own trama program with its own lifecycle, repair loop, and state. See [Session API](#session--multi-agent-coordination) below.
+No task graph. No message bus. The guardian is a TypeScript program that creates a `Session`, spawns check agents, and calls `session.workspace.observe()` to wait for their results. Each check agent is its own trama program with its own lifecycle, repair loop, and state. See [Session API](#session--multi-agent-coordination) below.
 
 ### Long-running service with live rewrite
 
@@ -400,7 +400,7 @@ The runtime is what makes agent programs **self-contained and shareable**:
 - **IPC bridge** — programs communicate with the runtime through a local HTTP server. Every `ctx`, `agent`, `tools` and `workspace` call goes through this bridge, which gives the runtime a single point where it validates each request and can cancel work in flight when a run ends.
 - **State persistence** — `ctx.state` survives across runs via `checkpoint()` and `done()`. Programs can be long-running, interruptible, and resumable. `ctx.yield()` suspends a program cooperatively — persists state and exits, ready for the session layer to resume it later.
 - **Shared workspace** — when programs run in a session, they share a workspace for artifact I/O. Atomic writes, path guarding, and level-triggered observation (`workspace.observe()`) — without a message bus or coordination framework.
-- **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, proves it on a throwaway copy of the project, and then runs it for real with snapshot protection. Up to 3 attempts.
+- **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, and runs it under snapshot protection: if the fix fails too, the project is rolled back to how it was. Up to 3 attempts.
 - **Version history** — every create, update, and repair saves a snapshot. You can diff any two versions to see how the program evolved.
 - **Scaffolding** — the runtime creates package.json, the module symlink, gitignore, and the history and log directories, and checks them before every run. Recipients of a shared program don't need to set anything up.
 
@@ -543,7 +543,7 @@ Node.js 22.19 or newer, on macOS or Linux.
 trama uses [pi](https://github.com/earendil-works/pi) for LLM calls. Set an API key for any supported provider:
 
 ```bash
-export ANTHROPIC_API_KEY="sk-ant-..."   # default provider + model: anthropic / claude-opus-4-6
+export ANTHROPIC_API_KEY="sk-ant-..."   # default provider + model: anthropic / claude-opus-5-5
 ```
 
 Other providers (OpenAI, Google, Bedrock, Azure) work via `~/.trama/config.json`:
@@ -552,7 +552,7 @@ Other providers (OpenAI, Google, Bedrock, Azure) work via `~/.trama/config.json`
 { "provider": "openai", "model": "gpt-5.4" }
 ```
 
-Or override per-project: `trama create my-task "do something" --model claude-opus-4-6`
+Or override per-project: `trama create my-task "do something" --model claude-sonnet-5-5`
 
 See all supported providers in [pi-ai docs](https://www.npmjs.com/package/@earendil-works/pi-ai).
 
@@ -663,7 +663,7 @@ Long-running programs should call `ctx.ready()` once startup completes so `creat
 
 ### workspace — shared artifact I/O
 
-Available when running in a session. Path-guarded to the workspace root (independent of the project directory).
+Available when running in a session. Path-guarded to the workspace root (independent of the project directory). The program that creates a session gets the same four functions as `session.workspace`.
 
 ```typescript
 await workspace.read(path)                           // -> string
@@ -687,6 +687,10 @@ import { Session } from "@trama-dev/session";
 
 const session = await Session.create({ workspace: "/tmp/my-session" });
 // or: const session = await Session.createTemp();
+
+// The creating program takes part through session.workspace — the same
+// read / write / list / observe that participants import as `workspace`.
+await session.workspace.write("brief.md", brief);
 
 const handle = session.spawn("check-sql", {
   projectDir: "~/.trama/projects/check-sql",
@@ -736,7 +740,7 @@ You can diff any two versions to see how the program evolved: `diff history/0001
 trama stores all projects at `~/.trama/projects/{name}/`. The runtime creates the scaffolding around `program.ts` automatically — at `create`, and again before every run, so a hand-written or freshly cloned project needs no setup:
 
 - `package.json` — with `"type": "module"` (required for top-level await). If one already exists and is valid JSON, trama patches in the `type` field without touching the rest.
-- `node_modules/@trama-dev/runtime` — symlink to the installed runtime (re-pointed if it has moved). (`@trama-dev/session` link is planned for a future release.)
+- `node_modules/@trama-dev/runtime` and `node_modules/@trama-dev/session` — symlinks to the installed packages (re-pointed if they have moved), so `program.ts` can import both.
 - `history/` — version snapshots and metadata.
 - `logs/` — structured run logs (viewable via `trama logs`).
 - `.gitignore` — creates or appends exclusions for generated files.

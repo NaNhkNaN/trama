@@ -7,7 +7,7 @@ The session layer for [trama](https://github.com/NaNhkNaN/trama) — shared work
 ## Usage
 
 ```typescript
-import { ctx, agent, tools, workspace } from "@trama-dev/runtime";
+import { ctx } from "@trama-dev/runtime";
 import { Session } from "@trama-dev/session";
 
 const session = await Session.createTemp();
@@ -16,6 +16,10 @@ const session = await Session.createTemp();
 const handle = session.spawn("check-sql", {
   projectDir: "~/.trama/projects/check-sql",
 });
+
+// Take part in the shared workspace yourself
+await session.workspace.write("diff.txt", diff);
+const findings = await session.workspace.observe("findings/*.json", { expect: 1 });
 
 const result = await handle.wait();
 // { status: "done" | "yielded" | "failed", reason?, result? }
@@ -29,7 +33,7 @@ if (result.status === "yielded") {
 
 ## What the session layer provides
 
-- **Shared workspace** — participants read and write artifacts through a common directory with atomic writes and path guarding.
+- **Shared workspace** — participants read and write artifacts through a common directory with atomic writes and path guarding. Participants import it as `workspace` from `@trama-dev/runtime`; the program that created the session uses `session.workspace`.
 - **Structured results** — `ProgramResult` with `status`, `reason`, and `result` fields. The session layer never reads `state.json` directly.
 - **Yield/resume** — participants can suspend cooperatively via `ctx.yield()` and be resumed with new args.
 - **Failure isolation** — each participant has its own trama lifecycle, repair loop, and state. A crashing participant doesn't corrupt the workspace or block others.
@@ -38,4 +42,4 @@ if (result.status === "yielded") {
 
 The session layer is **policy**. The runtime is **mechanism**. The session manages coordination (who participates, when to resume). The runtime manages execution (state persistence, auto-repair, version history). This boundary is enforced: `session` depends on `runtime`, never the reverse.
 
-See the [main README](https://github.com/NaNhkNaN/trama) for the full API reference, and [docs/workspace-rfc.md](https://github.com/NaNhkNaN/trama/blob/main/docs/workspace-rfc.md) for the design rationale.
+See the [main README](https://github.com/NaNhkNaN/trama) for the full API reference.

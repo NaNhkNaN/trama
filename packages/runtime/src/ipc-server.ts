@@ -3,6 +3,7 @@
 // for the other end).
 
 import { createServer, type Server } from "http";
+import { timingSafeEqual } from "crypto";
 import type { Ctx, Agent, Tools, Workspace } from "./types.js";
 import type { ProgramResult } from "./runner-types.js";
 import { assertSerializable } from "./serializable.js";
@@ -24,6 +25,12 @@ interface Route {
 }
 
 export interface IpcBackends {
+  /**
+   * The secret only this run's program knows. Every request must present it:
+   * the server listens on a loopback port that any local process — or a web
+   * page the user happens to have open — could otherwise send commands to.
+   */
+  token: string;
   ctx: Ctx;
   agent: Agent;
   tools: Tools;
@@ -46,6 +53,13 @@ function validate(body: Body, fields: Record<string, FieldType>): void {
       throw new BadRequest(`Missing or invalid field: ${name} (expected ${type})`);
     }
   }
+}
+
+/** Whether a request carries `Authorization: Bearer <token>`, compared in constant time. */
+function isAuthorized(header: string | undefined, token: string): boolean {
+  const expected = Buffer.from(`Bearer ${token}`);
+  const actual = Buffer.from(header ?? "");
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
 function buildRoutes({ ctx, agent, tools, workspace, onTerminalSignal }: IpcBackends): Record<string, Route> {
@@ -132,6 +146,10 @@ export function createIPCServer(backends: IpcBackends): Server {
     };
 
     if (req.method !== "POST") return reply(405, "Method not allowed");
+    if (!isAuthorized(req.headers.authorization, backends.token)) {
+      req.resume(); // discard the body
+      return reply(401, "Missing or invalid IPC token");
+    }
 
     const chunks: Buffer[] = [];
     let byteCount = 0;

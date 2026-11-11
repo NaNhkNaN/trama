@@ -1,18 +1,18 @@
-import { mkdirSync, existsSync, mkdtempSync } from "fs";
-import { resolve } from "path";
-import { tmpdir } from "os";
-import { runProgram } from "@trama-dev/runtime/runner";
-import type { ProgramResult } from "@trama-dev/runtime/runner";
+import { existsSync, mkdtempSync } from "fs";
+import { join, resolve } from "path";
+import { homedir, tmpdir } from "os";
+import { createWorkspace, runProgram } from "@trama-dev/runtime/runner";
+import type { ProgramResult, Workspace } from "@trama-dev/runtime/runner";
 
-export type { ProgramResult };
+export type { ProgramResult, Workspace };
 
 export interface SessionOptions {
-  /** Directory for shared workspace artifacts. Created if it doesn't exist. */
+  /** Directory for shared workspace artifacts. Created if it doesn't exist. A leading `~` is expanded. */
   workspace: string;
 }
 
 export interface SpawnOptions {
-  /** Path to the trama project directory. */
+  /** Path to the trama project directory. A leading `~` is expanded. */
   projectDir: string;
   /** Arguments passed to the program via ctx.input.args. */
   args?: Record<string, unknown>;
@@ -36,12 +36,27 @@ export interface ParticipantHandle {
   resume(args?: Record<string, unknown>): Promise<ParticipantHandle>;
 }
 
-export class Session {
-  /** The shared workspace directory path. */
-  readonly workspace: string;
+/** Make a path absolute, expanding a leading `~` to the user's home directory. */
+function toAbsolute(path: string): string {
+  if (path === "~") return homedir();
+  if (path.startsWith("~/")) return join(homedir(), path.slice(2));
+  return resolve(path);
+}
 
-  private constructor(workspace: string) {
-    this.workspace = workspace;
+export class Session {
+  /** The shared workspace directory. */
+  readonly workspaceDir: string;
+
+  /**
+   * The shared workspace itself — the same read / write / list / observe that
+   * participants get as `workspace` from "@trama-dev/runtime". This is how the
+   * program that creates the session takes part in it.
+   */
+  readonly workspace: Workspace;
+
+  private constructor(workspaceDir: string) {
+    this.workspaceDir = workspaceDir;
+    this.workspace = createWorkspace(workspaceDir);
   }
 
   /**
@@ -49,9 +64,7 @@ export class Session {
    * The workspace is created if it doesn't exist.
    */
   static async create(options: SessionOptions): Promise<Session> {
-    const workspace = resolve(options.workspace);
-    mkdirSync(workspace, { recursive: true });
-    return new Session(workspace);
+    return new Session(toAbsolute(options.workspace));
   }
 
   /**
@@ -62,8 +75,7 @@ export class Session {
     if (prefix.includes("/") || prefix.includes("\\")) {
       throw new Error("createTemp prefix must not contain path separators");
     }
-    const workspace = mkdtempSync(resolve(tmpdir(), prefix));
-    return new Session(workspace);
+    return new Session(mkdtempSync(resolve(tmpdir(), prefix)));
   }
 
   /**
@@ -71,8 +83,9 @@ export class Session {
    * The program gets access to the shared workspace via the workspace API.
    */
   spawn(name: string, options: SpawnOptions): ParticipantHandle {
-    const { projectDir, args, timeout, maxRepairAttempts } = options;
-    const workspaceDir = this.workspace;
+    const { args, timeout, maxRepairAttempts } = options;
+    const projectDir = toAbsolute(options.projectDir);
+    const workspaceDir = this.workspaceDir;
 
     if (!existsSync(projectDir)) {
       throw new Error(`Project directory not found: ${projectDir}`);

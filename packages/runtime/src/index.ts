@@ -11,7 +11,9 @@ import {
 import { guardPath } from "./path-guard.js";
 
 export { runProgram } from "./runner.js";
+export { createWorkspace } from "./workspace.js";
 export type { ProgramResult, RunOptions } from "./runner-types.js";
+export type { Workspace, ObserveResult } from "./types.js";
 
 // --- Example programs (included in system prompt during create/update) ---
 
@@ -250,8 +252,9 @@ export async function listProjects(): Promise<void> {
     return;
   }
 
+  // Dot-directories are not projects (a rollback snapshot is kept beside its project while a run is in flight).
   const entries = readdirSync(dir, { withFileTypes: true })
-    .filter(e => e.isDirectory());
+    .filter(e => e.isDirectory() && !e.name.startsWith("."));
 
   if (entries.length === 0) {
     console.log("No projects found.");

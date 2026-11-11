@@ -3,12 +3,12 @@ import {
   readFileSync, writeFileSync, appendFileSync,
   readdirSync, copyFileSync, mkdirSync, existsSync, statSync,
   symlinkSync, rmSync, lstatSync, readlinkSync,
-  cpSync, mkdtempSync, openSync, closeSync,
+  cpSync, mkdtempSync, openSync, closeSync, renameSync,
 } from "fs";
-import { join, dirname } from "path";
+import { join, dirname, basename, resolve } from "path";
 import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
-import { createRequire } from "module";
+import { randomBytes } from "crypto";
 import type { ShellResult } from "./types.js";
 import type { RunOptions, TramaConfig, ProgramResult } from "./runner-types.js";
 import { PiAdapter } from "./pi-adapter.js";
@@ -26,20 +26,32 @@ import { createIPCServer, listen, closeServer } from "./ipc-server.js";
 const RUNTIME_PACKAGE_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 
 /** tsx executes program.ts. Resolved through the module system, so any install layout works. */
-const TSX_CLI = createRequire(import.meta.url).resolve("tsx/cli");
+const TSX_CLI = fileURLToPath(import.meta.resolve("tsx/cli"));
+
+/**
+ * The @trama-dev packages a program.ts can import, and where they are installed.
+ * The runtime always; the session layer when it is installed alongside (as it
+ * is with the CLI). The runtime never imports the session layer itself — it
+ * only makes it reachable from projects.
+ */
+const IMPORTABLE_PACKAGES: Record<string, string> = { runtime: RUNTIME_PACKAGE_DIR };
+try {
+  // Resolves to <package>/dist/index.js
+  IMPORTABLE_PACKAGES.session = dirname(dirname(fileURLToPath(import.meta.resolve("@trama-dev/session"))));
+} catch { /* not installed — programs simply cannot import it */ }
 
 // --- Project scaffolding ---
 
 /**
- * Point the project's node_modules/@trama-dev/runtime at this runtime, so
- * program.ts can import it. Replaces any existing symlink whose target differs
- * (including user-managed ones). Only refuses to touch a real directory/file
- * to avoid destroying user content.
+ * Point the project's node_modules/@trama-dev/<name> at an installed package,
+ * so program.ts can import it. Replaces any existing symlink whose target
+ * differs (including user-managed ones). Only refuses to touch a real
+ * directory/file to avoid destroying user content.
  */
-function linkRuntime(projectDir: string): void {
+function linkPackage(projectDir: string, name: string, target: string): void {
   // The link deliberately points OUTSIDE the project — do not apply guardPath here.
   const linkDir = join(projectDir, "node_modules", "@trama-dev");
-  const linkPath = join(linkDir, "runtime");
+  const linkPath = join(linkDir, name);
 
   try {
     if (!lstatSync(linkPath).isSymbolicLink()) {
@@ -49,14 +61,14 @@ function linkRuntime(projectDir: string): void {
         `Remove it manually or rename it to proceed.`
       );
     }
-    if (readlinkSync(linkPath) === RUNTIME_PACKAGE_DIR) return;
+    if (readlinkSync(linkPath) === target) return;
     rmSync(linkPath);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
   }
 
   mkdirSync(linkDir, { recursive: true });
-  symlinkSync(RUNTIME_PACKAGE_DIR, linkPath, "dir");
+  symlinkSync(target, linkPath, "dir");
 }
 
 /** Make sure package.json exists and declares an ES module (program.ts uses top-level await). */
@@ -104,7 +116,8 @@ function ensureGitignore(projectDir: string): void {
 
 /**
  * Everything a project directory needs around program.ts before it can run:
- * history/ and logs/, an ESM package.json, .gitignore entries, and the runtime link.
+ * history/ and logs/, an ESM package.json, .gitignore entries, and links to the
+ * @trama-dev packages it can import.
  * Idempotent — called before every run, so a freshly cloned project just works.
  */
 export function ensureProjectScaffold(projectDir: string): void {
@@ -112,7 +125,7 @@ export function ensureProjectScaffold(projectDir: string): void {
   mkdirSync(guardPath(projectDir, "logs"), { recursive: true });
   ensureModulePackageJson(projectDir);
   ensureGitignore(projectDir);
-  linkRuntime(projectDir);
+  for (const [name, target] of Object.entries(IMPORTABLE_PACKAGES)) linkPackage(projectDir, name, target);
 }
 
 // --- The API reference shown to the LLM ---
@@ -139,7 +152,7 @@ export function loadConfig(): TramaConfig {
   const configPath = join(homedir(), ".trama", "config.json");
   const defaults: TramaConfig = {
     provider: "anthropic",
-    model: "claude-opus-4-6",
+    model: "claude-opus-5-5",
     maxRepairAttempts: 3,
     defaultTimeout: 300_000,
     defaultMaxIterations: 100,
@@ -320,28 +333,39 @@ export function commitWorkspaceChanges(
 }
 
 /**
- * Snapshot a directory, run fn, restore from snapshot if fn returns false
- * or if fn throws. Always cleans up the snapshot. Returns whatever fn returns.
+ * Run fn against a directory that can be put back exactly as it was: if fn
+ * returns keep:false or throws, the directory is rolled back. Returns fn's value.
+ *
+ * The snapshot is a hidden copy next to the directory, on the same file
+ * system, so rolling back is two renames — move the directory aside, move the
+ * snapshot into its place — and at no point does the content exist nowhere.
+ * (If the process is killed outright, the snapshot is left behind beside the
+ * directory: it is the pre-change state.)
  */
 export async function withSnapshot<T>(dir: string, fn: () => Promise<{ keep: boolean; value: T }>): Promise<T> {
-  const snap = mkdtempSync(join(tmpdir(), "trama-snapshot-"));
-  const restore = () => {
-    rmSync(dir, { recursive: true, force: true });
-    cpSync(snap, dir, { recursive: true });
+  const target = resolve(dir);
+  const snap = mkdtempSync(join(dirname(target), `.${basename(target)}.trama-snapshot-`));
+  let rolledBack = false;
+  const rollBack = () => {
+    const discarded = `${snap}.discarded`;
+    renameSync(target, discarded);
+    renameSync(snap, target);
+    rolledBack = true;
+    removeTempDir(discarded);
   };
   try {
-    cpSync(dir, snap, { recursive: true });
+    cpSync(target, snap, { recursive: true });
     let result: { keep: boolean; value: T };
     try {
       result = await fn();
     } catch (err) {
-      restore();
+      rollBack();
       throw err;
     }
-    if (!result.keep) restore();
+    if (!result.keep) rollBack();
     return result.value;
   } finally {
-    rmSync(snap, { recursive: true, force: true });
+    if (!rolledBack) removeTempDir(snap);
   }
 }
 
@@ -464,7 +488,10 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   writeFileSync(guardPath(projectDir, join("logs", "latest.jsonl")), "");
 
   const tools = createTools(projectDir, runEnded.signal);
+  // Known only to this run's program, through its init file.
+  const token = randomBytes(32).toString("hex");
   const server = createIPCServer({
+    token,
     ctx,
     agent: createAgent(adapter, runEnded.signal),
     tools,
@@ -477,6 +504,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   try {
     const port = await listen(server);
     const init = writeInitFile({
+      token,
       input: ctx.input,
       state: ctx.state,
       iteration: ctx.iteration,
@@ -544,57 +572,36 @@ interface ExecuteOptions extends Omit<RunOnceOptions, "streamOutput"> {
   onRepair?: (attempt: number, maxAttempts: number, error: string) => void;
 }
 
-/** One LLM repair call, bounded by its own timeout. Returns null (and records why) if it fails. */
-async function requestRepair(
-  adapter: PiAdapter,
-  input: { programSource: string; error: string },
-  timeout: number,
-  repairErrors: string[],
-): Promise<string | null> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
-  try {
-    return await adapter.repair({ ...input, runtimeTypes: RUNTIME_TYPES }, controller.signal);
-  } catch (err) {
-    repairErrors.push(err instanceof Error ? err.message : String(err));
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 /**
- * Ask the LLM for a fix and try it out on throwaway copies of the project and
- * workspace, so neither the repair agent's side effects nor a still-broken
- * program can touch the real ones. Returns null if the LLM produced no fix.
+ * Ask the LLM for a fix. The repair agent has tools, so it works in a
+ * throwaway copy of the project — whatever it reads is real, whatever it
+ * writes is discarded; only the program text it returns is used. Bounded by
+ * its own timeout. Returns null (and records why) if no fix came back.
  */
-async function tryRepairInIsolation(
+async function requestRepair(
   options: ExecuteOptions,
   input: { programSource: string; error: string },
   repairErrors: string[],
-): Promise<{ fixed: string; verified: boolean; error: string } | null> {
+): Promise<string | null> {
   return withTempDir("trama-repair-", async (tempDir) => {
     cpSync(options.projectDir, tempDir, { recursive: true });
-    const tempAdapter = options.adapter.withCwd(tempDir);
-
-    const fixed = await requestRepair(tempAdapter, input, options.timeout, repairErrors);
-    if (!fixed) return null;
-    writeFileSync(guardPath(tempDir, "program.ts"), fixed);
-
-    const run = await withStagedWorkspace(options.workspaceDir, async (stagedWorkspace) => ({
-      commit: false,
-      value: await runProgramOnce({
-        ...options, projectDir: tempDir, adapter: tempAdapter, workspaceDir: stagedWorkspace,
-      }),
-    }));
-    return { fixed, verified: settle(tempDir, run) !== null, error: formatError(run.child) };
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), options.timeout);
+    try {
+      return await options.adapter.withCwd(tempDir).repair({ ...input, runtimeTypes: RUNTIME_TYPES }, controller.signal);
+    } catch (err) {
+      repairErrors.push(err instanceof Error ? err.message : String(err));
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
   });
 }
 
 /**
- * Run a fix that passed in isolation for real. If it fails here after all, the
- * project is rolled back to its pre-repair state and its workspace writes are
- * dropped; if it succeeds, they are merged into the shared workspace.
+ * Run a proposed fix. If it fails too, the project is rolled back to how it
+ * was before the fix and its workspace writes are dropped; if it succeeds,
+ * they are merged into the shared workspace.
  */
 async function applyRepair(
   options: ExecuteOptions,
@@ -613,9 +620,9 @@ async function applyRepair(
 }
 
 /**
- * Run a program to an outcome. If it crashes, ask the LLM to repair it — up to
- * maxRepairAttempts times, each fix first proven on a throwaway copy and only
- * then run for real.
+ * Run a program to an outcome. If it crashes, ask the LLM to repair it and run
+ * the fix — up to maxRepairAttempts times. A fix that also fails leaves no
+ * trace: the project and the shared workspace are as they were before it ran.
  */
 async function executeProgram(options: ExecuteOptions): Promise<ProgramResult> {
   const { projectDir, maxRepairAttempts } = options;
@@ -630,24 +637,20 @@ async function executeProgram(options: ExecuteOptions): Promise<ProgramResult> {
   }
 
   // Each attempt builds on the previous one's source, even though a failed
-  // attempt leaves the real project untouched.
+  // attempt is rolled back out of the real project.
   let currentSource = readFileSync(guardPath(projectDir, "program.ts"), "utf-8");
   const repairErrors: string[] = [];
   const repairDetails = () => repairErrors.length > 0
     ? `\nRepair errors:\n${repairErrors.map((e, i) => `  [${i + 1}] ${e}`).join("\n")}` : "";
 
   for (let attempt = 0; attempt < maxRepairAttempts; attempt++) {
-    const repair = await tryRepairInIsolation(options, { programSource: currentSource, error: lastError }, repairErrors);
-    if (!repair) {
+    const fixed = await requestRepair(options, { programSource: currentSource, error: lastError }, repairErrors);
+    if (!fixed) {
       return { status: "failed", reason: `Failed after ${attempt + 1} repair attempt(s): ${lastError}${repairDetails()}` };
     }
-    currentSource = repair.fixed;
-    if (!repair.verified) {
-      lastError = repair.error;
-      continue;
-    }
+    currentSource = fixed;
 
-    const applied = await applyRepair(options, repair.fixed);
+    const applied = await applyRepair(options, fixed);
     if (applied.outcome) {
       try {
         // lastError is still the failure this repair fixed.

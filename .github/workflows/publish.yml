@@ -26,13 +26,15 @@ jobs:
           CLI_VER=$(node -p "require('./packages/cli/package.json').version")
           CLI_DEP=$(node -p "require('./packages/cli/package.json').dependencies['@trama-dev/runtime']")
           SS_DEP=$(node -p "require('./packages/session/package.json').dependencies['@trama-dev/runtime']")
-          echo "tag=$TAG runtime=$RT_VER session=$SS_VER cli=$CLI_VER cli->runtime=$CLI_DEP session->runtime=$SS_DEP"
+          CLI_SS_DEP=$(node -p "require('./packages/cli/package.json').dependencies['@trama-dev/session']")
+          echo "tag=$TAG runtime=$RT_VER session=$SS_VER cli=$CLI_VER cli->runtime=$CLI_DEP cli->session=$CLI_SS_DEP session->runtime=$SS_DEP"
           FAIL=0
           [ "$RT_VER" != "$TAG" ] && echo "::error::runtime version $RT_VER != tag $TAG" && FAIL=1
           [ "$SS_VER" != "$TAG" ] && echo "::error::session version $SS_VER != tag $TAG" && FAIL=1
           [ "$CLI_VER" != "$TAG" ] && echo "::error::cli version $CLI_VER != tag $TAG" && FAIL=1
           [ "$CLI_DEP" != "$TAG" ] && echo "::error::cli depends on runtime $CLI_DEP != tag $TAG" && FAIL=1
           [ "$SS_DEP" != "$TAG" ] && echo "::error::session depends on runtime $SS_DEP != tag $TAG" && FAIL=1
+          [ "$CLI_SS_DEP" != "$TAG" ] && echo "::error::cli depends on session $CLI_SS_DEP != tag $TAG" && FAIL=1
           exit $FAIL
 
       - run: npm ci
@@ -44,5 +46,17 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
       - run: npm publish -w @trama-dev/cli --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      # Older versions stay installable but warn on install. Best-effort: a
+      # failure here must not fail a release that has already been published.
+      - name: Deprecate older versions
+        continue-on-error: true
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          for PKG in runtime session cli; do
+            npm deprecate "@trama-dev/$PKG@<$TAG" "Superseded by $TAG — see https://github.com/NaNhkNaN/trama/blob/main/CHANGELOG.md" || true
+          done
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

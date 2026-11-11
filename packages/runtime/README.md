@@ -32,7 +32,7 @@ The runtime is what makes agent programs **self-contained and shareable**:
 - **Execution** — child process spawning, streaming output, timeout management, background process cleanup.
 - **IPC bridge** — a local HTTP server that every `ctx`, `agent`, `tools` and `workspace` call goes through: one point where the runtime validates each request and can cancel work in flight when a run ends.
 - **State persistence** — `ctx.state` survives across runs. Programs can be long-running, interruptible, and resumable.
-- **Auto-repair** — on crash, the runtime gets an LLM fix, validates it in isolation, applies it with snapshot protection. Up to 3 attempts.
+- **Auto-repair** — on crash, the runtime gets an LLM fix and runs it under snapshot protection, rolling the project back if the fix fails too. Up to 3 attempts.
 - **Version history** — every create, update, and repair saves a snapshot to `history/`.
 - **Scaffolding** — package.json, module symlinks, gitignore, logs. `git clone && trama run` just works.
 

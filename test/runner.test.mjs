@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
-import { join } from "path";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
+import { basename, dirname, join } from "path";
 import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
 import { copyToHistory, loadConfig, loadState, runProgram, RUNTIME_TYPES, withSnapshot } from "../packages/runtime/dist/runner.js";
 import { REPO_ROOT, cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson, writeText } from "./helpers.mjs";
@@ -573,7 +573,7 @@ test("runProgram restores original program.ts when repair LLM call fails", async
   }
 });
 
-test("runProgram repair side effects are isolated from the real project directory", async (t) => {
+test("runProgram leaves no trace of a repair that did not work", async (t) => {
   const projectDir = makeTempDir("trama-runner-");
   t.after(() => cleanupTempDir(projectDir));
 
@@ -584,8 +584,9 @@ test("runProgram repair side effects are isolated from the real project director
   });
 
   const originalRepair = PiAdapter.prototype.repair;
-  // Repair writes a side-effect file via this.cwd and returns code that also writes one.
-  // Both should stay in the temp dir, never touching the real project.
+  // The repair agent writes a file in its working directory, and the program it
+  // returns writes another before failing. Neither may remain in the project:
+  // the agent works in a throwaway copy, and the failed run is rolled back.
   PiAdapter.prototype.repair = async function repair() {
     writeFileSync(join(this.cwd, "repair-side-effect.txt"), "from-repair-llm");
     return `import { tools } from "@trama-dev/runtime";
@@ -597,52 +598,19 @@ throw new Error("still broken");`;
     const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 });
     assert.equal(result.status, "failed");
     assert.match(result.reason, /Failed after 1 repair attempt/);
-    // program.ts is never modified since no repair was verified
+    // program.ts is back to the original: the repair did not work
     assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
-    // Side effects from repair LLM and repaired program must NOT leak to real dir
     assert.equal(existsSync(join(projectDir, "repair-side-effect.txt")), false);
     assert.equal(existsSync(join(projectDir, "program-side-effect.txt")), false);
+    // ...and the rollback snapshot kept beside the project is gone too
+    const siblings = readdirSync(dirname(projectDir)).filter(name => name.includes(".trama-snapshot-"));
+    assert.deepEqual(siblings.filter(name => name.includes(basename(projectDir))), []);
   } finally {
     PiAdapter.prototype.repair = originalRepair;
   }
 });
 
-test("runProgram fully restores project when repair passes in temp but fails in real dir", async (t) => {
-  const projectDir = makeTempDir("trama-runner-");
-  t.after(() => cleanupTempDir(projectDir));
-
-  const originalSource = 'throw new Error("original");';
-  createProjectFixture(projectDir, {
-    scaffold: false,
-    programSource: originalSource,
-  });
-
-  const originalRepair = PiAdapter.prototype.repair;
-  // Return code that succeeds in temp but writes a side-effect file and then fails in real dir.
-  PiAdapter.prototype.repair = async function repair() {
-    return `import { tools } from "@trama-dev/runtime";
-await tools.write("leaked.txt", "from-repair-rerun");
-if (!process.cwd().includes("trama-repair-")) {
-  throw new Error("fails in real dir");
-}
-import { ctx } from "@trama-dev/runtime";
-await ctx.done();`;
-  };
-
-  try {
-    const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 });
-    assert.equal(result.status, "failed");
-    assert.match(result.reason, /Failed after 1 repair attempt/);
-    // Full restore: both program.ts and side effects from the failed real rerun.
-    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
-    assert.equal(existsSync(join(projectDir, "leaked.txt")), false,
-      "side effects from the rolled-back repair rerun must not persist");
-  } finally {
-    PiAdapter.prototype.repair = originalRepair;
-  }
-});
-
-test("runProgram keeps verified repair even when post-success bookkeeping (onRepair) fails", async (t) => {
+test("runProgram keeps a working repair even when post-success bookkeeping (onRepair) fails", async (t) => {
   const projectDir = makeTempDir("trama-runner-");
   t.after(() => cleanupTempDir(projectDir));
 
@@ -817,11 +785,13 @@ test("IPC server rejects oversized request bodies with 413", async (t) => {
   createProjectFixture(projectDir, {
     scaffold: false,
     programSource: `import { ctx, tools } from "@trama-dev/runtime";
+import { readFileSync } from "fs";
 const port = process.env.TRAMA_PORT;
+const { token } = JSON.parse(readFileSync(process.env.TRAMA_INIT, "utf-8"));
 const big = "x".repeat(51 * 1024 * 1024);
 const res = await fetch("http://127.0.0.1:" + port + "/ctx/log", {
   method: "POST",
-  headers: { "Content-Type": "application/json" },
+  headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
   body: big,
 });
 await tools.write("ipc-status.txt", String(res.status));
@@ -830,6 +800,40 @@ await ctx.done();`,
 
   await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 10_000 });
   assert.equal(readFileSync(join(projectDir, "ipc-status.txt"), "utf-8"), "413");
+});
+
+test("IPC server refuses requests that do not carry the run's token", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  // The server listens on a loopback port. Without the token, knowing the port
+  // must not be enough to have the runner execute anything — whether the
+  // request comes with no credentials, a wrong token, or the "simple request"
+  // shape a web page can send without a CORS preflight.
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+const url = "http://127.0.0.1:" + process.env.TRAMA_PORT + "/tools/shell";
+const body = JSON.stringify({ command: "echo intruder > intruder.txt" });
+const attempts = [
+  { "Content-Type": "application/json" },
+  { "Content-Type": "application/json", "Authorization": "Bearer " + "0".repeat(64) },
+  { "Content-Type": "text/plain" },
+];
+const statuses = [];
+for (const headers of attempts) {
+  statuses.push((await fetch(url, { method: "POST", headers, body })).status);
+}
+// The real client still works.
+const legit = await tools.shell("echo ok");
+await tools.write("ipc-auth.txt", statuses.join(",") + " " + legit.stdout.trim());
+await ctx.done();`,
+  });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 10_000 });
+  assert.equal(result.status, "done");
+  assert.equal(readFileSync(join(projectDir, "ipc-auth.txt"), "utf-8"), "401,401,401 ok");
+  assert.equal(existsSync(join(projectDir, "intruder.txt")), false, "an unauthenticated request must not run a command");
 });
 
 test("RUNTIME_TYPES stays in sync with types.ts public interfaces", () => {

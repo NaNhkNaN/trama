@@ -29,7 +29,7 @@ const initData = JSON.parse(readFileSync(INIT_PATH, "utf-8"));
 async function call(endpoint: string, body: unknown) {
   const res = await fetch(`${BASE}${endpoint}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${initData.token}` },
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`trama runtime error: ${await res.text()}`);
