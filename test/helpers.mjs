@@ -2,7 +2,7 @@ import { spawn } from "child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { dirname, join } from "path";
-import { fileURLToPath } from "url";
+import { fileURLToPath, pathToFileURL } from "url";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 
@@ -119,4 +119,45 @@ export async function runNodeCommand(args, options = {}) {
       resolve({ exitCode: code ?? 1, stdout, stderr });
     });
   });
+}
+
+// --- Processes ---
+
+export const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+/** The pid a program wrote to a file — or null until it has. */
+export function pidIn(file) {
+  try {
+    return Number(readFileSync(file, "utf-8").trim()) || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Poll until `check` holds. Fails, naming what was being waited for, if it never does. */
+export async function waitFor(check, what, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+}
+
+/**
+ * Run a project with a runner in a process of its own, so that a test can stop
+ * it the way a user (Ctrl-C) or a parent runner would. `setup` is code run
+ * before the project is — to stub the LLM (`llm`, see fake-llm.mjs), say.
+ */
+export function startRunnerProcess(fakeHome, projectDir, { setup = "", maxRepairAttempts = 0 } = {}) {
+  const urlOf = (...parts) => pathToFileURL(join(REPO_ROOT, ...parts)).href;
+  const script = `import { runProgram } from ${JSON.stringify(urlOf("packages", "runtime", "dist", "runner.js"))};
+import { llm } from ${JSON.stringify(urlOf("test", "fake-llm.mjs"))};
+${setup}
+await runProgram({ projectDir: ${JSON.stringify(projectDir)}, maxRepairAttempts: ${maxRepairAttempts}, timeout: 60_000 });`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, HOME: fakeHome },
+    stdio: "ignore",
+  });
+  const exited = new Promise(resolve => child.on("close", (code, signal) => resolve({ code, signal })));
+  return { child, exited };
 }

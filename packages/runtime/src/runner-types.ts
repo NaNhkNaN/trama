@@ -20,8 +20,9 @@ export interface RunOptions {
   maxRepairAttempts?: number;
   /**
    * Per-phase limit in ms on the program's own time, for each run and each
-   * repair attempt. Time during which a run the program itself started is in
-   * flight is not counted — that run has a timeout of its own.
+   * repair attempt. Time during which a run the program started with
+   * runProgram() — a session participant — is in flight is not counted: that
+   * run has a timeout of its own.
    */
   timeout?: number;
   args?: Record<string, unknown>;

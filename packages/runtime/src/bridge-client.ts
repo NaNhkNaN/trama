@@ -9,6 +9,12 @@ export interface Bridge {
   init: Record<string, any>;
   /** POST one call to the runner and return its result. */
   call(endpoint: string, body: unknown): Promise<any>;
+  /**
+   * Open a call that lasts until the returned function is called — or until
+   * this process ends, however it ends. It has no result; it is the connection
+   * itself the runner goes by.
+   */
+  hold(endpoint: string): () => void;
 }
 
 /**
@@ -18,23 +24,26 @@ export interface Bridge {
 export function openBridge(port: string, initPath: string): Bridge {
   const init = JSON.parse(readFileSync(initPath, "utf-8"));
 
+  const post = (endpoint: string, payload: string) => request({
+    host: "127.0.0.1",
+    port,
+    path: endpoint,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(payload),
+      "Authorization": `Bearer ${init.token}`,
+    },
+  });
+
   // A call lasts as long as the work behind it — an agent run, or a wait for
   // another program — so this uses node:http, which sets no deadline for the
   // response. (fetch gives up after five minutes without response headers.)
   const call = (endpoint: string, body: unknown): Promise<any> =>
     new Promise((resolve, reject) => {
       const payload = JSON.stringify(body);
-      const req = request({
-        host: "127.0.0.1",
-        port,
-        path: endpoint,
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-          "Authorization": `Bearer ${init.token}`,
-        },
-      }, (res) => {
+      const req = post(endpoint, payload);
+      req.on("response", (res) => {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
         res.on("error", reject);
@@ -48,5 +57,14 @@ export function openBridge(port: string, initPath: string): Bridge {
       req.end(payload);
     });
 
-  return { init, call };
+  const hold = (endpoint: string): (() => void) => {
+    const req = post(endpoint, "{}");
+    // Nothing to do if the runner is gone or will not have it: there is no clock to hold.
+    req.on("error", () => {});
+    req.on("response", res => res.resume());
+    req.end("{}");
+    return () => req.destroy();
+  };
+
+  return { init, call, hold };
 }

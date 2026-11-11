@@ -62,7 +62,7 @@ test("createTools shell enforces timeouts", async (t) => {
   assert.match(result.stderr, /timeout/);
 });
 
-test("createTools killActiveShells terminates in-flight commands", async (t) => {
+test("createTools stopActiveShells terminates in-flight commands", async (t) => {
   const projectDir = makeTempDir("trama-tools-");
   t.after(() => cleanupTempDir(projectDir));
 
@@ -70,13 +70,13 @@ test("createTools killActiveShells terminates in-flight commands", async (t) => 
   const pending = tools.shell("sleep 10");
 
   await new Promise(resolve => setTimeout(resolve, 50));
-  tools.killActiveShells();
+  await tools.stopActiveShells();
 
   const result = await pending;
   assert.notEqual(result.exitCode, 0);
 });
 
-test("createTools killActiveShells terminates background processes in the same process group", async (t) => {
+test("createTools stopActiveShells terminates background processes in the same process group", async (t) => {
   const projectDir = makeTempDir("trama-tools-");
   t.after(() => cleanupTempDir(projectDir));
 
@@ -84,7 +84,7 @@ test("createTools killActiveShells terminates background processes in the same p
   const pending = tools.shell("(sleep 0.2; echo leaked > leaked.txt) & sleep 10");
 
   await new Promise(resolve => setTimeout(resolve, 50));
-  tools.killActiveShells();
+  await tools.stopActiveShells();
 
   const result = await pending;
   await new Promise(resolve => setTimeout(resolve, 400));
@@ -93,7 +93,7 @@ test("createTools killActiveShells terminates background processes in the same p
   assert.equal(existsSync(join(projectDir, "leaked.txt")), false);
 });
 
-test("createTools killActiveShells still terminates background processes after the shell has exited", async (t) => {
+test("createTools stopActiveShells still terminates background processes after the shell has exited", async (t) => {
   const projectDir = makeTempDir("trama-tools-");
   t.after(() => cleanupTempDir(projectDir));
 
@@ -102,7 +102,7 @@ test("createTools killActiveShells still terminates background processes after t
 
   assert.equal(result.exitCode, 0);
 
-  tools.killActiveShells();
+  await tools.stopActiveShells();
   await new Promise(resolve => setTimeout(resolve, 400));
 
   assert.equal(existsSync(join(projectDir, "leaked.txt")), false);

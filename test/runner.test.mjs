@@ -1,12 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { spawn } from "child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
 import { join } from "path";
 import { pathToFileURL } from "url";
 import { llm } from "./fake-llm.mjs";
-import { copyToHistory, loadConfig, loadState, runProgram, RUNTIME_TYPES } from "../packages/runtime/dist/runner.js";
-import { REPO_ROOT, cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson, writeText } from "./helpers.mjs";
+import {
+  copyToHistory, createBackend, loadConfig, loadState, runProgram, RUNTIME_TYPES, validateProgram,
+} from "../packages/runtime/dist/runner.js";
+import {
+  REPO_ROOT, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, readJson, startRunnerProcess, waitFor,
+  withEnv, writeJson, writeText,
+} from "./helpers.mjs";
 
 test("loadState returns an empty object when state.json is missing", (t) => {
   const projectDir = makeTempDir("trama-runner-");
@@ -746,33 +750,54 @@ test("an allowance that is cancelled, or never started, does not run out", async
   assert.equal(spent, false);
 });
 
-// --- Process lifetime, init file security, IPC limits ---
+test("an allowance can be longer than a single timer can measure", async () => {
+  const { createAllowance } = await import("../packages/runtime/dist/child-process.js");
 
-/** Start a runner in its own process, so the test can stop it the way a user or a parent runner would. */
-function startRunnerProcess(fakeHome, projectDir, { stubRepair = "" } = {}) {
-  const runnerUrl = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "runner.js")).href;
-  const fakeLlmUrl = pathToFileURL(join(REPO_ROOT, "test", "fake-llm.mjs")).href;
-  const script = `import { runProgram } from ${JSON.stringify(runnerUrl)};
-import { llm } from ${JSON.stringify(fakeLlmUrl)};
-${stubRepair}
-await runProgram({ projectDir: ${JSON.stringify(projectDir)}, maxRepairAttempts: 1, timeout: 60_000 });`;
-  const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
-    env: { ...process.env, HOME: fakeHome },
-    stdio: "ignore",
+  // More than 2^31 ms: handed to a timer as it is, it would run out at once.
+  let spent = false;
+  const allowance = createAllowance(3_000_000_000);
+  allowance.start(() => { spent = true; });
+  await pause(150);
+  allowance.cancel();
+  assert.equal(spent, false);
+});
+
+test("a hold on a program's clock ends with the process that asked for it", { timeout: 30_000 }, async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  // The program starts a process that holds its clock — as a runner started in
+  // a process of its own would — kills it outright a second and a half later,
+  // and then hangs. Nothing ever says the hold is over; the dead process's
+  // connection closing has to be enough.
+  const bridgeClientUrl = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "bridge-client.js")).href;
+  const holder = `import { writeFileSync } from "fs";
+import { openBridge } from ${JSON.stringify(bridgeClientUrl)};
+openBridge(process.env.TRAMA_PORT, process.env.TRAMA_INIT).hold("/clock/hold");
+writeFileSync("holding", "");
+setInterval(() => {}, 1000);`;
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { spawn } from "child_process";
+import { existsSync } from "fs";
+const holder = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(holder)}], { stdio: "ignore" });
+while (!existsSync("holding")) await new Promise(resolve => setTimeout(resolve, 20));
+await new Promise(resolve => setTimeout(resolve, 1500));
+holder.kill("SIGKILL");
+setInterval(() => {}, 1000);
+await new Promise(() => {});`,
   });
-  const exited = new Promise(resolve => child.on("close", (code, signal) => resolve({ code, signal })));
-  return { child, exited };
-}
 
-async function waitFor(check, what, timeoutMs = 10_000) {
-  const deadline = Date.now() + timeoutMs;
-  while (!check()) {
-    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
-    await new Promise(resolve => setTimeout(resolve, 25));
-  }
-}
+  const started = Date.now();
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 2_000 });
+  const elapsed = Date.now() - started;
 
-const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /timeout/, "once the holder is gone the program must be timed out again");
+  assert.ok(elapsed >= 3_000, `the clock should have stopped while it was held (the run took ${elapsed}ms)`);
+});
+
+// --- Process lifetime, init file security, IPC limits ---
 
 test("stopping the runner stops the program and the shell commands it started", async (t) => {
   const fakeHome = makeTempDir("trama-home-");
@@ -790,9 +815,9 @@ await tools.shell("echo $$ > ${join(signalDir, "shell.pid")}; sleep 60", { timeo
   });
 
   const { child, exited } = startRunnerProcess(fakeHome, projectDir);
-  await waitFor(() => existsSync(join(signalDir, "shell.pid")) && readFileSync(join(signalDir, "shell.pid"), "utf-8").trim() !== "", "the shell command to start");
-  const programPid = Number(readFileSync(join(signalDir, "program.pid"), "utf-8"));
-  const shellPid = Number(readFileSync(join(signalDir, "shell.pid"), "utf-8"));
+  await waitFor(() => pidIn(join(signalDir, "shell.pid")), "the shell command to start");
+  const programPid = pidIn(join(signalDir, "program.pid"));
+  const shellPid = pidIn(join(signalDir, "shell.pid"));
   assert.equal(isAlive(programPid) && isAlive(shellPid), true);
 
   child.kill("SIGINT");
@@ -821,12 +846,40 @@ await new Promise(() => {});`,
   });
 
   const { child, exited } = startRunnerProcess(fakeHome, projectDir);
-  await waitFor(() => existsSync(join(signalDir, "program.pid")), "the program to start");
-  const programPid = Number(readFileSync(join(signalDir, "program.pid"), "utf-8"));
+  await waitFor(() => pidIn(join(signalDir, "program.pid")), "the program to start");
+  const programPid = pidIn(join(signalDir, "program.pid"));
 
   child.kill("SIGINT");
   await exited;
   await waitFor(() => !isAlive(programPid), "the program to be killed", 12_000);
+});
+
+test("a program gets to act on being asked to stop, even when it is busy", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const projectDir = makeTempDir("trama-runner-");
+  const signalDir = makeTempDir("trama-signal-");
+  t.after(() => { cleanupTempDir(fakeHome); cleanupTempDir(projectDir); cleanupTempDir(signalDir); });
+
+  // Working in stretches of a fifth of a second, the program cannot answer a
+  // signal at once. It still has the whole grace period to — which is what a
+  // program that coordinates others needs to stop what it started.
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { writeFileSync } from "fs";
+process.on("SIGTERM", () => {
+  writeFileSync(${JSON.stringify(join(signalDir, "stopped-cleanly"))}, "");
+  process.exit(0);
+});
+writeFileSync(${JSON.stringify(join(signalDir, "program.pid"))}, String(process.pid));
+setInterval(() => { const until = Date.now() + 200; while (Date.now() < until); }, 0);`,
+  });
+
+  const { child, exited } = startRunnerProcess(fakeHome, projectDir);
+  await waitFor(() => pidIn(join(signalDir, "program.pid")), "the program to start");
+
+  child.kill("SIGINT");
+  await exited;
+  await waitFor(() => existsSync(join(signalDir, "stopped-cleanly")), "the program to act on SIGTERM", 5_000);
 });
 
 test("a runner stopped while trying a fix leaves the project as it was", async (t) => {
@@ -847,11 +900,12 @@ writeFileSync("written-by-fix.txt", "x");
 writeFileSync(${JSON.stringify(join(signalDir, "fix.pid"))}, String(process.pid));
 await new Promise(() => {});`;
   const { child, exited } = startRunnerProcess(fakeHome, projectDir, {
-    stubRepair: `llm.repair = async () => ${JSON.stringify(fix)};`,
+    maxRepairAttempts: 1,
+    setup: `llm.repair = async () => ${JSON.stringify(fix)};`,
   });
 
-  await waitFor(() => existsSync(join(signalDir, "fix.pid")), "the fix to be running");
-  const fixPid = Number(readFileSync(join(signalDir, "fix.pid"), "utf-8"));
+  await waitFor(() => pidIn(join(signalDir, "fix.pid")), "the fix to be running");
+  const fixPid = pidIn(join(signalDir, "fix.pid"));
   child.kill("SIGTERM");
   await exited;
 
@@ -878,6 +932,101 @@ await ctx.done();`,
   await new Promise(resolve => setTimeout(resolve, 600));
   assert.equal(existsSync(join(projectDir, "leaked.txt")), false,
     "background processes must be killed even on successful runs");
+});
+
+for (const [ending, lastLine] of [["finished", "await ctx.done();"], ["crashed", 'throw new Error("crash");']]) {
+  test(`what a program started itself does not outlive a run that ${ending}`, async (t) => {
+    const projectDir = makeTempDir("trama-runner-");
+    t.after(() => cleanupTempDir(projectDir));
+
+    // Not a shell command run through tools.shell(): a process of the program's own.
+    createProjectFixture(projectDir, {
+      scaffold: false,
+      programSource: `import { ctx } from "@trama-dev/runtime";
+import { spawn } from "child_process";
+import { writeFileSync } from "fs";
+const child = spawn("sleep", ["60"], { stdio: "ignore" });
+child.unref();
+writeFileSync("child.pid", String(child.pid));
+${lastLine}`,
+    });
+
+    await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+    const childPid = pidIn(join(projectDir, "child.pid"));
+    assert.ok(childPid, "the program should have started its process");
+    await waitFor(() => !isAlive(childPid), "the program's own process to be stopped", 5_000);
+  });
+}
+
+test("a run does not return while something it started is still running", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  // A background job that ignores being asked to stop. It has to be killed —
+  // and the run must not be reported over before it is: whoever called is
+  // about to merge, or delete, the directory it is working in.
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+await tools.shell("nohup sh -c 'trap \\"\\" TERM; echo $$ > job.pid; while :; do sleep 1; done' >/dev/null 2>&1 &");
+while (!(await tools.read("job.pid").catch(() => "")).trim()) await new Promise(resolve => setTimeout(resolve, 20));
+await ctx.done();`,
+  });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.equal(result.status, "done");
+  const jobPid = pidIn(join(projectDir, "job.pid"));
+  assert.ok(jobPid, "the job should have started");
+  // (A moment's allowance: a killed process is still listed until it has been collected.)
+  await waitFor(() => !isAlive(jobPid), "the job to be gone once the run has returned", 500);
+});
+
+test("a process that outlives a program on purpose does not keep its run from ending", { timeout: 30_000 }, async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  let detachedPid = null;
+  t.after(() => {
+    if (detachedPid) { try { process.kill(detachedPid, "SIGKILL"); } catch { /* already gone */ } }
+    cleanupTempDir(projectDir);
+  });
+
+  // Detached, so in a process group of its own and out of the runner's reach —
+  // but still holding the program's output pipes open.
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx } from "@trama-dev/runtime";
+import { spawn } from "child_process";
+import { writeFileSync } from "fs";
+const child = spawn("sleep", ["25"], { detached: true, stdio: "inherit" });
+child.unref();
+writeFileSync("detached.pid", String(child.pid));
+await ctx.done();`,
+  });
+
+  const started = Date.now();
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  detachedPid = pidIn(join(projectDir, "detached.pid"));
+
+  assert.equal(result.status, "done");
+  assert.ok(Date.now() - started < 10_000, "the run should end with the program, not with what it left behind");
+  assert.equal(isAlive(detachedPid), true, "what a program detaches is left alone");
+});
+
+test("a long-running program that does not handle SIGTERM is still a valid program", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false });
+
+  // Validation stops a program once it has been ready for a while. Dying of
+  // that signal is the expected end, whether or not the program handles it.
+  const candidate = `import { ctx } from "@trama-dev/runtime";
+await ctx.ready();
+setInterval(() => {}, 1000);
+await new Promise(() => {});`;
+
+  const validated = await validateProgram(projectDir, createBackend(loadConfig()), candidate, {
+    timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10,
+  });
+  assert.equal(validated.source, candidate);
 });
 
 test("runProgram init payload is not world-readable", async (t) => {

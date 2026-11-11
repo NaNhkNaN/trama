@@ -396,7 +396,7 @@ trama could have stopped at code generation. But generated code without an execu
 
 The runtime is what makes agent programs **self-contained and shareable**:
 
-- **Execution** — spawns programs as child processes with streaming stdout/stderr, manages timeouts, and handles cleanup of background processes and process groups.
+- **Execution** — spawns programs as child processes with streaming stdout/stderr, and manages timeouts. Nothing a program starts outlives its run: when the run ends — or the runner is stopped — its shell commands and its own child processes are asked to stop (SIGTERM) and killed if they have not gone five seconds later, and the run is not over until they are gone. A process the program detaches into a process group of its own is out of reach.
 - **IPC bridge** — programs communicate with the runtime through a local HTTP server. Every `ctx`, `agent`, `tools` and `workspace` call goes through this bridge, which gives the runtime a single point where it validates each request and can cancel work in flight when a run ends.
 - **State persistence** — `ctx.state` survives across runs via `checkpoint()` and `done()`. Programs can be long-running, interruptible, and resumable. `ctx.yield()` suspends a program cooperatively — persists state and exits, ready for the session layer to resume it later.
 - **Shared workspace** — when programs run in a session, they share a workspace for artifact I/O. Atomic writes, path guarding, and level-triggered observation (`workspace.observe()`) — without a message bus or coordination framework.

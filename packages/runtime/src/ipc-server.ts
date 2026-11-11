@@ -21,7 +21,8 @@ type Body = Record<string, any>;
 interface Route {
   /** Body fields checked before the handler runs. */
   fields: Record<string, FieldType>;
-  handle(body: Body): unknown;
+  /** `connectionClosed` resolves when the caller's connection ends, answered or not. */
+  handle(body: Body, connectionClosed: Promise<void>): unknown;
 }
 
 export interface IpcBackends {
@@ -74,9 +75,6 @@ function buildRoutes({ ctx, agent, tools, workspace, onTerminalSignal, holdClock
     if (!workspace) throw new BadRequest("Workspace is only available when running in a session");
     return workspace;
   };
-  /** Runs the program has started and not yet seen end, each holding its clock. */
-  const nestedRuns = new Map<string, () => void>();
-  let nestedRunCount = 0;
 
   return {
     "/agent/instruct": {
@@ -129,20 +127,15 @@ function buildRoutes({ ctx, agent, tools, workspace, onTerminalSignal, holdClock
     },
 
     // A run the program starts — a session participant — is under a timeout
-    // of its own. The program's clock stops for as long as that run lasts.
-    "/nested-run/begin": {
+    // of its own, and the program's clock stops while it lasts (see
+    // holdParentClock). The hold is the connection: it ends when the caller
+    // closes it, and cannot outlast a caller that dies without doing so.
+    "/clock/hold": {
       fields: {},
-      handle: () => {
-        const id = String(++nestedRunCount);
-        nestedRuns.set(id, holdClock());
-        return id;
-      },
-    },
-    "/nested-run/end": {
-      fields: { id: "string" },
-      handle: b => {
-        nestedRuns.get(b.id)?.();
-        nestedRuns.delete(b.id);
+      handle: async (_body, connectionClosed) => {
+        const release = holdClock();
+        await connectionClosed;
+        release();
       },
     },
 
@@ -163,7 +156,9 @@ export function createIPCServer(backends: IpcBackends): Server {
   const routes = buildRoutes(backends);
 
   return createServer((req, res) => {
+    const connectionClosed = new Promise<void>(resolve => res.once("close", resolve));
     const reply = (status: number, body: string, json = false) => {
+      if (res.writableEnded || res.destroyed) return; // answered already, or nobody left to answer
       res.writeHead(status, json ? { "Content-Type": "application/json" } : undefined);
       res.end(body);
     };
@@ -182,9 +177,12 @@ export function createIPCServer(backends: IpcBackends): Server {
       chunks.push(chunk);
       byteCount += chunk.length;
       if (byteCount > MAX_IPC_BODY) {
+        // Answer now, and let the rest of the body arrive and be discarded.
+        // Cutting the connection instead would race the answer: a sender still
+        // writing sees a broken connection, not the reason for it.
         overflow = true;
+        chunks.length = 0;
         reply(413, "IPC request body exceeds 50MB limit");
-        req.destroy();
       }
     });
     req.on("end", async () => {
@@ -194,7 +192,7 @@ export function createIPCServer(backends: IpcBackends): Server {
         const route = req.url ? routes[req.url] : undefined;
         if (!route) return reply(404, "Not found");
         validate(body, route.fields);
-        const result = await route.handle(body);
+        const result = await route.handle(body, connectionClosed);
         reply(200, JSON.stringify({ result: result ?? null }), true);
       } catch (err) {
         reply(err instanceof BadRequest ? 400 : 500, err instanceof BadRequest ? err.message : String(err));

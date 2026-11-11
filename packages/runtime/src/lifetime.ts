@@ -8,24 +8,25 @@
 // leave them running when it ended.
 
 import { rmSync } from "fs";
-import { stopGroups } from "./child-process.js";
+import { stopGroupsOnExit } from "./child-process.js";
 
 const SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 type Signal = (typeof SIGNALS)[number];
 
-const pendingUndos = new Set<() => void>();
 const pendingGroups = new Set<number>();
+const pendingDirs = new Set<string>();
 let installed = false;
 
 function runPending(): void {
-  for (const undo of [...pendingUndos]) {
-    try { undo(); } catch { /* best-effort: we are on the way out */ }
-  }
-  pendingUndos.clear();
-  // Asked to stop, not killed: a group may hold a runner with work of its own
-  // to undo — and this very code is what does that, one level down.
-  stopGroups([...pendingGroups]);
+  const groups = [...pendingGroups];
+  const dirs = [...pendingDirs];
   pendingGroups.clear();
+  pendingDirs.clear();
+  // The groups are asked to stop and given a moment; whatever sees that through
+  // also removes the directories again once they are gone, in case they were
+  // still writing to them.
+  stopGroupsOnExit(groups, dirs);
+  for (const dir of dirs) removeTempDir(dir);
 }
 
 function onSignal(signal: Signal): void {
@@ -55,30 +56,30 @@ function uninstall(): void {
   for (const signal of SIGNALS) process.removeListener(signal, onSignal);
 }
 
-function settle<T>(pending: Set<T>, item: T): () => void {
+/** Keep `item` pending until the returned function is called. */
+function track<T>(pending: Set<T>, item: T): () => void {
   pending.add(item);
   install();
   return () => {
     pending.delete(item);
-    if (pendingUndos.size === 0 && pendingGroups.size === 0) uninstall();
+    if (pendingGroups.size === 0 && pendingDirs.size === 0) uninstall();
   };
 }
 
 /**
- * Register something to undo if this process ends before `settle` is called.
- * `undo` must be synchronous. Returns `settle`: call it once the thing has been
- * dealt with in the normal course of the run.
+ * Register a process group this process started: if this process ends before
+ * the returned function is called, the group is stopped (see stopGroupsOnExit).
  */
-export function untilSettled(undo: () => void): () => void {
-  return settle(pendingUndos, undo);
+export function stopWithThisProcess(pgid: number): () => void {
+  return track(pendingGroups, pgid);
 }
 
 /**
- * Register a process group this process started: if this process ends before
- * `settle` is called, the group is stopped (see stopGroups). Returns `settle`.
+ * Register a temp directory this process created: if this process ends before
+ * the returned function is called, the directory is removed.
  */
-export function stopWithThisProcess(pgid: number): () => void {
-  return settle(pendingGroups, pgid);
+export function removeWithThisProcess(dir: string): () => void {
+  return track(pendingDirs, dir);
 }
 
 /** Remove a temp directory. Best-effort: failing to clean up must never change a run's outcome. */

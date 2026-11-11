@@ -18,9 +18,9 @@ import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
 import { guardPath } from "./path-guard.js";
-import { createAllowance, superviseChild, type ChildExit } from "./child-process.js";
+import { createAllowance, stopGroups, superviseChild, type ChildExit } from "./child-process.js";
 import { openBridge } from "./bridge-client.js";
-import { removeTempDir, stopWithThisProcess, untilSettled } from "./lifetime.js";
+import { removeTempDir, removeWithThisProcess, stopWithThisProcess } from "./lifetime.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
 
 // --- Locating the runtime itself ---
@@ -28,8 +28,14 @@ import { createIPCServer, listen, closeServer } from "./ipc-server.js";
 /** The installed @trama-dev/runtime package — this file lives in its dist/. */
 const RUNTIME_PACKAGE_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 
-/** tsx executes program.ts. Resolved through the module system, so any install layout works. */
-const TSX_CLI = fileURLToPath(import.meta.resolve("tsx/cli"));
+/**
+ * tsx lets node run program.ts. Resolved through the module system, so any
+ * install layout works. It is loaded into the program's own node process
+ * rather than run as the `tsx` command, which puts a process of its own in
+ * front of the program: one that kills the program some 60 ms after a SIGTERM
+ * it has not acted on, and reports its death by signal as an exit code.
+ */
+const TSX_LOADER = import.meta.resolve("tsx");
 
 /**
  * The @trama-dev packages a program.ts can import, and where they are installed.
@@ -354,7 +360,7 @@ export function commitStagedChanges(
 /** Run fn in a temp directory, clean up afterwards regardless of outcome — including this process being stopped. */
 export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), prefix));
-  const settled = untilSettled(() => removeTempDir(dir));
+  const settled = removeWithThisProcess(dir);
   try {
     return await fn(dir);
   } finally {
@@ -514,8 +520,10 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     holdClock: () => allowance.hold(),
   });
 
-  // If this process is stopped while the program is running, take the program down with it.
-  let programStopped = () => {};
+  // The program leads a process group of its own, so that everything it starts is in it.
+  let programGroup: number | undefined;
+  // If this process is stopped while the program is running, the program is stopped with it.
+  let programSettled = () => {};
   try {
     const child = await withTempDir("trama-init-", async (initDir) => {
       const port = await listen(server);
@@ -530,14 +538,14 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
         yieldReason: ctx.yieldReason,
       });
 
-      const program = spawn(process.execPath, [TSX_CLI, guardPath(projectDir, "program.ts")], {
+      const program = spawn(process.execPath, ["--import", TSX_LOADER, guardPath(projectDir, "program.ts")], {
         cwd: projectDir,
         env: { ...process.env, TRAMA_PORT: String(port), TRAMA_INIT: initFile },
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       });
-      const pgid = program.pid;
-      if (pgid) programStopped = stopWithThisProcess(pgid);
+      programGroup = program.pid;
+      if (programGroup) programSettled = stopWithThisProcess(programGroup);
 
       return toChildResult(await superviseChild(program, {
         timeout: allowance,
@@ -550,12 +558,14 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     });
     return { outcome: settle(projectDir, child, terminalSignal), failure: describeFailure(child) };
   } finally {
-    // The program is gone (or never started): cancel what it left in flight,
-    // kill shells it left running in the background, and drop its connections.
-    programStopped();
+    // The program is gone (or never started). Nothing it started outlives its
+    // run: cancel the calls it left in flight, and stop what is left of its
+    // process group and of its shell commands. Only once they are gone is the
+    // run over — whoever called will merge or delete what they were writing to.
     if (readyTimer) clearTimeout(readyTimer);
     runEnded.abort();
-    tools.killActiveShells();
+    await Promise.all([stopGroups(programGroup ? [programGroup] : []), tools.stopActiveShells()]);
+    programSettled();
     server.closeAllConnections();
     await closeServer(server).catch(() => { /* best-effort */ });
   }
@@ -572,6 +582,9 @@ interface Execution {
   /** Set when the program only worked after a repair: which attempt, and the failure it fixed. */
   repair?: { attempt: number; error: string };
 }
+
+/** The instructions a request for a fix is made under. (Exported so the tests' stand-in LLM can tell one from any other call.) */
+export const REPAIR_SYSTEM_PROMPT = "You are a TypeScript repair tool.";
 
 const repairPrompt = (input: { programSource: string; error: string }) =>
   `Fix this program so it runs.\n\n` +
@@ -599,7 +612,7 @@ async function requestRepair(
     const timer = setTimeout(() => controller.abort(), options.timeout);
     try {
       const fixed = stripCodeFences(await options.backend.ask(repairPrompt(input), {
-        cwd: tempDir, system: "You are a TypeScript repair tool.", signal: controller.signal,
+        cwd: tempDir, system: REPAIR_SYSTEM_PROMPT, signal: controller.signal,
       }));
       if (fixed.trim() === "") throw new Error("The repair returned an empty program.");
       if (fixed === input.programSource) throw new Error("The repair returned the program unchanged.");
@@ -633,14 +646,12 @@ async function tryFix(options: ExecuteOptions, fixed: string): Promise<RunOnceRe
   const { projectDir } = options;
   const run = await withStagedCopy(projectDir, async (stagedProject) => {
     writeFileSync(guardPath(stagedProject, "program.ts"), fixed);
-    let run: RunOnceResult;
-    try {
-      run = await runProgramOnce({ ...options, projectDir: stagedProject });
-    } catch (err) {
-      // The copy could not be run at all, or was left unusable. Either way this fix did not work.
-      run = { outcome: null, failure: `The repaired program could not be run: ${err instanceof Error ? err.message : err}` };
-    }
-    return { commit: run.outcome !== null, value: run };
+    // If the copy cannot be run at all, or is left unusable, this fix did not work either.
+    const trial = await runProgramOnce({ ...options, projectDir: stagedProject }).catch((err): RunOnceResult => ({
+      outcome: null,
+      failure: `The repaired program could not be run: ${err instanceof Error ? err.message : err}`,
+    }));
+    return { commit: trial.outcome !== null, value: trial };
   });
 
   // The merge above carries over what the run changed; the fix itself was
@@ -749,25 +760,27 @@ export function installValidatedProgram(
  *
  * Returns what ends the hold. Best-effort: if that runner cannot be reached
  * its program's run is over, and this one is about to be stopped with it.
+ *
+ * This exists only because the runner of a participant lives inside the
+ * program that spawned it, where that program's own runner cannot see it. It
+ * goes away once starting a run is itself a call on the bridge.
  */
-async function holdParentClock(): Promise<() => Promise<void>> {
+function holdParentClock(): () => void {
   const { TRAMA_PORT: port, TRAMA_INIT: initPath } = process.env;
   if (port && initPath) {
     try {
-      const bridge = openBridge(port, initPath);
-      const id = await bridge.call("/nested-run/begin", {});
-      return async () => { await bridge.call("/nested-run/end", { id }).catch(() => {}); };
+      return openBridge(port, initPath).hold("/clock/hold");
     } catch { /* not held */ }
   }
-  return async () => {};
+  return () => {};
 }
 
 export async function runProgram(options: RunOptions): Promise<ProgramResult> {
-  const releaseParentClock = await holdParentClock();
+  const releaseParentClock = holdParentClock();
   try {
     return await runProject(options);
   } finally {
-    await releaseParentClock();
+    releaseParentClock();
   }
 }
 

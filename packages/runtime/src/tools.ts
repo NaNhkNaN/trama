@@ -11,8 +11,8 @@ const DEFAULT_SHELL_TIMEOUT = 30_000;
 const GROUP_SWEEP_MS = 250;
 
 export interface ToolsWithCleanup extends Tools {
-  /** Stop every shell command still running, and anything they left in the background. */
-  killActiveShells(): void;
+  /** Stop every shell command still running, and anything they left in the background. Resolves when they are gone. */
+  stopActiveShells(): Promise<void>;
 }
 
 export function createTools(projectDir: string, signal?: AbortSignal): ToolsWithCleanup {
@@ -32,9 +32,11 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
     groups.delete(pgid);
   };
 
-  // Shell commands must not see the bridge's address or the init file (which
-  // holds its secret). A top-level runner has neither in its environment, but
-  // a runner inside a program — a session's creator — inherits both.
+  // Shell commands run here do not get the bridge's address or the init file
+  // (which holds its secret). A top-level runner has neither in its
+  // environment, but a runner inside a program — a session's creator —
+  // inherits both. (This covers tools.shell only: what the agent backend runs
+  // on its own takes its environment from this process.)
   const { TRAMA_PORT: _port, TRAMA_INIT: _init, ...shellEnv } = process.env;
 
   const stopSweeping = () => {
@@ -55,7 +57,7 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
 
   const markShellExited = (pgid: number) => {
     const group = groups.get(pgid);
-    if (!group) return; // already killed by killActiveShells
+    if (!group) return; // already stopped by stopActiveShells
     group.shellExited = true;
     if (!sweeper) {
       sweeper = setInterval(sweep, GROUP_SWEEP_MS);
@@ -64,9 +66,9 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
   };
 
   return {
-    killActiveShells() {
+    async stopActiveShells() {
       const pgids = [...groups.keys()];
-      stopGroups(pgids);
+      await stopGroups(pgids);
       for (const pgid of pgids) untrack(pgid);
       stopSweeping();
     },

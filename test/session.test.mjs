@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { spawn } from "child_process";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
-import { pathToFileURL } from "url";
 import { runProgram } from "../packages/runtime/dist/runner.js";
 import { Session } from "../packages/session/dist/index.js";
-import { cleanupTempDir, createProjectFixture, makeTempDir, REPO_ROOT, withEnv } from "./helpers.mjs";
+import {
+  cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, startRunnerProcess, waitFor, withEnv,
+} from "./helpers.mjs";
 
 test("Session.spawn returns done ProgramResult", async (t) => {
   const projectDir = makeTempDir("trama-session-");
@@ -347,22 +347,12 @@ while (!existsSync(${JSON.stringify(join(signalDir, "shell.pid"))})) await new P
 throw new Error("the entry program crashes");`,
   });
 
-  const pidOf = (name) => Number(readFileSync(join(signalDir, name), "utf-8"));
-  const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-  const settled = async (check, ms) => {
-    const deadline = Date.now() + ms;
-    while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
-    return check();
-  };
-
   const result = await runProgram({ projectDir: entryDir, maxRepairAttempts: 0, timeout: 30_000 });
   assert.equal(result.status, "failed");
   assert.match(result.reason, /the entry program crashes/);
 
-  assert.equal(
-    await settled(() => !isAlive(pidOf("worker.pid")) && !isAlive(pidOf("shell.pid")), 5_000), true,
-    "the participant and its shell command must be gone once the program that spawned them is",
-  );
+  const pids = ["worker.pid", "shell.pid"].map(name => pidIn(join(signalDir, name)));
+  await waitFor(() => !pids.some(isAlive), "the participant and its shell command to be gone", 5_000);
 });
 
 test("stopping the runner stops the participants of its program, and what they started", async (t) => {
@@ -393,31 +383,14 @@ await ctx.done();`,
   });
 
   // A runner in a process of its own, stopped the way Ctrl-C stops `trama run`.
-  const runnerUrl = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "runner.js")).href;
-  const runner = spawn(process.execPath, ["--input-type=module", "-e",
-    `import { runProgram } from ${JSON.stringify(runnerUrl)};
-await runProgram({ projectDir: ${JSON.stringify(entryDir)}, maxRepairAttempts: 0, timeout: 60_000 });`,
-  ], { env: { ...process.env, HOME: fakeHome }, stdio: "ignore" });
-  const exited = new Promise(resolve => runner.on("close", resolve));
+  const { child, exited } = startRunnerProcess(fakeHome, entryDir);
+  const pidFiles = ["entry.pid", "worker.pid", "shell.pid"].map(name => join(signalDir, name));
+  await waitFor(() => pidFiles.every(pidIn), "the participant to get as far as its shell command", 20_000);
+  const pids = pidFiles.map(pidIn);
+  assert.equal(pids.every(isAlive), true, "all three should be running");
 
-  const pidOf = (name) => Number(readFileSync(join(signalDir, name), "utf-8"));
-  const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-  const settled = async (check, ms) => {
-    const deadline = Date.now() + ms;
-    while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
-    return check();
-  };
-  const names = ["entry.pid", "worker.pid", "shell.pid"];
-
-  assert.equal(
-    await settled(() => existsSync(join(signalDir, "shell.pid")) && readFileSync(join(signalDir, "shell.pid"), "utf-8").trim() !== "", 20_000),
-    true, "the participant should get as far as its shell command",
-  );
-  assert.deepEqual(names.filter(name => !isAlive(pidOf(name))), [], "all three should be running");
-
-  runner.kill("SIGINT");
+  child.kill("SIGINT");
   await exited;
 
-  await settled(() => names.every(name => !isAlive(pidOf(name))), 5_000);
-  assert.deepEqual(names.filter(name => isAlive(pidOf(name))), [], "nothing the runner's program started may survive it");
+  await waitFor(() => !pids.some(isAlive), "everything the runner's program started to be gone", 5_000);
 });

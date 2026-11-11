@@ -17,6 +17,13 @@ All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`
 ### Fixed
 
 - **Stopping the runner no longer leaves the shell commands of session participants running.** A stopped runner killed its program's process group outright. But a program that coordinates others holds a runner of its own, which was killed before it could stop what it had started: the participant went, its shell command stayed. A runner now asks first — SIGTERM, then SIGKILL to whatever is still there after five seconds — both for its program and for shell commands, so that anything holding a runner gets to stop what it started. A program that ignores SIGTERM is therefore killed five seconds after the runner is stopped rather than at once.
+- **A program has the whole grace period to act on SIGTERM.** Programs were started through the `tsx` command, which put a process of its own in front of the program — one that killed the program about 60 ms after a SIGTERM it had not yet acted on. A program busy for longer than that never ran its handler. Programs are now run by node directly, with tsx loaded into it.
+- **A long-running program does not have to handle SIGTERM to be created or updated.** Validation stops a program once it has been ready for a while. Behind the `tsx` command, a program that simply died of that signal looked like one that had exited with code 143, and was rejected — or sent to be repaired.
+- **What a program starts itself no longer outlives its run.** Shell commands run through `tools.shell()` were stopped when a run ended; a process the program started on its own, with `child_process`, was not — it kept running after the program finished or crashed, and was still there when a repair ran. The program's process group is now stopped at the end of every run, and the run is not over until what it started is gone. A process the program deliberately detaches is still left alone.
+- **A run ends when its program does.** A process the program had detached, but which still held the program's output open, kept the run from ever ending — timeout included.
+- A timeout now kills everything left in the process group after the grace period, not only the process that was started.
+- A timeout longer than about 24.8 days expired at once. Timeouts are also no longer thrown off by the system clock being set while a program runs.
+- A request to the bridge with a body over 50 MB is answered with 413 and the rest of the body discarded. The connection used to be cut as the answer was sent, so the sender could see a broken connection instead of the reason.
 
 ### Internal
 
