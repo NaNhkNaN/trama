@@ -38,6 +38,6 @@
   },
   "dependencies": {
     "@earendil-works/pi-coding-agent": "1.5.2",
-    "tsx": "^4.23.15"
+    "tsx": "4.23.15"
   }
 }

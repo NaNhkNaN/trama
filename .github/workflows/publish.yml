@@ -4,26 +4,30 @@ on:
   push:
     tags: ["v*"]
 
-# Publishing authenticates with npm trusted publishing (OIDC): npm exchanges the
-# job's GitHub identity for a short-lived credential, so this workflow uses no
-# stored token at all. Each package must list this repository and this workflow
-# file (publish.yml) as a trusted publisher on npmjs.com.
-jobs:
-  publish:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write # lets the job request the OIDC token npm verifies
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
-          package-manager-cache: false # a release build should not start from a shared cache
+# Nothing in this workflow gets more than it needs: no job may write to the
+# repository, and only the publish job may ask npm for publishing rights.
+permissions:
+  contents: read
 
-      # Trusted publishing needs npm 11.5.1 or newer; Node 22 ships npm 10.
-      - run: npm install -g npm@latest
+# The release is split in two so that the job holding publishing rights runs no
+# third-party code at all.
+#
+#   build    installs dependencies, compiles, packs and tests — everything that
+#            executes code from node_modules. It has no way to publish.
+#   publish  takes the packed tarballs and hands them to npm. It installs
+#            nothing and checks out nothing.
+#
+# Actions are pinned to full commit SHAs (a tag can be moved; a commit cannot),
+# and nothing is fetched at "latest".
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          package-manager-cache: false # a release build should not start from a shared cache
 
       - name: Verify tag matches package versions
         run: |
@@ -44,9 +48,64 @@ jobs:
           [ "$CLI_SS_DEP" != "$TAG" ] && echo "::error::cli depends on session $CLI_SS_DEP != tag $TAG" && FAIL=1
           exit $FAIL
 
-      - run: npm ci
+      # Dependencies' install scripts are not needed and are not run.
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+
+      # Pack and hand over the tarballs BEFORE the test suite runs. The tests
+      # execute the whole dependency tree; whatever they do after this point
+      # cannot change what gets published. If they fail, this job fails and the
+      # publish job never starts.
+      - name: Pack
+        run: |
+          mkdir -p "$RUNNER_TEMP/tarballs"
+          npm pack --workspaces --ignore-scripts --pack-destination "$RUNNER_TEMP/tarballs"
+          ls -l "$RUNNER_TEMP/tarballs"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tarballs
+          path: ${{ runner.temp }}/tarballs/*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
       - run: npm test
-      # No token: these authenticate over OIDC, and provenance is attached automatically.
-      - run: npm publish -w @trama-dev/runtime --access public
-      - run: npm publish -w @trama-dev/session --access public
-      - run: npm publish -w @trama-dev/cli --access public
+
+  # Publishing authenticates with npm trusted publishing (OIDC): npm exchanges
+  # this job's GitHub identity for a short-lived credential, so no token is
+  # stored anywhere. Each package must list this repository and this workflow
+  # file (publish.yml) as a trusted publisher on npmjs.com.
+  #
+  # It uses the npm that ships with Node 24, which is new enough for trusted
+  # publishing (11.5.1 or later) — so there is no npm to install either.
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # lets the job request the OIDC token npm verifies
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tarballs
+          path: tarballs
+
+      # Runtime first: the other two depend on it, and the CLI on both.
+      # Provenance is attached automatically.
+      #
+      # A package whose version is already on the registry is skipped, so a run
+      # that failed part-way can simply be re-run to publish the rest.
+      - name: Publish
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          npm --version
+          for PKG in runtime session cli; do
+            if npm view "@trama-dev/$PKG@$VERSION" version >/dev/null 2>&1; then
+              echo "@trama-dev/$PKG@$VERSION is already published — skipping"
+              continue
+            fi
+            npm publish "tarballs/trama-dev-$PKG-$VERSION.tgz" --access public --ignore-scripts
+          done

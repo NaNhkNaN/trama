@@ -32,6 +32,6 @@
   "dependencies": {
     "@trama-dev/runtime": "0.2.1",
     "@trama-dev/session": "0.2.1",
-    "commander": "^15.1.0"
+    "commander": "15.1.0"
   }
 }
