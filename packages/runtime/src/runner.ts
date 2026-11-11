@@ -297,7 +297,7 @@ const sameStat = (a: { size: number; mtimeMs: number }, b: { size: number; mtime
 /**
  * Merge what a run did to a staged copy back into the real directory, with a
  * three-way check so that nothing changed in the real directory meanwhile —
- * by another session participant, or by the user — is overwritten.
+ * by the user, or by another run of the same project — is overwritten.
  *
  * @param stagedDir - the copy after the run (source of changes)
  * @param realDir - the real directory (destination)
@@ -610,33 +610,34 @@ async function requestRepair(
 }
 
 /**
- * Try a proposed fix: run it on a private copy of the project (and of the
- * shared workspace). Only if it works does anything reach the real ones — the
- * fix becomes program.ts, and what the run wrote is merged back. A fix that
- * fails, or a runner that is stopped half-way, leaves the project exactly as
- * it was, because it was never touched.
+ * Try a proposed fix.
+ *
+ * The project is the program's own, so the fix runs on a private copy of it.
+ * Only if it works does anything reach the real one — the fix becomes
+ * program.ts, and what the run wrote is merged back. A fix that fails, or a
+ * runner that is stopped half-way, leaves the project exactly as it was,
+ * because it was never touched: its state is only ever written by code that
+ * is, or becomes, its program.
+ *
+ * The shared workspace is not copied. It is how the participants of a session
+ * talk to each other, and a program that is being fixed still has to be heard
+ * and answered — a fix that wrote its requests where nobody could see them
+ * would wait for replies forever. So what a fix writes there is written,
+ * whether or not the fix works: like anything a run wrote before it failed.
  */
 async function tryFix(options: ExecuteOptions, fixed: string): Promise<RunOnceResult> {
-  const { projectDir, workspaceDir } = options;
-  const inStagedProject = (stagedWorkspace: string | undefined) =>
-    withStagedCopy(projectDir, async (stagedProject) => {
-      writeFileSync(guardPath(stagedProject, "program.ts"), fixed);
-      let run: RunOnceResult;
-      try {
-        run = await runProgramOnce({ ...options, projectDir: stagedProject, workspaceDir: stagedWorkspace });
-      } catch (err) {
-        // The copy could not be run at all, or was left unusable. Either way this fix did not work.
-        run = { outcome: null, failure: `The repaired program could not be run: ${err instanceof Error ? err.message : err}` };
-      }
-      return { commit: run.outcome !== null, value: run };
-    });
-
-  const run = workspaceDir
-    ? await withStagedCopy(workspaceDir, async (stagedWorkspace) => {
-        const value = await inStagedProject(stagedWorkspace);
-        return { commit: value.outcome !== null, value };
-      })
-    : await inStagedProject(undefined);
+  const { projectDir } = options;
+  const run = await withStagedCopy(projectDir, async (stagedProject) => {
+    writeFileSync(guardPath(stagedProject, "program.ts"), fixed);
+    let run: RunOnceResult;
+    try {
+      run = await runProgramOnce({ ...options, projectDir: stagedProject });
+    } catch (err) {
+      // The copy could not be run at all, or was left unusable. Either way this fix did not work.
+      run = { outcome: null, failure: `The repaired program could not be run: ${err instanceof Error ? err.message : err}` };
+    }
+    return { commit: run.outcome !== null, value: run };
+  });
 
   // The merge above carries over what the run changed; the fix itself was
   // written before the run started, so it is installed explicitly.

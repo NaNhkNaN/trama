@@ -400,7 +400,7 @@ The runtime is what makes agent programs **self-contained and shareable**:
 - **IPC bridge** — programs communicate with the runtime through a local HTTP server. Every `ctx`, `agent`, `tools` and `workspace` call goes through this bridge, which gives the runtime a single point where it validates each request and can cancel work in flight when a run ends.
 - **State persistence** — `ctx.state` survives across runs via `checkpoint()` and `done()`. Programs can be long-running, interruptible, and resumable. `ctx.yield()` suspends a program cooperatively — persists state and exits, ready for the session layer to resume it later.
 - **Shared workspace** — when programs run in a session, they share a workspace for artifact I/O. Atomic writes, path guarding, and level-triggered observation (`workspace.observe()`) — without a message bus or coordination framework.
-- **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, and tries it on a private copy of the project. Only a fix that works is installed, along with what its run produced; one that fails never touches the project. Up to 3 attempts.
+- **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, and tries it on a private copy of the project. Only a fix that works is installed, along with what its run produced; one that fails never touches the project. Up to 3 attempts. In a session the fix runs against the live shared workspace, so a participant being repaired can still be heard and answered.
 - **Version history** — every create, update, and repair saves a snapshot. You can diff any two versions to see how the program evolved.
 - **Scaffolding** — the runtime creates package.json, the module symlink, gitignore, and the history and log directories, and checks them before every run. Recipients of a shared program don't need to set anything up.
 
@@ -675,6 +675,11 @@ await workspace.observe(pattern, { expect?, timeout? })
 ```
 
 `workspace.write()` is **atomic** — writes to a temp file, fsyncs, then renames. Concurrent readers via `observe()` or `read()` never see partial content. `workspace.observe()` counts unique paths, not write events. The same path written twice counts as one.
+
+A write to the workspace is **immediate and never undone**. The workspace is how participants talk to each other, so nothing written there is held back — not by a run that later fails, and not by a repair that is being tried. Two things follow:
+
+- An artifact says that something was written, not that its writer finished. Check the participant's result (`handle.wait()`) before trusting what it left.
+- A participant that fails is run again from its last checkpoint — by a repair, or by you — and will write again what it wrote after that checkpoint. Give artifacts names that do not depend on the attempt, so a second write replaces the first instead of adding to it.
 
 If `workspace` is not available (program not running in a session), all calls throw with a clear message.
 

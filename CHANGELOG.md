@@ -2,6 +2,18 @@
 
 All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`) are released together under one version.
 
+## Unreleased
+
+### Changed
+
+- **A participant that is being repaired stays in its session.** Since 0.2.2 a fix was tried against a private copy of the shared workspace, merged back only if the fix worked. A fix could therefore neither be seen by the other participants nor see them, and any participant that writes a request and waits for a reply failed every repair attempt. A fix now runs against the live workspace. The project is still copied: a fix that fails never touches it.
+
+  The cost is that what a failed fix wrote to the workspace stays there — as what a failed first run wrote always has. A workspace write is immediate and is never undone; see the README for what that asks of a program.
+
+### Internal
+
+- Everything the runtime asks of an LLM goes through one interface, `AgentBackend`: a prompt and where to work in, the agent's final text out. pi is its one implementation. No change in behaviour; it is the seam for other backends.
+
 ## 0.2.2 — 2026-11-11
 
 ### Fixed

@@ -4,6 +4,7 @@ import { existsSync, readdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import { runProgram } from "../packages/runtime/dist/runner.js";
+import { createWorkspace } from "../packages/runtime/dist/workspace.js";
 import { cleanupTempDir, createProjectFixture, makeTempDir, readJson, writeText } from "./helpers.mjs";
 
 // --- ProgramResult from runProgram ---
@@ -273,16 +274,14 @@ await tools.write("iterations.txt", seen.join(","));
   assert.equal(readyLogs.length, 1, "ready must be recorded once however often it is called");
 });
 
-// --- Repair workspace isolation ---
+// --- Repair: the project is staged, the shared workspace is live ---
 
-// Several tests below need "another participant" to touch the shared workspace
-// while a repaired program is running — after the runner has staged the
-// workspace, before it commits. Rather than guess when that is, the repaired
-// program announces that it has started and waits to be released, and the test
-// acts in between.
-
-// A fix runs on a private copy of the project, so the two sides meet in a
-// directory of their own, named after the project.
+// A fix runs on a private copy of the project. Several tests below need
+// something else to change the real project while a repaired program is
+// running — after the copy is taken, before a working fix is merged back.
+// Rather than guess when that is, the repaired program announces that it has
+// started and waits to be released, and the test acts in between. The two
+// sides meet in a directory of their own, named after the project.
 const signalDirFor = (projectDir) => `${projectDir}.signals`;
 
 /** Source for a repaired program: announce the run and pause until released. */
@@ -307,23 +306,22 @@ async function duringRepairRun(projectDir, act) {
   writeText(join(signalDir, "proceed"), "");
 }
 
-test("a repair that fails leaves the shared workspace as it was", async (t) => {
+test("a fix that fails never touches the project, but what it wrote to the shared workspace stays", async (t) => {
   const projectDir = makeTempDir("trama-result-");
   const wsDir = makeTempDir("trama-ws-");
   t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
 
-  // Seed workspace with a pre-existing artifact
   writeText(join(wsDir, "existing.txt"), "keep me");
 
-  createProjectFixture(projectDir, {
-    programSource: `throw new Error("original failure");`,
-  });
+  const originalSource = `throw new Error("original failure");`;
+  createProjectFixture(projectDir, { programSource: originalSource });
 
   const originalRepair = llm.repair;
   llm.repair = async function repair() {
-    // The repaired program writes an artifact and then fails as well.
-    return `import { workspace } from "@trama-dev/runtime";
-await workspace.write("artifact.txt", "from repair");
+    // The repaired program writes to both places and then fails as well.
+    return `import { tools, workspace } from "@trama-dev/runtime";
+await tools.write("private.txt", "from the fix");
+await workspace.write("artifact.txt", "from the fix");
 throw new Error("repair also fails");`;
   };
 
@@ -332,20 +330,59 @@ throw new Error("repair also fails");`;
       projectDir, maxRepairAttempts: 1, timeout: 5_000, workspaceDir: wsDir,
     });
     assert.equal(result.status, "failed");
-    // What the failed repair wrote must not reach the shared workspace
-    assert.equal(existsSync(join(wsDir, "artifact.txt")), false,
-      "a failed repair must not leave workspace artifacts");
-    // Pre-existing artifacts must survive
+    // The project is the program's own: the fix ran on a copy of it.
+    assert.equal(existsSync(join(projectDir, "private.txt")), false);
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
+    // The workspace is shared and live: what was written there was written,
+    // as it would have been by any run that failed part-way.
+    assert.equal(readFileSync(join(wsDir, "artifact.txt"), "utf-8"), "from the fix");
     assert.equal(readFileSync(join(wsDir, "existing.txt"), "utf-8"), "keep me");
   } finally {
     llm.repair = originalRepair;
   }
 });
 
-test("a failed repair run preserves concurrent workspace writes from other participants", async (t) => {
+test("a program being fixed still takes part in its session", async (t) => {
   const projectDir = makeTempDir("trama-result-");
   const wsDir = makeTempDir("trama-ws-");
   t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
+
+  createProjectFixture(projectDir, {
+    programSource: `throw new Error("original failure");`,
+  });
+
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
+    // The repaired program asks another participant for something and waits for the answer.
+    return `import { ctx, workspace } from "@trama-dev/runtime";
+await workspace.write("request.txt", "ping");
+const reply = await workspace.observe("reply.txt", { timeout: 8000 });
+await ctx.done({ reply });`;
+  };
+
+  // The other participant: answers a request once it sees one.
+  const other = createWorkspace(wsDir);
+  const answer = async () => {
+    const request = await other.observe("request.txt", { timeout: 9_000 });
+    await other.write("reply.txt", `pong to ${request}`);
+  };
+
+  try {
+    const [result] = await Promise.all([
+      runProgram({ projectDir, maxRepairAttempts: 1, timeout: 10_000, workspaceDir: wsDir }),
+      answer(),
+    ]);
+    // It was heard while it was being tried, and it heard back.
+    assert.equal(result.status, "done");
+    assert.deepEqual(result.result, { reply: "pong to ping" });
+  } finally {
+    llm.repair = originalRepair;
+  }
+});
+
+test("a fix that fails leaves alone what changed in the project meanwhile", async (t) => {
+  const projectDir = makeTempDir("trama-result-");
+  t.after(() => cleanupTempDir(projectDir));
 
   createProjectFixture(projectDir, {
     programSource: `throw new Error("original failure");`,
@@ -359,189 +396,172 @@ throw new Error("crash after concurrent write window");`;
   };
 
   try {
-    const runPromise = runProgram({
-      projectDir, maxRepairAttempts: 1, timeout: 10_000, workspaceDir: wsDir,
-    });
+    const runPromise = runProgram({ projectDir, maxRepairAttempts: 1, timeout: 10_000 });
 
     await duringRepairRun(projectDir, () => {
-      writeText(join(wsDir, "concurrent.txt"), "from another participant");
+      writeText(join(projectDir, "concurrent.txt"), "written meanwhile");
     });
 
     const result = await runPromise;
     assert.equal(result.status, "failed");
-    // Concurrent write from another participant must still be there after the failed fix
-    assert.equal(readFileSync(join(wsDir, "concurrent.txt"), "utf-8"), "from another participant");
+    assert.equal(readFileSync(join(projectDir, "concurrent.txt"), "utf-8"), "written meanwhile");
   } finally {
     llm.repair = originalRepair;
   }
 });
 
-test("successful repair commit does not overwrite concurrent workspace updates (disjoint paths)", async (t) => {
+test("a working fix is merged around what changed in the project meanwhile (other paths)", async (t) => {
   const projectDir = makeTempDir("trama-result-");
-  const wsDir = makeTempDir("trama-ws-");
-  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
+  t.after(() => cleanupTempDir(projectDir));
 
-  // Seed workspace with a file that another participant will update concurrently
-  writeText(join(wsDir, "shared.txt"), "seed");
+  createProjectFixture(projectDir, {
+    programSource: `throw new Error("original failure");`,
+  });
+  // A file that something else will update while the fix is being tried
+  writeText(join(projectDir, "shared.txt"), "seed");
 
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
+    return `import { ctx, tools } from "@trama-dev/runtime";
+${pauseRepairRun(projectDir)}
+await tools.write("new-artifact.txt", "from repair");
+await ctx.done();`;
+  };
+
+  try {
+    const runPromise = runProgram({ projectDir, maxRepairAttempts: 1, timeout: 10_000 });
+
+    await duringRepairRun(projectDir, () => {
+      writeText(join(projectDir, "shared.txt"), "updated-meanwhile");
+    });
+
+    const result = await runPromise;
+    assert.equal(result.status, "done");
+    assert.equal(readFileSync(join(projectDir, "new-artifact.txt"), "utf-8"), "from repair");
+    assert.equal(readFileSync(join(projectDir, "shared.txt"), "utf-8"), "updated-meanwhile");
+  } finally {
+    llm.repair = originalRepair;
+  }
+});
+
+test("a working fix does not overwrite a file that changed in the project meanwhile", async (t) => {
+  const projectDir = makeTempDir("trama-result-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  createProjectFixture(projectDir, {
+    programSource: `throw new Error("original failure");`,
+  });
+  // Both the fix and something else will write to shared.txt
+  writeText(join(projectDir, "shared.txt"), "seed");
+
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
+    return `import { ctx, tools } from "@trama-dev/runtime";
+${pauseRepairRun(projectDir)}
+await tools.write("shared.txt", "from-repair");
+await ctx.done();`;
+  };
+
+  try {
+    const runPromise = runProgram({ projectDir, maxRepairAttempts: 1, timeout: 10_000 });
+
+    // While the fix runs on its copy, the real file is updated
+    await duringRepairRun(projectDir, () => {
+      writeText(join(projectDir, "shared.txt"), "updated-meanwhile");
+    });
+
+    const result = await runPromise;
+    assert.equal(result.status, "done");
+    // The update made to the real project is kept; the fix's stale write is skipped
+    assert.equal(readFileSync(join(projectDir, "shared.txt"), "utf-8"), "updated-meanwhile");
+  } finally {
+    llm.repair = originalRepair;
+  }
+});
+
+test("a working fix does not overwrite a file that appeared in the project meanwhile", async (t) => {
+  const projectDir = makeTempDir("trama-result-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  // shared-new.txt does not exist when the copy is taken — both sides create it
   createProjectFixture(projectDir, {
     programSource: `throw new Error("original failure");`,
   });
 
   const originalRepair = llm.repair;
   llm.repair = async function repair() {
-    return `import { ctx, workspace } from "@trama-dev/runtime";
+    return `import { ctx, tools } from "@trama-dev/runtime";
 ${pauseRepairRun(projectDir)}
-await workspace.write("new-artifact.txt", "from repair");
+await tools.write("shared-new.txt", "from-repair");
 await ctx.done();`;
   };
 
   try {
-    const runPromise = runProgram({
-      projectDir, maxRepairAttempts: 1, timeout: 10_000, workspaceDir: wsDir,
-    });
+    const runPromise = runProgram({ projectDir, maxRepairAttempts: 1, timeout: 10_000 });
 
     await duringRepairRun(projectDir, () => {
-      writeText(join(wsDir, "shared.txt"), "updated-by-other");
+      writeText(join(projectDir, "shared-new.txt"), "created-meanwhile");
     });
 
     const result = await runPromise;
     assert.equal(result.status, "done");
-    assert.equal(readFileSync(join(wsDir, "new-artifact.txt"), "utf-8"), "from repair");
-    assert.equal(readFileSync(join(wsDir, "shared.txt"), "utf-8"), "updated-by-other");
+    assert.equal(readFileSync(join(projectDir, "shared-new.txt"), "utf-8"), "created-meanwhile");
   } finally {
     llm.repair = originalRepair;
   }
 });
 
-test("successful repair commit does not overwrite concurrent update on same path", async (t) => {
-  const projectDir = makeTempDir("trama-result-");
-  const wsDir = makeTempDir("trama-ws-");
-  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
-
-  // Both the repair and another participant will write to shared.txt
-  writeText(join(wsDir, "shared.txt"), "seed");
-
-  createProjectFixture(projectDir, {
-    programSource: `throw new Error("original failure");`,
-  });
-
-  const originalRepair = llm.repair;
-  llm.repair = async function repair() {
-    // Repaired program modifies shared.txt (same file another participant will update)
-    return `import { ctx, workspace } from "@trama-dev/runtime";
-${pauseRepairRun(projectDir)}
-await workspace.write("shared.txt", "from-repair");
-await ctx.done();`;
-  };
-
-  try {
-    const runPromise = runProgram({
-      projectDir, maxRepairAttempts: 1, timeout: 10_000, workspaceDir: wsDir,
-    });
-
-    // While the rerun holds its staged copy, another participant updates shared.txt
-    await duringRepairRun(projectDir, () => {
-      writeText(join(wsDir, "shared.txt"), "updated-by-other");
-    });
-
-    const result = await runPromise;
-    assert.equal(result.status, "done");
-    // The concurrent update must be preserved — repair's stale write must be skipped
-    assert.equal(readFileSync(join(wsDir, "shared.txt"), "utf-8"), "updated-by-other");
-  } finally {
-    llm.repair = originalRepair;
-  }
-});
-
-test("successful repair commit does not overwrite concurrently created new path", async (t) => {
-  const projectDir = makeTempDir("trama-result-");
-  const wsDir = makeTempDir("trama-ws-");
-  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
-
-  // shared-new.txt does NOT exist at seed time — both sides create it during the rerun window
-  createProjectFixture(projectDir, {
-    programSource: `throw new Error("original failure");`,
-  });
-
-  const originalRepair = llm.repair;
-  llm.repair = async function repair() {
-    return `import { ctx, workspace } from "@trama-dev/runtime";
-${pauseRepairRun(projectDir)}
-await workspace.write("shared-new.txt", "from-repair");
-await ctx.done();`;
-  };
-
-  try {
-    const runPromise = runProgram({
-      projectDir, maxRepairAttempts: 1, timeout: 10_000, workspaceDir: wsDir,
-    });
-
-    // While the rerun holds its staged copy, another participant creates the same new path
-    await duringRepairRun(projectDir, () => {
-      writeText(join(wsDir, "shared-new.txt"), "from-other");
-    });
-
-    const result = await runPromise;
-    assert.equal(result.status, "done");
-    // The other participant's version must be preserved
-    assert.equal(readFileSync(join(wsDir, "shared-new.txt"), "utf-8"), "from-other");
-  } finally {
-    llm.repair = originalRepair;
-  }
-});
-
-test("successful repair commit handles path-shape conflict gracefully", async (t) => {
+test("merging a staged copy skips a path whose shape changed in the real directory", async (t) => {
   // Test commitStagedChanges directly to avoid timing fragility.
-  // Simulate: repair wrote "nested/out.txt" in temp workspace, but another
-  // participant created "nested" as a regular file in the real workspace.
+  // Simulate: the fix wrote "nested/out.txt" in its copy, but meanwhile
+  // "nested" was created as a regular file in the real directory.
   const { commitStagedChanges, snapshotDir } = await import("../packages/runtime/dist/runner.js");
 
-  const tempDir = makeTempDir("trama-temp-ws-");
-  const realDir = makeTempDir("trama-real-ws-");
+  const tempDir = makeTempDir("trama-staged-");
+  const realDir = makeTempDir("trama-real-");
   t.after(() => { cleanupTempDir(tempDir); cleanupTempDir(realDir); });
 
-  // Take the "before" snapshot of the empty temp workspace
+  // The copy before the run
   const tempBefore = snapshotDir(tempDir);
-  // Take the "seed" snapshot of the empty real workspace
+  // The real directory when the copy was taken
   const realSeed = snapshotDir(realDir);
 
-  // Simulate the rerun writing nested/out.txt in the temp workspace
+  // The fix writes nested/out.txt in its copy
   const { mkdirSync: mkdir } = await import("fs");
   mkdir(join(tempDir, "nested"), { recursive: true });
   writeText(join(tempDir, "nested", "out.txt"), "from-repair");
 
-  // Simulate another participant creating "nested" as a regular file in real workspace
+  // Meanwhile "nested" appears as a regular file in the real directory
   writeText(join(realDir, "nested"), "i-am-a-file");
 
   // commitStagedChanges must not throw — it should skip the conflicting path
   commitStagedChanges(tempDir, realDir, tempBefore, realSeed);
 
-  // The other participant's "nested" regular file must be preserved
+  // The regular file must be preserved
   assert.equal(readFileSync(join(realDir, "nested"), "utf-8"), "i-am-a-file");
 });
 
-test("repair commit does not follow symlinks escaping workspace", async (t) => {
-  // Test that commitStagedChanges respects the workspace bounded root
-  // when a concurrent participant places a symlink pointing outside.
+test("merging a staged copy does not follow a symlink out of the real directory", async (t) => {
+  // commitStagedChanges must stay inside the real directory even when a
+  // symlink pointing outside has been placed in it meanwhile.
   const { commitStagedChanges, snapshotDir } = await import("../packages/runtime/dist/runner.js");
   const { symlinkSync } = await import("fs");
 
-  const tempDir = makeTempDir("trama-temp-ws-");
-  const realDir = makeTempDir("trama-real-ws-");
+  const tempDir = makeTempDir("trama-staged-");
+  const realDir = makeTempDir("trama-real-");
   const outsideDir = makeTempDir("trama-outside-");
   t.after(() => { cleanupTempDir(tempDir); cleanupTempDir(realDir); cleanupTempDir(outsideDir); });
 
   writeText(join(outsideDir, "target.txt"), "external-original");
 
-  // Snapshots of both empty workspaces
+  // Snapshots of both empty directories
   const tempBefore = snapshotDir(tempDir);
   const realSeed = snapshotDir(realDir);
 
-  // Simulate the rerun writing escape.txt in the temp workspace
+  // The fix writes escape.txt in its copy
   writeText(join(tempDir, "escape.txt"), "from-repair");
 
-  // Simulate another participant creating escape.txt as a symlink to an external file
+  // Meanwhile escape.txt appears in the real directory as a symlink to an external file
   symlinkSync(join(outsideDir, "target.txt"), join(realDir, "escape.txt"));
 
   // commitStagedChanges must not follow the symlink and overwrite the external file
@@ -551,24 +571,24 @@ test("repair commit does not follow symlinks escaping workspace", async (t) => {
   assert.equal(readFileSync(join(outsideDir, "target.txt"), "utf-8"), "external-original");
 });
 
-test("repair commit does not follow symlinked parent directory escaping workspace", async (t) => {
+test("merging a staged copy does not follow a symlinked parent directory out of the real directory", async (t) => {
   const { commitStagedChanges, snapshotDir } = await import("../packages/runtime/dist/runner.js");
   const { symlinkSync } = await import("fs");
 
-  const tempDir = makeTempDir("trama-temp-ws-");
-  const realDir = makeTempDir("trama-real-ws-");
+  const tempDir = makeTempDir("trama-staged-");
+  const realDir = makeTempDir("trama-real-");
   const outsideDir = makeTempDir("trama-outside-");
   t.after(() => { cleanupTempDir(tempDir); cleanupTempDir(realDir); cleanupTempDir(outsideDir); });
 
   const tempBefore = snapshotDir(tempDir);
   const realSeed = snapshotDir(realDir);
 
-  // Simulate the rerun writing reports/data.txt in the temp workspace
+  // The fix writes reports/data.txt in its copy
   const { mkdirSync: mkdir } = await import("fs");
   mkdir(join(tempDir, "reports"), { recursive: true });
   writeText(join(tempDir, "reports", "data.txt"), "from-repair");
 
-  // Simulate another participant creating "reports" as a symlink to an external directory
+  // Meanwhile "reports" appears in the real directory as a symlink to an external directory
   symlinkSync(outsideDir, join(realDir, "reports"));
 
   commitStagedChanges(tempDir, realDir, tempBefore, realSeed);
