@@ -2,6 +2,16 @@
 
 All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`) are released together under one version.
 
+## 0.2.1 — 2026-11-11
+
+No change to how trama behaves; this release exercises the new release process.
+
+### Internal
+
+- Releases are published with npm trusted publishing (OIDC) and the latest npm CLI. The workflow no longer uses a stored npm token.
+- Publishing no longer marks older versions as deprecated. (0.1.x was deprecated when 0.2.0 came out and stays that way.)
+- `repository.url` and the CLI's `bin` path are written the way npm normalises them, so publishing has nothing to correct.
+
 ## 0.2.0 — 2026-11-11
 
 ### Breaking

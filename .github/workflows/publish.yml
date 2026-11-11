@@ -4,19 +4,26 @@ on:
   push:
     tags: ["v*"]
 
+# Publishing authenticates with npm trusted publishing (OIDC): npm exchanges the
+# job's GitHub identity for a short-lived credential, so this workflow uses no
+# stored token at all. Each package must list this repository and this workflow
+# file (publish.yml) as a trusted publisher on npmjs.com.
 jobs:
   publish:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
+      id-token: write # lets the job request the OIDC token npm verifies
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
-          cache: npm
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false # a release build should not start from a shared cache
+
+      # Trusted publishing needs npm 11.5.1 or newer; Node 22 ships npm 10.
+      - run: npm install -g npm@latest
 
       - name: Verify tag matches package versions
         run: |
@@ -39,24 +46,7 @@ jobs:
 
       - run: npm ci
       - run: npm test
-      - run: npm publish -w @trama-dev/runtime --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - run: npm publish -w @trama-dev/session --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-      - run: npm publish -w @trama-dev/cli --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      # Older versions stay installable but warn on install. Best-effort: a
-      # failure here must not fail a release that has already been published.
-      - name: Deprecate older versions
-        continue-on-error: true
-        run: |
-          TAG="${GITHUB_REF#refs/tags/v}"
-          for PKG in runtime session cli; do
-            npm deprecate "@trama-dev/$PKG@<$TAG" "Superseded by $TAG — see https://github.com/NaNhkNaN/trama/blob/main/CHANGELOG.md" || true
-          done
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # No token: these authenticate over OIDC, and provenance is attached automatically.
+      - run: npm publish -w @trama-dev/runtime --access public
+      - run: npm publish -w @trama-dev/session --access public
+      - run: npm publish -w @trama-dev/cli --access public

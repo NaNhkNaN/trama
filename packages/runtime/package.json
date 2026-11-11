@@ -1,6 +1,6 @@
 {
   "name": "@trama-dev/runtime",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "exports": {
     ".": {
@@ -22,7 +22,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/NaNhkNaN/trama.git",
+    "url": "git+https://github.com/NaNhkNaN/trama.git",
     "directory": "packages/runtime"
   },
   "homepage": "https://github.com/NaNhkNaN/trama",
