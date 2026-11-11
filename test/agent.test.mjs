@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { getEventListeners } from "node:events";
 import test from "node:test";
 import { createAgent } from "../packages/runtime/dist/agent.js";
+import { captureConsole, cleanupTempDir, makeTempDir, withEnv } from "./helpers.mjs";
 
 test("createAgent instruct delegates prompt and options to the adapter", async () => {
   const calls = [];
@@ -309,6 +310,37 @@ test("PiAdapter.ask cleans up abort listeners after successful calls", async () 
     async () => adapter.ask("after abort", { signal: controller.signal }),
     /Aborted/,
   );
+});
+
+test("PiAdapter warns once when the configured model is not in pi's catalog", async (t) => {
+  const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
+
+  // Isolated pi config dir: the result must not depend on the developer's own ~/.pi/agent.
+  const agentDir = makeTempDir("trama-pi-agent-");
+  t.after(() => cleanupTempDir(agentDir));
+
+  await withEnv({ PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" }, async () => {
+    const unknown = new PiAdapter({ provider: "anthropic", model: "no-such-model-typo" }, process.cwd());
+    const { messages } = await captureConsole("warn", async () => {
+      // Two sessions, plus a copy of the adapter in another cwd — still one warning.
+      (await unknown.createSession()).dispose();
+      (await unknown.createSession()).dispose();
+      (await unknown.withCwd(agentDir).createSession()).dispose();
+    });
+    assert.equal(messages.length, 1, `expected exactly one warning, got: ${JSON.stringify(messages)}`);
+    assert.match(messages[0], /anthropic\/no-such-model-typo/);
+    assert.match(messages[0], /not found/);
+    // The isolated config dir has no credentials, so there is nothing to fall back to —
+    // pi's placeholder model must not be reported as a fallback.
+    assert.match(messages[0], /no fallback model available/);
+    assert.doesNotMatch(messages[0], /unknown\/unknown/);
+
+    const known = new PiAdapter({ provider: "openai", model: "gpt-5.4" }, process.cwd());
+    const { messages: none } = await captureConsole("warn", async () => {
+      (await known.createSession()).dispose();
+    });
+    assert.deepEqual(none, [], "a model that exists in the catalog must not warn");
+  });
 });
 
 test("PiAdapter.repair trims whitespace even without code fences", async () => {

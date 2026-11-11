@@ -26,8 +26,11 @@
     "LICENSE"
   ],
   "os": ["darwin", "linux"],
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "dependencies": {
     "@trama-dev/runtime": "0.1.5",
-    "commander": "^14.0.0"
+    "commander": "^15.1.0"
   }
 }

@@ -538,7 +538,7 @@ if (ctx.resumed) {
 
 ### Prerequisites
 
-trama uses [pi](https://github.com/badlogic/pi-mono) for LLM calls. Set an API key for any supported provider:
+trama uses [pi](https://github.com/earendil-works/pi) for LLM calls. Set an API key for any supported provider:
 
 ```bash
 export ANTHROPIC_API_KEY="sk-ant-..."   # default provider + model: anthropic / claude-opus-4-6
@@ -552,7 +552,7 @@ Other providers (OpenAI, Google, Bedrock, Azure) work via `~/.trama/config.json`
 
 Or override per-project: `trama create my-task "do something" --model claude-opus-4-6`
 
-See all supported providers in [pi-ai docs](https://www.npmjs.com/package/@mariozechner/pi-ai).
+See all supported providers in [pi-ai docs](https://www.npmjs.com/package/@earendil-works/pi-ai).
 
 ### Install and run
 
@@ -774,7 +774,7 @@ No plugin system, no middleware, no hooks. Extend trama by editing program.ts or
 
 ## Relationship to pi
 
-trama uses [pi](https://github.com/badlogic/pi-mono) as its intelligence substrate. All LLM calls go through [`@mariozechner/pi-coding-agent`](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) — trama does not implement its own agent loop, tool calling, or provider abstraction. When `agent.instruct()` runs, pi handles the full agent loop (bash, file I/O, multi-step reasoning). trama benefits from pi's evolution automatically.
+trama uses [pi](https://github.com/earendil-works/pi) as its intelligence substrate. All LLM calls go through [`@earendil-works/pi-coding-agent`](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) — trama does not implement its own agent loop, tool calling, or provider abstraction. When `agent.instruct()` runs, pi handles the full agent loop (bash, file I/O, multi-step reasoning). trama benefits from pi's evolution automatically.
 
 ---
 

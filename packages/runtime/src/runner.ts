@@ -41,7 +41,7 @@ const TRAMA_NODE_MODULES = findRuntimeNodeModules();
 const TSX_CLI = join(TRAMA_NODE_MODULES, "tsx", "dist", "cli.mjs");
 
 export const PI_VERSION: string = JSON.parse(
-  readFileSync(join(TRAMA_NODE_MODULES, "@mariozechner", "pi-coding-agent", "package.json"), "utf-8"),
+  readFileSync(join(TRAMA_NODE_MODULES, "@earendil-works", "pi-coding-agent", "package.json"), "utf-8"),
 ).version;
 
 /**

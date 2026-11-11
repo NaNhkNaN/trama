@@ -10,7 +10,7 @@
     "test": "npm run build && node --test --test-concurrency=1 test/*.test.mjs && npm run test --workspaces --if-present"
   },
   "devDependencies": {
-    "@types/node": "^25.5.0",
-    "typescript": "^6.0.2"
+    "@types/node": "^26.6.6",
+    "typescript": "^7.0.2"
   }
 }

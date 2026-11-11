@@ -33,9 +33,11 @@
     "LICENSE"
   ],
   "os": ["darwin", "linux"],
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "dependencies": {
-    "@mariozechner/pi-coding-agent": "0.64.0",
-    "@mariozechner/pi-ai": "0.64.0",
-    "tsx": "^4.21.0"
+    "@earendil-works/pi-coding-agent": "1.5.2",
+    "tsx": "^4.23.15"
   }
 }
