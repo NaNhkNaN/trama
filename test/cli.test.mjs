@@ -77,13 +77,10 @@ test("CLI create honors the configured default model when --model is omitted", a
   writeText(preloadPath, `import { writeFileSync } from "node:fs";
 import { PiAdapter } from ${JSON.stringify(pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "pi-adapter.js")).href)};
 
-PiAdapter.prototype.ask = async function ask() {
+PiAdapter.prototype.ask = async function ask(prompt) {
+  if (!prompt.startsWith("write something")) throw new Error("only the program should be asked for");
   writeFileSync(${JSON.stringify(observedModelPath)}, this.config.model, "utf-8");
   return 'import { ctx } from "@trama-dev/runtime";\\nawait ctx.done();\\n';
-};
-
-PiAdapter.prototype.repair = async function repair() {
-  throw new Error("repair should not run");
 };
 `);
 

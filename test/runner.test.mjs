@@ -4,7 +4,7 @@ import { spawn } from "child_process";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
 import { join } from "path";
 import { pathToFileURL } from "url";
-import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
+import { llm } from "./fake-llm.mjs";
 import { copyToHistory, loadConfig, loadState, runProgram, RUNTIME_TYPES } from "../packages/runtime/dist/runner.js";
 import { REPO_ROOT, cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson, writeText } from "./helpers.mjs";
 
@@ -192,20 +192,22 @@ await tools.write("repaired.txt", "ok");
 await ctx.done();
 `;
 
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair(input) {
-    assert.match(input.error, /boom/);
-    return fixedProgram;
+  const originalRepair = llm.repair;
+  llm.repair = async function repair(prompt) {
+    assert.match(prompt, /Error:\n[\s\S]*boom/, "the fix request carries the failure");
+    // A model rarely returns the program alone, whatever it was told.
+    return "Here is the fixed program:\n\n```typescript\n" + fixedProgram + "```\n";
   };
 
   try {
     await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 });
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 
-  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram);
-  assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), fixedProgram);
+  // What is installed is the program in the reply, without the wrapping around it.
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram.trim());
+  assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), fixedProgram.trim());
   // The fix is tried on a copy of the project; what it wrote is merged back because it worked.
   assert.equal(readFileSync(join(projectDir, "repaired.txt"), "utf-8"), "ok");
 
@@ -232,8 +234,8 @@ test("runProgram surfaces repair failures after retries are exhausted", async (t
     programSource: 'throw new Error("boom");',
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair() {
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
     throw new Error("repair blew up");
   };
 
@@ -242,7 +244,7 @@ test("runProgram surfaces repair failures after retries are exhausted", async (t
     assert.equal(result.status, "failed");
     assert.match(result.reason, /Repair errors:[\s\S]*repair blew up/s);
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -440,9 +442,9 @@ test("runProgram does not trigger repair when program succeeds", async (t) => {
   t.after(() => cleanupTempDir(projectDir));
   createProjectFixture(projectDir, { scaffold: false });
 
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalRepair = llm.repair;
   let repairCalled = false;
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     repairCalled = true;
     return 'throw new Error("repair should not run");';
   };
@@ -452,7 +454,7 @@ test("runProgram does not trigger repair when program succeeds", async (t) => {
     assert.equal(repairCalled, false, "repair should not be called when program succeeds");
     assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "iteration:0");
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -473,8 +475,8 @@ await tools.write("run-count.txt", String(runCount + 1));
 throw new Error("boom");`,
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair() {
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
     throw new Error("LLM unavailable");
   };
 
@@ -484,7 +486,7 @@ throw new Error("boom");`,
     assert.match(result.reason, /Failed after 1 repair attempt\(s\)/);
     assert.equal(readFileSync(join(projectDir, "run-count.txt"), "utf-8"), "1");
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -496,10 +498,10 @@ test("runProgram only records repair history after the repaired program succeeds
     programSource: 'throw new Error("original");',
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalRepair = llm.repair;
   // First repair returns code that also fails, second repair returns working code
   let repairAttempt = 0;
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     repairAttempt++;
     if (repairAttempt === 1) {
       return 'throw new Error("still broken");';
@@ -510,7 +512,7 @@ test("runProgram only records repair history after the repaired program succeeds
   try {
     await runProgram({ projectDir, maxRepairAttempts: 3, timeout: 5_000 });
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 
   const history = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8")
@@ -535,9 +537,9 @@ test("runProgram restores original program.ts when all repair attempts produce b
     programSource: originalSource,
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalRepair = llm.repair;
   let attempts = 0;
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     attempts += 1;
     return `throw new Error("still broken, attempt ${attempts}");`;
   };
@@ -548,7 +550,7 @@ test("runProgram restores original program.ts when all repair attempts produce b
     assert.match(result.reason, /Failed after 2 repair attempts/);
     assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -561,10 +563,10 @@ appendFileSync(${JSON.stringify(join(projectDir, "executions.txt"))}, "ran\\n");
 throw new Error("original");`;
   createProjectFixture(projectDir, { scaffold: false, programSource: originalSource });
 
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalRepair = llm.repair;
   try {
     for (const [useless, expected] of [[originalSource, /returned the program unchanged/], ["  \n", /returned an empty program/]]) {
-      PiAdapter.prototype.repair = async function repair() { return useless; };
+      llm.repair = async function repair() { return useless; };
       const result = await runProgram({ projectDir, maxRepairAttempts: 3, timeout: 5_000 });
       assert.equal(result.status, "failed");
       assert.match(result.reason, /Failed after 1 repair attempt\(s\)/);
@@ -573,7 +575,7 @@ throw new Error("original");`;
     // Two runs of the original program, one per runProgram call — and no reruns of a "fix" that fixes nothing.
     assert.equal(readFileSync(join(projectDir, "executions.txt"), "utf-8"), "ran\nran\n");
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -587,8 +589,8 @@ test("runProgram restores original program.ts when repair LLM call fails", async
     programSource: originalSource,
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair() {
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
     throw new Error("LLM unavailable");
   };
 
@@ -598,7 +600,7 @@ test("runProgram restores original program.ts when repair LLM call fails", async
     assert.match(result.reason, /Failed after 1 repair attempt/);
     assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -612,12 +614,12 @@ test("runProgram leaves no trace of a repair that did not work", async (t) => {
     programSource: originalSource,
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalRepair = llm.repair;
   // The repair agent writes a file in its working directory, and the program it
   // returns writes another before failing. Neither may reach the project: the
   // agent works in a throwaway copy, and a fix is tried on a copy too.
-  PiAdapter.prototype.repair = async function repair() {
-    writeFileSync(join(this.cwd, "repair-side-effect.txt"), "from-repair-llm");
+  llm.repair = async function repair(_prompt, call) {
+    writeFileSync(join(call.cwd, "repair-side-effect.txt"), "from-repair-llm");
     return `import { tools } from "@trama-dev/runtime";
 await tools.write("program-side-effect.txt", "from-repaired-program");
 throw new Error("still broken");`;
@@ -632,7 +634,7 @@ throw new Error("still broken");`;
     assert.equal(existsSync(join(projectDir, "repair-side-effect.txt")), false);
     assert.equal(existsSync(join(projectDir, "program-side-effect.txt")), false);
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -649,8 +651,8 @@ test("runProgram keeps a working repair even when post-success bookkeeping (onRe
 await ctx.done();
 `;
 
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair() {
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
     // Make history/ unwritable so onRepair's copyToHistory throws
     const { chmodSync } = await import("fs");
     chmodSync(join(projectDir, "history"), 0o444);
@@ -661,9 +663,9 @@ await ctx.done();
     // onRepair bookkeeping (history write) fails with EACCES, but program succeeded —
     // runProgram should still return success, not propagate the bookkeeping error.
     await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 });
-    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram);
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram.trim());
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
     // Restore permissions for cleanup
     const { chmodSync } = await import("fs");
     try { chmodSync(join(projectDir, "history"), 0o755); } catch { /* may not exist */ }
@@ -703,9 +705,9 @@ test("runProgram rejects non-object package.json (array)", async (t) => {
 /** Start a runner in its own process, so the test can stop it the way a user or a parent runner would. */
 function startRunnerProcess(fakeHome, projectDir, { stubRepair = "" } = {}) {
   const runnerUrl = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "runner.js")).href;
-  const adapterUrl = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "pi-adapter.js")).href;
+  const fakeLlmUrl = pathToFileURL(join(REPO_ROOT, "test", "fake-llm.mjs")).href;
   const script = `import { runProgram } from ${JSON.stringify(runnerUrl)};
-import { PiAdapter } from ${JSON.stringify(adapterUrl)};
+import { llm } from ${JSON.stringify(fakeLlmUrl)};
 ${stubRepair}
 await runProgram({ projectDir: ${JSON.stringify(projectDir)}, maxRepairAttempts: 1, timeout: 60_000 });`;
   const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
@@ -772,7 +774,7 @@ writeFileSync("written-by-fix.txt", "x");
 writeFileSync(${JSON.stringify(join(signalDir, "fix.pid"))}, String(process.pid));
 await new Promise(() => {});`;
   const { child, exited } = startRunnerProcess(fakeHome, projectDir, {
-    stubRepair: `PiAdapter.prototype.repair = async () => ${JSON.stringify(fix)};`,
+    stubRepair: `llm.repair = async () => ${JSON.stringify(fix)};`,
   });
 
   await waitFor(() => existsSync(join(signalDir, "fix.pid")), "the fix to be running");

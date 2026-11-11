@@ -9,7 +9,8 @@ export interface ProgramResult {
   result?: unknown;
 }
 
-export interface PiAdapterConfig {
+/** Which model serves a project's LLM calls. */
+export interface ModelConfig {
   provider: string;
   model: string;
 }
@@ -23,13 +24,7 @@ export interface RunOptions {
   workspaceDir?: string;
 }
 
-export interface RepairInput {
-  programSource: string;
-  error: string;
-  runtimeTypes: string;
-}
-
-export interface TramaConfig extends PiAdapterConfig {
+export interface TramaConfig extends ModelConfig {
   maxRepairAttempts: number;
   defaultTimeout: number;
   defaultMaxIterations: number;

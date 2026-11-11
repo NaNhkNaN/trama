@@ -6,45 +6,29 @@ import {
   getAgentDir,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
-import type { PiAdapterConfig, RepairInput } from "./runner-types.js";
+import type { AgentBackend, AgentCall } from "./agent-backend.js";
+import type { ModelConfig } from "./runner-types.js";
 
 /** The pi version this runtime is built against (recorded in each project's meta.json). */
 export { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 
-/** Strip markdown code fences and trim whitespace. */
-export function stripCodeFences(text: string): string {
-  const trimmed = text.trim();
-  // Extract the last fenced code block (LLMs may prepend explanation or emit multiple blocks)
-  const matches = [...trimmed.matchAll(/```(?:\w*)\s*\n([\s\S]*?)\n\s*```/g)];
-  if (matches.length > 0) {
-    return matches[matches.length - 1][1].trim();
-  }
-  return trimmed;
-}
-
 /** provider/model pairs already warned about, so a loop of agent calls warns once per process. */
 const warnedUnknownModels = new Set<string>();
 
-export class PiAdapter {
-  private config: PiAdapterConfig;
-  private cwd: string;
+/** The pi coding agent, run in-process: a fresh in-memory session for every call. */
+export class PiAdapter implements AgentBackend {
+  private config: ModelConfig;
 
-  constructor(config: PiAdapterConfig, cwd: string) {
+  constructor(config: ModelConfig) {
     this.config = config;
-    this.cwd = cwd;
   }
 
-  /** Create a copy of this adapter that operates in a different working directory. */
-  withCwd(cwd: string): PiAdapter {
-    return new PiAdapter(this.config, cwd);
-  }
-
-  private async createSession(systemPrompt?: string, signal?: AbortSignal): Promise<AgentSession> {
+  private async createSession(cwd: string, systemPrompt?: string, signal?: AbortSignal): Promise<AgentSession> {
     if (signal?.aborted) throw new Error("Aborted");
 
     const agentDir = getAgentDir();
     const resourceLoader = new DefaultResourceLoader({
-      cwd: this.cwd,
+      cwd,
       agentDir,
       noExtensions: true,
       noSkills: true,
@@ -80,11 +64,11 @@ export class PiAdapter {
 
     // Keep a reference to the raw promise so we can clean up a late-arriving session
     const sessionPromise = createAgentSession({
-      cwd: this.cwd,
+      cwd,
       agentDir,
       modelRuntime,
       model,
-      sessionManager: SessionManager.inMemory(this.cwd),
+      sessionManager: SessionManager.inMemory(cwd),
       resourceLoader,
     });
 
@@ -144,8 +128,8 @@ export class PiAdapter {
    * pi 1.x settles the prompt by resolving it (not rejecting), so abort is
    * re-checked after prompt() returns.
    */
-  async ask(prompt: string, options?: { system?: string; signal?: AbortSignal }): Promise<string> {
-    const signal = options?.signal;
+  async ask(prompt: string, call: AgentCall): Promise<string> {
+    const { cwd, system, signal } = call;
     if (signal?.aborted) throw new Error("Aborted");
 
     // Track session so abort can dispose it at any point — even during createSession
@@ -154,7 +138,7 @@ export class PiAdapter {
     signal?.addEventListener("abort", onAbort, { once: true });
 
     try {
-      session = await this.createSession(options?.system, signal);
+      session = await this.createSession(cwd, system, signal);
       // Re-check: abort may have fired during createSession (before session existed)
       if (signal?.aborted) throw new Error("Aborted");
 
@@ -169,17 +153,5 @@ export class PiAdapter {
       signal?.removeEventListener("abort", onAbort);
       session?.dispose();
     }
-  }
-
-  async repair(input: RepairInput, signal?: AbortSignal): Promise<string> {
-    const response = await this.ask(
-      `Fix this program so it runs.\n\n` +
-      `Runtime types:\n${input.runtimeTypes}\n\n` +
-      `Broken program:\n${input.programSource}\n\n` +
-      `Error:\n${input.error}\n\n` +
-      `Output ONLY the fixed program. No explanation.`,
-      { system: "You are a TypeScript repair tool.", signal }
-    );
-    return stripCodeFences(response);
   }
 }

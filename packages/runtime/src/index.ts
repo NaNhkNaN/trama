@@ -3,9 +3,11 @@
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, statSync, rmSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
-import { PiAdapter, PI_VERSION, stripCodeFences } from "./pi-adapter.js";
+import { PI_VERSION } from "./pi-adapter.js";
+import { stripCodeFences } from "./agent.js";
+import type { AgentBackend } from "./agent-backend.js";
 import {
-  loadConfig, loadProjectConfig, loadState, validateProgram, installValidatedProgram,
+  loadConfig, loadProjectConfig, loadState, createBackend, validateProgram, installValidatedProgram,
   withTempDir, ensureProjectScaffold, RUNTIME_TYPES,
 } from "./runner.js";
 import { guardPath } from "./path-guard.js";
@@ -131,9 +133,9 @@ export function resolveProject(name: string): string {
 
 // --- Helpers ---
 
-/** Run an LLM instruction in an isolated temp cwd so pi-coding-agent tools can't write into the real project. */
-async function isolatedAsk(adapter: PiAdapter, prompt: string, options?: { system?: string }): Promise<string> {
-  return withTempDir("trama-gen-", (dir) => adapter.withCwd(dir).ask(prompt, options));
+/** Ask in an empty throwaway directory, so the agent's tools cannot write into the real project. */
+async function isolatedAsk(backend: AgentBackend, prompt: string, system: string): Promise<string> {
+  return withTempDir("trama-gen-", (cwd) => backend.ask(prompt, { cwd, system }));
 }
 
 const validationOptions = (config: TramaConfig) => ({
@@ -174,12 +176,12 @@ export async function createProject(
     };
     writeFileSync(join(projectDir, "meta.json"), JSON.stringify(meta, null, 2));
 
-    const adapter = new PiAdapter(config, projectDir);
+    const backend = createBackend(config);
 
     console.log(`Generating program for "${name}"...`);
-    const candidate = stripCodeFences(await isolatedAsk(adapter,
+    const candidate = stripCodeFences(await isolatedAsk(backend,
       `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation.`,
-      { system: getSystemPrompt() },
+      getSystemPrompt(),
     ));
 
     // From here on the project is kept even if validation fails, so the
@@ -188,7 +190,7 @@ export async function createProject(
     keepProjectOnFailure = true;
 
     console.log("Validating program...");
-    const validated = await validateProgram(projectDir, adapter, candidate, validationOptions(config));
+    const validated = await validateProgram(projectDir, backend, candidate, validationOptions(config));
     installValidatedProgram(projectDir, validated, "create", prompt);
 
     console.log(`Created ${name}. Run with: trama run ${name}`);
@@ -210,7 +212,7 @@ export async function updateProject(name: string, prompt: string): Promise<void>
   const state = loadState(projectDir);
   const meta = JSON.parse(readFileSync(guardPath(projectDir, "meta.json"), "utf-8"));
   const config = loadProjectConfig(projectDir);
-  const adapter = new PiAdapter(config, projectDir);
+  const backend = createBackend(config);
 
   const systemPrompt =
     getSystemPrompt() +
@@ -223,13 +225,13 @@ export async function updateProject(name: string, prompt: string): Promise<void>
   // nothing to undo.
   try {
     console.log(`Updating "${name}"...`);
-    const candidate = stripCodeFences(await isolatedAsk(adapter,
+    const candidate = stripCodeFences(await isolatedAsk(backend,
       `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
-      { system: systemPrompt },
+      systemPrompt,
     ));
 
     console.log("Validating updated program...");
-    const validated = await validateProgram(projectDir, adapter, candidate, validationOptions(config));
+    const validated = await validateProgram(projectDir, backend, candidate, validationOptions(config));
     try {
       installValidatedProgram(projectDir, validated, "update", prompt);
     } catch (err) {

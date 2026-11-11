@@ -4,7 +4,7 @@ import test from "node:test";
 import { createAgent } from "../packages/runtime/dist/agent.js";
 import { captureConsole, cleanupTempDir, makeTempDir, withEnv } from "./helpers.mjs";
 
-test("createAgent instruct delegates prompt and options to the adapter", async () => {
+test("createAgent instruct hands the backend the prompt, where to work, and the options", async () => {
   const calls = [];
   const adapter = {
     async ask(prompt, options) {
@@ -13,11 +13,11 @@ test("createAgent instruct delegates prompt and options to the adapter", async (
     },
   };
 
-  const agent = createAgent(adapter);
+  const agent = createAgent(adapter, "/work");
   const result = await agent.instruct("hello", { system: "sys" });
 
   assert.equal(result, "adapter reply");
-  assert.deepEqual(calls, [{ prompt: "hello", options: { system: "sys" } }]);
+  assert.deepEqual(calls, [{ prompt: "hello", options: { cwd: "/work", system: "sys", signal: undefined } }]);
 });
 
 test("createAgent generate strips fenced JSON and validates the requested shape", async () => {
@@ -27,7 +27,7 @@ test("createAgent generate strips fenced JSON and validates the requested shape"
     },
   };
 
-  const agent = createAgent(adapter);
+  const agent = createAgent(adapter, "/work");
   const result = await agent.generate({
     prompt: "analyze",
     schema: {
@@ -54,7 +54,7 @@ test("createAgent generate retries once after a validation failure", async () =>
     },
   };
 
-  const agent = createAgent(adapter);
+  const agent = createAgent(adapter, "/work");
   const result = await agent.generate({
     prompt: "repair",
     schema: { reasoning: "string: explanation" },
@@ -75,7 +75,7 @@ test("createAgent instruct passes abort signal to adapter", async () => {
   };
 
   const controller = new AbortController();
-  const agent = createAgent(adapter, controller.signal);
+  const agent = createAgent(adapter, "/work", controller.signal);
   await agent.instruct("hello");
 
   assert.equal(calls.length, 1);
@@ -91,7 +91,7 @@ test("createAgent instruct works without a signal", async () => {
     },
   };
 
-  const agent = createAgent(adapter);
+  const agent = createAgent(adapter, "/work");
   await agent.instruct("hello", { system: "sys" });
 
   assert.equal(calls.length, 1);
@@ -106,7 +106,7 @@ test("createAgent generate surfaces the second failure when retries are exhauste
     },
   };
 
-  const agent = createAgent(adapter);
+  const agent = createAgent(adapter, "/work");
 
   await assert.rejects(
     async () => agent.generate({
@@ -124,7 +124,7 @@ test("createAgent generate rejects unsupported schema types", async () => {
     },
   };
 
-  const agent = createAgent(adapter);
+  const agent = createAgent(adapter, "/work");
 
   await assert.rejects(
     async () => agent.generate({
@@ -144,7 +144,7 @@ test("createAgent generate does NOT retry on adapter.ask() errors (network/auth)
     },
   };
 
-  const agent = createAgent(adapter);
+  const agent = createAgent(adapter, "/work");
 
   await assert.rejects(
     async () => agent.generate({
@@ -163,7 +163,7 @@ test("createAgent generate strips extra keys from LLM response", async () => {
     },
   };
 
-  const agent = createAgent(adapter);
+  const agent = createAgent(adapter, "/work");
   const result = await agent.generate({
     prompt: "analyze",
     schema: { reasoning: "string", success: "boolean" },
@@ -184,7 +184,7 @@ test("createAgent generate retries on parse error from first ask but not adapter
     },
   };
 
-  const agent = createAgent(adapter);
+  const agent = createAgent(adapter, "/work");
 
   await assert.rejects(
     async () => agent.generate({
@@ -203,7 +203,7 @@ test("createAgent generate parses valid JSON containing fenced code in string va
     },
   };
 
-  const agent = createAgent(adapter);
+  const agent = createAgent(adapter, "/work");
   const result = await agent.generate({
     prompt: "summarize",
     schema: { summary: "string: the summary", ok: "boolean: success" },
@@ -220,7 +220,7 @@ test("createAgent generate extracts JSON from fenced response with leading text"
     },
   };
 
-  const agent = createAgent(adapter);
+  const agent = createAgent(adapter, "/work");
   const result = await agent.generate({
     prompt: "count",
     schema: { count: "number: the count" },
@@ -234,12 +234,12 @@ test("createAgent generate extracts JSON from fenced response with leading text"
 test("PiAdapter.ask rejects immediately when signal is already aborted", async () => {
   const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
 
-  const adapter = new PiAdapter({ provider: "anthropic", model: "test" }, "/tmp");
+  const adapter = new PiAdapter({ provider: "anthropic", model: "test" });
   const controller = new AbortController();
   controller.abort();
 
   await assert.rejects(
-    async () => adapter.ask("hello", { signal: controller.signal }),
+    async () => adapter.ask("hello", { cwd: process.cwd(), signal: controller.signal }),
     /Aborted/,
   );
 });
@@ -261,11 +261,11 @@ test("PiAdapter.ask calls session.dispose on abort during prompt", async () => {
   };
 
   // Override createSession to return our mock
-  const adapter = new PiAdapter({ provider: "anthropic", model: "test" }, "/tmp");
+  const adapter = new PiAdapter({ provider: "anthropic", model: "test" });
   adapter.createSession = async () => fakeSession;
 
   const controller = new AbortController();
-  const promise = adapter.ask("hello", { signal: controller.signal });
+  const promise = adapter.ask("hello", { cwd: process.cwd(), signal: controller.signal });
 
   // Abort after a tick — should dispose the session and reject the prompt
   await new Promise(resolve => setTimeout(resolve, 10));
@@ -278,14 +278,14 @@ test("PiAdapter.ask calls session.dispose on abort during prompt", async () => {
 test("PiAdapter.ask cleans up abort listeners after successful calls", async () => {
   const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
 
-  const adapter = new PiAdapter({ provider: "openai", model: "gpt-5.4" }, process.cwd());
+  const adapter = new PiAdapter({ provider: "openai", model: "gpt-5.4" });
 
   const controller = new AbortController();
 
   // Exercise the real createSession() path, which attaches two abort listeners
   // via raceAbort(). They must be cleaned up after each successful call.
   for (let i = 0; i < 5; i++) {
-    const session = await adapter.createSession?.(undefined, controller.signal);
+    const session = await adapter.createSession(process.cwd(), undefined, controller.signal);
     assert.equal(
       getEventListeners(controller.signal, "abort").length,
       0,
@@ -297,7 +297,7 @@ test("PiAdapter.ask cleans up abort listeners after successful calls", async () 
   assert.equal(getEventListeners(controller.signal, "abort").length, 0);
   controller.abort();
   await assert.rejects(
-    async () => adapter.ask("after abort", { signal: controller.signal }),
+    async () => adapter.ask("after abort", { cwd: process.cwd(), signal: controller.signal }),
     /Aborted/,
   );
 });
@@ -310,12 +310,12 @@ test("PiAdapter warns once when the configured model is not in pi's catalog", as
   t.after(() => cleanupTempDir(agentDir));
 
   await withEnv({ PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" }, async () => {
-    const unknown = new PiAdapter({ provider: "anthropic", model: "no-such-model-typo" }, process.cwd());
+    const unknown = new PiAdapter({ provider: "anthropic", model: "no-such-model-typo" });
     const { messages } = await captureConsole("warn", async () => {
-      // Two sessions, plus a copy of the adapter in another cwd — still one warning.
-      (await unknown.createSession()).dispose();
-      (await unknown.createSession()).dispose();
-      (await unknown.withCwd(agentDir).createSession()).dispose();
+      // Two sessions, plus one in another directory — still one warning.
+      (await unknown.createSession(process.cwd())).dispose();
+      (await unknown.createSession(process.cwd())).dispose();
+      (await unknown.createSession(agentDir)).dispose();
     });
     assert.equal(messages.length, 1, `expected exactly one warning, got: ${JSON.stringify(messages)}`);
     assert.match(messages[0], /anthropic\/no-such-model-typo/);
@@ -325,33 +325,16 @@ test("PiAdapter warns once when the configured model is not in pi's catalog", as
     assert.match(messages[0], /no fallback model available/);
     assert.doesNotMatch(messages[0], /unknown\/unknown/);
 
-    const known = new PiAdapter({ provider: "openai", model: "gpt-5.4" }, process.cwd());
+    const known = new PiAdapter({ provider: "openai", model: "gpt-5.4" });
     const { messages: none } = await captureConsole("warn", async () => {
-      (await known.createSession()).dispose();
+      (await known.createSession(process.cwd())).dispose();
     });
     assert.deepEqual(none, [], "a model that exists in the catalog must not warn");
   });
 });
 
-test("PiAdapter.repair trims whitespace even without code fences", async () => {
-  const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
-
-  const adapter = new PiAdapter({ provider: "anthropic", model: "test" }, "/tmp");
-  adapter.ask = async function ask() {
-    return "\n  const value = 1;\n\n";
-  };
-
-  const result = await adapter.repair({
-    programSource: "throw new Error('boom');",
-    error: "boom",
-    runtimeTypes: "type Runtime = {};",
-  });
-
-  assert.equal(result, "const value = 1;");
-});
-
 test("stripCodeFences extracts code from responses with leading text", async () => {
-  const { stripCodeFences } = await import("../packages/runtime/dist/pi-adapter.js");
+  const { stripCodeFences } = await import("../packages/runtime/dist/agent.js");
 
   const withPrefix = "Here is the fixed program:\n\n```typescript\nconst x = 1;\n```";
   assert.equal(stripCodeFences(withPrefix), "const x = 1;");
@@ -362,21 +345,7 @@ test("stripCodeFences extracts code from responses with leading text", async () 
   // Plain unfenced code should pass through unchanged
   const plain = "const y = 2;";
   assert.equal(stripCodeFences(plain), "const y = 2;");
-});
 
-test("PiAdapter.repair strips fenced TypeScript responses", async () => {
-  const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
-
-  const adapter = new PiAdapter({ provider: "anthropic", model: "test" }, "/tmp");
-  adapter.ask = async function ask() {
-    return "```typescript\nconst value = 1;\n```";
-  };
-
-  const result = await adapter.repair({
-    programSource: "throw new Error('boom');",
-    error: "boom",
-    runtimeTypes: "type Runtime = {};",
-  });
-
-  assert.equal(result, "const value = 1;");
+  // ...apart from the whitespace around it
+  assert.equal(stripCodeFences("\n  const value = 1;\n\n"), "const value = 1;");
 });

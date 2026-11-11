@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { existsSync, readdirSync, readFileSync } from "fs";
 import { join } from "path";
-import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
+import { llm } from "./fake-llm.mjs";
 import { runProgram } from "../packages/runtime/dist/runner.js";
 import { cleanupTempDir, createProjectFixture, makeTempDir, readJson, writeText } from "./helpers.mjs";
 
@@ -319,8 +319,8 @@ test("a repair that fails leaves the shared workspace as it was", async (t) => {
     programSource: `throw new Error("original failure");`,
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair() {
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
     // The repaired program writes an artifact and then fails as well.
     return `import { workspace } from "@trama-dev/runtime";
 await workspace.write("artifact.txt", "from repair");
@@ -338,7 +338,7 @@ throw new Error("repair also fails");`;
     // Pre-existing artifacts must survive
     assert.equal(readFileSync(join(wsDir, "existing.txt"), "utf-8"), "keep me");
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -351,8 +351,8 @@ test("a failed repair run preserves concurrent workspace writes from other parti
     programSource: `throw new Error("original failure");`,
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair() {
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
     // The repaired program waits for the concurrent write and then crashes.
     return `${pauseRepairRun(projectDir)}
 throw new Error("crash after concurrent write window");`;
@@ -372,7 +372,7 @@ throw new Error("crash after concurrent write window");`;
     // Concurrent write from another participant must still be there after the failed fix
     assert.equal(readFileSync(join(wsDir, "concurrent.txt"), "utf-8"), "from another participant");
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -388,8 +388,8 @@ test("successful repair commit does not overwrite concurrent workspace updates (
     programSource: `throw new Error("original failure");`,
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair() {
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
     return `import { ctx, workspace } from "@trama-dev/runtime";
 ${pauseRepairRun(projectDir)}
 await workspace.write("new-artifact.txt", "from repair");
@@ -410,7 +410,7 @@ await ctx.done();`;
     assert.equal(readFileSync(join(wsDir, "new-artifact.txt"), "utf-8"), "from repair");
     assert.equal(readFileSync(join(wsDir, "shared.txt"), "utf-8"), "updated-by-other");
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -426,8 +426,8 @@ test("successful repair commit does not overwrite concurrent update on same path
     programSource: `throw new Error("original failure");`,
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair() {
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
     // Repaired program modifies shared.txt (same file another participant will update)
     return `import { ctx, workspace } from "@trama-dev/runtime";
 ${pauseRepairRun(projectDir)}
@@ -450,7 +450,7 @@ await ctx.done();`;
     // The concurrent update must be preserved — repair's stale write must be skipped
     assert.equal(readFileSync(join(wsDir, "shared.txt"), "utf-8"), "updated-by-other");
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -464,8 +464,8 @@ test("successful repair commit does not overwrite concurrently created new path"
     programSource: `throw new Error("original failure");`,
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair() {
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
     return `import { ctx, workspace } from "@trama-dev/runtime";
 ${pauseRepairRun(projectDir)}
 await workspace.write("shared-new.txt", "from-repair");
@@ -487,7 +487,7 @@ await ctx.done();`;
     // The other participant's version must be preserved
     assert.equal(readFileSync(join(wsDir, "shared-new.txt"), "utf-8"), "from-other");
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -585,9 +585,9 @@ test("a successful repair runs the fixed program exactly once", async (t) => {
     programSource: `throw new Error("original failure");`,
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalRepair = llm.repair;
   let repairCalls = 0;
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     repairCalls += 1;
     // Each execution leaves one line behind, in the project and in the workspace.
     return `import { ctx, workspace } from "@trama-dev/runtime";
@@ -608,7 +608,7 @@ await ctx.done();`;
     assert.equal(readFileSync(join(projectDir, "executions.txt"), "utf-8"), "ran\n");
     assert.deepEqual(readdirSync(wsDir).sort(), ["run-0.txt"]);
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -624,8 +624,8 @@ test("a repaired program sees the workspace's existing artifacts", async (t) => 
     programSource: `throw new Error("original failure");`,
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair() {
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
     return `import { ctx, workspace } from "@trama-dev/runtime";
 const data = await workspace.read("input.txt");
 await ctx.done({ data });`;
@@ -638,7 +638,7 @@ await ctx.done({ data });`;
     assert.equal(result.status, "done");
     assert.equal(result.result.data, "session data");
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });
 
@@ -649,8 +649,8 @@ test("repair respects done marker precedence (done then throw)", async (t) => {
     programSource: `throw new Error("original failure");`,
   });
 
-  const originalRepair = PiAdapter.prototype.repair;
-  PiAdapter.prototype.repair = async function repair() {
+  const originalRepair = llm.repair;
+  llm.repair = async function repair() {
     // Repaired program calls done() then throws — done should take precedence
     return `import { ctx } from "@trama-dev/runtime";
 await ctx.done({ repaired: true });
@@ -662,6 +662,6 @@ throw new Error("post-done error");`;
     assert.equal(result.status, "done");
     assert.deepEqual(result.result, { repaired: true });
   } finally {
-    PiAdapter.prototype.repair = originalRepair;
+    llm.repair = originalRepair;
   }
 });

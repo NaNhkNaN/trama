@@ -1,5 +1,19 @@
 import type { Agent } from "./types.js";
-import type { PiAdapter } from "./pi-adapter.js";
+import type { AgentBackend } from "./agent-backend.js";
+
+/**
+ * The program in an LLM reply that was asked to contain nothing else: the last
+ * fenced block if there is one (models add explanations, or show a "before"
+ * first), otherwise the whole reply.
+ */
+export function stripCodeFences(text: string): string {
+  const trimmed = text.trim();
+  const matches = [...trimmed.matchAll(/```(?:\w*)\s*\n([\s\S]*?)\n\s*```/g)];
+  if (matches.length > 0) {
+    return matches[matches.length - 1][1].trim();
+  }
+  return trimmed;
+}
 
 /**
  * Minimal shape validation.
@@ -20,10 +34,14 @@ function validateShape(result: unknown, schema: Record<string, string>): string 
   return null;
 }
 
-export function createAgent(adapter: PiAdapter, signal?: AbortSignal): Agent {
+/**
+ * The `agent` a program talks to: its calls, served by `backend` working in
+ * `cwd`, and cancelled together through `signal`.
+ */
+export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSignal): Agent {
   return {
     async instruct(prompt, options) {
-      return adapter.ask(prompt, signal ? { ...options, signal } : options);
+      return backend.ask(prompt, { cwd, system: options?.system, signal });
     },
 
     async generate(input) {
@@ -32,7 +50,7 @@ export function createAgent(adapter: PiAdapter, signal?: AbortSignal): Agent {
       }\nNo markdown. No explanation. Just the JSON.`;
 
       const fullPrompt = `${input.prompt}\n\n${schemaInstruction}`;
-      const askOptions = signal ? { system: input.system, signal } : { system: input.system };
+      const call = { cwd, system: input.system, signal };
 
       const parseAndValidate = (response: string): Record<string, unknown> => {
         const trimmed = response.trim();
@@ -50,14 +68,14 @@ export function createAgent(adapter: PiAdapter, signal?: AbortSignal): Agent {
         return stripToSchema(parsed as Record<string, unknown>, input.schema);
       };
 
-      // First attempt — adapter errors (network/auth) propagate immediately.
+      // First attempt — backend errors (network/auth) propagate immediately.
       // Only parse/validation failures trigger a retry.
-      const response = await adapter.ask(fullPrompt, askOptions);
+      const response = await backend.ask(fullPrompt, call);
       try {
         return parseAndValidate(response) as any;
       } catch (firstError) {
         const retryPrompt = `Your previous response failed validation: ${firstError}.\nTry again.\n\n${fullPrompt}`;
-        const retryResponse = await adapter.ask(retryPrompt, askOptions);
+        const retryResponse = await backend.ask(retryPrompt, call);
         return parseAndValidate(retryResponse) as any;
       }
     }

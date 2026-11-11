@@ -11,9 +11,10 @@ import { fileURLToPath } from "url";
 import { randomBytes } from "crypto";
 import type { ShellResult } from "./types.js";
 import type { RunOptions, TramaConfig, ProgramResult } from "./runner-types.js";
+import type { AgentBackend } from "./agent-backend.js";
 import { PiAdapter } from "./pi-adapter.js";
 import { createContext } from "./context.js";
-import { createAgent } from "./agent.js";
+import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
 import { guardPath } from "./path-guard.js";
@@ -206,6 +207,14 @@ export function loadProjectConfig(projectDir: string): TramaConfig {
   return config;
 }
 
+/**
+ * What does the LLM work for a project. The only place that picks a backend:
+ * everything else is handed one and does not know which it is.
+ */
+export function createBackend(config: TramaConfig): AgentBackend {
+  return new PiAdapter(config);
+}
+
 export function loadState(projectDir: string): Record<string, unknown> {
   const statePath = guardPath(projectDir, "state.json");
   if (!existsSync(statePath)) return {};
@@ -382,8 +391,9 @@ async function withStagedCopy<T>(
 // --- Single program execution ---
 
 interface RunOnceOptions {
+  /** The project to run. It is also where the program's agent calls work. */
   projectDir: string;
-  adapter: PiAdapter;
+  backend: AgentBackend;
   timeout: number;
   maxIterations: number;
   argsOverride?: Record<string, unknown>;
@@ -465,7 +475,7 @@ function settle(projectDir: string, child: ShellResult, terminalSignal: ProgramR
  * (bad project, server or spawn failure) or left state.json unreadable.
  */
 async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
-  const { projectDir, adapter, timeout, maxIterations, argsOverride, stopOnReady, workspaceDir } = options;
+  const { projectDir, backend, timeout, maxIterations, argsOverride, stopOnReady, workspaceDir } = options;
 
   ensureProjectScaffold(projectDir);
 
@@ -493,7 +503,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   const server = createIPCServer({
     token,
     ctx,
-    agent: createAgent(adapter, runEnded.signal),
+    agent: createAgent(backend, projectDir, runEnded.signal),
     tools,
     workspace: workspaceDir ? createWorkspace(workspaceDir, runEnded.signal) : null,
     // The first terminal signal wins; ctx itself rejects a conflicting second one.
@@ -559,11 +569,18 @@ interface Execution {
   repair?: { attempt: number; error: string };
 }
 
+const repairPrompt = (input: { programSource: string; error: string }) =>
+  `Fix this program so it runs.\n\n` +
+  `Runtime types:\n${RUNTIME_TYPES}\n\n` +
+  `Broken program:\n${input.programSource}\n\n` +
+  `Error:\n${input.error}\n\n` +
+  `Output ONLY the fixed program. No explanation.`;
+
 /**
- * Ask the LLM for a fix. The repair agent has tools, so it works in a
- * throwaway copy of the project that holds the program it is asked to fix —
- * whatever it reads is real, whatever it writes is discarded; only the program
- * text it returns is used. Bounded by its own timeout.
+ * Ask the LLM for a fix. The agent has tools, so it works in a throwaway copy
+ * of the project that holds the program it is asked to fix — whatever it reads
+ * is real, whatever it writes is discarded; only the program text it returns
+ * is used. Bounded by its own timeout.
  * Returns null (and records why) if no usable fix came back.
  */
 async function requestRepair(
@@ -577,7 +594,9 @@ async function requestRepair(
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), options.timeout);
     try {
-      const fixed = await options.adapter.withCwd(tempDir).repair({ ...input, runtimeTypes: RUNTIME_TYPES }, controller.signal);
+      const fixed = stripCodeFences(await options.backend.ask(repairPrompt(input), {
+        cwd: tempDir, system: "You are a TypeScript repair tool.", signal: controller.signal,
+      }));
       if (fixed.trim() === "") throw new Error("The repair returned an empty program.");
       if (fixed === input.programSource) throw new Error("The repair returned the program unchanged.");
       return fixed;
@@ -604,9 +623,7 @@ async function tryFix(options: ExecuteOptions, fixed: string): Promise<RunOnceRe
       writeFileSync(guardPath(stagedProject, "program.ts"), fixed);
       let run: RunOnceResult;
       try {
-        run = await runProgramOnce({
-          ...options, projectDir: stagedProject, adapter: options.adapter.withCwd(stagedProject), workspaceDir: stagedWorkspace,
-        });
+        run = await runProgramOnce({ ...options, projectDir: stagedProject, workspaceDir: stagedWorkspace });
       } catch (err) {
         // The copy could not be run at all, or was left unusable. Either way this fix did not work.
         run = { outcome: null, failure: `The repaired program could not be run: ${err instanceof Error ? err.message : err}` };
@@ -675,7 +692,7 @@ const VALIDATION_READY_GRACE_MS = 2_000;
  */
 export async function validateProgram(
   projectDir: string,
-  adapter: PiAdapter,
+  backend: AgentBackend,
   candidate: string,
   options: { timeout: number; maxRepairAttempts: number; maxIterations: number },
 ): Promise<{ source: string; repairedError?: string }> {
@@ -687,7 +704,7 @@ export async function validateProgram(
     const { result, repair } = await executeProgram({
       ...options,
       projectDir: trialDir,
-      adapter: adapter.withCwd(trialDir),
+      backend,
       stopOnReady: { graceMs: VALIDATION_READY_GRACE_MS },
     });
     if (result.status === "failed") {
@@ -742,7 +759,7 @@ export async function runProgram(options: RunOptions): Promise<ProgramResult> {
 
   const { result, repair } = await executeProgram({
     projectDir,
-    adapter: new PiAdapter(config, projectDir),
+    backend: createBackend(config),
     maxRepairAttempts,
     timeout,
     maxIterations: config.defaultMaxIterations,

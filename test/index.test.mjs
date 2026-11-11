@@ -3,7 +3,7 @@ import test from "node:test";
 import { join } from "path";
 import { existsSync, mkdirSync, readFileSync } from "fs";
 import { createProject, listProjects, showLogs, updateProject, validateProjectName } from "../packages/runtime/dist/index.js";
-import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
+import { llm } from "./fake-llm.mjs";
 import {
   DEFAULT_PROGRAM,
   captureConsole,
@@ -27,16 +27,16 @@ test("createProject writes scaffold, validates the generated program, and record
   const fakeHome = makeTempDir("trama-home-");
   t.after(() => cleanupTempDir(fakeHome));
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
   const prompts = [];
 
-  PiAdapter.prototype.ask = async function ask(prompt, options) {
+  llm.ask = async function ask(prompt, options) {
     prompts.push(options?.system ?? "");
     assert.match(prompt, /Output ONLY the TypeScript program/);
     return DEFAULT_PROGRAM;
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     throw new Error("repair should not be called");
   };
 
@@ -45,8 +45,8 @@ test("createProject writes scaffold, validates the generated program, and record
       await createProject("alpha", "write an output file", { model: "test-model" });
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   const projectDir = join(fakeHome, ".trama", "projects", "alpha");
@@ -69,16 +69,16 @@ test("createProject generation runs in a temp cwd and does not leak ask side eff
   const fakeHome = makeTempDir("trama-home-");
   t.after(() => cleanupTempDir(fakeHome));
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
   let observedCwd = "";
 
-  PiAdapter.prototype.ask = async function ask() {
-    observedCwd = this.cwd;
-    writeText(join(this.cwd, "ask-side-effect.txt"), "temp-only");
+  llm.ask = async function ask(_prompt, call) {
+    observedCwd = call.cwd;
+    writeText(join(call.cwd, "ask-side-effect.txt"), "temp-only");
     return DEFAULT_PROGRAM;
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     throw new Error("repair should not be called");
   };
 
@@ -87,8 +87,8 @@ test("createProject generation runs in a temp cwd and does not leak ask side eff
       await createProject("alpha-temp-cwd", "write an output file");
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   const projectDir = join(fakeHome, ".trama", "projects", "alpha-temp-cwd");
@@ -101,8 +101,8 @@ test("createProject cleans up the project directory when generation fails before
   const fakeHome = makeTempDir("trama-home-");
   t.after(() => cleanupTempDir(fakeHome));
 
-  const originalAsk = PiAdapter.prototype.ask;
-  PiAdapter.prototype.ask = async function ask() {
+  const originalAsk = llm.ask;
+  llm.ask = async function ask() {
     throw new Error("LLM unavailable");
   };
 
@@ -114,7 +114,7 @@ test("createProject cleans up the project directory when generation fails before
       );
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
+    llm.ask = originalAsk;
   }
 
   assert.equal(existsSync(join(fakeHome, ".trama", "projects", "broken")), false);
@@ -124,15 +124,15 @@ test("createProject keeps the generated project when validation fails after prog
   const fakeHome = makeTempDir("trama-home-");
   t.after(() => cleanupTempDir(fakeHome));
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return 'throw new Error("broken");';
   };
   // Each attempt proposes a different program, and each is broken.
   let attempts = 0;
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     attempts += 1;
     return `throw new Error("still broken, attempt ${attempts}");`;
   };
@@ -145,8 +145,8 @@ test("createProject keeps the generated project when validation fails after prog
       );
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   const projectDir = join(fakeHome, ".trama", "projects", "broken-after-write");
@@ -158,13 +158,13 @@ test("createProject smoke validation errors include buffered stdout", async (t) 
   const fakeHome = makeTempDir("trama-home-");
   t.after(() => cleanupTempDir(fakeHome));
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return 'console.log("stdout-hint"); process.exit(1);';
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     return 'console.log("stdout-hint"); process.exit(1);';
   };
 
@@ -176,8 +176,8 @@ test("createProject smoke validation errors include buffered stdout", async (t) 
       );
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 });
 
@@ -185,20 +185,20 @@ test("createProject smoke repair runs in a temp cwd and records create-repair hi
   const fakeHome = makeTempDir("trama-home-");
   t.after(() => cleanupTempDir(fakeHome));
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
   let repairCwd = "";
   const fixedProgram = `import { ctx, tools } from "@trama-dev/runtime";
 await tools.write("fixed.txt", "ok");
 await ctx.done();
 `;
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return 'throw new Error("boom");';
   };
-  PiAdapter.prototype.repair = async function repair() {
-    repairCwd = this.cwd;
-    writeText(join(this.cwd, "repair-side-effect.txt"), "temp-only");
+  llm.repair = async function repair(_prompt, call) {
+    repairCwd = call.cwd;
+    writeText(join(call.cwd, "repair-side-effect.txt"), "temp-only");
     return fixedProgram;
   };
 
@@ -207,15 +207,15 @@ await ctx.done();
       await createProject("alpha-repair", "fix the generated program");
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   const projectDir = join(fakeHome, ".trama", "projects", "alpha-repair");
   assert.match(repairCwd, /trama-repair-/);
   assert.notEqual(repairCwd, projectDir);
   assert.equal(existsSync(join(projectDir, "repair-side-effect.txt")), false);
-  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram);
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram.trim());
 
   const historyLines = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8")
     .trim()
@@ -236,8 +236,8 @@ test("createProject accepts long-running server programs during smoke validation
     defaultMaxIterations: 100,
   });
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
   let repairCalled = false;
   const serverProgram = `import { ctx } from "@trama-dev/runtime";
 import { createServer } from "node:http";
@@ -261,10 +261,10 @@ process.on("SIGTERM", () => {
 await new Promise(() => {});
 `;
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return serverProgram;
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     repairCalled = true;
     throw new Error("repair should not run");
   };
@@ -277,8 +277,8 @@ await new Promise(() => {});
     const elapsed = Date.now() - startedAt;
     assert.ok(elapsed < 15_000, `expected smoke validation to finish quickly, got ${elapsed}ms`);
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   const projectDir = join(fakeHome, ".trama", "projects", "server-app");
@@ -298,8 +298,8 @@ test("createProject times out long-running server programs that never call ctx.r
     defaultMaxIterations: 100,
   });
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
   const serverProgram = `import { createServer } from "node:http";
 
 const server = createServer((_req, res) => {
@@ -319,10 +319,10 @@ process.on("SIGTERM", () => {
 await new Promise(() => {});
 `;
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return serverProgram;
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     throw new Error("repair should not run");
   };
 
@@ -337,8 +337,8 @@ await new Promise(() => {});
     const elapsed = Date.now() - startedAt;
     assert.ok(elapsed < 5_000, `expected smoke validation to fail quickly, got ${elapsed}ms`);
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 });
 
@@ -354,8 +354,8 @@ test("createProject detects server crash during smoke grace period after ctx.rea
     defaultMaxIterations: 100,
   });
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
   // Server calls ctx.ready() then crashes 200ms later — should fail smoke validation
   const crashingServer = `import { ctx } from "@trama-dev/runtime";
 import { createServer } from "node:http";
@@ -379,10 +379,10 @@ setTimeout(() => {
 await new Promise(() => {});
 `;
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return crashingServer;
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     throw new Error("repair should not run");
   };
 
@@ -395,8 +395,8 @@ await new Promise(() => {});
       );
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 });
 
@@ -426,15 +426,15 @@ test("updateProject rewrites the program and appends an update history entry", a
     programSource: DEFAULT_PROGRAM,
   });
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
   let systemPrompt = "";
 
-  PiAdapter.prototype.ask = async function ask(_prompt, options) {
+  llm.ask = async function ask(_prompt, options) {
     systemPrompt = options?.system ?? "";
     return UPDATED_PROGRAM;
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     throw new Error("repair should not be called");
   };
 
@@ -443,8 +443,8 @@ test("updateProject rewrites the program and appends an update history entry", a
       await updateProject("beta", "add an updated output");
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   // stripCodeFences trims the LLM response, so program.ts won't have trailing whitespace
@@ -474,16 +474,16 @@ test("updateProject generation runs in a temp cwd and does not leak ask side eff
     programSource: DEFAULT_PROGRAM,
   });
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
   let observedCwd = "";
 
-  PiAdapter.prototype.ask = async function ask() {
-    observedCwd = this.cwd;
-    writeText(join(this.cwd, "ask-side-effect.txt"), "temp-only");
+  llm.ask = async function ask(_prompt, call) {
+    observedCwd = call.cwd;
+    writeText(join(call.cwd, "ask-side-effect.txt"), "temp-only");
     return UPDATED_PROGRAM;
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     throw new Error("repair should not be called");
   };
 
@@ -492,8 +492,8 @@ test("updateProject generation runs in a temp cwd and does not leak ask side eff
       await updateProject("beta-temp-cwd", "add an updated output");
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   assert.match(observedCwd, /trama-gen-/);
@@ -511,13 +511,13 @@ test("updateProject restores original program.ts when validation fails", async (
     programSource: DEFAULT_PROGRAM,
   });
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return 'throw new Error("broken");';
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     return 'throw new Error("still broken");';
   };
 
@@ -529,8 +529,8 @@ test("updateProject restores original program.ts when validation fails", async (
       );
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   // Original program.ts should be restored
@@ -548,8 +548,8 @@ test("updateProject restores original state.json when validation fails after che
     state: { stable: true },
   });
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
   const brokenProgram = `import { ctx } from "@trama-dev/runtime";
 
 ctx.state.mode = "broken";
@@ -557,10 +557,10 @@ await ctx.checkpoint();
 throw new Error("boom");
 `;
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return brokenProgram;
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     return brokenProgram;
   };
 
@@ -572,8 +572,8 @@ throw new Error("boom");
       );
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   assert.deepEqual(readJson(join(projectDir, "state.json")), { stable: true });
@@ -590,18 +590,18 @@ test("updateProject restores files written by a failed validation run", async (t
     programSource: DEFAULT_PROGRAM,
   });
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
   const brokenProgram = `import { tools } from "@trama-dev/runtime";
 
 await tools.write("leftover.txt", "oops");
 throw new Error("boom");
 `;
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return brokenProgram;
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     return brokenProgram;
   };
 
@@ -613,8 +613,8 @@ throw new Error("boom");
       );
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   assert.equal(existsSync(join(projectDir, "leftover.txt")), false);
@@ -635,14 +635,14 @@ test("updateProject records no repair in history when the update fails", async (
     `${JSON.stringify({ version: 1, reason: "create", timestamp: "2026-03-28T00:00:00.000Z" })}\n`,
   );
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
   const brokenProgram = 'throw new Error("boom");\n';
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return brokenProgram;
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     return brokenProgram;
   };
 
@@ -654,8 +654,8 @@ test("updateProject records no repair in history when the update fails", async (
       );
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   const historyLines = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8")
@@ -716,13 +716,13 @@ test("createProject strips code fences from LLM-generated program", async (t) =>
   const fakeHome = makeTempDir("trama-home-");
   t.after(() => cleanupTempDir(fakeHome));
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return "```typescript\n" + DEFAULT_PROGRAM + "```";
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     throw new Error("repair should not be called");
   };
 
@@ -731,8 +731,8 @@ test("createProject strips code fences from LLM-generated program", async (t) =>
       await createProject("fenced", "write something");
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   const projectDir = join(fakeHome, ".trama", "projects", "fenced");
@@ -751,13 +751,13 @@ test("updateProject strips code fences from LLM-updated program", async (t) => {
     programSource: DEFAULT_PROGRAM,
   });
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return "```typescript\n" + UPDATED_PROGRAM + "```";
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     throw new Error("repair should not be called");
   };
 
@@ -766,8 +766,8 @@ test("updateProject strips code fences from LLM-updated program", async (t) => {
       await updateProject("fenced-update", "add an updated output");
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 
   const written = readFileSync(join(projectDir, "program.ts"), "utf-8");
@@ -781,14 +781,14 @@ test("createProject smoke validation uses config maxRepairAttempts", async (t) =
 
   writeJson(join(fakeHome, ".trama", "config.json"), { maxRepairAttempts: 0 });
 
-  const originalAsk = PiAdapter.prototype.ask;
-  const originalRepair = PiAdapter.prototype.repair;
+  const originalAsk = llm.ask;
+  const originalRepair = llm.repair;
   let repairCalled = false;
 
-  PiAdapter.prototype.ask = async function ask() {
+  llm.ask = async function ask() {
     return 'throw new Error("broken");';
   };
-  PiAdapter.prototype.repair = async function repair() {
+  llm.repair = async function repair() {
     repairCalled = true;
     return 'throw new Error("still broken");';
   };
@@ -802,8 +802,8 @@ test("createProject smoke validation uses config maxRepairAttempts", async (t) =
     });
     assert.equal(repairCalled, false, "repair should not be called when maxRepairAttempts is 0");
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
-    PiAdapter.prototype.repair = originalRepair;
+    llm.ask = originalAsk;
+    llm.repair = originalRepair;
   }
 });
 
@@ -816,8 +816,8 @@ test("createProject rejects duplicate project names", async (t) => {
   // Pre-create the project directory
   mkdirSync(join(fakeHome, ".trama", "projects", "dupe"), { recursive: true });
 
-  const originalAsk = PiAdapter.prototype.ask;
-  PiAdapter.prototype.ask = async function ask() { return DEFAULT_PROGRAM; };
+  const originalAsk = llm.ask;
+  llm.ask = async function ask() { return DEFAULT_PROGRAM; };
 
   try {
     await withEnv({ HOME: fakeHome }, async () => {
@@ -827,7 +827,7 @@ test("createProject rejects duplicate project names", async (t) => {
       );
     });
   } finally {
-    PiAdapter.prototype.ask = originalAsk;
+    llm.ask = originalAsk;
   }
 });
 
