@@ -275,6 +275,33 @@ await tools.write("iterations.txt", seen.join(","));
 
 // --- Repair workspace isolation ---
 
+// Several tests below need "another participant" to touch the shared workspace
+// while a repaired program is being re-run for real — after the runner has
+// staged the workspace, before it commits. Rather than guess when that is, the
+// repaired program announces that the real rerun has begun and waits to be
+// released, and the test acts in between.
+
+/** Source for a repaired program: pause the real rerun (not the verification run) until released. */
+function pauseDuringRealRerun(projectDir) {
+  return `import { existsSync, realpathSync, writeFileSync } from "fs";
+const inRealProject = realpathSync(process.cwd()) === realpathSync(${JSON.stringify(projectDir)});
+if (inRealProject) {
+  writeFileSync("rerun-started.txt", "");
+  while (!existsSync("rerun-proceed.txt")) await new Promise(r => setTimeout(r, 20));
+}`;
+}
+
+/** Wait for the real rerun to pause, run `act`, then let the rerun continue. */
+async function duringRealRerun(projectDir, act) {
+  const deadline = Date.now() + 9_000;
+  while (!existsSync(join(projectDir, "rerun-started.txt"))) {
+    if (Date.now() > deadline) throw new Error("the real rerun never started");
+    await new Promise(r => setTimeout(r, 20));
+  }
+  act();
+  writeText(join(projectDir, "rerun-proceed.txt"), "");
+}
+
 test("repair verification does not leak workspace artifacts", async (t) => {
   const projectDir = makeTempDir("trama-result-");
   const wsDir = makeTempDir("trama-ws-");
@@ -358,30 +385,22 @@ test("failed real rerun preserves concurrent workspace writes from other partici
 
   const originalRepair = PiAdapter.prototype.repair;
   PiAdapter.prototype.repair = async function repair() {
-    const realProjectDir = JSON.stringify(projectDir);
-    // Program sleeps briefly in real dir (to allow simulated concurrent write),
-    // then crashes. Passes in temp dir.
-    return `import { ctx, tools, workspace } from "@trama-dev/runtime";
-import { realpathSync } from "fs";
-const cwd = realpathSync(process.cwd());
-const realDir = realpathSync(${realProjectDir});
-if (cwd === realDir) {
-  await tools.shell("sleep 0.3");
-  throw new Error("crash after concurrent write window");
-}
+    // Passes in the verification copy; in the real project it waits for the
+    // concurrent write and then crashes.
+    return `import { ctx } from "@trama-dev/runtime";
+${pauseDuringRealRerun(projectDir)}
+if (inRealProject) throw new Error("crash after concurrent write window");
 await ctx.done();`;
   };
 
   try {
-    // Start runProgram and simulate a concurrent write during the real rerun window
     const runPromise = runProgram({
       projectDir, maxRepairAttempts: 1, timeout: 10_000, workspaceDir: wsDir,
     });
 
-    // Wait for the real rerun to start, then write a concurrent artifact
-    // The repair takes ~2 runs (temp verify + real), so wait a bit
-    await new Promise(r => setTimeout(r, 2000));
-    writeText(join(wsDir, "concurrent.txt"), "from another participant");
+    await duringRealRerun(projectDir, () => {
+      writeText(join(wsDir, "concurrent.txt"), "from another participant");
+    });
 
     const result = await runPromise;
     assert.equal(result.status, "failed");
@@ -406,14 +425,8 @@ test("successful repair commit does not overwrite concurrent workspace updates (
 
   const originalRepair = PiAdapter.prototype.repair;
   PiAdapter.prototype.repair = async function repair() {
-    const realProjectDir = JSON.stringify(projectDir);
-    return `import { ctx, tools, workspace } from "@trama-dev/runtime";
-import { realpathSync } from "fs";
-const cwd = realpathSync(process.cwd());
-const realDir = realpathSync(${realProjectDir});
-if (cwd === realDir) {
-  await tools.shell("sleep 0.3");
-}
+    return `import { ctx, workspace } from "@trama-dev/runtime";
+${pauseDuringRealRerun(projectDir)}
 await workspace.write("new-artifact.txt", "from repair");
 await ctx.done();`;
   };
@@ -423,8 +436,9 @@ await ctx.done();`;
       projectDir, maxRepairAttempts: 1, timeout: 10_000, workspaceDir: wsDir,
     });
 
-    await new Promise(r => setTimeout(r, 2000));
-    writeText(join(wsDir, "shared.txt"), "updated-by-other");
+    await duringRealRerun(projectDir, () => {
+      writeText(join(wsDir, "shared.txt"), "updated-by-other");
+    });
 
     const result = await runPromise;
     assert.equal(result.status, "done");
@@ -449,15 +463,9 @@ test("successful repair commit does not overwrite concurrent update on same path
 
   const originalRepair = PiAdapter.prototype.repair;
   PiAdapter.prototype.repair = async function repair() {
-    const realProjectDir = JSON.stringify(projectDir);
     // Repaired program modifies shared.txt (same file another participant will update)
-    return `import { ctx, tools, workspace } from "@trama-dev/runtime";
-import { realpathSync } from "fs";
-const cwd = realpathSync(process.cwd());
-const realDir = realpathSync(${realProjectDir});
-if (cwd === realDir) {
-  await tools.shell("sleep 0.3");
-}
+    return `import { ctx, workspace } from "@trama-dev/runtime";
+${pauseDuringRealRerun(projectDir)}
 await workspace.write("shared.txt", "from-repair");
 await ctx.done();`;
   };
@@ -467,9 +475,10 @@ await ctx.done();`;
       projectDir, maxRepairAttempts: 1, timeout: 10_000, workspaceDir: wsDir,
     });
 
-    // Wait for real rerun to start, then update shared.txt concurrently
-    await new Promise(r => setTimeout(r, 2000));
-    writeText(join(wsDir, "shared.txt"), "updated-by-other");
+    // While the rerun holds its staged copy, another participant updates shared.txt
+    await duringRealRerun(projectDir, () => {
+      writeText(join(wsDir, "shared.txt"), "updated-by-other");
+    });
 
     const result = await runPromise;
     assert.equal(result.status, "done");
@@ -492,14 +501,8 @@ test("successful repair commit does not overwrite concurrently created new path"
 
   const originalRepair = PiAdapter.prototype.repair;
   PiAdapter.prototype.repair = async function repair() {
-    const realProjectDir = JSON.stringify(projectDir);
-    return `import { ctx, tools, workspace } from "@trama-dev/runtime";
-import { realpathSync } from "fs";
-const cwd = realpathSync(process.cwd());
-const realDir = realpathSync(${realProjectDir});
-if (cwd === realDir) {
-  await tools.shell("sleep 0.3");
-}
+    return `import { ctx, workspace } from "@trama-dev/runtime";
+${pauseDuringRealRerun(projectDir)}
 await workspace.write("shared-new.txt", "from-repair");
 await ctx.done();`;
   };
@@ -509,9 +512,10 @@ await ctx.done();`;
       projectDir, maxRepairAttempts: 1, timeout: 10_000, workspaceDir: wsDir,
     });
 
-    // Wait for real rerun to start, then create the same new path concurrently
-    await new Promise(r => setTimeout(r, 2000));
-    writeText(join(wsDir, "shared-new.txt"), "from-other");
+    // While the rerun holds its staged copy, another participant creates the same new path
+    await duringRealRerun(projectDir, () => {
+      writeText(join(wsDir, "shared-new.txt"), "from-other");
+    });
 
     const result = await runPromise;
     assert.equal(result.status, "done");
