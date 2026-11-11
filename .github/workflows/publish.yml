@@ -107,5 +107,6 @@ jobs:
               echo "@trama-dev/$PKG@$VERSION is already published — skipping"
               continue
             fi
-            npm publish "tarballs/trama-dev-$PKG-$VERSION.tgz" --access public --ignore-scripts
+            # The leading ./ matters: npm reads a bare "dir/file" as a GitHub "owner/repo".
+            npm publish "./tarballs/trama-dev-$PKG-$VERSION.tgz" --access public --ignore-scripts
           done
