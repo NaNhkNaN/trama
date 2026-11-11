@@ -2,7 +2,7 @@
 
 All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`) are released together under one version.
 
-## Unreleased
+## 0.2.2 — 2026-11-11
 
 ### Fixed
 
@@ -53,7 +53,7 @@ No change to how trama behaves; this release exercises the new release process.
 
 ### Changed
 
-- **A repair runs the fixed program once**, not twice. (How it does so in 0.2.0 and 0.2.1 has a flaw — see the fix listed under Unreleased.)
+- **A repair runs the fixed program once**, not twice. (How it does so in 0.2.0 and 0.2.1 has a flaw — see the fix in 0.2.2.)
 - `ctx.done()` followed by `ctx.checkpoint()` and a crash is reported as done. It used to be mistaken for a failure and sent to repair.
 - `state.json` no longer contains a `__trama_done` key.
 - The API reference shown to the LLM when it writes or repairs a program is generated from the real type definitions, doc comments included.
