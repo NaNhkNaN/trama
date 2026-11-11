@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync } from "fs";
+import { mkdtempSync } from "fs";
 import { join, resolve } from "path";
 import { homedir, tmpdir } from "os";
 import { createWorkspace, runProgram } from "@trama-dev/runtime/runner";
@@ -86,10 +86,6 @@ export class Session {
     const { args, timeout, maxRepairAttempts } = options;
     const projectDir = toAbsolute(options.projectDir);
     const workspaceDir = this.workspaceDir;
-
-    if (!existsSync(projectDir)) {
-      throw new Error(`Project directory not found: ${projectDir}`);
-    }
 
     // Where the participant is in its lifecycle, and the args of its latest run —
     // a resume merges new args over them, so they accumulate across yields.

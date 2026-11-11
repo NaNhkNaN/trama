@@ -3,7 +3,8 @@ import { createServer } from "http";
 import test from "node:test";
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
-import { createTools, cappedBuffer } from "../packages/runtime/dist/tools.js";
+import { createTools } from "../packages/runtime/dist/tools.js";
+import { cappedBuffer } from "../packages/runtime/dist/child-process.js";
 import { cleanupTempDir, makeTempDir } from "./helpers.mjs";
 
 test("createTools read and write operate inside the project directory", async (t) => {
@@ -352,4 +353,24 @@ test("createTools read gives clear error for missing files", async (t) => {
     async () => tools.read("nonexistent.txt"),
     /File not found: nonexistent\.txt/,
   );
+});
+
+test("createTools shell commands do not inherit the bridge's address or its init file", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  // A runner inside a program (a session's creator) has these in its own
+  // environment; the init file holds that program's bridge secret.
+  const saved = { port: process.env.TRAMA_PORT, init: process.env.TRAMA_INIT };
+  process.env.TRAMA_PORT = "12345";
+  process.env.TRAMA_INIT = "/somewhere/init.json";
+  t.after(() => {
+    for (const [key, value] of [["TRAMA_PORT", saved.port], ["TRAMA_INIT", saved.init]]) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  });
+
+  const tools = createTools(projectDir);
+  const result = await tools.shell('echo "[$TRAMA_PORT][$TRAMA_INIT][$HOME]"');
+  assert.equal(result.stdout.trim(), `[][][${process.env.HOME}]`);
 });

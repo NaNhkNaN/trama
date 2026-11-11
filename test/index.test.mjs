@@ -130,8 +130,11 @@ test("createProject keeps the generated project when validation fails after prog
   PiAdapter.prototype.ask = async function ask() {
     return 'throw new Error("broken");';
   };
+  // Each attempt proposes a different program, and each is broken.
+  let attempts = 0;
   PiAdapter.prototype.repair = async function repair() {
-    return 'throw new Error("still broken");';
+    attempts += 1;
+    return `throw new Error("still broken, attempt ${attempts}");`;
   };
 
   try {
@@ -522,7 +525,7 @@ test("updateProject restores original program.ts when validation fails", async (
     await withEnv({ HOME: fakeHome }, async () => {
       await assert.rejects(
         async () => updateProject("gamma", "break it"),
-        /have been restored/,
+        /the project is unchanged/,
       );
     });
   } finally {
@@ -565,7 +568,7 @@ throw new Error("boom");
     await withEnv({ HOME: fakeHome }, async () => {
       await assert.rejects(
         async () => updateProject("delta", "break state"),
-        /project files have been restored/,
+        /the project is unchanged/,
       );
     });
   } finally {
@@ -606,7 +609,7 @@ throw new Error("boom");
     await withEnv({ HOME: fakeHome }, async () => {
       await assert.rejects(
         async () => updateProject("epsilon", "leave files"),
-        /project files have been restored/,
+        /the project is unchanged/,
       );
     });
   } finally {
@@ -618,7 +621,7 @@ throw new Error("boom");
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), DEFAULT_PROGRAM);
 });
 
-test("updateProject does not record unverified repair history entries on rollback", async (t) => {
+test("updateProject records no repair in history when the update fails", async (t) => {
   const fakeHome = makeTempDir("trama-home-");
   t.after(() => cleanupTempDir(fakeHome));
 
@@ -647,7 +650,7 @@ test("updateProject does not record unverified repair history entries on rollbac
     await withEnv({ HOME: fakeHome }, async () => {
       await assert.rejects(
         async () => updateProject("zeta", "break history"),
-        /project files have been restored/,
+        /the project is unchanged/,
       );
     });
   } finally {

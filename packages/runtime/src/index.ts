@@ -5,14 +5,15 @@ import { join } from "path";
 import { homedir } from "os";
 import { PiAdapter, PI_VERSION, stripCodeFences } from "./pi-adapter.js";
 import {
-  loadConfig, loadProjectConfig, loadState, smokeRunAndRepair, copyToHistory,
-  withSnapshot, withTempDir, ensureProjectScaffold, RUNTIME_TYPES,
+  loadConfig, loadProjectConfig, loadState, validateProgram, installValidatedProgram,
+  withTempDir, ensureProjectScaffold, RUNTIME_TYPES,
 } from "./runner.js";
 import { guardPath } from "./path-guard.js";
 
 export { runProgram } from "./runner.js";
 export { createWorkspace } from "./workspace.js";
 export type { ProgramResult, RunOptions } from "./runner-types.js";
+import type { TramaConfig } from "./runner-types.js";
 export type { Workspace, ObserveResult } from "./types.js";
 
 // --- Example programs (included in system prompt during create/update) ---
@@ -135,6 +136,12 @@ async function isolatedAsk(adapter: PiAdapter, prompt: string, options?: { syste
   return withTempDir("trama-gen-", (dir) => adapter.withCwd(dir).ask(prompt, options));
 }
 
+const validationOptions = (config: TramaConfig) => ({
+  timeout: config.defaultTimeout,
+  maxRepairAttempts: config.maxRepairAttempts,
+  maxIterations: config.defaultMaxIterations,
+});
+
 // --- Public API ---
 
 export async function createProject(
@@ -170,22 +177,19 @@ export async function createProject(
     const adapter = new PiAdapter(config, projectDir);
 
     console.log(`Generating program for "${name}"...`);
-    const program = stripCodeFences(await isolatedAsk(adapter,
+    const candidate = stripCodeFences(await isolatedAsk(adapter,
       `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation.`,
       { system: getSystemPrompt() },
     ));
 
-    writeFileSync(join(projectDir, "program.ts"), program);
+    // From here on the project is kept even if validation fails, so the
+    // generated program can be inspected and fixed by hand.
+    writeFileSync(join(projectDir, "program.ts"), candidate);
     keepProjectOnFailure = true;
 
     console.log("Validating program...");
-    await smokeRunAndRepair(projectDir, adapter, "create", {
-      timeout: config.defaultTimeout,
-      maxRepairAttempts: config.maxRepairAttempts,
-      maxIterations: config.defaultMaxIterations,
-    });
-
-    copyToHistory(projectDir, "create", prompt);
+    const validated = await validateProgram(projectDir, adapter, candidate, validationOptions(config));
+    installValidatedProgram(projectDir, validated, "create", prompt);
 
     console.log(`Created ${name}. Run with: trama run ${name}`);
   } catch (err) {
@@ -214,30 +218,27 @@ export async function updateProject(name: string, prompt: string): Promise<void>
     `\n\nCurrent program.ts:\n${originalSource}` +
     (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : "");
 
-  // All-or-nothing: if generation or validation fails, the whole project
-  // directory — program, state, history — goes back to how it was.
+  // The new program is generated and validated off to the side. The project is
+  // only written to once there is a program that works, so a failed update has
+  // nothing to undo.
   try {
-    await withSnapshot(projectDir, async () => {
-      console.log(`Updating "${name}"...`);
-      const updated = stripCodeFences(await isolatedAsk(adapter,
-        `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
-        { system: systemPrompt },
-      ));
-      writeFileSync(programPath, updated);
+    console.log(`Updating "${name}"...`);
+    const candidate = stripCodeFences(await isolatedAsk(adapter,
+      `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
+      { system: systemPrompt },
+    ));
 
-      console.log("Validating updated program...");
-      await smokeRunAndRepair(projectDir, adapter, "update", {
-        timeout: config.defaultTimeout,
-        maxRepairAttempts: config.maxRepairAttempts,
-        maxIterations: config.defaultMaxIterations,
-      });
-
-      copyToHistory(projectDir, "update", prompt);
-      return { keep: true, value: undefined };
-    });
+    console.log("Validating updated program...");
+    const validated = await validateProgram(projectDir, adapter, candidate, validationOptions(config));
+    try {
+      installValidatedProgram(projectDir, validated, "update", prompt);
+    } catch (err) {
+      writeFileSync(programPath, originalSource); // recording the version failed: don't leave an unrecorded program behind
+      throw err;
+    }
   } catch (err) {
     throw new Error(
-      `Update failed — project files have been restored to the previous version.\n` +
+      `Update failed — the project is unchanged.\n` +
       `${err instanceof Error ? err.message : err}`
     );
   }
@@ -252,9 +253,8 @@ export async function listProjects(): Promise<void> {
     return;
   }
 
-  // Dot-directories are not projects (a rollback snapshot is kept beside its project while a run is in flight).
   const entries = readdirSync(dir, { withFileTypes: true })
-    .filter(e => e.isDirectory() && !e.name.startsWith("."));
+    .filter(e => e.isDirectory());
 
   if (entries.length === 0) {
     console.log("No projects found.");

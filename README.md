@@ -400,7 +400,7 @@ The runtime is what makes agent programs **self-contained and shareable**:
 - **IPC bridge** — programs communicate with the runtime through a local HTTP server. Every `ctx`, `agent`, `tools` and `workspace` call goes through this bridge, which gives the runtime a single point where it validates each request and can cancel work in flight when a run ends.
 - **State persistence** — `ctx.state` survives across runs via `checkpoint()` and `done()`. Programs can be long-running, interruptible, and resumable. `ctx.yield()` suspends a program cooperatively — persists state and exits, ready for the session layer to resume it later.
 - **Shared workspace** — when programs run in a session, they share a workspace for artifact I/O. Atomic writes, path guarding, and level-triggered observation (`workspace.observe()`) — without a message bus or coordination framework.
-- **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, and runs it under snapshot protection: if the fix fails too, the project is rolled back to how it was. Up to 3 attempts.
+- **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, and tries it on a private copy of the project. Only a fix that works is installed, along with what its run produced; one that fails never touches the project. Up to 3 attempts.
 - **Version history** — every create, update, and repair saves a snapshot. You can diff any two versions to see how the program evolved.
 - **Scaffolding** — the runtime creates package.json, the module symlink, gitignore, and the history and log directories, and checks them before every run. Recipients of a shared program don't need to set anything up.
 
@@ -769,7 +769,7 @@ trama's runtime is minimal. It loads, executes, and repairs programs. Everything
 There is no YAML, no JSON graph, no visual builder. The orchestration is a `.ts` file that you can read, diff, and `git log`.
 
 **3. The only built-in intelligence is repair.**
-If a program crashes, the runtime sends the error back to the LLM, gets a fix, validates it, then applies it with snapshot protection. Up to 3 attempts. This is the only "smart" behavior in the kernel.
+If a program crashes, the runtime sends the error back to the LLM, gets a fix, and tries it on a copy of the project — installing it only if it works. Up to 3 attempts. This is the only "smart" behavior in the kernel.
 
 **4. Adapt trama to your workflow, not the other way around.**
 No plugin system, no middleware, no hooks. Extend trama by editing program.ts or composing trama programs together.

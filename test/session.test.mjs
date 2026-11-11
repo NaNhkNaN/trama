@@ -292,3 +292,45 @@ await ctx.done({ workspaceDir: session.workspaceDir, statuses, findings });`,
   ]);
   assert.equal(existsSync(join(entryDir, "node_modules", "@trama-dev", "session")), true);
 });
+
+test("participants do not outlive the program that spawned them", async (t) => {
+  const entryDir = makeTempDir("trama-session-entry-");
+  const workerDir = makeTempDir("trama-session-worker-");
+  const signalDir = makeTempDir("trama-session-signal-");
+  t.after(() => { cleanupTempDir(entryDir); cleanupTempDir(workerDir); cleanupTempDir(signalDir); });
+
+  // A participant that never finishes, with a shell command of its own still running.
+  createProjectFixture(workerDir, {
+    programSource: `import { tools } from "@trama-dev/runtime";
+import { writeFileSync } from "fs";
+writeFileSync(${JSON.stringify(join(signalDir, "worker.pid"))}, String(process.pid));
+await tools.shell("echo $$ > ${join(signalDir, "shell.pid")}; sleep 60", { timeout: 60000 });`,
+  });
+  // The program that spawned it waits for it — until the runner's timeout stops it.
+  createProjectFixture(entryDir, {
+    scaffold: false,
+    programSource: `import { ctx } from "@trama-dev/runtime";
+import { Session } from "@trama-dev/session";
+const session = await Session.create({ workspace: ${JSON.stringify(join(signalDir, "workspace"))} });
+await session.spawn("worker", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 60000 }).wait();
+await ctx.done();`,
+  });
+
+  const pidOf = (name) => Number(readFileSync(join(signalDir, name), "utf-8"));
+  const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const settled = async (check, ms) => {
+    const deadline = Date.now() + ms;
+    while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+    return check();
+  };
+
+  const result = await runProgram({ projectDir: entryDir, maxRepairAttempts: 0, timeout: 4_000 });
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /timeout/);
+
+  assert.equal(existsSync(join(signalDir, "shell.pid")), true, "the participant should have got as far as its shell command");
+  assert.equal(
+    await settled(() => !isAlive(pidOf("worker.pid")) && !isAlive(pidOf("shell.pid")), 5_000), true,
+    "the participant and its shell command must be gone once the program that spawned them is",
+  );
+});

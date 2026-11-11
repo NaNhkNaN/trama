@@ -16,7 +16,7 @@ function runtimeEnv(initOverrides = {}) {
     state: {},
     iteration: 0,
     maxIterations: 100,
-    workspace: null,
+    inSession: false,
     resumed: false,
     yieldReason: null,
     ...initOverrides,
@@ -33,7 +33,7 @@ function runtimeEnv(initOverrides = {}) {
 }
 
 test("client.ts workspace throws when not in a session (workspace=null)", async () => {
-  const { env, initDir } = runtimeEnv({ workspace: null });
+  const { env, initDir } = runtimeEnv({ inSession: false });
   try {
     const result = await runNodeCommand(
       [
@@ -59,7 +59,7 @@ try {
 });
 
 test("client.ts workspace.write throws when not in a session", async () => {
-  const { env, initDir } = runtimeEnv({ workspace: null });
+  const { env, initDir } = runtimeEnv({ inSession: false });
   try {
     const result = await runNodeCommand(
       [
@@ -85,7 +85,7 @@ try {
 });
 
 test("client.ts workspace.list throws when not in a session", async () => {
-  const { env, initDir } = runtimeEnv({ workspace: null });
+  const { env, initDir } = runtimeEnv({ inSession: false });
   try {
     const result = await runNodeCommand(
       [
@@ -111,7 +111,7 @@ try {
 });
 
 test("client.ts workspace.observe throws when not in a session", async () => {
-  const { env, initDir } = runtimeEnv({ workspace: null });
+  const { env, initDir } = runtimeEnv({ inSession: false });
   try {
     const result = await runNodeCommand(
       [

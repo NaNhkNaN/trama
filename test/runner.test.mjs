@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
-import { basename, dirname, join } from "path";
+import { spawn } from "child_process";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
+import { join } from "path";
+import { pathToFileURL } from "url";
 import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
-import { copyToHistory, loadConfig, loadState, runProgram, RUNTIME_TYPES, withSnapshot } from "../packages/runtime/dist/runner.js";
+import { copyToHistory, loadConfig, loadState, runProgram, RUNTIME_TYPES } from "../packages/runtime/dist/runner.js";
 import { REPO_ROOT, cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson, writeText } from "./helpers.mjs";
 
 test("loadState returns an empty object when state.json is missing", (t) => {
@@ -204,7 +206,7 @@ await ctx.done();
 
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram);
   assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), fixedProgram);
-  // After repair is verified in isolation, the repaired program runs in the real dir for actual output.
+  // The fix is tried on a copy of the project; what it wrote is merged back because it worked.
   assert.equal(readFileSync(join(projectDir, "repaired.txt"), "utf-8"), "ok");
 
   const history = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8")
@@ -534,8 +536,10 @@ test("runProgram restores original program.ts when all repair attempts produce b
   });
 
   const originalRepair = PiAdapter.prototype.repair;
+  let attempts = 0;
   PiAdapter.prototype.repair = async function repair() {
-    return 'throw new Error("still broken");';
+    attempts += 1;
+    return `throw new Error("still broken, attempt ${attempts}");`;
   };
 
   try {
@@ -543,6 +547,31 @@ test("runProgram restores original program.ts when all repair attempts produce b
     assert.equal(result.status, "failed");
     assert.match(result.reason, /Failed after 2 repair attempts/);
     assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
+  } finally {
+    PiAdapter.prototype.repair = originalRepair;
+  }
+});
+
+test("runProgram does not run a repair that changes nothing or returns nothing", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  const originalSource = `import { appendFileSync } from "fs";
+appendFileSync(${JSON.stringify(join(projectDir, "executions.txt"))}, "ran\\n");
+throw new Error("original");`;
+  createProjectFixture(projectDir, { scaffold: false, programSource: originalSource });
+
+  const originalRepair = PiAdapter.prototype.repair;
+  try {
+    for (const [useless, expected] of [[originalSource, /returned the program unchanged/], ["  \n", /returned an empty program/]]) {
+      PiAdapter.prototype.repair = async function repair() { return useless; };
+      const result = await runProgram({ projectDir, maxRepairAttempts: 3, timeout: 5_000 });
+      assert.equal(result.status, "failed");
+      assert.match(result.reason, /Failed after 1 repair attempt\(s\)/);
+      assert.match(result.reason, expected);
+    }
+    // Two runs of the original program, one per runProgram call — and no reruns of a "fix" that fixes nothing.
+    assert.equal(readFileSync(join(projectDir, "executions.txt"), "utf-8"), "ran\nran\n");
   } finally {
     PiAdapter.prototype.repair = originalRepair;
   }
@@ -585,8 +614,8 @@ test("runProgram leaves no trace of a repair that did not work", async (t) => {
 
   const originalRepair = PiAdapter.prototype.repair;
   // The repair agent writes a file in its working directory, and the program it
-  // returns writes another before failing. Neither may remain in the project:
-  // the agent works in a throwaway copy, and the failed run is rolled back.
+  // returns writes another before failing. Neither may reach the project: the
+  // agent works in a throwaway copy, and a fix is tried on a copy too.
   PiAdapter.prototype.repair = async function repair() {
     writeFileSync(join(this.cwd, "repair-side-effect.txt"), "from-repair-llm");
     return `import { tools } from "@trama-dev/runtime";
@@ -598,13 +627,10 @@ throw new Error("still broken");`;
     const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 });
     assert.equal(result.status, "failed");
     assert.match(result.reason, /Failed after 1 repair attempt/);
-    // program.ts is back to the original: the repair did not work
+    // program.ts is the original: a fix that did not work is never installed
     assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
     assert.equal(existsSync(join(projectDir, "repair-side-effect.txt")), false);
     assert.equal(existsSync(join(projectDir, "program-side-effect.txt")), false);
-    // ...and the rollback snapshot kept beside the project is gone too
-    const siblings = readdirSync(dirname(projectDir)).filter(name => name.includes(".trama-snapshot-"));
-    assert.deepEqual(siblings.filter(name => name.includes(basename(projectDir))), []);
   } finally {
     PiAdapter.prototype.repair = originalRepair;
   }
@@ -672,69 +698,93 @@ test("runProgram rejects non-object package.json (array)", async (t) => {
   );
 });
 
-// --- Tests for consolidated bug fixes (withSnapshot, process leak, init file security) ---
+// --- Process lifetime, init file security, IPC limits ---
 
-test("withSnapshot keeps directory when fn() returns keep:true", async (t) => {
-  const dir = makeTempDir("trama-snapshot-");
-  t.after(() => cleanupTempDir(dir));
+/** Start a runner in its own process, so the test can stop it the way a user or a parent runner would. */
+function startRunnerProcess(fakeHome, projectDir, { stubRepair = "" } = {}) {
+  const runnerUrl = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "runner.js")).href;
+  const adapterUrl = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "pi-adapter.js")).href;
+  const script = `import { runProgram } from ${JSON.stringify(runnerUrl)};
+import { PiAdapter } from ${JSON.stringify(adapterUrl)};
+${stubRepair}
+await runProgram({ projectDir: ${JSON.stringify(projectDir)}, maxRepairAttempts: 1, timeout: 60_000 });`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
+    env: { ...process.env, HOME: fakeHome },
+    stdio: "ignore",
+  });
+  const exited = new Promise(resolve => child.on("close", (code, signal) => resolve({ code, signal })));
+  return { child, exited };
+}
 
-  writeText(join(dir, "original.txt"), "before");
+async function waitFor(check, what, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!check()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise(resolve => setTimeout(resolve, 25));
+  }
+}
 
-  const value = await withSnapshot(dir, async () => {
-    writeFileSync(join(dir, "original.txt"), "after");
-    writeFileSync(join(dir, "new.txt"), "created");
-    return { keep: true, value: "ok" };
+const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+
+test("stopping the runner stops the program and the shell commands it started", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const projectDir = makeTempDir("trama-runner-");
+  const signalDir = makeTempDir("trama-signal-");
+  t.after(() => { cleanupTempDir(fakeHome); cleanupTempDir(projectDir); cleanupTempDir(signalDir); });
+
+  // A program in the middle of a long shell command, as when the user presses Ctrl-C.
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { tools } from "@trama-dev/runtime";
+import { writeFileSync } from "fs";
+writeFileSync(${JSON.stringify(join(signalDir, "program.pid"))}, String(process.pid));
+await tools.shell("echo $$ > ${join(signalDir, "shell.pid")}; sleep 60", { timeout: 60000 });`,
   });
 
-  assert.equal(value, "ok");
-  assert.equal(readFileSync(join(dir, "original.txt"), "utf-8"), "after",
-    "mutations should persist when keep:true");
-  assert.equal(existsSync(join(dir, "new.txt")), true);
+  const { child, exited } = startRunnerProcess(fakeHome, projectDir);
+  await waitFor(() => existsSync(join(signalDir, "shell.pid")) && readFileSync(join(signalDir, "shell.pid"), "utf-8").trim() !== "", "the shell command to start");
+  const programPid = Number(readFileSync(join(signalDir, "program.pid"), "utf-8"));
+  const shellPid = Number(readFileSync(join(signalDir, "shell.pid"), "utf-8"));
+  assert.equal(isAlive(programPid) && isAlive(shellPid), true);
+
+  child.kill("SIGINT");
+  const { signal } = await exited;
+  assert.equal(signal, "SIGINT", "the runner should still die of the signal it was sent");
+
+  await waitFor(() => !isAlive(programPid) && !isAlive(shellPid), "the program and its shell command to be gone", 5_000);
 });
 
-test("withSnapshot restores directory when fn() returns keep:false", async (t) => {
-  const dir = makeTempDir("trama-snapshot-");
-  t.after(() => cleanupTempDir(dir));
+test("a runner stopped while trying a fix leaves the project as it was", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const projectDir = makeTempDir("trama-runner-");
+  const signalDir = makeTempDir("trama-signal-");
+  t.after(() => { cleanupTempDir(fakeHome); cleanupTempDir(projectDir); cleanupTempDir(signalDir); });
 
-  writeText(join(dir, "original.txt"), "before");
+  const originalSource = 'throw new Error("original");';
+  createProjectFixture(projectDir, { scaffold: false, programSource: originalSource, state: { kept: true } });
 
-  const value = await withSnapshot(dir, async () => {
-    writeFileSync(join(dir, "original.txt"), "after");
-    writeFileSync(join(dir, "side-effect.txt"), "leaked");
-    return { keep: false, value: 42 };
+  // The proposed fix checkpoints new state, writes a file, announces itself and then hangs.
+  const fix = `import { ctx } from "@trama-dev/runtime";
+import { writeFileSync } from "fs";
+ctx.state.kept = false;
+await ctx.checkpoint();
+writeFileSync("written-by-fix.txt", "x");
+writeFileSync(${JSON.stringify(join(signalDir, "fix.pid"))}, String(process.pid));
+await new Promise(() => {});`;
+  const { child, exited } = startRunnerProcess(fakeHome, projectDir, {
+    stubRepair: `PiAdapter.prototype.repair = async () => ${JSON.stringify(fix)};`,
   });
 
-  assert.equal(value, 42);
-  assert.equal(readFileSync(join(dir, "original.txt"), "utf-8"), "before",
-    "mutations should be reverted when keep:false");
-  assert.equal(existsSync(join(dir, "side-effect.txt")), false);
-});
+  await waitFor(() => existsSync(join(signalDir, "fix.pid")), "the fix to be running");
+  const fixPid = Number(readFileSync(join(signalDir, "fix.pid"), "utf-8"));
+  child.kill("SIGTERM");
+  await exited;
 
-test("withSnapshot restores directory when fn() throws after mutating it", async (t) => {
-  const dir = makeTempDir("trama-snapshot-");
-  t.after(() => cleanupTempDir(dir));
-
-  // Set up original state
-  writeText(join(dir, "program.ts"), "original");
-  writeText(join(dir, "keep.txt"), "untouched");
-
-  await assert.rejects(
-    () => withSnapshot(dir, async () => {
-      // Simulate the real-rerun path: overwrite program.ts, write side effects, then throw
-      writeFileSync(join(dir, "program.ts"), "repaired");
-      writeFileSync(join(dir, "side-effect.txt"), "leaked");
-      throw new Error("infrastructure failure");
-    }),
-    /infrastructure failure/,
-  );
-
-  // Directory must be fully restored to pre-fn state
-  assert.equal(readFileSync(join(dir, "program.ts"), "utf-8"), "original",
-    "program.ts must be restored after fn() throws");
-  assert.equal(readFileSync(join(dir, "keep.txt"), "utf-8"), "untouched",
-    "pre-existing files must survive");
-  assert.equal(existsSync(join(dir, "side-effect.txt")), false,
-    "side effects from fn() must not persist after throw");
+  // The unverified fix was never installed, and nothing it did reached the project.
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { kept: true });
+  assert.equal(existsSync(join(projectDir, "written-by-fix.txt")), false);
+  await waitFor(() => !isAlive(fixPid), "the fix to be gone", 5_000);
 });
 
 test("runProgram cleans up background processes even on successful runs", async (t) => {

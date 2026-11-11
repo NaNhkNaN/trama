@@ -3,9 +3,9 @@ import {
   readFileSync, writeFileSync, appendFileSync,
   readdirSync, copyFileSync, mkdirSync, existsSync, statSync,
   symlinkSync, rmSync, lstatSync, readlinkSync,
-  cpSync, mkdtempSync, openSync, closeSync, renameSync,
+  cpSync, mkdtempSync, openSync, closeSync, realpathSync,
 } from "fs";
-import { join, dirname, basename, resolve } from "path";
+import { join, dirname } from "path";
 import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { randomBytes } from "crypto";
@@ -17,7 +17,8 @@ import { createAgent } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
 import { guardPath } from "./path-guard.js";
-import { superviseChild, type ChildExit } from "./child-process.js";
+import { signalGroup, superviseChild, type ChildExit } from "./child-process.js";
+import { removeTempDir, untilSettled } from "./lifetime.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
 
 // --- Locating the runtime itself ---
@@ -239,9 +240,7 @@ const HISTORY_DETAIL_FIELD: Record<string, string> = { create: "prompt", update:
  * Save the current program.ts as the next version: copy it to history/NNNN.ts
  * and record why in index.jsonl.
  *
- * Repairs made while validating a create or update are NOT versions of their
- * own — they are noted in index.jsonl only (reason "create-repair" /
- * "update-repair"), and the validated program becomes the create/update version.
+ * (See installValidatedProgram for how a create or update is recorded.)
  */
 export function copyToHistory(projectDir: string, reason: string, detail?: string) {
   const historyDir = guardPath(projectDir, "history");
@@ -259,7 +258,7 @@ export function copyToHistory(projectDir: string, reason: string, detail?: strin
   appendHistoryIndex(projectDir, entry);
 }
 
-// --- Snapshots and staging ---
+// --- Staging: run against a copy, merge back what worked ---
 
 type DirSnapshot = Map<string, { size: number; mtimeMs: number }>;
 
@@ -287,120 +286,95 @@ const sameStat = (a: { size: number; mtimeMs: number }, b: { size: number; mtime
   a.size === b.size && a.mtimeMs === b.mtimeMs;
 
 /**
- * Commit workspace changes from a temp workspace back to the real workspace,
- * using a three-way check to avoid overwriting concurrent updates by other participants.
+ * Merge what a run did to a staged copy back into the real directory, with a
+ * three-way check so that nothing changed in the real directory meanwhile —
+ * by another session participant, or by the user — is overwritten.
  *
- * @param tempDir - temp workspace after the run (source of changes)
- * @param realDir - real shared workspace (destination)
- * @param tempBefore - temp workspace snapshot before the run (detects what the run changed)
- * @param realSeed - real workspace snapshot at seed time (detects concurrent changes)
+ * @param stagedDir - the copy after the run (source of changes)
+ * @param realDir - the real directory (destination)
+ * @param stagedBefore - snapshot of the copy before the run (detects what the run changed)
+ * @param realSeed - snapshot of the real directory when the copy was taken (detects concurrent changes)
  *
- * For each file the run created or modified in the temp workspace:
- * - New file: copied unless that path has meanwhile appeared in the real workspace.
- * - Modified file: copied only if the real workspace's copy still matches realSeed.
- *   If it doesn't, another participant changed or removed it concurrently — skip.
- * Best-effort: anything that cannot be committed safely is skipped, never thrown.
+ * For each file the run touched in the copy:
+ * - Created: copied, unless that path has meanwhile appeared in the real directory.
+ * - Modified: copied only if the real file still matches realSeed.
+ * - Deleted: deleted only if the real file still matches realSeed.
+ * Best-effort: anything that cannot be merged safely is skipped, never thrown.
  */
-export function commitWorkspaceChanges(
-  tempDir: string,
+export function commitStagedChanges(
+  stagedDir: string,
   realDir: string,
-  tempBefore: DirSnapshot,
+  stagedBefore: DirSnapshot,
   realSeed: DirSnapshot,
 ): void {
-  for (const [relPath, afterStat] of snapshotDir(tempDir)) {
-    const beforeStat = tempBefore.get(relPath);
-    if (beforeStat && sameStat(beforeStat, afterStat)) continue; // the run didn't touch it
-
-    try {
-      // A concurrent participant could have placed a symlink at this path or in
-      // a parent directory, pointing outside the workspace — guardPath throws.
-      const dstPath = guardPath(realDir, relPath);
-      const realNow = statSync(dstPath, { throwIfNoEntry: false });
-
-      if (beforeStat) {
-        const seedStat = realSeed.get(relPath);
-        if (seedStat && (!realNow || !sameStat(realNow, seedStat))) continue; // changed or removed concurrently
-      } else if (realNow) {
-        continue; // someone else created the same path first — keep theirs
-      }
-
-      mkdirSync(dirname(dstPath), { recursive: true });
-      copyFileSync(join(tempDir, relPath), dstPath);
-    } catch {
-      // Escapes the workspace, path-shape conflict, permissions — skip
-    }
-  }
-}
-
-/**
- * Run fn against a directory that can be put back exactly as it was: if fn
- * returns keep:false or throws, the directory is rolled back. Returns fn's value.
- *
- * The snapshot is a hidden copy next to the directory, on the same file
- * system, so rolling back is two renames — move the directory aside, move the
- * snapshot into its place — and at no point does the content exist nowhere.
- * (If the process is killed outright, the snapshot is left behind beside the
- * directory: it is the pre-change state.)
- */
-export async function withSnapshot<T>(dir: string, fn: () => Promise<{ keep: boolean; value: T }>): Promise<T> {
-  const target = resolve(dir);
-  const snap = mkdtempSync(join(dirname(target), `.${basename(target)}.trama-snapshot-`));
-  let rolledBack = false;
-  const rollBack = () => {
-    const discarded = `${snap}.discarded`;
-    renameSync(target, discarded);
-    renameSync(snap, target);
-    rolledBack = true;
-    removeTempDir(discarded);
+  const stagedAfter = snapshotDir(stagedDir);
+  /** The real file as it is now — but only if nobody has touched it since the copy was taken. */
+  const untouchedSinceSeed = (relPath: string, dstPath: string): boolean => {
+    const seedStat = realSeed.get(relPath);
+    const realNow = statSync(dstPath, { throwIfNoEntry: false });
+    return seedStat === undefined || (realNow !== undefined && sameStat(realNow, seedStat));
   };
-  try {
-    cpSync(target, snap, { recursive: true });
-    let result: { keep: boolean; value: T };
+
+  for (const relPath of new Set([...stagedBefore.keys(), ...stagedAfter.keys()])) {
+    const beforeStat = stagedBefore.get(relPath);
+    const afterStat = stagedAfter.get(relPath);
+    if (beforeStat && afterStat && sameStat(beforeStat, afterStat)) continue; // the run didn't touch it
+
     try {
-      result = await fn();
-    } catch (err) {
-      rollBack();
-      throw err;
+      // A symlink placed at this path, or in a parent directory, could point
+      // outside the real directory — guardPath throws.
+      const dstPath = guardPath(realDir, relPath);
+
+      if (!afterStat) {
+        if (untouchedSinceSeed(relPath, dstPath)) rmSync(dstPath, { force: true });
+      } else if (beforeStat) {
+        if (!untouchedSinceSeed(relPath, dstPath)) continue; // changed or removed concurrently
+        copyFileSync(join(stagedDir, relPath), dstPath);
+      } else {
+        if (statSync(dstPath, { throwIfNoEntry: false })) continue; // someone else created it first — keep theirs
+        mkdirSync(dirname(dstPath), { recursive: true });
+        copyFileSync(join(stagedDir, relPath), dstPath);
+      }
+    } catch {
+      // Escapes the directory, path-shape conflict, permissions — skip
     }
-    if (!result.keep) rollBack();
-    return result.value;
-  } finally {
-    if (!rolledBack) removeTempDir(snap);
   }
 }
 
-/** Remove a temp directory. Best-effort: failing to clean up must never change a run's outcome. */
-function removeTempDir(dir: string): void {
-  try { rmSync(dir, { recursive: true, force: true }); } catch { /* left for the OS to reap */ }
-}
-
-/** Run fn in a temp directory, clean up afterwards regardless of outcome. */
+/** Run fn in a temp directory, clean up afterwards regardless of outcome — including this process being stopped. */
 export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promise<T>): Promise<T> {
   const dir = mkdtempSync(join(tmpdir(), prefix));
+  const settled = untilSettled(() => removeTempDir(dir));
   try {
     return await fn(dir);
   } finally {
     removeTempDir(dir);
+    settled();
   }
 }
 
+/** Copy a directory's contents into an existing one, keeping symlinks as they are written. */
+function copyDirInto(srcDir: string, dstDir: string): void {
+  // realpath: a project directory may itself be a symlink.
+  cpSync(realpathSync(srcDir), dstDir, { recursive: true, verbatimSymlinks: true });
+}
+
 /**
- * Run fn against a private copy of the shared workspace, so its writes stay
- * invisible to other participants unless fn asks to commit them — in which
- * case what it created or changed is merged back (see commitWorkspaceChanges).
- * Outside a session there is no workspace and fn simply runs.
+ * Run fn against a private copy of a directory. What fn does there stays
+ * invisible to the real directory unless fn asks to commit it — then it is
+ * merged back (see commitStagedChanges). If fn fails, or this process is
+ * stopped half-way, the real directory was never touched.
  */
-async function withStagedWorkspace<T>(
-  workspaceDir: string | undefined,
-  fn: (stagedDir: string | undefined) => Promise<{ commit: boolean; value: T }>,
+async function withStagedCopy<T>(
+  realDir: string,
+  fn: (stagedDir: string) => Promise<{ commit: boolean; value: T }>,
 ): Promise<T> {
-  if (!workspaceDir) return (await fn(undefined)).value;
-  const realSeed = snapshotDir(workspaceDir);
-  return withTempDir("trama-repair-ws-", async (stagedDir) => {
-    cpSync(workspaceDir, stagedDir, { recursive: true });
+  const realSeed = snapshotDir(realDir);
+  return withTempDir("trama-staged-", async (stagedDir) => {
+    copyDirInto(realDir, stagedDir);
     const stagedBefore = snapshotDir(stagedDir);
     const { commit, value } = await fn(stagedDir);
-    if (commit) commitWorkspaceChanges(stagedDir, workspaceDir, stagedBefore, realSeed);
+    if (commit) commitStagedChanges(stagedDir, realDir, stagedBefore, realSeed);
     return value;
   });
 }
@@ -413,8 +387,6 @@ interface RunOnceOptions {
   timeout: number;
   maxIterations: number;
   argsOverride?: Record<string, unknown>;
-  /** Echo the program's stdout/stderr to ours as it runs. */
-  streamOutput?: boolean;
   /**
    * Treat the run as successful once the program has called ctx.ready() and
    * stayed up for graceMs — used to validate long-running programs.
@@ -425,21 +397,26 @@ interface RunOnceOptions {
 }
 
 interface RunOnceResult {
-  child: ShellResult;
-  /** Set if the program called ctx.done() or ctx.yield() during this run. */
-  terminalSignal: ProgramResult | null;
+  /** How the run ended, or null if it failed (non-zero exit with no terminal signal). */
+  outcome: ProgramResult | null;
+  /** A description of the failure, for the repair prompt and for the user. */
+  failure: string;
 }
 
-const formatError = (r: ShellResult) =>
-  `program.ts exited with code ${r.exitCode}\nstdout: ${r.stdout}\nstderr: ${r.stderr}`;
+/** The end of a long output — where the error is — with a note of how much was dropped. */
+function tail(text: string, max = 20_000): string {
+  return text.length <= max ? text : `[… ${text.length - max} earlier characters omitted]\n${text.slice(-max)}`;
+}
+
+const describeFailure = (r: ShellResult) =>
+  `program.ts exited with code ${r.exitCode}\nstdout: ${tail(r.stdout)}\nstderr: ${tail(r.stderr)}`;
 
 /**
  * Hand the program its starting state through a private temp file rather than
  * env vars — no OS size limit, and mode 0600 in an unpredictable directory
- * keeps it from other local users. Returns the directory to remove afterwards.
+ * keeps it (and the bridge secret in it) from other local users.
  */
-function writeInitFile(payload: unknown): { dir: string; file: string } {
-  const dir = mkdtempSync(join(tmpdir(), "trama-init-"));
+function writeInitFile(dir: string, payload: unknown): string {
   const file = join(dir, "init.json");
   const fd = openSync(file, "w", 0o600);
   try {
@@ -447,7 +424,7 @@ function writeInitFile(payload: unknown): { dir: string; file: string } {
   } finally {
     closeSync(fd);
   }
-  return { dir, file };
+  return file;
 }
 
 function toChildResult(exit: ChildExit): ShellResult {
@@ -459,13 +436,36 @@ function toChildResult(exit: ChildExit): ShellResult {
 }
 
 /**
+ * Decide how a finished run ended. A terminal signal the program completed
+ * takes precedence over its exit code: a program that called ctx.done() and
+ * then crashed is done. Returns null for a failure (non-zero exit, no signal).
+ */
+function settle(projectDir: string, child: ShellResult, terminalSignal: ProgramResult | null): ProgramResult | null {
+  // Read state first: if the program left state.json corrupt, say so now
+  // rather than report an outcome (or start a repair) on top of it.
+  const state = loadState(projectDir);
+  if (terminalSignal) return terminalSignal;
+  if (child.exitCode !== 0) return null;
+
+  // Natural success without done() or yield(): if this run was the resumption
+  // of an earlier yield, that yield is now over — don't let its marker make
+  // the next run look resumed.
+  if (state.__trama_yield != null) {
+    delete state.__trama_yield;
+    writeFileSync(guardPath(projectDir, "state.json"), JSON.stringify(state, null, 2));
+  }
+  return { status: "done" };
+}
+
+/**
  * Run program.ts once in the given directory: scaffold, start the IPC server,
- * spawn the program, wait for it, and tear everything down.
- * Reports how the program ended — does NOT throw on non-zero exit. Throws only
- * when the run could not happen at all (bad project, server or spawn failure).
+ * spawn the program, wait for it, tear everything down, and say how it ended.
+ * The program's output is echoed as it runs. A program that fails is a result,
+ * not an exception — this throws only when the run could not happen at all
+ * (bad project, server or spawn failure) or left state.json unreadable.
  */
 async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
-  const { projectDir, adapter, timeout, maxIterations, argsOverride, streamOutput, stopOnReady, workspaceDir } = options;
+  const { projectDir, adapter, timeout, maxIterations, argsOverride, stopOnReady, workspaceDir } = options;
 
   ensureProjectScaffold(projectDir);
 
@@ -500,83 +500,71 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     onTerminalSignal: result => { terminalSignal ??= result; },
   });
 
-  let initDir: string | undefined;
+  // If this process is stopped while the program is running, take the program down with it.
+  let programStopped = () => {};
   try {
-    const port = await listen(server);
-    const init = writeInitFile({
-      token,
-      input: ctx.input,
-      state: ctx.state,
-      iteration: ctx.iteration,
-      maxIterations: ctx.maxIterations,
-      workspace: workspaceDir ?? null,
-      resumed: ctx.resumed,
-      yieldReason: ctx.yieldReason,
-    });
-    initDir = init.dir;
+    const child = await withTempDir("trama-init-", async (initDir) => {
+      const port = await listen(server);
+      const initFile = writeInitFile(initDir, {
+        token,
+        input: ctx.input,
+        state: ctx.state,
+        iteration: ctx.iteration,
+        maxIterations: ctx.maxIterations,
+        inSession: workspaceDir !== undefined,
+        resumed: ctx.resumed,
+        yieldReason: ctx.yieldReason,
+      });
 
-    const child = spawn(process.execPath, [TSX_CLI, guardPath(projectDir, "program.ts")], {
-      cwd: projectDir,
-      env: { ...process.env, TRAMA_PORT: String(port), TRAMA_INIT: init.file },
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: true,
+      const program = spawn(process.execPath, [TSX_CLI, guardPath(projectDir, "program.ts")], {
+        cwd: projectDir,
+        env: { ...process.env, TRAMA_PORT: String(port), TRAMA_INIT: initFile },
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: true,
+      });
+      const pgid = program.pid;
+      if (pgid) programStopped = untilSettled(() => signalGroup(pgid, "SIGKILL"));
+
+      return toChildResult(await superviseChild(program, {
+        timeout,
+        stopSignal: stopOnReady ? readyStop.signal : undefined,
+        sinks: {
+          stdout: chunk => { process.stdout.write(chunk); },
+          stderr: chunk => { process.stderr.write(chunk); },
+        },
+      }));
     });
-    const exit = await superviseChild(child, {
-      timeout,
-      stopSignal: stopOnReady ? readyStop.signal : undefined,
-      sinks: streamOutput ? {
-        stdout: chunk => { process.stdout.write(chunk); },
-        stderr: chunk => { process.stderr.write(chunk); },
-      } : undefined,
-    });
-    return { child: toChildResult(exit), terminalSignal };
+    return { outcome: settle(projectDir, child, terminalSignal), failure: describeFailure(child) };
   } finally {
     // The program is gone (or never started): cancel what it left in flight,
     // kill shells it left running in the background, and drop its connections.
+    programStopped();
     if (readyTimer) clearTimeout(readyTimer);
     runEnded.abort();
     tools.killActiveShells();
     server.closeAllConnections();
     await closeServer(server).catch(() => { /* best-effort */ });
-    if (initDir) removeTempDir(initDir);
   }
-}
-
-/**
- * Decide how a finished run ended. A terminal signal the program persisted
- * takes precedence over its exit code: a program that called ctx.done() and
- * then crashed is done. Returns null for a failure (non-zero exit, no signal).
- */
-function settle(projectDir: string, run: RunOnceResult): ProgramResult | null {
-  // Read state first: if the program left state.json corrupt, say so now
-  // rather than report an outcome (or start a repair) on top of it.
-  const state = loadState(projectDir);
-  if (run.terminalSignal) return run.terminalSignal;
-  if (run.child.exitCode !== 0) return null;
-
-  // Natural success without done() or yield(): if this run was the resumption
-  // of an earlier yield, that yield is now over — don't let its marker make
-  // the next run look resumed.
-  if (state.__trama_yield != null) {
-    delete state.__trama_yield;
-    writeFileSync(guardPath(projectDir, "state.json"), JSON.stringify(state, null, 2));
-  }
-  return { status: "done" };
 }
 
 // --- Execution with repair ---
 
-interface ExecuteOptions extends Omit<RunOnceOptions, "streamOutput"> {
+interface ExecuteOptions extends RunOnceOptions {
   maxRepairAttempts: number;
-  /** Called after a repaired program has succeeded. Receives the attempt index and the error that was fixed. */
-  onRepair?: (attempt: number, maxAttempts: number, error: string) => void;
+}
+
+interface Execution {
+  result: ProgramResult;
+  /** Set when the program only worked after a repair: which attempt, and the failure it fixed. */
+  repair?: { attempt: number; error: string };
 }
 
 /**
  * Ask the LLM for a fix. The repair agent has tools, so it works in a
- * throwaway copy of the project — whatever it reads is real, whatever it
- * writes is discarded; only the program text it returns is used. Bounded by
- * its own timeout. Returns null (and records why) if no fix came back.
+ * throwaway copy of the project that holds the program it is asked to fix —
+ * whatever it reads is real, whatever it writes is discarded; only the program
+ * text it returns is used. Bounded by its own timeout.
+ * Returns null (and records why) if no usable fix came back.
  */
 async function requestRepair(
   options: ExecuteOptions,
@@ -584,11 +572,15 @@ async function requestRepair(
   repairErrors: string[],
 ): Promise<string | null> {
   return withTempDir("trama-repair-", async (tempDir) => {
-    cpSync(options.projectDir, tempDir, { recursive: true });
+    copyDirInto(options.projectDir, tempDir);
+    writeFileSync(guardPath(tempDir, "program.ts"), input.programSource);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), options.timeout);
     try {
-      return await options.adapter.withCwd(tempDir).repair({ ...input, runtimeTypes: RUNTIME_TYPES }, controller.signal);
+      const fixed = await options.adapter.withCwd(tempDir).repair({ ...input, runtimeTypes: RUNTIME_TYPES }, controller.signal);
+      if (fixed.trim() === "") throw new Error("The repair returned an empty program.");
+      if (fixed === input.programSource) throw new Error("The repair returned the program unchanged.");
+      return fixed;
     } catch (err) {
       repairErrors.push(err instanceof Error ? err.message : String(err));
       return null;
@@ -599,45 +591,57 @@ async function requestRepair(
 }
 
 /**
- * Run a proposed fix. If it fails too, the project is rolled back to how it
- * was before the fix and its workspace writes are dropped; if it succeeds,
- * they are merged into the shared workspace.
+ * Try a proposed fix: run it on a private copy of the project (and of the
+ * shared workspace). Only if it works does anything reach the real ones — the
+ * fix becomes program.ts, and what the run wrote is merged back. A fix that
+ * fails, or a runner that is stopped half-way, leaves the project exactly as
+ * it was, because it was never touched.
  */
-async function applyRepair(
-  options: ExecuteOptions,
-  fixed: string,
-): Promise<{ outcome: ProgramResult | null; error: string }> {
-  const { projectDir } = options;
-  return withStagedWorkspace(options.workspaceDir, async (stagedWorkspace) => {
-    const value = await withSnapshot(projectDir, async () => {
-      writeFileSync(guardPath(projectDir, "program.ts"), fixed);
-      const run = await runProgramOnce({ ...options, streamOutput: true, workspaceDir: stagedWorkspace });
-      const outcome = settle(projectDir, run);
-      return { keep: outcome !== null, value: { outcome, error: formatError(run.child) } };
+async function tryFix(options: ExecuteOptions, fixed: string): Promise<RunOnceResult> {
+  const { projectDir, workspaceDir } = options;
+  const inStagedProject = (stagedWorkspace: string | undefined) =>
+    withStagedCopy(projectDir, async (stagedProject) => {
+      writeFileSync(guardPath(stagedProject, "program.ts"), fixed);
+      let run: RunOnceResult;
+      try {
+        run = await runProgramOnce({
+          ...options, projectDir: stagedProject, adapter: options.adapter.withCwd(stagedProject), workspaceDir: stagedWorkspace,
+        });
+      } catch (err) {
+        // The copy could not be run at all, or was left unusable. Either way this fix did not work.
+        run = { outcome: null, failure: `The repaired program could not be run: ${err instanceof Error ? err.message : err}` };
+      }
+      return { commit: run.outcome !== null, value: run };
     });
-    return { commit: value.outcome !== null, value };
-  });
+
+  const run = workspaceDir
+    ? await withStagedCopy(workspaceDir, async (stagedWorkspace) => {
+        const value = await inStagedProject(stagedWorkspace);
+        return { commit: value.outcome !== null, value };
+      })
+    : await inStagedProject(undefined);
+
+  // The merge above carries over what the run changed; the fix itself was
+  // written before the run started, so it is installed explicitly.
+  if (run.outcome) writeFileSync(guardPath(projectDir, "program.ts"), fixed);
+  return run;
 }
 
 /**
- * Run a program to an outcome. If it crashes, ask the LLM to repair it and run
- * the fix — up to maxRepairAttempts times. A fix that also fails leaves no
- * trace: the project and the shared workspace are as they were before it ran.
+ * Run a program to an outcome. If it crashes, ask the LLM to repair it and try
+ * the fix — up to maxRepairAttempts times.
  */
-async function executeProgram(options: ExecuteOptions): Promise<ProgramResult> {
+async function executeProgram(options: ExecuteOptions): Promise<Execution> {
   const { projectDir, maxRepairAttempts } = options;
+  const failed = (reason: string): Execution => ({ result: { status: "failed", reason } });
 
-  const firstRun = await runProgramOnce({ ...options, streamOutput: true });
-  const outcome = settle(projectDir, firstRun);
-  if (outcome) return outcome;
+  const firstRun = await runProgramOnce(options);
+  if (firstRun.outcome) return { result: firstRun.outcome };
 
-  let lastError = formatError(firstRun.child);
-  if (maxRepairAttempts === 0) {
-    return { status: "failed", reason: `Program failed (repair disabled): ${lastError}` };
-  }
+  let lastError = firstRun.failure;
+  if (maxRepairAttempts === 0) return failed(`Program failed (repair disabled): ${lastError}`);
 
-  // Each attempt builds on the previous one's source, even though a failed
-  // attempt is rolled back out of the real project.
+  // Each attempt builds on the previous one's source, though a fix that failed never reached the project.
   let currentSource = readFileSync(guardPath(projectDir, "program.ts"), "utf-8");
   const repairErrors: string[] = [];
   const repairDetails = () => repairErrors.length > 0
@@ -645,63 +649,72 @@ async function executeProgram(options: ExecuteOptions): Promise<ProgramResult> {
 
   for (let attempt = 0; attempt < maxRepairAttempts; attempt++) {
     const fixed = await requestRepair(options, { programSource: currentSource, error: lastError }, repairErrors);
-    if (!fixed) {
-      return { status: "failed", reason: `Failed after ${attempt + 1} repair attempt(s): ${lastError}${repairDetails()}` };
-    }
+    if (!fixed) return failed(`Failed after ${attempt + 1} repair attempt(s): ${lastError}${repairDetails()}`);
     currentSource = fixed;
 
-    const applied = await applyRepair(options, fixed);
-    if (applied.outcome) {
-      try {
-        // lastError is still the failure this repair fixed.
-        options.onRepair?.(attempt, maxRepairAttempts, lastError);
-      } catch (bookkeepingErr) {
-        console.warn(`[trama] repair bookkeeping failed: ${bookkeepingErr instanceof Error ? bookkeepingErr.message : bookkeepingErr}`);
-      }
-      return applied.outcome;
-    }
-    lastError = applied.error;
+    const run = await tryFix(options, fixed);
+    if (run.outcome) return { result: run.outcome, repair: { attempt, error: lastError } };
+    lastError = run.failure;
   }
 
-  return { status: "failed", reason: `Failed after ${maxRepairAttempts} repair attempts: ${lastError}${repairDetails()}` };
+  return failed(`Failed after ${maxRepairAttempts} repair attempts: ${lastError}${repairDetails()}`);
 }
 
-// --- Smoke run (used by create and update) ---
+// --- Validating a candidate program (used by create and update) ---
 
-const SMOKE_READY_GRACE_MS = 2_000;
+const VALIDATION_READY_GRACE_MS = 2_000;
 
 /**
- * Validate a freshly generated program.ts by running it (with repair) in a
- * throwaway copy of the project, so the validation run's file side effects
- * don't persist. On success the validated — possibly repaired — program is
- * copied back. Throws if it cannot be made to run.
+ * Validate a candidate program.ts for a project without touching the project:
+ * run it (with repair) in a throwaway copy. Returns the program that worked —
+ * the candidate itself, or a repaired version of it, with the failure that was
+ * repaired. Throws if it cannot be made to run.
+ *
+ * Only the project's own files are shielded. What the program does beyond
+ * them — network calls, shell commands, other projects it runs — is real.
  */
-export async function smokeRunAndRepair(
+export async function validateProgram(
   projectDir: string,
   adapter: PiAdapter,
-  reason: "create" | "update",
+  candidate: string,
   options: { timeout: number; maxRepairAttempts: number; maxIterations: number },
-): Promise<void> {
-  await withTempDir("trama-smoke-", async (smokeDir) => {
-    cpSync(projectDir, smokeDir, { recursive: true });
+): Promise<{ source: string; repairedError?: string }> {
+  return withTempDir("trama-validate-", async (trialDir) => {
+    copyDirInto(projectDir, trialDir);
+    const programPath = guardPath(trialDir, "program.ts");
+    writeFileSync(programPath, candidate);
 
-    const result = await executeProgram({
-      projectDir: smokeDir,
-      adapter: adapter.withCwd(smokeDir),
-      maxRepairAttempts: options.maxRepairAttempts,
-      timeout: options.timeout,
-      maxIterations: options.maxIterations,
-      stopOnReady: { graceMs: SMOKE_READY_GRACE_MS },
-      onRepair(_attempt, _max, error) {
-        appendHistoryIndex(projectDir, { reason: `${reason}-repair`, timestamp: new Date().toISOString(), error });
-      },
+    const { result, repair } = await executeProgram({
+      ...options,
+      projectDir: trialDir,
+      adapter: adapter.withCwd(trialDir),
+      stopOnReady: { graceMs: VALIDATION_READY_GRACE_MS },
     });
     if (result.status === "failed") {
       throw new Error(`Program failed: ${result.reason}`);
     }
-
-    copyFileSync(guardPath(smokeDir, "program.ts"), guardPath(projectDir, "program.ts"));
+    return { source: readFileSync(programPath, "utf-8"), repairedError: repair?.error };
   });
+}
+
+/**
+ * Make a validated program the project's program.ts and record it as a new
+ * version. A repair made while validating is not a version of its own — it is
+ * noted in the history index only.
+ */
+export function installValidatedProgram(
+  projectDir: string,
+  validated: { source: string; repairedError?: string },
+  reason: "create" | "update",
+  prompt: string,
+): void {
+  writeFileSync(guardPath(projectDir, "program.ts"), validated.source);
+  if (validated.repairedError) {
+    appendHistoryIndex(projectDir, {
+      reason: `${reason}-repair`, timestamp: new Date().toISOString(), error: validated.repairedError,
+    });
+  }
+  copyToHistory(projectDir, reason, prompt);
 }
 
 // --- Core execution ---
@@ -727,7 +740,7 @@ export async function runProgram(options: RunOptions): Promise<ProgramResult> {
     throw new Error(`Invalid maxRepairAttempts: ${maxRepairAttempts}. Must be a non-negative integer.`);
   }
 
-  return executeProgram({
+  const { result, repair } = await executeProgram({
     projectDir,
     adapter: new PiAdapter(config, projectDir),
     maxRepairAttempts,
@@ -735,13 +748,18 @@ export async function runProgram(options: RunOptions): Promise<ProgramResult> {
     maxIterations: config.defaultMaxIterations,
     argsOverride: options.args,
     workspaceDir: options.workspaceDir,
-    onRepair(attempt, max, error) {
-      // Runs after the repaired program's own run, so this lands at the end of its log.
-      const entry = { ts: Date.now(), message: `Repair attempt ${attempt + 1}/${max}`, data: { error } };
-      appendFileSync(guardPath(projectDir, join("logs", "latest.jsonl")), JSON.stringify(entry) + "\n");
-      console.log(`[trama] Repair attempt ${attempt + 1}/${max}`);
-
-      copyToHistory(projectDir, "repair", error);
-    },
   });
+
+  if (repair) {
+    // The program is fixed and has run; failing to write this down must not turn that into an error.
+    try {
+      const entry = { ts: Date.now(), message: `Repair attempt ${repair.attempt + 1}/${maxRepairAttempts}`, data: { error: repair.error } };
+      appendFileSync(guardPath(projectDir, join("logs", "latest.jsonl")), JSON.stringify(entry) + "\n");
+      console.log(`[trama] Repair attempt ${repair.attempt + 1}/${maxRepairAttempts}`);
+      copyToHistory(projectDir, "repair", repair.error);
+    } catch (err) {
+      console.warn(`[trama] repair bookkeeping failed: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  return result;
 }

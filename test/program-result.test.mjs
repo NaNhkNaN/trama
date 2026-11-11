@@ -281,20 +281,30 @@ await tools.write("iterations.txt", seen.join(","));
 // program announces that it has started and waits to be released, and the test
 // acts in between.
 
+// A fix runs on a private copy of the project, so the two sides meet in a
+// directory of their own, named after the project.
+const signalDirFor = (projectDir) => `${projectDir}.signals`;
+
 /** Source for a repaired program: announce the run and pause until released. */
-const PAUSE_REPAIR_RUN = `import { existsSync, writeFileSync } from "fs";
-writeFileSync("repair-run-started.txt", "");
-while (!existsSync("repair-run-proceed.txt")) await new Promise(r => setTimeout(r, 20));`;
+function pauseRepairRun(projectDir) {
+  const signalDir = signalDirFor(projectDir);
+  return `import { existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
+mkdirSync(${JSON.stringify(signalDir)}, { recursive: true });
+writeFileSync(${JSON.stringify(join(signalDir, "started"))}, "");
+while (!existsSync(${JSON.stringify(join(signalDir, "proceed"))})) await new Promise(r => setTimeout(r, 20));
+rmSync(${JSON.stringify(signalDir)}, { recursive: true, force: true });`;
+}
 
 /** Wait for the repaired program to pause, run `act`, then let it continue. */
 async function duringRepairRun(projectDir, act) {
+  const signalDir = signalDirFor(projectDir);
   const deadline = Date.now() + 9_000;
-  while (!existsSync(join(projectDir, "repair-run-started.txt"))) {
+  while (!existsSync(join(signalDir, "started"))) {
     if (Date.now() > deadline) throw new Error("the repaired program never started");
     await new Promise(r => setTimeout(r, 20));
   }
   act();
-  writeText(join(projectDir, "repair-run-proceed.txt"), "");
+  writeText(join(signalDir, "proceed"), "");
 }
 
 test("a repair that fails leaves the shared workspace as it was", async (t) => {
@@ -344,7 +354,7 @@ test("a failed repair run preserves concurrent workspace writes from other parti
   const originalRepair = PiAdapter.prototype.repair;
   PiAdapter.prototype.repair = async function repair() {
     // The repaired program waits for the concurrent write and then crashes.
-    return `${PAUSE_REPAIR_RUN}
+    return `${pauseRepairRun(projectDir)}
 throw new Error("crash after concurrent write window");`;
   };
 
@@ -359,7 +369,7 @@ throw new Error("crash after concurrent write window");`;
 
     const result = await runPromise;
     assert.equal(result.status, "failed");
-    // Concurrent write from another participant must survive the rollback
+    // Concurrent write from another participant must still be there after the failed fix
     assert.equal(readFileSync(join(wsDir, "concurrent.txt"), "utf-8"), "from another participant");
   } finally {
     PiAdapter.prototype.repair = originalRepair;
@@ -381,7 +391,7 @@ test("successful repair commit does not overwrite concurrent workspace updates (
   const originalRepair = PiAdapter.prototype.repair;
   PiAdapter.prototype.repair = async function repair() {
     return `import { ctx, workspace } from "@trama-dev/runtime";
-${PAUSE_REPAIR_RUN}
+${pauseRepairRun(projectDir)}
 await workspace.write("new-artifact.txt", "from repair");
 await ctx.done();`;
   };
@@ -420,7 +430,7 @@ test("successful repair commit does not overwrite concurrent update on same path
   PiAdapter.prototype.repair = async function repair() {
     // Repaired program modifies shared.txt (same file another participant will update)
     return `import { ctx, workspace } from "@trama-dev/runtime";
-${PAUSE_REPAIR_RUN}
+${pauseRepairRun(projectDir)}
 await workspace.write("shared.txt", "from-repair");
 await ctx.done();`;
   };
@@ -457,7 +467,7 @@ test("successful repair commit does not overwrite concurrently created new path"
   const originalRepair = PiAdapter.prototype.repair;
   PiAdapter.prototype.repair = async function repair() {
     return `import { ctx, workspace } from "@trama-dev/runtime";
-${PAUSE_REPAIR_RUN}
+${pauseRepairRun(projectDir)}
 await workspace.write("shared-new.txt", "from-repair");
 await ctx.done();`;
   };
@@ -482,10 +492,10 @@ await ctx.done();`;
 });
 
 test("successful repair commit handles path-shape conflict gracefully", async (t) => {
-  // Test commitWorkspaceChanges directly to avoid timing fragility.
+  // Test commitStagedChanges directly to avoid timing fragility.
   // Simulate: repair wrote "nested/out.txt" in temp workspace, but another
   // participant created "nested" as a regular file in the real workspace.
-  const { commitWorkspaceChanges, snapshotDir } = await import("../packages/runtime/dist/runner.js");
+  const { commitStagedChanges, snapshotDir } = await import("../packages/runtime/dist/runner.js");
 
   const tempDir = makeTempDir("trama-temp-ws-");
   const realDir = makeTempDir("trama-real-ws-");
@@ -504,17 +514,17 @@ test("successful repair commit handles path-shape conflict gracefully", async (t
   // Simulate another participant creating "nested" as a regular file in real workspace
   writeText(join(realDir, "nested"), "i-am-a-file");
 
-  // commitWorkspaceChanges must not throw — it should skip the conflicting path
-  commitWorkspaceChanges(tempDir, realDir, tempBefore, realSeed);
+  // commitStagedChanges must not throw — it should skip the conflicting path
+  commitStagedChanges(tempDir, realDir, tempBefore, realSeed);
 
   // The other participant's "nested" regular file must be preserved
   assert.equal(readFileSync(join(realDir, "nested"), "utf-8"), "i-am-a-file");
 });
 
 test("repair commit does not follow symlinks escaping workspace", async (t) => {
-  // Test that commitWorkspaceChanges respects the workspace bounded root
+  // Test that commitStagedChanges respects the workspace bounded root
   // when a concurrent participant places a symlink pointing outside.
-  const { commitWorkspaceChanges, snapshotDir } = await import("../packages/runtime/dist/runner.js");
+  const { commitStagedChanges, snapshotDir } = await import("../packages/runtime/dist/runner.js");
   const { symlinkSync } = await import("fs");
 
   const tempDir = makeTempDir("trama-temp-ws-");
@@ -534,15 +544,15 @@ test("repair commit does not follow symlinks escaping workspace", async (t) => {
   // Simulate another participant creating escape.txt as a symlink to an external file
   symlinkSync(join(outsideDir, "target.txt"), join(realDir, "escape.txt"));
 
-  // commitWorkspaceChanges must not follow the symlink and overwrite the external file
-  commitWorkspaceChanges(tempDir, realDir, tempBefore, realSeed);
+  // commitStagedChanges must not follow the symlink and overwrite the external file
+  commitStagedChanges(tempDir, realDir, tempBefore, realSeed);
 
   // The external file must NOT have been overwritten
   assert.equal(readFileSync(join(outsideDir, "target.txt"), "utf-8"), "external-original");
 });
 
 test("repair commit does not follow symlinked parent directory escaping workspace", async (t) => {
-  const { commitWorkspaceChanges, snapshotDir } = await import("../packages/runtime/dist/runner.js");
+  const { commitStagedChanges, snapshotDir } = await import("../packages/runtime/dist/runner.js");
   const { symlinkSync } = await import("fs");
 
   const tempDir = makeTempDir("trama-temp-ws-");
@@ -561,7 +571,7 @@ test("repair commit does not follow symlinked parent directory escaping workspac
   // Simulate another participant creating "reports" as a symlink to an external directory
   symlinkSync(outsideDir, join(realDir, "reports"));
 
-  commitWorkspaceChanges(tempDir, realDir, tempBefore, realSeed);
+  commitStagedChanges(tempDir, realDir, tempBefore, realSeed);
 
   // The external directory must NOT have a data.txt written into it
   assert.equal(existsSync(join(outsideDir, "data.txt")), false);

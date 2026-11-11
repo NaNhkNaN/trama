@@ -3,9 +3,8 @@ import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { resolve, dirname } from "path";
 import type { Tools, ShellResult } from "./types.js";
 import { guardPath } from "./path-guard.js";
-import { cappedBuffer, signalGroup, superviseChild } from "./child-process.js";
-
-export { cappedBuffer };
+import { signalGroup, superviseChild } from "./child-process.js";
+import { untilSettled } from "./lifetime.js";
 
 const MAX_FETCH_BODY = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_SHELL_TIMEOUT = 30_000;
@@ -21,11 +20,22 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
 
   // Each shell command leads its own process group, so background processes it
   // starts stay killable after the shell itself exits. A group is tracked from
-  // spawn until it has no members left; `true` marks groups whose shell has
-  // exited — only those are probed, since a group that is still starting up
-  // may not be visible yet.
-  const groups = new Map<number, boolean>();
+  // spawn until it has no members left. `shellExited` marks groups whose shell
+  // has exited — only those are probed, since a group that is still starting
+  // up may not be visible yet. `forget` tells the process-lifetime guard the
+  // group no longer needs killing if this process dies.
+  const groups = new Map<number, { shellExited: boolean; forget: () => void }>();
   let sweeper: ReturnType<typeof setInterval> | null = null;
+
+  const untrack = (pgid: number) => {
+    groups.get(pgid)?.forget();
+    groups.delete(pgid);
+  };
+
+  // Shell commands must not see the bridge's address or the init file (which
+  // holds its secret). A top-level runner has neither in its environment, but
+  // a runner inside a program — a session's creator — inherits both.
+  const { TRAMA_PORT: _port, TRAMA_INIT: _init, ...shellEnv } = process.env;
 
   const stopSweeping = () => {
     if (sweeper) clearInterval(sweeper);
@@ -35,17 +45,18 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
   /** Forget groups that have fully exited, so a recycled pid is never signalled. */
   const sweep = () => {
     let pending = false;
-    for (const [pgid, shellExited] of groups) {
-      if (!shellExited) continue;
+    for (const [pgid, group] of groups) {
+      if (!group.shellExited) continue;
       if (signalGroup(pgid, 0)) pending = true;
-      else groups.delete(pgid);
+      else untrack(pgid);
     }
     if (!pending) stopSweeping();
   };
 
   const markShellExited = (pgid: number) => {
-    if (!groups.has(pgid)) return; // already killed by killActiveShells
-    groups.set(pgid, true);
+    const group = groups.get(pgid);
+    if (!group) return; // already killed by killActiveShells
+    group.shellExited = true;
     if (!sweeper) {
       sweeper = setInterval(sweep, GROUP_SWEEP_MS);
       sweeper.unref();
@@ -54,8 +65,10 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
 
   return {
     killActiveShells() {
-      for (const pgid of groups.keys()) signalGroup(pgid, "SIGKILL");
-      groups.clear();
+      for (const pgid of [...groups.keys()]) {
+        signalGroup(pgid, "SIGKILL");
+        untrack(pgid);
+      }
       stopSweeping();
     },
 
@@ -79,11 +92,14 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
       const cwd = options.cwd ? guardPath(normalizedProjectDir, options.cwd) : normalizedProjectDir;
       const child = spawn("sh", ["-c", command], {
         cwd,
+        env: shellEnv,
         stdio: ["pipe", "pipe", "pipe"],
         detached: true,
       });
       const pgid = child.pid;
-      if (pgid) groups.set(pgid, false);
+      if (pgid) {
+        groups.set(pgid, { shellExited: false, forget: untilSettled(() => signalGroup(pgid, "SIGKILL")) });
+      }
 
       try {
         const exit = await superviseChild(child, { timeout: options.timeout ?? DEFAULT_SHELL_TIMEOUT });
@@ -95,7 +111,7 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
         };
       } catch (spawnError) {
         // Failed to start (e.g. cwd does not exist) — a result, not an exception.
-        if (pgid) groups.delete(pgid);
+        if (pgid) untrack(pgid);
         return { exitCode: 1, stdout: "", stderr: (spawnError as Error).message };
       }
     },
