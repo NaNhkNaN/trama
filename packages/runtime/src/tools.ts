@@ -3,15 +3,15 @@ import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { resolve, dirname } from "path";
 import type { Tools, ShellResult } from "./types.js";
 import { guardPath } from "./path-guard.js";
-import { signalGroup, superviseChild } from "./child-process.js";
-import { untilSettled } from "./lifetime.js";
+import { signalGroup, stopGroups, superviseChild } from "./child-process.js";
+import { stopWithThisProcess } from "./lifetime.js";
 
 const MAX_FETCH_BODY = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_SHELL_TIMEOUT = 30_000;
 const GROUP_SWEEP_MS = 250;
 
 export interface ToolsWithCleanup extends Tools {
-  /** Kill every shell command still running, and anything they left in the background. */
+  /** Stop every shell command still running, and anything they left in the background. */
   killActiveShells(): void;
 }
 
@@ -65,10 +65,9 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
 
   return {
     killActiveShells() {
-      for (const pgid of [...groups.keys()]) {
-        signalGroup(pgid, "SIGKILL");
-        untrack(pgid);
-      }
+      const pgids = [...groups.keys()];
+      stopGroups(pgids);
+      for (const pgid of pgids) untrack(pgid);
       stopSweeping();
     },
 
@@ -98,7 +97,7 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
       });
       const pgid = child.pid;
       if (pgid) {
-        groups.set(pgid, { shellExited: false, forget: untilSettled(() => signalGroup(pgid, "SIGKILL")) });
+        groups.set(pgid, { shellExited: false, forget: stopWithThisProcess(pgid) });
       }
 
       try {

@@ -18,9 +18,9 @@ import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
 import { guardPath } from "./path-guard.js";
-import { createAllowance, signalGroup, superviseChild, type ChildExit } from "./child-process.js";
+import { createAllowance, superviseChild, type ChildExit } from "./child-process.js";
 import { openBridge } from "./bridge-client.js";
-import { removeTempDir, untilSettled } from "./lifetime.js";
+import { removeTempDir, stopWithThisProcess, untilSettled } from "./lifetime.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
 
 // --- Locating the runtime itself ---
@@ -537,7 +537,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
         detached: true,
       });
       const pgid = program.pid;
-      if (pgid) programStopped = untilSettled(() => signalGroup(pgid, "SIGKILL"));
+      if (pgid) programStopped = stopWithThisProcess(pgid);
 
       return toChildResult(await superviseChild(program, {
         timeout: allowance,

@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawn } from "child_process";
 import { existsSync, readFileSync } from "fs";
 import { join } from "path";
+import { pathToFileURL } from "url";
 import { runProgram } from "../packages/runtime/dist/runner.js";
 import { Session } from "../packages/session/dist/index.js";
-import { cleanupTempDir, createProjectFixture, makeTempDir, withEnv } from "./helpers.mjs";
+import { cleanupTempDir, createProjectFixture, makeTempDir, REPO_ROOT, withEnv } from "./helpers.mjs";
 
 test("Session.spawn returns done ProgramResult", async (t) => {
   const projectDir = makeTempDir("trama-session-");
@@ -361,4 +363,61 @@ throw new Error("the entry program crashes");`,
     await settled(() => !isAlive(pidOf("worker.pid")) && !isAlive(pidOf("shell.pid")), 5_000), true,
     "the participant and its shell command must be gone once the program that spawned them is",
   );
+});
+
+test("stopping the runner stops the participants of its program, and what they started", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const entryDir = makeTempDir("trama-session-entry-");
+  const workerDir = makeTempDir("trama-session-worker-");
+  const signalDir = makeTempDir("trama-session-signal-");
+  t.after(() => { for (const dir of [fakeHome, entryDir, workerDir, signalDir]) cleanupTempDir(dir); });
+
+  // Three levels down from the runner that gets stopped: its program, that
+  // program's participant, and the participant's shell command. The runner
+  // that started the last two lives inside the program.
+  createProjectFixture(workerDir, {
+    programSource: `import { tools } from "@trama-dev/runtime";
+import { writeFileSync } from "fs";
+writeFileSync(${JSON.stringify(join(signalDir, "worker.pid"))}, String(process.pid));
+await tools.shell("echo $$ > ${join(signalDir, "shell.pid")}; sleep 60", { timeout: 60000 });`,
+  });
+  createProjectFixture(entryDir, {
+    scaffold: false,
+    programSource: `import { ctx } from "@trama-dev/runtime";
+import { writeFileSync } from "fs";
+import { Session } from "@trama-dev/session";
+writeFileSync(${JSON.stringify(join(signalDir, "entry.pid"))}, String(process.pid));
+const session = await Session.create({ workspace: ${JSON.stringify(join(signalDir, "workspace"))} });
+await session.spawn("worker", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 60000 }).wait();
+await ctx.done();`,
+  });
+
+  // A runner in a process of its own, stopped the way Ctrl-C stops `trama run`.
+  const runnerUrl = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "runner.js")).href;
+  const runner = spawn(process.execPath, ["--input-type=module", "-e",
+    `import { runProgram } from ${JSON.stringify(runnerUrl)};
+await runProgram({ projectDir: ${JSON.stringify(entryDir)}, maxRepairAttempts: 0, timeout: 60_000 });`,
+  ], { env: { ...process.env, HOME: fakeHome }, stdio: "ignore" });
+  const exited = new Promise(resolve => runner.on("close", resolve));
+
+  const pidOf = (name) => Number(readFileSync(join(signalDir, name), "utf-8"));
+  const isAlive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  const settled = async (check, ms) => {
+    const deadline = Date.now() + ms;
+    while (!check() && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+    return check();
+  };
+  const names = ["entry.pid", "worker.pid", "shell.pid"];
+
+  assert.equal(
+    await settled(() => existsSync(join(signalDir, "shell.pid")) && readFileSync(join(signalDir, "shell.pid"), "utf-8").trim() !== "", 20_000),
+    true, "the participant should get as far as its shell command",
+  );
+  assert.deepEqual(names.filter(name => !isAlive(pidOf(name))), [], "all three should be running");
+
+  runner.kill("SIGINT");
+  await exited;
+
+  await settled(() => names.every(name => !isAlive(pidOf(name))), 5_000);
+  assert.deepEqual(names.filter(name => isAlive(pidOf(name))), [], "nothing the runner's program started may survive it");
 });

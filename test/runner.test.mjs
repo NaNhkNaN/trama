@@ -802,6 +802,33 @@ await tools.shell("echo $$ > ${join(signalDir, "shell.pid")}; sleep 60", { timeo
   await waitFor(() => !isAlive(programPid) && !isAlive(shellPid), "the program and its shell command to be gone", 5_000);
 });
 
+test("a program that ignores being asked to stop does not survive a stopped runner", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const projectDir = makeTempDir("trama-runner-");
+  const signalDir = makeTempDir("trama-signal-");
+  t.after(() => { cleanupTempDir(fakeHome); cleanupTempDir(projectDir); cleanupTempDir(signalDir); });
+
+  // A runner asks before it kills, so that a program can stop what it started.
+  // One that will not go is killed once the grace period is over — by then the
+  // runner itself is long gone.
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { writeFileSync } from "fs";
+process.on("SIGTERM", () => {});
+writeFileSync(${JSON.stringify(join(signalDir, "program.pid"))}, String(process.pid));
+setInterval(() => {}, 1000);
+await new Promise(() => {});`,
+  });
+
+  const { child, exited } = startRunnerProcess(fakeHome, projectDir);
+  await waitFor(() => existsSync(join(signalDir, "program.pid")), "the program to start");
+  const programPid = Number(readFileSync(join(signalDir, "program.pid"), "utf-8"));
+
+  child.kill("SIGINT");
+  await exited;
+  await waitFor(() => !isAlive(programPid), "the program to be killed", 12_000);
+});
+
 test("a runner stopped while trying a fix leaves the project as it was", async (t) => {
   const fakeHome = makeTempDir("trama-home-");
   const projectDir = makeTempDir("trama-runner-");

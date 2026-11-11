@@ -14,6 +14,10 @@ All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`
 
   This changes what `--timeout` means for a program that runs others. It is no longer a limit on the whole session; the participants' timeouts are what bound it.
 
+### Fixed
+
+- **Stopping the runner no longer leaves the shell commands of session participants running.** A stopped runner killed its program's process group outright. But a program that coordinates others holds a runner of its own, which was killed before it could stop what it had started: the participant went, its shell command stayed. A runner now asks first — SIGTERM, then SIGKILL to whatever is still there after five seconds — both for its program and for shell commands, so that anything holding a runner gets to stop what it started. A program that ignores SIGTERM is therefore killed five seconds after the runner is stopped rather than at once.
+
 ### Internal
 
 - Everything the runtime asks of an LLM goes through one interface, `AgentBackend`: a prompt and where to work in, the agent's final text out. pi is its one implementation. No change in behaviour; it is the seam for other backends.

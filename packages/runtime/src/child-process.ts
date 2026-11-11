@@ -1,4 +1,4 @@
-import type { ChildProcess } from "child_process";
+import { spawn, type ChildProcess } from "child_process";
 import { StringDecoder } from "string_decoder";
 
 const MAX_OUTPUT = 10 * 1024 * 1024; // 10 MB
@@ -44,6 +44,47 @@ export function signalGroup(pgid: number, signal: NodeJS.Signals | 0): boolean {
  * so that every moment is charged to exactly one of them and a program is
  * never killed for the time something else was entitled to take.
  */
+// Run by a process of its own (see stopGroups): wait for the groups to go, and
+// kill outright whichever are still there when the grace period is over.
+const REAPER = `
+const [grace, ...groups] = process.argv.slice(1).map(Number);
+const alive = (pgid) => { try { process.kill(-pgid, 0); return true; } catch { return false; } };
+const deadline = Date.now() + grace;
+setInterval(() => {
+  const left = groups.filter(alive);
+  if (left.length > 0 && Date.now() < deadline) return;
+  for (const pgid of left) { try { process.kill(-pgid, "SIGKILL"); } catch {} }
+  process.exit(0);
+}, 100);
+`;
+
+/**
+ * Stop process groups for good: SIGTERM now, SIGKILL after a grace period to
+ * whichever are still there.
+ *
+ * Never SIGKILL first. A group may hold a runner of its own — a program that
+ * coordinates others, a shell command that runs trama — and that runner has
+ * started process groups this one cannot see. SIGTERM is its chance to stop
+ * them; killed outright, it leaves them running.
+ *
+ * The grace period is seen through by a small detached process rather than a
+ * timer here, because the caller is often on its way out — this is what a
+ * runner does with everything it started when it is stopped itself.
+ */
+export function stopGroups(pgids: number[]): void {
+  const stopping = pgids.filter(pgid => signalGroup(pgid, "SIGTERM"));
+  if (stopping.length === 0) return;
+  try {
+    spawn(process.execPath, ["-e", REAPER, String(KILL_GRACE_MS), ...stopping.map(String)], {
+      detached: true,
+      stdio: "ignore",
+    }).unref();
+  } catch {
+    // No reaper could be started: without one, do not leave them to chance.
+    for (const pgid of stopping) signalGroup(pgid, "SIGKILL");
+  }
+}
+
 export interface Allowance {
   /** Start the clock. `onSpent` is called once, if the allowance runs out. */
   start(onSpent: () => void): void;
