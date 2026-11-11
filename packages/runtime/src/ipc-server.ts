@@ -38,6 +38,8 @@ export interface IpcBackends {
   workspace: Workspace | null;
   /** Called once ctx.done() or ctx.yield() has been persisted for this run. */
   onTerminalSignal(result: ProgramResult): void;
+  /** Stop the program's clock until the returned function is called (see Allowance). */
+  holdClock(): () => void;
 }
 
 const isPlainObject = (v: unknown) => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -62,7 +64,7 @@ function isAuthorized(header: string | undefined, token: string): boolean {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-function buildRoutes({ ctx, agent, tools, workspace, onTerminalSignal }: IpcBackends): Record<string, Route> {
+function buildRoutes({ ctx, agent, tools, workspace, onTerminalSignal, holdClock }: IpcBackends): Record<string, Route> {
   /** The program owns ctx.state; each persisting call hands over its current copy. */
   const adoptState = (state: Record<string, unknown>) => {
     assertSerializable(state, "ctx.state");
@@ -72,6 +74,9 @@ function buildRoutes({ ctx, agent, tools, workspace, onTerminalSignal }: IpcBack
     if (!workspace) throw new BadRequest("Workspace is only available when running in a session");
     return workspace;
   };
+  /** Runs the program has started and not yet seen end, each holding its clock. */
+  const nestedRuns = new Map<string, () => void>();
+  let nestedRunCount = 0;
 
   return {
     "/agent/instruct": {
@@ -120,6 +125,24 @@ function buildRoutes({ ctx, agent, tools, workspace, onTerminalSignal }: IpcBack
         // Persists the yield marker and returns; the program exits itself once we answer.
         await ctx.yield(b.reason);
         onTerminalSignal({ status: "yielded", reason: b.reason });
+      },
+    },
+
+    // A run the program starts — a session participant — is under a timeout
+    // of its own. The program's clock stops for as long as that run lasts.
+    "/nested-run/begin": {
+      fields: {},
+      handle: () => {
+        const id = String(++nestedRunCount);
+        nestedRuns.set(id, holdClock());
+        return id;
+      },
+    },
+    "/nested-run/end": {
+      fields: { id: "string" },
+      handle: b => {
+        nestedRuns.get(b.id)?.();
+        nestedRuns.delete(b.id);
       },
     },
 

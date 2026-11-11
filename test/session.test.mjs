@@ -293,6 +293,34 @@ await ctx.done({ workspaceDir: session.workspaceDir, statuses, findings });`,
   assert.equal(existsSync(join(entryDir, "node_modules", "@trama-dev", "session")), true);
 });
 
+test("a program is not timed out for the time its participant takes", async (t) => {
+  const entryDir = makeTempDir("trama-session-entry-");
+  const workerDir = makeTempDir("trama-session-worker-");
+  const wsDir = makeTempDir("trama-session-ws-");
+  t.after(() => { cleanupTempDir(entryDir); cleanupTempDir(workerDir); cleanupTempDir(wsDir); });
+
+  // A participant that takes longer than the whole allowance of the program waiting for it.
+  createProjectFixture(workerDir, {
+    programSource: `import { ctx } from "@trama-dev/runtime";
+await new Promise(resolve => setTimeout(resolve, 7000));
+await ctx.done({ worked: true });`,
+  });
+  createProjectFixture(entryDir, {
+    scaffold: false,
+    programSource: `import { ctx } from "@trama-dev/runtime";
+import { Session } from "@trama-dev/session";
+const session = await Session.create({ workspace: ${JSON.stringify(wsDir)} });
+const worker = await session.spawn("worker", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 30000 }).wait();
+await ctx.done({ worker: worker.status });`,
+  });
+
+  // The program's own work takes a moment; its participant, under its own
+  // timeout, takes seven seconds. Only the first counts against these five.
+  const result = await runProgram({ projectDir: entryDir, maxRepairAttempts: 0, timeout: 5_000 });
+  assert.equal(result.status, "done", result.reason);
+  assert.deepEqual(result.result, { worker: "done" });
+});
+
 test("participants do not outlive the program that spawned them", async (t) => {
   const entryDir = makeTempDir("trama-session-entry-");
   const workerDir = makeTempDir("trama-session-worker-");
@@ -306,14 +334,15 @@ import { writeFileSync } from "fs";
 writeFileSync(${JSON.stringify(join(signalDir, "worker.pid"))}, String(process.pid));
 await tools.shell("echo $$ > ${join(signalDir, "shell.pid")}; sleep 60", { timeout: 60000 });`,
   });
-  // The program that spawned it waits for it — until the runner's timeout stops it.
+  // The program that spawned it crashes once the participant is well under way.
   createProjectFixture(entryDir, {
     scaffold: false,
-    programSource: `import { ctx } from "@trama-dev/runtime";
+    programSource: `import { existsSync } from "fs";
 import { Session } from "@trama-dev/session";
 const session = await Session.create({ workspace: ${JSON.stringify(join(signalDir, "workspace"))} });
-await session.spawn("worker", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 60000 }).wait();
-await ctx.done();`,
+session.spawn("worker", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 60000 });
+while (!existsSync(${JSON.stringify(join(signalDir, "shell.pid"))})) await new Promise(resolve => setTimeout(resolve, 25));
+throw new Error("the entry program crashes");`,
   });
 
   const pidOf = (name) => Number(readFileSync(join(signalDir, name), "utf-8"));
@@ -324,11 +353,10 @@ await ctx.done();`,
     return check();
   };
 
-  const result = await runProgram({ projectDir: entryDir, maxRepairAttempts: 0, timeout: 4_000 });
+  const result = await runProgram({ projectDir: entryDir, maxRepairAttempts: 0, timeout: 30_000 });
   assert.equal(result.status, "failed");
-  assert.match(result.reason, /timeout/);
+  assert.match(result.reason, /the entry program crashes/);
 
-  assert.equal(existsSync(join(signalDir, "shell.pid")), true, "the participant should have got as far as its shell command");
   assert.equal(
     await settled(() => !isAlive(pidOf("worker.pid")) && !isAlive(pidOf("shell.pid")), 5_000), true,
     "the participant and its shell command must be gone once the program that spawned them is",

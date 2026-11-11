@@ -700,6 +700,52 @@ test("runProgram rejects non-object package.json (array)", async (t) => {
   );
 });
 
+// --- A program's time allowance ---
+
+const pause = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+test("an allowance runs out only while nothing is holding it", async () => {
+  const { createAllowance } = await import("../packages/runtime/dist/child-process.js");
+
+  let spent = false;
+  const allowance = createAllowance(300);
+  allowance.start(() => { spent = true; });
+
+  // Held — twice over — for far longer than the allowance.
+  await pause(100);
+  const releaseFirst = allowance.hold();
+  const releaseSecond = allowance.hold();
+  await pause(600);
+  assert.equal(spent, false, "the clock must not run while it is held");
+
+  releaseFirst();
+  releaseFirst(); // releasing twice releases once
+  await pause(400);
+  assert.equal(spent, false, "the clock must stay stopped until every hold is released");
+
+  // Released: what was left when it was first held — about 200ms — now runs down.
+  releaseSecond();
+  await pause(60);
+  assert.equal(spent, false, "the time before the hold was used up, not the time during it");
+  await pause(600);
+  assert.equal(spent, true);
+});
+
+test("an allowance that is cancelled, or never started, does not run out", async () => {
+  const { createAllowance } = await import("../packages/runtime/dist/child-process.js");
+
+  let spent = false;
+  const cancelled = createAllowance(50);
+  cancelled.start(() => { spent = true; });
+  cancelled.cancel();
+
+  const neverStarted = createAllowance(50);
+  neverStarted.hold()();
+
+  await pause(250);
+  assert.equal(spent, false);
+});
+
 // --- Process lifetime, init file security, IPC limits ---
 
 /** Start a runner in its own process, so the test can stop it the way a user or a parent runner would. */

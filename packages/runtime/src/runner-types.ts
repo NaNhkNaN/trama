@@ -18,6 +18,11 @@ export interface ModelConfig {
 export interface RunOptions {
   projectDir: string;
   maxRepairAttempts?: number;
+  /**
+   * Per-phase limit in ms on the program's own time, for each run and each
+   * repair attempt. Time during which a run the program itself started is in
+   * flight is not counted — that run has a timeout of its own.
+   */
   timeout?: number;
   args?: Record<string, unknown>;
   /** Shared workspace directory. When set, workspace.* API is enabled for the program. */

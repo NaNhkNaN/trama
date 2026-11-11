@@ -36,9 +36,68 @@ export function signalGroup(pgid: number, signal: NodeJS.Signals | 0): boolean {
   }
 }
 
+/**
+ * A time limit that only runs down while nothing is holding it.
+ *
+ * A program's timeout is an allowance for its own work. While it waits for a
+ * run it started — one that is under a timeout of its own — the clock stops,
+ * so that every moment is charged to exactly one of them and a program is
+ * never killed for the time something else was entitled to take.
+ */
+export interface Allowance {
+  /** Start the clock. `onSpent` is called once, if the allowance runs out. */
+  start(onSpent: () => void): void;
+  /** Stop the clock until the returned function is called. Holds add up: the clock runs only when all are released. */
+  hold(): () => void;
+  /** Stop for good; `onSpent` will not be called. */
+  cancel(): void;
+}
+
+export function createAllowance(ms: number): Allowance {
+  let remaining = ms;
+  let holds = 0;
+  let onSpent: (() => void) | null = null;
+  // Set while the clock is running: the timer, and when it was started.
+  let running: { timer: ReturnType<typeof setTimeout>; since: number } | null = null;
+
+  const run = () => {
+    if (!onSpent || holds > 0 || running) return;
+    const spent = onSpent;
+    running = {
+      since: Date.now(),
+      timer: setTimeout(() => { running = null; onSpent = null; spent(); }, remaining),
+    };
+  };
+  const pause = () => {
+    if (!running) return;
+    clearTimeout(running.timer);
+    remaining = Math.max(0, remaining - (Date.now() - running.since));
+    running = null;
+  };
+
+  return {
+    start(fn) { onSpent = fn; run(); },
+    hold() {
+      holds += 1;
+      pause();
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        holds -= 1;
+        run();
+      };
+    },
+    cancel() { pause(); onSpent = null; },
+  };
+}
+
 export interface SuperviseOptions {
-  /** Wall-clock limit in ms. On expiry the child's process group is terminated. */
-  timeout: number;
+  /**
+   * Time limit: a number of ms of wall-clock time, or an allowance that its
+   * owner may put on hold. On expiry the child's process group is terminated.
+   */
+  timeout: number | Allowance;
   /** Receive output as it arrives, in addition to it being collected. */
   sinks?: { stdout?: (chunk: string) => void; stderr?: (chunk: string) => void };
   /** Aborting this asks the child to stop (same SIGTERM → SIGKILL sequence as a timeout). */
@@ -57,13 +116,14 @@ export interface ChildExit {
 }
 
 /**
- * Collect a child's output and wait for it to exit, enforcing a wall-clock
- * timeout and an optional stop request. Termination is SIGTERM to the child's
+ * Collect a child's output and wait for it to exit, enforcing a time limit
+ * and an optional stop request. Termination is SIGTERM to the child's
  * process group, then SIGKILL if it is still alive after a grace period.
  * Resolves on exit however it happened; rejects only if the child failed to spawn.
  */
 export function superviseChild(child: ChildProcess, options: SuperviseOptions): Promise<ChildExit> {
-  const { timeout, sinks, stopSignal } = options;
+  const { sinks, stopSignal } = options;
+  const allowance = typeof options.timeout === "number" ? createAllowance(options.timeout) : options.timeout;
   return new Promise((resolve, reject) => {
     const out = cappedBuffer();
     const err = cappedBuffer();
@@ -96,14 +156,14 @@ export function superviseChild(child: ChildProcess, options: SuperviseOptions): 
     };
     stopSignal?.addEventListener("abort", onStopRequest, { once: true });
 
-    const timer = setTimeout(() => {
+    allowance.start(() => {
       if (exited) return;
       timedOut = true;
       terminate();
-    }, timeout);
+    });
 
     const cleanup = () => {
-      clearTimeout(timer);
+      allowance.cancel();
       if (killFallbackTimer) clearTimeout(killFallbackTimer);
       stopSignal?.removeEventListener("abort", onStopRequest);
     };

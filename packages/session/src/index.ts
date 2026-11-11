@@ -16,7 +16,11 @@ export interface SpawnOptions {
   projectDir: string;
   /** Arguments passed to the program via ctx.input.args. */
   args?: Record<string, unknown>;
-  /** Per-phase timeout in ms. */
+  /**
+   * Per-phase timeout in ms, for each run and each repair attempt of this
+   * participant. While the participant runs, the clock of the program that
+   * spawned it is stopped: this timeout is what limits that time.
+   */
   timeout?: number;
   /** Max repair attempts. */
   maxRepairAttempts?: number;

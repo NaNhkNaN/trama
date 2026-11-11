@@ -18,7 +18,8 @@ import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
 import { guardPath } from "./path-guard.js";
-import { signalGroup, superviseChild, type ChildExit } from "./child-process.js";
+import { createAllowance, signalGroup, superviseChild, type ChildExit } from "./child-process.js";
+import { openBridge } from "./bridge-client.js";
 import { removeTempDir, untilSettled } from "./lifetime.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
 
@@ -497,6 +498,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   // diagnostics if scaffolding, state loading, or context creation fails.
   writeFileSync(guardPath(projectDir, join("logs", "latest.jsonl")), "");
 
+  // The program's own time. It stops while a run the program started is in flight.
+  const allowance = createAllowance(timeout);
   const tools = createTools(projectDir, runEnded.signal);
   // Known only to this run's program, through its init file.
   const token = randomBytes(32).toString("hex");
@@ -508,6 +511,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     workspace: workspaceDir ? createWorkspace(workspaceDir, runEnded.signal) : null,
     // The first terminal signal wins; ctx itself rejects a conflicting second one.
     onTerminalSignal: result => { terminalSignal ??= result; },
+    holdClock: () => allowance.hold(),
   });
 
   // If this process is stopped while the program is running, take the program down with it.
@@ -536,7 +540,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       if (pgid) programStopped = untilSettled(() => signalGroup(pgid, "SIGKILL"));
 
       return toChildResult(await superviseChild(program, {
-        timeout,
+        timeout: allowance,
         stopSignal: stopOnReady ? readyStop.signal : undefined,
         sinks: {
           stdout: chunk => { process.stdout.write(chunk); },
@@ -737,7 +741,37 @@ export function installValidatedProgram(
 
 // --- Core execution ---
 
+/**
+ * A run started from inside a program — a session participant, typically — is
+ * under a timeout of its own. Tell the runner of the program it was started
+ * from, so that program's clock stops while this run lasts and it is not
+ * killed for the time its participant was entitled to take.
+ *
+ * Returns what ends the hold. Best-effort: if that runner cannot be reached
+ * its program's run is over, and this one is about to be stopped with it.
+ */
+async function holdParentClock(): Promise<() => Promise<void>> {
+  const { TRAMA_PORT: port, TRAMA_INIT: initPath } = process.env;
+  if (port && initPath) {
+    try {
+      const bridge = openBridge(port, initPath);
+      const id = await bridge.call("/nested-run/begin", {});
+      return async () => { await bridge.call("/nested-run/end", { id }).catch(() => {}); };
+    } catch { /* not held */ }
+  }
+  return async () => {};
+}
+
 export async function runProgram(options: RunOptions): Promise<ProgramResult> {
+  const releaseParentClock = await holdParentClock();
+  try {
+    return await runProject(options);
+  } finally {
+    await releaseParentClock();
+  }
+}
+
+async function runProject(options: RunOptions): Promise<ProgramResult> {
   const { projectDir } = options;
 
   if (!existsSync(join(projectDir, "meta.json"))) {

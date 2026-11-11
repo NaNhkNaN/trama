@@ -582,7 +582,7 @@ trama logs <name>
 ```
 
 - `--model` — override the LLM model for program generation (create only).
-- `--timeout` — per-phase timeout in milliseconds. Applies to each run and repair attempt separately. Default: `300000` (5 minutes).
+- `--timeout` — per-phase timeout in milliseconds. Applies to each run and repair attempt separately. Default: `300000` (5 minutes). It limits the program's own time: while a participant it spawned is running — under a timeout of its own — the clock is stopped.
 - `--arg` — pass key-value arguments to the program, accessible via `ctx.input.args`. Repeatable.
 
 ```bash
@@ -713,6 +713,8 @@ if (result.status === "yielded") {
 ```
 
 Each participant is a full trama program with its own lifecycle, repair loop, and state. The session layer does not manage execution — trama does. The session manages coordination: who participates, when to resume, and what the shared workspace contains.
+
+Each participant also has its own timeout, and its time is charged to it alone. A program is never timed out for the time its participants take: its clock stops while one of them is running, so a participant that needs a repair does not bring down the program waiting for it. How long a session may run is therefore decided by the participants' timeouts, not by the entry program's.
 
 `runProgram()` (and so `handle.wait()`) returns a structured `ProgramResult`:
 

@@ -10,6 +10,10 @@ All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`
 
   The cost is that what a failed fix wrote to the workspace stays there — as what a failed first run wrote always has. A workspace write is immediate and is never undone; see the README for what that asks of a program.
 
+- **A program is no longer timed out for the time its participants take.** A program waiting on a session participant had the same five-minute default as the participant, so a participant that needed a single repair outlasted the program waiting for it — which was killed, taking the participant with it. A timeout now limits a program's own time: its clock stops while a run it started is in flight, since that run is under a timeout of its own.
+
+  This changes what `--timeout` means for a program that runs others. It is no longer a limit on the whole session; the participants' timeouts are what bound it.
+
 ### Internal
 
 - Everything the runtime asks of an LLM goes through one interface, `AgentBackend`: a prompt and where to work in, the agent's final text out. pi is its one implementation. No change in behaviour; it is the seam for other backends.
