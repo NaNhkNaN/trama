@@ -222,6 +222,57 @@ await tools.write("should-not-exist.txt", "bad");
   assert.equal(existsSync(join(projectDir, "should-not-exist.txt")), false);
 });
 
+test("runProgram refuses yield after done — the runner enforces it, not the client", async (t) => {
+  const projectDir = makeTempDir("trama-result-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+await ctx.done({ final: true });
+try {
+  await ctx.yield("too late");
+  await tools.write("verdict.txt", "yield was accepted");
+} catch (err) {
+  await tools.write("verdict.txt", err.message);
+}
+`,
+  });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
+  assert.equal(result.status, "done");
+  assert.deepEqual(result.result, { final: true });
+  assert.match(
+    readFileSync(join(projectDir, "verdict.txt"), "utf-8"),
+    /Cannot call ctx\.yield\(\) after ctx\.done\(\)/,
+  );
+  assert.equal(readJson(join(projectDir, "state.json")).__trama_yield, undefined);
+});
+
+test("runProgram keeps the program's ctx.iteration in step with the runner", async (t) => {
+  const projectDir = makeTempDir("trama-result-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    state: { __trama_iteration: 5 },
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+const seen = [ctx.iteration];
+await ctx.checkpoint(); seen.push(ctx.iteration);
+await ctx.checkpoint(); seen.push(ctx.iteration);
+await ctx.done();       seen.push(ctx.iteration);
+// A repeated done() is a no-op: it must not advance the counter again.
+await ctx.done();       seen.push(ctx.iteration);
+await Promise.all([ctx.ready(), ctx.ready()]);
+await tools.write("iterations.txt", seen.join(","));
+`,
+  });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
+  assert.equal(result.status, "done");
+  assert.equal(readFileSync(join(projectDir, "iterations.txt"), "utf-8"), "5,6,7,8,8");
+  assert.equal(readJson(join(projectDir, "state.json")).__trama_iteration, 8);
+  const readyLogs = readFileSync(join(projectDir, "logs", "latest.jsonl"), "utf-8")
+    .trim().split("\n").map(line => JSON.parse(line)).filter(entry => entry.message === "ready");
+  assert.equal(readyLogs.length, 1, "ready must be recorded once however often it is called");
+});
+
 // --- Repair workspace isolation ---
 
 test("repair verification does not leak workspace artifacts", async (t) => {

@@ -8,9 +8,12 @@ import { guardPath } from "./path-guard.js";
  * The runner-side ctx: owns state.json and the run log for one run of a
  * program. The program's own `ctx` (client.ts) forwards to this over IPC.
  *
+ * This is the one place the ctx lifecycle rules are enforced (ready once,
+ * done once, done and yield mutually exclusive) — the client only forwards.
+ *
  * Bookkeeping lives in ctx.state under reserved `__trama_*` keys:
- * `__trama_iteration` (progress counter), `__trama_yield` (set while the
- * program is suspended, cleared when it next advances) and `__trama_done`.
+ * `__trama_iteration` (progress counter) and `__trama_yield` (set while the
+ * program is suspended, cleared when it next advances).
  */
 export function createContext(
   projectDir: string,
@@ -26,7 +29,6 @@ export function createContext(
   const meta = JSON.parse(readFileSync(guardPath(projectDir, "meta.json"), "utf-8"));
 
   let donePromise: Promise<void> | null = null;
-  let doneLogged = false;
   let readyCalled = false;
   let terminalSignal: "done" | "yielded" | null = null;
 
@@ -84,28 +86,25 @@ export function createContext(
       }
 
       // A completed done() is a no-op; one still in flight is shared.
-      // One that failed cleared the promise below, so it can be retried.
       if (donePromise) return donePromise;
 
-      // Locked in on the first attempt: a failed done() may be retried, but not swapped for yield().
+      // Claimed while in flight so a yield() cannot slip in alongside it.
       terminalSignal = "done";
 
       const run = async () => {
-        this.state.__trama_done = { result: result ?? null };
         await this.checkpoint();
         // Persistence is the critical part; a log failure must not turn a
         // completed done() into an error.
-        if (!doneLogged) {
-          try { await this.log("done", result); } catch { /* best-effort */ }
-          doneLogged = true;
-        }
+        try { await this.log("done", result); } catch { /* best-effort */ }
       };
 
       donePromise = run();
       try {
         await donePromise;
       } catch (err) {
+        // Nothing was persisted, so nothing is settled: done() or yield() may be called again.
         donePromise = null;
+        terminalSignal = null;
         throw err;
       }
     },
@@ -119,10 +118,9 @@ export function createContext(
       if (terminalSignal !== "yielded") {
         assertSerializable(this.state, "ctx.state");
         this.state.__trama_yield = { reason };
-        delete this.state.__trama_done;
         persist(this);
 
-        // Locked in only once persisted — a failed yield() leaves done() and yield() both open.
+        // Settled only once persisted — a failed yield() leaves done() and yield() both open.
         terminalSignal = "yielded";
         try { await this.log("yield", { reason }); } catch { /* best-effort */ }
       }

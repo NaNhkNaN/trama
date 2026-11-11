@@ -60,7 +60,7 @@ function buildRoutes({ ctx, agent, tools, workspace, onTerminalSignal }: IpcBack
   };
 
   return {
-    "/agent/ask": {
+    "/agent/instruct": {
       fields: { prompt: "string" },
       handle: b => agent.instruct(b.prompt, { system: b.system }),
     },
@@ -87,6 +87,7 @@ function buildRoutes({ ctx, agent, tools, workspace, onTerminalSignal }: IpcBack
       handle: async b => {
         adoptState(b.state);
         await ctx.checkpoint();
+        return ctx.iteration;
       },
     },
     "/ctx/done": {
@@ -95,6 +96,7 @@ function buildRoutes({ ctx, agent, tools, workspace, onTerminalSignal }: IpcBack
         adoptState(b.state);
         await ctx.done(b.result);
         onTerminalSignal({ status: "done", result: b.result ?? undefined });
+        return ctx.iteration;
       },
     },
     "/ctx/yield": {

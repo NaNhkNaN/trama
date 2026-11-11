@@ -89,7 +89,7 @@ await ctx.done(new Map());`,
   }
 });
 
-test("client.ts ready forwards to /ctx/ready once and is idempotent", async () => {
+test("client.ts ready forwards each call to /ctx/ready (the runner makes it idempotent)", async () => {
   const result = await runNodeCommand(
     [
       "--input-type=module",
@@ -141,5 +141,6 @@ try {
   const events = JSON.parse(result.stdout.trim());
   assert.deepEqual(events, [
     { url: "/ctx/ready", body: { data: { url: "http://127.0.0.1:3000" } } },
+    { url: "/ctx/ready", body: { data: { url: "ignored" } } },
   ]);
 });

@@ -48,8 +48,6 @@ export interface Ctx {
    * Does NOT terminate execution — program should return naturally.
    * Idempotent: second call is a no-op.
    * Mutually exclusive with yield() — throws if yield() was already called.
-   * Terminal choice is irreversible: once done() is attempted (even if it fails),
-   * yield() is permanently blocked. Fix the issue and retry done() instead.
    */
   done(result?: Record<string, unknown>): Promise<void>;
 
@@ -57,10 +55,9 @@ export interface Ctx {
    * Cooperative suspension. Persists ctx.state with a yield marker and exits (logging is best-effort).
    * The session layer (or manual `trama run`) re-runs the program when ready.
    * The program resumes by reading its own ctx.state.
-   * Idempotent: second call is a no-op.
    * Mutually exclusive with done() — throws if done() was already called.
-   * Unlike done(), yield's terminal choice is only locked after successful persistence —
-   * a failed yield() leaves both done() and yield() available for retry.
+   * A done() or yield() that fails (e.g. on unserializable state) settles nothing:
+   * fix the problem and call either one.
    */
   yield(reason: string): Promise<never>;
 }
@@ -72,9 +69,6 @@ export interface Agent {
    * (bash, file read/write/edit) to fulfill the instruction.
    */
   instruct(prompt: string, options?: { system?: string }): Promise<string>;
-
-  /** @deprecated Use instruct() instead. Alias kept for backwards compatibility. */
-  ask(prompt: string, options?: { system?: string }): Promise<string>;
 
   /**
    * Structured LLM call. Returns typed object matching the provided schema.

@@ -20,16 +20,6 @@ test("createAgent instruct delegates prompt and options to the adapter", async (
   assert.deepEqual(calls, [{ prompt: "hello", options: { system: "sys" } }]);
 });
 
-test("createAgent ask still works as deprecated alias", async () => {
-  const adapter = {
-    async ask(prompt) { return "reply"; },
-  };
-
-  const agent = createAgent(adapter);
-  const result = await agent.ask("hello");
-  assert.equal(result, "reply");
-});
-
 test("createAgent generate strips fenced JSON and validates the requested shape", async () => {
   const adapter = {
     async ask() {

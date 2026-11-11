@@ -46,78 +46,42 @@ function sendable(data: Record<string, unknown> | undefined) {
   }
 }
 
-let donePromise: Promise<void> | null = null;
-let readyCalled = false;
-let terminalSignal: "done" | "yielded" | null = null;
-
+// The lifecycle rules (ready once, done once, done and yield mutually exclusive)
+// are enforced by the runner. Here each call is checked for what only this
+// process can see — whether the values survive JSON — and then forwarded.
 export const ctx: Ctx = {
   input: initData.input,
   state: initData.state,
   iteration: initData.iteration,
   maxIterations: initData.maxIterations,
-  resumed: initData.resumed ?? false,
-  yieldReason: initData.yieldReason ?? null,
+  resumed: initData.resumed,
+  yieldReason: initData.yieldReason,
 
   async log(msg, data) {
     await call("/ctx/log", { message: msg, data: sendable(data) });
   },
   async ready(data) {
-    if (readyCalled) return;
     await call("/ctx/ready", { data: sendable(data) });
-    readyCalled = true;
   },
   async checkpoint() {
     assertSerializable(ctx.state, "ctx.state");
-    await call("/ctx/checkpoint", { state: ctx.state });
-    ctx.iteration += 1;
+    ctx.iteration = await call("/ctx/checkpoint", { state: ctx.state });
   },
   async done(result) {
-    if (terminalSignal === "yielded") {
-      throw new Error("Cannot call ctx.done() after ctx.yield() — yield already signaled.");
-    }
-
-    // A completed done() is a no-op; one still in flight is shared.
-    // One that failed cleared the promise below, so it can be retried.
-    if (donePromise) return donePromise;
-
-    // Locked in on the first attempt: a failed done() may be retried, but not swapped for yield().
-    terminalSignal = "done";
-
-    const run = async () => {
-      assertSerializable(ctx.state, "ctx.state");
-      if (result !== undefined) assertSerializable(result, "ctx.done(result)");
-      await call("/ctx/done", { state: ctx.state, result });
-      ctx.iteration += 1;
-    };
-
-    donePromise = run();
-    try {
-      await donePromise;
-    } catch (err) {
-      donePromise = null;
-      throw err;
-    }
+    assertSerializable(ctx.state, "ctx.state");
+    if (result !== undefined) assertSerializable(result, "ctx.done(result)");
+    ctx.iteration = await call("/ctx/done", { state: ctx.state, result });
   },
   async yield(reason) {
-    if (terminalSignal === "done") {
-      throw new Error("Cannot call ctx.yield() after ctx.done() — done already signaled.");
-    }
-
     assertSerializable(ctx.state, "ctx.state");
-    // If this throws, nothing was persisted and both done() and yield() remain open.
     await call("/ctx/yield", { state: ctx.state, reason });
-    terminalSignal = "yielded";
-
     // The runner has recorded the yield; suspending means ending this process.
     process.exit(0);
   },
 };
 
-const instruct: Agent["instruct"] = (prompt, opts) => call("/agent/ask", { prompt, ...opts });
-
 export const agent: Agent = {
-  instruct,
-  ask: instruct,
+  instruct: (prompt, opts) => call("/agent/instruct", { prompt, ...opts }),
   generate: (input) => call("/agent/generate", input),
 };
 

@@ -3,7 +3,7 @@ import test from "node:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
 import { join } from "path";
 import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
-import { copyToHistory, loadConfig, loadState, resolveSmokeTimeout, runProgram, RUNTIME_TYPES, withSnapshot } from "../packages/runtime/dist/runner.js";
+import { copyToHistory, loadConfig, loadState, runProgram, RUNTIME_TYPES, withSnapshot } from "../packages/runtime/dist/runner.js";
 import { REPO_ROOT, cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson, writeText } from "./helpers.mjs";
 
 test("loadState returns an empty object when state.json is missing", (t) => {
@@ -431,12 +431,6 @@ test("loadConfig rejects invalid field values", (t) => {
       assert.throws(() => loadConfig(), pattern, `should reject ${JSON.stringify(override)}`);
     });
   }
-});
-
-test("resolveSmokeTimeout uses the provided timeout without applying a 30s cap", () => {
-  assert.equal(resolveSmokeTimeout(undefined), 30_000);
-  assert.equal(resolveSmokeTimeout(1_500), 1_500);
-  assert.equal(resolveSmokeTimeout(45_000), 45_000);
 });
 
 test("runProgram does not trigger repair when program succeeds", async (t) => {

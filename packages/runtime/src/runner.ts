@@ -665,12 +665,7 @@ async function executeProgram(options: ExecuteOptions): Promise<ProgramResult> {
 
 // --- Smoke run (used by create and update) ---
 
-const DEFAULT_SMOKE_TIMEOUT = 30_000;
 const SMOKE_READY_GRACE_MS = 2_000;
-
-export function resolveSmokeTimeout(timeout?: number): number {
-  return timeout ?? DEFAULT_SMOKE_TIMEOUT;
-}
 
 /**
  * Validate a freshly generated program.ts by running it (with repair) in a
@@ -682,7 +677,7 @@ export async function smokeRunAndRepair(
   projectDir: string,
   adapter: PiAdapter,
   reason: "create" | "update",
-  options: { timeout?: number; maxRepairAttempts: number; maxIterations: number },
+  options: { timeout: number; maxRepairAttempts: number; maxIterations: number },
 ): Promise<void> {
   await withTempDir("trama-smoke-", async (smokeDir) => {
     cpSync(projectDir, smokeDir, { recursive: true });
@@ -691,7 +686,7 @@ export async function smokeRunAndRepair(
       projectDir: smokeDir,
       adapter: adapter.withCwd(smokeDir),
       maxRepairAttempts: options.maxRepairAttempts,
-      timeout: resolveSmokeTimeout(options.timeout),
+      timeout: options.timeout,
       maxIterations: options.maxIterations,
       stopOnReady: { graceMs: SMOKE_READY_GRACE_MS },
       onRepair(_attempt, _max, error) {

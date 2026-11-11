@@ -144,7 +144,7 @@ test("createContext checkpoint clears yield marker", async (t) => {
   assert.equal(saved.__trama_iteration, 2);
 });
 
-test("createContext done clears yield marker and sets done marker", async (t) => {
+test("createContext done clears yield marker and writes no marker of its own", async (t) => {
   const projectDir = makeTempDir("trama-yield-");
   t.after(() => cleanupTempDir(projectDir));
   createProjectFixture(projectDir);
@@ -160,50 +160,26 @@ test("createContext done clears yield marker and sets done marker", async (t) =>
 
   const saved = readJson(join(projectDir, "state.json"));
   assert.equal(saved.__trama_yield, undefined);
-  assert.deepEqual(saved.__trama_done, { result: { result: "finished" } });
+  // Completion is reported to the runner in memory — state.json carries only
+  // the program's state and the iteration counter.
+  assert.deepEqual(Object.keys(saved), ["__trama_iteration"]);
 });
 
-test("createContext done persists done marker", async (t) => {
+test("createContext a failed done settles nothing — yield is still available", async (t) => {
   const projectDir = makeTempDir("trama-yield-");
   t.after(() => cleanupTempDir(projectDir));
   createProjectFixture(projectDir);
 
   const ctx = createContext(projectDir, {});
-  await ctx.done({ answer: 42 });
+  ctx.state.bad = new Date();
+  await assert.rejects(async () => ctx.done(), /not a plain object/);
+
+  // Nothing was persisted, so the program may still choose to suspend instead.
+  delete ctx.state.bad;
+  await ctx.yield("changed my mind");
 
   const saved = readJson(join(projectDir, "state.json"));
-  assert.deepEqual(saved.__trama_done, { result: { answer: 42 } });
-});
-
-test("createContext done without result persists null result in marker", async (t) => {
-  const projectDir = makeTempDir("trama-yield-");
-  t.after(() => cleanupTempDir(projectDir));
-  createProjectFixture(projectDir);
-
-  const ctx = createContext(projectDir, {});
-  await ctx.done();
-
-  const saved = readJson(join(projectDir, "state.json"));
-  assert.deepEqual(saved.__trama_done, { result: null });
-});
-
-test("createContext yield clears done marker if present", async (t) => {
-  const projectDir = makeTempDir("trama-yield-");
-  t.after(() => cleanupTempDir(projectDir));
-  createProjectFixture(projectDir);
-
-  // Start with a stale done marker (shouldn't normally happen, but test defensive behavior)
-  const state = {
-    __trama_iteration: 1,
-    __trama_done: { result: null },
-  };
-  // Since done marker was already there, the mutual exclusivity check
-  // is based on in-memory terminalSignal, not persisted markers.
-  // A fresh context should allow yield even with persisted __trama_done.
-  const ctx = createContext(projectDir, state);
-  await ctx.yield("override");
-
-  const saved = readJson(join(projectDir, "state.json"));
-  assert.equal(saved.__trama_done, undefined);
-  assert.deepEqual(saved.__trama_yield, { reason: "override" });
+  assert.deepEqual(saved.__trama_yield, { reason: "changed my mind" });
+  // ...and having yielded, done is now the one that is refused.
+  await assert.rejects(async () => ctx.done(), /Cannot call ctx\.done\(\) after ctx\.yield\(\)/);
 });
