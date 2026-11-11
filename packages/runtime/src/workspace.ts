@@ -1,12 +1,11 @@
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, readlinkSync,
-  realpathSync, lstatSync, statSync, existsSync, renameSync, fdatasyncSync,
+  realpathSync, lstatSync, statSync, renameSync, fdatasyncSync,
   openSync, closeSync,
 } from "fs";
 import { resolve, dirname, relative, sep } from "path";
-import { tmpdir } from "os";
-import type { Workspace, ObserveResult } from "./types.js";
-import { resolveBounded, verifyRealPath, verifyNearestAncestor, verifySymlink } from "./path-guard.js";
+import type { Workspace } from "./types.js";
+import { guardPath, isInside, realRootOf, resolveBounded } from "./path-guard.js";
 
 const OBSERVE_POLL_MS = 250;
 
@@ -33,7 +32,15 @@ function matchGlob(pattern: string, filePath: string): boolean {
 }
 
 /**
- * Recursively list all files under a directory, returning paths relative to root.
+ * A pattern with no glob operators names exactly one artifact.
+ * Only `*` and `?` are operators here — `[ ] { }` are literal filename characters.
+ */
+function isExactPath(pattern: string): boolean {
+  return !/[*?]/.test(pattern);
+}
+
+/**
+ * Recursively list all files under a directory, as forward-slash paths relative to root.
  * Includes symlinks to files and follows symlinked directories, but only if
  * they resolve inside the bounded root (prevents symlink escapes).
  *
@@ -43,9 +50,7 @@ function matchGlob(pattern: string, filePath: string): boolean {
  * aliases (symlink pointing to another dir in the workspace) to produce their
  * own workspace-relative paths alongside the original directory's paths.
  */
-function listFilesRecursive(dir: string, root: string, realRoot: string, visited?: Set<string>): string[] {
-  const seen = visited ?? new Set<string>();
-
+function listFilesRecursive(dir: string, root: string, realRoot: string, visited = new Set<string>()): string[] {
   const results: string[] = [];
   let entries;
   try {
@@ -53,90 +58,90 @@ function listFilesRecursive(dir: string, root: string, realRoot: string, visited
   } catch {
     return results;
   }
+  const addFile = (full: string) => results.push(relative(root, full).split(sep).join("/"));
   for (const entry of entries) {
     const full = resolve(dir, entry.name);
     if (entry.isSymbolicLink()) {
-      // Verify symlink target is inside workspace root
       let real: string;
       try { real = realpathSync(full); } catch { continue; /* dangling symlink */ }
-      if (!real.startsWith(realRoot + sep) && real !== realRoot) continue; // escapes workspace
+      if (!isInside(real, realRoot)) continue; // escapes workspace
       try {
         const stat = statSync(full);
         if (stat.isDirectory()) {
-          // Cycle detection: only for symlinked directories
-          if (seen.has(real)) continue;
-          seen.add(real);
-          results.push(...listFilesRecursive(full, root, realRoot, seen));
+          if (visited.has(real)) continue;
+          visited.add(real);
+          results.push(...listFilesRecursive(full, root, realRoot, visited));
         } else if (stat.isFile()) {
-          results.push(relative(root, full));
+          addFile(full);
         }
       } catch { /* stat failed */ }
     } else if (entry.isDirectory()) {
-      // Regular directories can't cause cycles — traverse unconditionally
-      results.push(...listFilesRecursive(full, root, realRoot, seen));
+      results.push(...listFilesRecursive(full, root, realRoot, visited));
     } else if (entry.isFile()) {
-      results.push(relative(root, full));
+      addFile(full);
     }
   }
   return results;
 }
 
-/**
- * Check if a pattern is a simple exact path (no glob characters).
- */
-function isExactPath(pattern: string): boolean {
-  // Only check for glob chars that matchGlob actually supports: * and ?
-  // Characters like [ ] { } are not glob operators in our implementation
-  // and should be treated as literal filename characters.
-  return !/[*?]/.test(pattern);
+/** Resolve after `ms`, or reject as soon as `signal` aborts. */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("workspace.observe() aborted"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Workspace {
-  const normalizedDir = resolve(workspaceDir);
+  const root = resolve(workspaceDir);
+  mkdirSync(root, { recursive: true });
+  const realRoot = realRootOf(root);
 
-  // Ensure workspace directory exists before resolving realpath
-  mkdirSync(normalizedDir, { recursive: true });
+  /** All artifact paths matching a glob, sorted. */
+  const listMatching = (pattern: string): string[] =>
+    listFilesRecursive(root, root, realRoot).filter(f => matchGlob(pattern, f)).sort();
 
-  let realDir: string;
-  try { realDir = realpathSync(normalizedDir); } catch { realDir = normalizedDir; }
-
-  const resolvePath = (p: string): string => resolveBounded(normalizedDir, p);
-
-  const checkRealPath = (real: string, original: string): void =>
-    verifyRealPath(real, realDir, original);
-
-  const checkNearestAncestor = (resolved: string, original: string): void =>
-    verifyNearestAncestor(resolved, realDir, original);
+  /** Read an artifact, or null if it is missing, unreadable, or escapes the workspace. */
+  const readIfPresent = (path: string): string | null => {
+    try {
+      return readFileSync(guardPath(root, path), "utf-8");
+    } catch {
+      return null;
+    }
+  };
 
   return {
     async read(path) {
-      const target = resolvePath(path);
-      let real: string;
-      try { real = realpathSync(target); } catch (e) {
-        if ((e as NodeJS.ErrnoException).code === "ENOENT") {
-          throw new Error(`Workspace artifact not found: ${path}`);
-        }
+      const target = guardPath(root, path);
+      try {
+        return readFileSync(target, "utf-8");
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`Workspace artifact not found: ${path}`);
         throw e;
       }
-      checkRealPath(real, path);
-      return readFileSync(target, "utf-8");
     },
 
     async write(path, content) {
-      const target = resolvePath(path);
-      checkNearestAncestor(target, path);
+      const target = guardPath(root, path);
       mkdirSync(dirname(target), { recursive: true });
 
-      // If target is a symlink, resolve to real path and write through it
-      // (matches tools.write behavior — write to the target, don't replace the link)
+      // If the target is a symlink, write to what it points at rather than
+      // replacing the link (matches tools.write). guardPath has already
+      // verified the destination stays inside the workspace.
       let writePath = target;
       try {
         if (lstatSync(target).isSymbolicLink()) {
-          verifySymlink(target, realDir, path);
           try {
             writePath = realpathSync(target);
-          } catch (realErr) {
-            if ((realErr as NodeJS.ErrnoException).code !== "ENOENT") throw realErr;
+          } catch (e) {
+            if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
             // Dangling symlink — resolve the link destination manually
             writePath = resolve(dirname(target), readlinkSync(target));
             mkdirSync(dirname(writePath), { recursive: true });
@@ -144,7 +149,8 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
         }
       } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
 
-      // Atomic write: write to temp file in same directory, fsync, rename
+      // Atomic write: temp file in the same directory, fsync, rename.
+      // Readers see either the old content or the new — never a partial file.
       const tmpFile = writePath + `.trama-tmp-${process.pid}-${Date.now()}`;
       const fd = openSync(tmpFile, "w");
       try {
@@ -157,12 +163,7 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
     },
 
     async list(pattern) {
-      const allFiles = listFilesRecursive(normalizedDir, normalizedDir, realDir);
-      // Normalize to forward slashes for matching
-      return allFiles
-        .map(f => f.split(sep).join("/"))
-        .filter(f => matchGlob(pattern, f))
-        .sort();
+      return listMatching(pattern);
     },
 
     async observe(pattern, options = {}) {
@@ -173,86 +174,36 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
       if (timeout !== undefined && (!Number.isFinite(timeout) || timeout < 0)) {
         throw new Error(`workspace.observe(): timeout must be a non-negative number (got ${timeout})`);
       }
-      const isExact = isExactPath(pattern) && (expect === undefined || expect <= 1);
-      const startTime = Date.now();
+      const needed = expect ?? 1;
+      // One exact path, one artifact wanted → the caller gets its content as a string.
+      const single = isExactPath(pattern) && needed === 1;
+      if (single) resolveBounded(root, pattern); // reject traversal up front rather than polling forever
 
       const collectMatches = (): Array<{ path: string; content: string }> => {
-        if (isExact) {
-          const target = resolvePath(pattern);
-          if (existsSync(target)) {
-            try {
-              const real = realpathSync(target);
-              checkRealPath(real, pattern);
-              return [{ path: pattern, content: readFileSync(target, "utf-8") }];
-            } catch {
-              return [];
-            }
-          }
-          return [];
-        }
-
-        const allFiles = listFilesRecursive(normalizedDir, normalizedDir, realDir);
         const matches: Array<{ path: string; content: string }> = [];
-        for (const f of allFiles) {
-          const normalized = f.split(sep).join("/");
-          if (matchGlob(pattern, normalized)) {
-            const target = resolve(normalizedDir, f);
-            try {
-              const real = realpathSync(target);
-              checkRealPath(real, normalized);
-              matches.push({ path: normalized, content: readFileSync(target, "utf-8") });
-            } catch {
-              // Skip files we can't read
-            }
-          }
+        for (const path of single ? [pattern] : listMatching(pattern)) {
+          const content = readIfPresent(path);
+          if (content !== null) matches.push({ path, content });
         }
-        return matches.sort((a, b) => a.path.localeCompare(b.path));
+        return matches;
       };
 
-      const neededCount = expect ?? 1;
-
-      // Poll until condition is met
+      // Level-triggered: artifacts that already exist count immediately.
+      const startTime = Date.now();
       while (true) {
-        if (signal?.aborted) {
-          throw new Error("workspace.observe() aborted");
-        }
+        if (signal?.aborted) throw new Error("workspace.observe() aborted");
 
         const matches = collectMatches();
-        if (matches.length >= neededCount) {
-          // Return single string for exact single-file, array otherwise
-          if (isExact && neededCount <= 1) {
-            return matches[0].content;
-          }
-          return matches;
-        }
+        if (matches.length >= needed) return single ? matches[0].content : matches;
 
         if (timeout !== undefined && (Date.now() - startTime) >= timeout) {
           throw new Error(
             `workspace.observe("${pattern}") timed out after ${timeout}ms. ` +
-            `Found ${matches.length}/${neededCount} matching artifacts.`
+            `Found ${matches.length}/${needed} matching artifacts.`
           );
         }
 
-        // Wait before polling again
-        await new Promise<void>((resolve, reject) => {
-          let settled = false;
-          const onTimer = () => {
-            if (settled) return;
-            settled = true;
-            if (signal) signal.removeEventListener("abort", onAbort);
-            resolve();
-          };
-          const onAbort = () => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            reject(new Error("workspace.observe() aborted"));
-          };
-          const timer = setTimeout(onTimer, OBSERVE_POLL_MS);
-          if (signal) {
-            signal.addEventListener("abort", onAbort, { once: true });
-          }
-        });
+        await sleep(OBSERVE_POLL_MS, signal);
       }
     },
   };

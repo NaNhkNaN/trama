@@ -1,5 +1,6 @@
 // @trama-dev/runtime client — this is what program.ts imports.
-// Thin HTTP wrapper that calls the runner's IPC server.
+// A thin wrapper that forwards every call to the runner's IPC server
+// (ipc-server.ts), which does the real work.
 
 import { readFileSync } from "fs";
 import type { Ctx, Agent, Tools, Workspace } from "./types.js";
@@ -24,6 +25,7 @@ if (!INIT_PATH) {
 const BASE = `http://127.0.0.1:${PORT}`;
 const initData = JSON.parse(readFileSync(INIT_PATH, "utf-8"));
 
+/** POST one call to the runner and return its result. */
 async function call(endpoint: string, body: unknown) {
   const res = await fetch(`${BASE}${endpoint}`, {
     method: "POST",
@@ -31,7 +33,17 @@ async function call(endpoint: string, body: unknown) {
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`trama runtime error: ${await res.text()}`);
-  return res.json();
+  return (await res.json()).result;
+}
+
+/** Log payloads are best-effort: anything that can't be sent as JSON is replaced by its string form. */
+function sendable(data: Record<string, unknown> | undefined) {
+  try {
+    JSON.stringify(data);
+    return data;
+  } catch {
+    return { __trama_unserializable: String(data) };
+  }
 }
 
 let donePromise: Promise<void> | null = null;
@@ -47,15 +59,11 @@ export const ctx: Ctx = {
   yieldReason: initData.yieldReason ?? null,
 
   async log(msg, data) {
-    let safeData = data;
-    try { JSON.stringify(safeData); } catch { safeData = { __trama_unserializable: String(data) }; }
-    await call("/ctx/log", { message: msg, data: safeData });
+    await call("/ctx/log", { message: msg, data: sendable(data) });
   },
   async ready(data) {
     if (readyCalled) return;
-    let safeData = data;
-    try { JSON.stringify(safeData); } catch { safeData = { __trama_unserializable: String(data) }; }
-    await call("/ctx/ready", { data: safeData });
+    await call("/ctx/ready", { data: sendable(data) });
     readyCalled = true;
   },
   async checkpoint() {
@@ -64,15 +72,15 @@ export const ctx: Ctx = {
     ctx.iteration += 1;
   },
   async done(result) {
-    // Mutual exclusivity: yield() was already called
     if (terminalSignal === "yielded") {
       throw new Error("Cannot call ctx.done() after ctx.yield() — yield already signaled.");
     }
 
-    // If a previous done() completed or is in flight, coalesce onto it.
-    // If a previous done() failed, allow retry (promise was cleared).
+    // A completed done() is a no-op; one still in flight is shared.
+    // One that failed cleared the promise below, so it can be retried.
     if (donePromise) return donePromise;
 
+    // Locked in on the first attempt: a failed done() may be retried, but not swapped for yield().
     terminalSignal = "done";
 
     const run = async () => {
@@ -91,70 +99,46 @@ export const ctx: Ctx = {
     }
   },
   async yield(reason) {
-    // Mutual exclusivity: done() was already called
     if (terminalSignal === "done") {
       throw new Error("Cannot call ctx.yield() after ctx.done() — done already signaled.");
     }
 
-    // Idempotent: second yield after successful persistence is a no-op
-    if (terminalSignal === "yielded") {
-      process.exit(0);
-    }
-
     assertSerializable(ctx.state, "ctx.state");
-
-    // Set terminalSignal only after validation and HTTP call succeed,
-    // so a failed yield can be retried (mirrors done()'s retry pattern).
+    // If this throws, nothing was persisted and both done() and yield() remain open.
     await call("/ctx/yield", { state: ctx.state, reason });
     terminalSignal = "yielded";
 
-    // Structured exit — the runner detects the yield marker in state.json
+    // The runner has recorded the yield; suspending means ending this process.
     process.exit(0);
   },
 };
 
-const instructImpl = (prompt: string, opts?: { system?: string }) =>
-  call("/agent/ask", { prompt, ...opts }).then(r => r.result);
+const instruct: Agent["instruct"] = (prompt, opts) => call("/agent/ask", { prompt, ...opts });
 
 export const agent: Agent = {
-  instruct: instructImpl,
-  ask: instructImpl,
-  generate: (input) => call("/agent/generate", input).then(r => r.result),
+  instruct,
+  ask: instruct,
+  generate: (input) => call("/agent/generate", input),
 };
 
 export const tools: Tools = {
-  read: (path) => call("/tools/read", { path }).then(r => r.result),
-  write: (path, content) => call("/tools/write", { path, content }).then(r => r.result),
-  shell: (cmd, opts) => call("/tools/shell", { command: cmd, ...opts }).then(r => r.result),
-  fetch: (url, opts) => call("/tools/fetch", { url, ...opts }).then(r => r.result),
+  read: (path) => call("/tools/read", { path }),
+  write: (path, content) => call("/tools/write", { path, content }),
+  shell: (cmd, opts) => call("/tools/shell", { command: cmd, ...opts }),
+  fetch: (url, opts) => call("/tools/fetch", { url, ...opts }),
 };
 
-// Workspace — available only when running in a session (workspace path is in init data)
-function createWorkspaceClient(): Workspace {
-  const throwIfNoWorkspace = () => {
-    if (!initData.workspace) {
-      throw new Error("workspace is only available when running in a session");
-    }
-  };
-
-  return {
-    async read(path) {
-      throwIfNoWorkspace();
-      return call("/workspace/read", { path }).then(r => r.result);
-    },
-    async write(path, content) {
-      throwIfNoWorkspace();
-      return call("/workspace/write", { path, content }).then(r => r.result);
-    },
-    async list(pattern) {
-      throwIfNoWorkspace();
-      return call("/workspace/list", { pattern }).then(r => r.result);
-    },
-    async observe(pattern, options) {
-      throwIfNoWorkspace();
-      return call("/workspace/observe", { pattern, ...options }).then(r => r.result);
-    },
-  };
+/** workspace.* exists only inside a session — everywhere else it fails clearly, without a round trip. */
+async function workspaceCall(endpoint: string, body: unknown) {
+  if (!initData.workspace) {
+    throw new Error("workspace is only available when running in a session");
+  }
+  return call(endpoint, body);
 }
 
-export const workspace: Workspace = createWorkspaceClient();
+export const workspace: Workspace = {
+  read: (path) => workspaceCall("/workspace/read", { path }),
+  write: (path, content) => workspaceCall("/workspace/write", { path, content }),
+  list: (pattern) => workspaceCall("/workspace/list", { pattern }),
+  observe: (pattern, options) => workspaceCall("/workspace/observe", { pattern, ...options }),
+};

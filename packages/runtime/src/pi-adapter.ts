@@ -6,7 +6,10 @@ import {
   getAgentDir,
   type AgentSession,
 } from "@earendil-works/pi-coding-agent";
-import type { PiAdapterConfig, RepairInput } from "./types.js";
+import type { PiAdapterConfig, RepairInput } from "./runner-types.js";
+
+/** The pi version this runtime is built against (recorded in each project's meta.json). */
+export { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
 
 /** Strip markdown code fences and trim whitespace. */
 export function stripCodeFences(text: string): string {

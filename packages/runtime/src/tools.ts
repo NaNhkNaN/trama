@@ -1,193 +1,103 @@
-import { spawn, type ChildProcess } from "child_process";
-import { readFileSync, writeFileSync, mkdirSync, realpathSync, lstatSync } from "fs";
+import { spawn } from "child_process";
+import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { resolve, dirname } from "path";
-import { StringDecoder } from "string_decoder";
 import type { Tools, ShellResult } from "./types.js";
-import { resolveBounded, verifyRealPath, verifyNearestAncestor, verifySymlink } from "./path-guard.js";
+import { guardPath } from "./path-guard.js";
+import { cappedBuffer, signalGroup, superviseChild } from "./child-process.js";
 
-const MAX_OUTPUT = 10 * 1024 * 1024; // 10 MB
+export { cappedBuffer };
 
-export function cappedBuffer() {
-  let buf = "";
-  let capped = false;
-  return {
-    append(text: string) {
-      if (capped) return;
-      buf += text;
-      if (buf.length > MAX_OUTPUT) {
-        buf = buf.slice(0, MAX_OUTPUT) + "\n[trama] output truncated at 10MB";
-        capped = true;
-      }
-    },
-    get value() { return buf; },
-  };
-}
+const MAX_FETCH_BODY = 10 * 1024 * 1024; // 10 MB
+const DEFAULT_SHELL_TIMEOUT = 30_000;
+const GROUP_SWEEP_MS = 250;
 
 export interface ToolsWithCleanup extends Tools {
-  /** Kill all in-flight shell processes. Called by runner on timeout/error. */
+  /** Kill every shell command still running, and anything they left in the background. */
   killActiveShells(): void;
 }
 
 export function createTools(projectDir: string, signal?: AbortSignal): ToolsWithCleanup {
   const normalizedProjectDir = resolve(projectDir);
-  let realProjectDir: string;
-  try { realProjectDir = realpathSync(normalizedProjectDir); } catch { realProjectDir = normalizedProjectDir; }
-  const activeShells = new Set<ChildProcess>();
-  const activeSessions = new Set<number>();
-  const sessionReapers = new Map<number, ReturnType<typeof setTimeout>>();
 
-  const stopReapingSession = (sessionId: number): void => {
-    const timer = sessionReapers.get(sessionId);
-    if (timer) {
-      clearTimeout(timer);
-      sessionReapers.delete(sessionId);
+  // Each shell command leads its own process group, so background processes it
+  // starts stay killable after the shell itself exits. A group is tracked from
+  // spawn until it has no members left; `true` marks groups whose shell has
+  // exited — only those are probed, since a group that is still starting up
+  // may not be visible yet.
+  const groups = new Map<number, boolean>();
+  let sweeper: ReturnType<typeof setInterval> | null = null;
+
+  const stopSweeping = () => {
+    if (sweeper) clearInterval(sweeper);
+    sweeper = null;
+  };
+
+  /** Forget groups that have fully exited, so a recycled pid is never signalled. */
+  const sweep = () => {
+    let pending = false;
+    for (const [pgid, shellExited] of groups) {
+      if (!shellExited) continue;
+      if (signalGroup(pgid, 0)) pending = true;
+      else groups.delete(pgid);
+    }
+    if (!pending) stopSweeping();
+  };
+
+  const markShellExited = (pgid: number) => {
+    if (!groups.has(pgid)) return; // already killed by killActiveShells
+    groups.set(pgid, true);
+    if (!sweeper) {
+      sweeper = setInterval(sweep, GROUP_SWEEP_MS);
+      sweeper.unref();
     }
   };
 
-  const killSession = (sessionId: number, signal: NodeJS.Signals): void => {
-    try {
-      process.kill(-sessionId, signal);
-    } catch { /* already exited */ }
-  };
-
-  /** Poll until the process group is gone, then remove from tracking. */
-  const reapSessionWhenGone = (sessionId: number): void => {
-    stopReapingSession(sessionId);
-    const timer = setTimeout(() => {
-      if (!activeSessions.has(sessionId)) return;
-      try {
-        process.kill(-sessionId, 0); // signal 0: check if process group still exists
-      } catch {
-        // ESRCH — process group gone
-        activeSessions.delete(sessionId);
-        sessionReapers.delete(sessionId);
-        return;
-      }
-      reapSessionWhenGone(sessionId);
-    }, 250);
-    timer.unref?.();
-    sessionReapers.set(sessionId, timer);
-  };
-
-  const resolvePath = (p: string): string => resolveBounded(normalizedProjectDir, p);
-
-  const checkRealPath = (real: string, original: string): void =>
-    verifyRealPath(real, realProjectDir, original);
-
-  const checkNearestAncestor = (resolved: string, original: string): void =>
-    verifyNearestAncestor(resolved, realProjectDir, original);
-
   return {
     killActiveShells() {
-      for (const proc of activeShells) {
-        if (proc.pid) {
-          try { process.kill(-proc.pid, "SIGKILL"); } catch { /* already exited */ }
-        }
-      }
-      for (const sessionId of activeSessions) {
-        killSession(sessionId, "SIGKILL");
-        stopReapingSession(sessionId);
-      }
-      activeShells.clear();
-      activeSessions.clear();
+      for (const pgid of groups.keys()) signalGroup(pgid, "SIGKILL");
+      groups.clear();
+      stopSweeping();
     },
 
     async read(path) {
-      const target = resolvePath(path);
-      let real: string;
-      try { real = realpathSync(target); } catch (e) {
-        if ((e as NodeJS.ErrnoException).code === "ENOENT") {
-          throw new Error(`File not found: ${path}`);
-        }
+      const target = guardPath(normalizedProjectDir, path);
+      try {
+        return readFileSync(target, "utf-8");
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`File not found: ${path}`);
         throw e;
       }
-      checkRealPath(real, path);
-      return readFileSync(target, "utf-8");
     },
 
     async write(path, content) {
-      const target = resolvePath(path);
-      checkNearestAncestor(target, path);       // before mkdir — prevents side effects outside project
+      const target = guardPath(normalizedProjectDir, path); // before mkdir — no side effects outside the project
       mkdirSync(dirname(target), { recursive: true });
-      try {
-        if (lstatSync(target).isSymbolicLink()) {
-          verifySymlink(target, realProjectDir, path);
-        }
-      } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
       writeFileSync(target, content);
     },
 
-    async shell(command, options = {}) {
-      const timeout = options.timeout ?? 30_000;
-      const cwd = options.cwd ? resolvePath(options.cwd) : normalizedProjectDir;
-      try {
-        if (options.cwd) checkRealPath(realpathSync(cwd), options.cwd);
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-        // cwd doesn't exist — spawn will fail with ENOENT on its own
-      }
-
-      return new Promise<ShellResult>((resolve) => {
-        const child = spawn("sh", ["-c", command], {
-          cwd,
-          stdio: ["pipe", "pipe", "pipe"],
-          detached: true,
-        });
-        activeShells.add(child);
-        if (child.pid) activeSessions.add(child.pid);
-
-        const out = cappedBuffer();
-        const err = cappedBuffer();
-        const outDecoder = new StringDecoder("utf-8");
-        const errDecoder = new StringDecoder("utf-8");
-        let timedOut = false;
-        let exited = false;
-        let killFallbackTimer: ReturnType<typeof setTimeout> | null = null;
-
-        child.stdout.on("data", (chunk: Buffer) => { out.append(outDecoder.write(chunk)); });
-        child.stderr.on("data", (chunk: Buffer) => { err.append(errDecoder.write(chunk)); });
-
-        const timer = setTimeout(() => {
-          timedOut = true;
-          if (child.pid) {
-            killSession(child.pid, "SIGTERM");
-          }
-          killFallbackTimer = setTimeout(() => {
-            if (!exited && child.pid) {
-              killSession(child.pid, "SIGKILL");
-            }
-          }, 5000);
-          killFallbackTimer.unref?.();
-        }, timeout);
-
-        child.on("error", (spawnError) => {
-          clearTimeout(timer);
-          if (killFallbackTimer) clearTimeout(killFallbackTimer);
-          activeShells.delete(child);
-          if (child.pid) {
-            activeSessions.delete(child.pid);
-            stopReapingSession(child.pid);
-          }
-          resolve({ exitCode: 1, stdout: out.value, stderr: spawnError.message });
-        });
-
-        child.on("close", (code) => {
-          exited = true;
-          activeShells.delete(child);
-          clearTimeout(timer);
-          if (killFallbackTimer) clearTimeout(killFallbackTimer);
-          if (child.pid) reapSessionWhenGone(child.pid);
-          const outFlush = outDecoder.end();
-          const errFlush = errDecoder.end();
-          if (outFlush) out.append(outFlush);
-          if (errFlush) err.append(errFlush);
-          resolve({
-            exitCode: timedOut ? 1 : (code ?? 1),
-            stdout: out.value,
-            stderr: timedOut ? err.value + "\ntimeout" : err.value,
-          });
-        });
+    async shell(command, options = {}): Promise<ShellResult> {
+      const cwd = options.cwd ? guardPath(normalizedProjectDir, options.cwd) : normalizedProjectDir;
+      const child = spawn("sh", ["-c", command], {
+        cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        detached: true,
       });
+      const pgid = child.pid;
+      if (pgid) groups.set(pgid, false);
+
+      try {
+        const exit = await superviseChild(child, { timeout: options.timeout ?? DEFAULT_SHELL_TIMEOUT });
+        if (pgid) markShellExited(pgid);
+        return {
+          exitCode: exit.timedOut ? 1 : (exit.code ?? 1),
+          stdout: exit.stdout,
+          stderr: exit.timedOut ? exit.stderr + "\ntimeout" : exit.stderr,
+        };
+      } catch (spawnError) {
+        // Failed to start (e.g. cwd does not exist) — a result, not an exception.
+        if (pgid) groups.delete(pgid);
+        return { exitCode: 1, stdout: "", stderr: (spawnError as Error).message };
+      }
     },
 
     async fetch(url, options = {}) {
@@ -199,8 +109,8 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
       });
 
       const raw = await response.text();
-      const body = raw.length > MAX_OUTPUT
-        ? raw.slice(0, MAX_OUTPUT) + "\n[trama] response body truncated at 10MB"
+      const body = raw.length > MAX_FETCH_BODY
+        ? raw.slice(0, MAX_FETCH_BODY) + "\n[trama] response body truncated at 10MB"
         : raw;
 
       const headers: Record<string, string> = {};

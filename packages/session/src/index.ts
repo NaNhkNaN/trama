@@ -78,39 +78,21 @@ export class Session {
       throw new Error(`Project directory not found: ${projectDir}`);
     }
 
-    // Track participant lifecycle state
-    let state: "running" | "yielded" | "done" | "failed" = "running";
-    let resultPromise: Promise<ProgramResult>;
-    // Track the latest effective args so multi-yield resumes accumulate state
-    let lastArgs: Record<string, unknown> | undefined = args;
+    // Where the participant is in its lifecycle, and the args of its latest run —
+    // a resume merges new args over them, so they accumulate across yields.
+    let state: "running" | ProgramResult["status"] = "running";
+    let lastArgs = args;
 
     const startRun = (runArgs?: Record<string, unknown>): Promise<ProgramResult> => {
       state = "running";
       lastArgs = runArgs;
-      const promise = runProgram({
-        projectDir,
-        timeout,
-        maxRepairAttempts,
-        args: runArgs ?? args,
-        workspaceDir,
-      });
-      // Track state transitions when the run completes
-      promise.then(
-        (result) => {
-          state = result.status === "yielded" ? "yielded"
-            : result.status === "done" ? "done"
-            : "failed";
-        },
-        () => {
-          // Infrastructure error — treat as failed
-          state = "failed";
-        },
-      );
-      return promise;
+      const run = runProgram({ projectDir, timeout, maxRepairAttempts, args: runArgs, workspaceDir });
+      // An infrastructure error (the run could not happen at all) counts as failed.
+      run.then(result => { state = result.status; }, () => { state = "failed"; });
+      return run;
     };
 
-    // Start the run immediately
-    resultPromise = startRun(args);
+    let resultPromise = startRun(args);
 
     const handle: ParticipantHandle = {
       name,
@@ -120,7 +102,7 @@ export class Session {
       },
 
       async resume(newArgs?: Record<string, unknown>): Promise<ParticipantHandle> {
-        // Fail-fast: check current state synchronously — don't block on a running participant
+        // Fail fast rather than wait on a participant that is still running.
         if (state !== "yielded") {
           throw new Error(
             `Cannot resume participant "${name}": expected state "yielded" but got "${state}". ` +
@@ -128,8 +110,7 @@ export class Session {
           );
         }
 
-        const mergedArgs = newArgs ? { ...(lastArgs ?? {}), ...newArgs } : lastArgs;
-        resultPromise = startRun(mergedArgs);
+        resultPromise = startRun(newArgs ? { ...lastArgs, ...newArgs } : lastArgs);
         return handle;
       },
     };

@@ -1,14 +1,17 @@
 // @trama-dev/runtime runner surface — exported via "@trama-dev/runtime/runner"
 
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, copyFileSync, appendFileSync, statSync, rmSync, cpSync, mkdtempSync } from "fs";
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, statSync, rmSync } from "fs";
 import { join } from "path";
-import { homedir, tmpdir } from "os";
-import { PiAdapter, stripCodeFences } from "./pi-adapter.js";
-import { loadConfig, loadState, smokeRunAndRepair, copyToHistory, withTempDir, ensureProjectScaffold, RUNTIME_TYPES, PI_VERSION } from "./runner.js";
+import { homedir } from "os";
+import { PiAdapter, PI_VERSION, stripCodeFences } from "./pi-adapter.js";
+import {
+  loadConfig, loadProjectConfig, loadState, smokeRunAndRepair, copyToHistory,
+  withSnapshot, withTempDir, ensureProjectScaffold, RUNTIME_TYPES,
+} from "./runner.js";
 import { guardPath } from "./path-guard.js";
 
 export { runProgram } from "./runner.js";
-export type { ProgramResult, RunOptions } from "./types.js";
+export type { ProgramResult, RunOptions } from "./runner-types.js";
 
 // --- Example programs (included in system prompt during create/update) ---
 
@@ -130,39 +133,6 @@ async function isolatedAsk(adapter: PiAdapter, prompt: string, options?: { syste
   return withTempDir("trama-gen-", (dir) => adapter.withCwd(dir).ask(prompt, options));
 }
 
-/** Backup projectDir, run fn, restore on failure. Preserves new repair history entries across restore. */
-async function withProjectBackup(
-  projectDir: string,
-  originalHistory: string,
-  historyIndexPath: string,
-  fn: () => Promise<void>,
-): Promise<void> {
-  const backupRoot = mkdtempSync(join(tmpdir(), "trama-update-backup-"));
-  const backupDir = join(backupRoot, "project");
-  cpSync(projectDir, backupDir, { recursive: true });
-
-  try {
-    await fn();
-  } catch (err) {
-    // Restore from backup, preserving any new repair history entries
-    const failedHistory = existsSync(historyIndexPath) ? readFileSync(historyIndexPath, "utf-8") : "";
-    rmSync(projectDir, { recursive: true, force: true });
-    cpSync(backupDir, projectDir, { recursive: true });
-    if (failedHistory.startsWith(originalHistory)) {
-      const repairEntries = failedHistory.slice(originalHistory.length);
-      if (repairEntries.length > 0) {
-        appendFileSync(guardPath(projectDir, join("history", "index.jsonl")), repairEntries);
-      }
-    }
-    throw new Error(
-      `Update failed — project files have been restored to the previous version.\n` +
-      `${err instanceof Error ? err.message : err}`
-    );
-  } finally {
-    rmSync(backupRoot, { recursive: true, force: true });
-  }
-}
-
 // --- Public API ---
 
 export async function createProject(
@@ -181,8 +151,6 @@ export async function createProject(
   mkdirSync(projectDir, { recursive: true });
 
   try {
-    mkdirSync(join(projectDir, "history"), { recursive: true });
-    mkdirSync(join(projectDir, "logs"), { recursive: true });
     ensureProjectScaffold(projectDir);
 
     const config = loadConfig();
@@ -215,11 +183,7 @@ export async function createProject(
       maxIterations: config.defaultMaxIterations,
     });
 
-    copyFileSync(join(projectDir, "program.ts"), join(projectDir, "history", "0001.ts"));
-    appendFileSync(
-      join(projectDir, "history", "index.jsonl"),
-      JSON.stringify({ version: 1, reason: "create", timestamp: new Date().toISOString(), prompt }) + "\n",
-    );
+    copyToHistory(projectDir, "create", prompt);
 
     console.log(`Created ${name}. Run with: trama run ${name}`);
   } catch (err) {
@@ -232,46 +196,51 @@ export async function createProject(
 
 export async function updateProject(name: string, prompt: string): Promise<void> {
   const projectDir = resolveProject(name);
+  // A hand-written project may never have been run: give it history/ and the rest first.
+  ensureProjectScaffold(projectDir);
 
   const programPath = guardPath(projectDir, "program.ts");
   const originalSource = readFileSync(programPath, "utf-8");
   const state = loadState(projectDir);
   const meta = JSON.parse(readFileSync(guardPath(projectDir, "meta.json"), "utf-8"));
-  const historyIndexPath = guardPath(projectDir, join("history", "index.jsonl"));
-  const originalHistory = existsSync(historyIndexPath) ? readFileSync(historyIndexPath, "utf-8") : "";
-
-  const config = loadConfig();
-  if (meta.model) config.model = meta.model;
-  if (meta.provider) config.provider = meta.provider;
+  const config = loadProjectConfig(projectDir);
   const adapter = new PiAdapter(config, projectDir);
 
-  // Backup before any LLM calls, restore on any failure
-  await withProjectBackup(projectDir, originalHistory, historyIndexPath, async () => {
-    const systemPrompt =
-      getSystemPrompt() +
-      `\n\nOriginal prompt: ${meta.input.prompt}` +
-      `\n\nCurrent program.ts:\n${originalSource}` +
-      (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : "");
+  const systemPrompt =
+    getSystemPrompt() +
+    `\n\nOriginal prompt: ${meta.input.prompt}` +
+    `\n\nCurrent program.ts:\n${originalSource}` +
+    (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : "");
 
-    console.log(`Updating "${name}"...`);
-    const updated = stripCodeFences(await isolatedAsk(adapter,
-      `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
-      { system: systemPrompt },
-    ));
+  // All-or-nothing: if generation or validation fails, the whole project
+  // directory — program, state, history — goes back to how it was.
+  try {
+    await withSnapshot(projectDir, async () => {
+      console.log(`Updating "${name}"...`);
+      const updated = stripCodeFences(await isolatedAsk(adapter,
+        `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
+        { system: systemPrompt },
+      ));
+      writeFileSync(programPath, updated);
 
-    writeFileSync(programPath, updated);
+      console.log("Validating updated program...");
+      await smokeRunAndRepair(projectDir, adapter, "update", {
+        timeout: config.defaultTimeout,
+        maxRepairAttempts: config.maxRepairAttempts,
+        maxIterations: config.defaultMaxIterations,
+      });
 
-    console.log("Validating updated program...");
-    await smokeRunAndRepair(projectDir, adapter, "update", {
-      timeout: config.defaultTimeout,
-      maxRepairAttempts: config.maxRepairAttempts,
-      maxIterations: config.defaultMaxIterations,
+      copyToHistory(projectDir, "update", prompt);
+      return { keep: true, value: undefined };
     });
+  } catch (err) {
+    throw new Error(
+      `Update failed — project files have been restored to the previous version.\n` +
+      `${err instanceof Error ? err.message : err}`
+    );
+  }
 
-    copyToHistory(projectDir, "update", prompt);
-
-    console.log(`Updated ${name}. Run with: trama run ${name}`);
-  });
+  console.log(`Updated ${name}. Run with: trama run ${name}`);
 }
 
 export async function listProjects(): Promise<void> {

@@ -1,4 +1,7 @@
-// @trama-dev/runtime - All shared types
+// The program-facing API: everything a program.ts can import from "@trama-dev/runtime".
+// This file is the single source of truth for that API — its generated .d.ts is also
+// what the LLM is shown when it writes or repairs a program, so the doc comments here
+// are part of the prompt. Runner-side types live in runner-types.ts.
 
 export interface Ctx {
   /** Original user prompt and any arguments */
@@ -132,48 +135,4 @@ export interface Workspace {
    * Single-file pattern returns content string. Glob/expect>1 returns sorted array of {path, content}.
    */
   observe(pattern: string, options?: { expect?: number; timeout?: number }): Promise<ObserveResult>;
-}
-
-// --- Program result ---
-
-export interface ProgramResult {
-  status: "done" | "yielded" | "failed";
-  /** Yield reason, or error summary for failed. */
-  reason?: string;
-  /** From ctx.done(result), if provided. */
-  result?: unknown;
-}
-
-// --- Internal types ---
-
-export interface PiAdapterConfig {
-  provider: string;
-  model: string;
-}
-
-export interface RunOptions {
-  projectDir: string;
-  maxRepairAttempts?: number;
-  timeout?: number;
-  args?: Record<string, unknown>;
-  /** Shared workspace directory. When set, workspace.* API is enabled for the program. */
-  workspaceDir?: string;
-}
-
-export interface RepairInput {
-  programSource: string;
-  error: string;
-  runtimeTypes: string;
-}
-
-export interface ChildResult {
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-}
-
-export interface TramaConfig extends PiAdapterConfig {
-  maxRepairAttempts: number;
-  defaultTimeout: number;
-  defaultMaxIterations: number;
 }

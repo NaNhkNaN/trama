@@ -15,8 +15,9 @@ function collectArg(value: string, previous: string[]) {
   return [...previous, value];
 }
 
-function parseArgs(args: string[]): Record<string, unknown> {
-  if (args.length === 0) return {};
+/** Turn repeated `--arg key=value` options into an args object (undefined if none were given). */
+function parseArgs(args: string[]): Record<string, unknown> | undefined {
+  if (args.length === 0) return undefined;
   const result: Record<string, unknown> = {};
   for (const arg of args) {
     const eq = arg.indexOf("=");
@@ -26,6 +27,18 @@ function parseArgs(args: string[]): Record<string, unknown> {
     result[arg.slice(0, eq)] = arg.slice(eq + 1);
   }
   return result;
+}
+
+/** Wrap a command so any failure is reported as a one-line error with a non-zero exit. */
+function command<A extends unknown[]>(run: (...args: A) => Promise<void>) {
+  return async (...args: A) => {
+    try {
+      await run(...args);
+    } catch (err) {
+      console.error(`Error: ${err instanceof Error ? err.message : err}`);
+      process.exit(1);
+    }
+  };
 }
 
 // Read the version from package.json (shipped next to dist/) so it can't drift from the published version.
@@ -43,85 +56,43 @@ cli
   .description("Generate a new program from a natural language prompt")
   .option("--model <model>", "LLM model to use")
   .option("--arg <key=value>", "Pass argument to the program (repeatable)", collectArg, [])
-  .action(async (name: string, prompt: string, opts: { model?: string; arg: string[] }) => {
-    try {
-      const args = parseArgs(opts.arg);
-      await createProject(name, prompt, {
-        model: opts.model,
-        args: Object.keys(args).length > 0 ? args : undefined,
-      });
-    } catch (err) {
-      console.error(`Error: ${err instanceof Error ? err.message : err}`);
-      process.exit(1);
-    }
-  });
+  .action(command(async (name: string, prompt: string, opts: { model?: string; arg: string[] }) => {
+    await createProject(name, prompt, { model: opts.model, args: parseArgs(opts.arg) });
+  }));
 
 cli
   .command("run <name>")
   .description("Execute a program")
   .option("--timeout <ms>", "Per-phase timeout in ms (applies to each run and repair attempt separately)")
   .option("--arg <key=value>", "Pass argument to the program (repeatable)", collectArg, [])
-  .action(async (name: string, opts: { timeout?: string; arg: string[] }) => {
-    try {
-      let timeout: number | undefined;
-      if (opts.timeout !== undefined) {
-        timeout = Number(opts.timeout);
-        if (!Number.isFinite(timeout) || timeout <= 0) {
-          console.error(`Error: --timeout must be a positive number (got "${opts.timeout}")`);
-          process.exit(1);
-        }
+  .action(command(async (name: string, opts: { timeout?: string; arg: string[] }) => {
+    let timeout: number | undefined;
+    if (opts.timeout !== undefined) {
+      timeout = Number(opts.timeout);
+      if (!Number.isFinite(timeout) || timeout <= 0) {
+        throw new Error(`--timeout must be a positive number (got "${opts.timeout}")`);
       }
-      const args = parseArgs(opts.arg);
-      const projectDir = resolveProject(name);
-      const result = await runProgram({
-        projectDir,
-        timeout,
-        args: Object.keys(args).length > 0 ? args : undefined,
-      });
-      if (result.status === "failed") {
-        console.error(`Error: Program failed: ${result.reason}`);
-        process.exit(1);
-      }
-    } catch (err) {
-      console.error(`Error: ${err instanceof Error ? err.message : err}`);
-      process.exit(1);
     }
-  });
+    const args = parseArgs(opts.arg);
+    const result = await runProgram({ projectDir: resolveProject(name), timeout, args });
+    if (result.status === "failed") {
+      throw new Error(`Program failed: ${result.reason}`);
+    }
+  }));
 
 cli
   .command("update <name> <prompt>")
   .description("Update an existing program with new requirements")
-  .action(async (name: string, prompt: string) => {
-    try {
-      await updateProject(name, prompt);
-    } catch (err) {
-      console.error(`Error: ${err instanceof Error ? err.message : err}`);
-      process.exit(1);
-    }
-  });
+  .action(command(updateProject));
 
 cli
   .command("list")
   .description("List all projects")
-  .action(async () => {
-    try {
-      await listProjects();
-    } catch (err) {
-      console.error(`Error: ${err instanceof Error ? err.message : err}`);
-      process.exit(1);
-    }
-  });
+  .action(command(listProjects));
 
 cli
   .command("logs <name>")
   .description("Show logs from last run")
-  .action(async (name: string) => {
-    try {
-      await showLogs(name);
-    } catch (err) {
-      console.error(`Error: ${err instanceof Error ? err.message : err}`);
-      process.exit(1);
-    }
-  });
+  .action(command(showLogs));
 
 cli.parse();
