@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { readFileSync } from "node:fs";
 import { Command } from "commander";
 import {
   createProject,
@@ -27,10 +28,15 @@ function parseArgs(args: string[]): Record<string, unknown> {
   return result;
 }
 
+// Read the version from package.json (shipped next to dist/) so it can't drift from the published version.
+const { version } = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf-8"),
+) as { version: string };
+
 const cli = new Command()
   .name("trama")
   .description("A minimal runtime for agent-authored programs")
-  .version("0.1.4");
+  .version(version);
 
 cli
   .command("create <name> <prompt>")
