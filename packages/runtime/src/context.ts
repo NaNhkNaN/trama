@@ -1,8 +1,18 @@
-import { readFileSync, writeFileSync, appendFileSync } from "fs";
+import { writeFileSync, appendFileSync } from "fs";
 import { join } from "path";
 import type { Ctx } from "./types.js";
-import { assertSerializable } from "./serializable.js";
+import { assertSerializable, toLogData } from "./serializable.js";
 import { guardPath } from "./path-guard.js";
+import { readProjectMeta } from "./meta.js";
+
+/** Where a project's structured run log lives, relative to the project root. */
+export const LATEST_LOG_PATH = join("logs", "latest.jsonl");
+
+/** Append one structured JSONL entry to a run log file. */
+export function appendLogEntry(logsPath: string, message: string, data?: unknown): void {
+  const entry = { ts: Date.now(), message, data: toLogData(data ?? null) };
+  appendFileSync(logsPath, JSON.stringify(entry) + "\n");
+}
 
 /**
  * The runner-side ctx: owns state.json and the run log for one run of a
@@ -26,27 +36,38 @@ export function createContext(
     print?: (line: string) => void;
   },
 ): Ctx {
-  const logsPath = guardPath(projectDir, join("logs", "latest.jsonl"));
+  const logsPath = guardPath(projectDir, LATEST_LOG_PATH);
   const statePath = guardPath(projectDir, "state.json");
-  const meta = JSON.parse(readFileSync(guardPath(projectDir, "meta.json"), "utf-8"));
+  const meta = readProjectMeta(projectDir);
 
-  let donePromise: Promise<void> | null = null;
   let readyCalled = false;
   let terminalSignal: "done" | "yielded" | null = null;
 
-  const input = options?.argsOverride
+  // The input is the project's own: it is handed on as the file has it.
+  const input = (options?.argsOverride
     ? { ...meta.input, args: { ...(meta.input.args ?? {}), ...options.argsOverride } }
-    : meta.input;
+    : meta.input) as Ctx["input"];
 
   // A yield marker left by the previous run means this run is its resumption.
   const yieldMarker = initialState.__trama_yield as { reason: string } | undefined;
   const savedIteration = initialState.__trama_iteration;
 
-  /** Write ctx.state to disk and advance the iteration counter. */
-  const persist = (ctx: Ctx) => {
+  const writeLog = (message: string, data?: unknown) => {
+    appendLogEntry(logsPath, message, data);
+    (options?.print ?? console.log)(`[trama] ${message}`);
+  };
+
+  /** Validate ctx.state, write state.json, and advance in-memory state only once persisted. */
+  const persistState = (ctx: Ctx, yieldReason?: string) => {
+    assertSerializable(ctx.state, "ctx.state");
     const nextIteration = ctx.iteration + 1;
+    const nextState: Record<string, unknown> = { ...ctx.state, __trama_iteration: nextIteration };
+    if (yieldReason !== undefined) nextState.__trama_yield = { reason: yieldReason };
+    else delete nextState.__trama_yield; // the program has moved on from its last yield
+    writeFileSync(statePath, JSON.stringify(nextState, null, 2));
+    if (yieldReason !== undefined) ctx.state.__trama_yield = { reason: yieldReason };
+    else delete ctx.state.__trama_yield;
     ctx.state.__trama_iteration = nextIteration;
-    writeFileSync(statePath, JSON.stringify(ctx.state, null, 2));
     ctx.iteration = nextIteration;
   };
 
@@ -60,55 +81,31 @@ export function createContext(
     yieldReason: yieldMarker?.reason ?? null,
 
     async log(message, data) {
-      let safeData = data ?? null;
-      try { JSON.stringify(safeData); } catch {
-        safeData = { __trama_unserializable: String(data) };
-      }
-      const entry = { ts: Date.now(), message, data: safeData };
-      appendFileSync(logsPath, JSON.stringify(entry) + "\n");
-      (options?.print ?? console.log)(`[trama] ${message}`);
+      writeLog(message, data);
     },
 
     async ready(data) {
       if (readyCalled) return;
-      await this.log("ready", data);
+      writeLog("ready", data);
       options?.onReady?.(data);
       readyCalled = true;
     },
 
     async checkpoint() {
-      assertSerializable(this.state, "ctx.state");
-      delete this.state.__trama_yield; // the program has moved on from its last yield
-      persist(this);
+      persistState(this);
     },
 
     async done(result) {
       if (terminalSignal === "yielded") {
         throw new Error("Cannot call ctx.done() after ctx.yield() — yield already signaled.");
       }
+      if (terminalSignal === "done") return;
 
-      // A completed done() is a no-op; one still in flight is shared.
-      if (donePromise) return donePromise;
-
-      // Claimed while in flight so a yield() cannot slip in alongside it.
+      persistState(this);
+      // Settled only once persisted — a failed done() leaves done() and yield() both open.
       terminalSignal = "done";
-
-      const run = async () => {
-        await this.checkpoint();
-        // Persistence is the critical part; a log failure must not turn a
-        // completed done() into an error.
-        try { await this.log("done", result); } catch { /* best-effort */ }
-      };
-
-      donePromise = run();
-      try {
-        await donePromise;
-      } catch (err) {
-        // Nothing was persisted, so nothing is settled: done() or yield() may be called again.
-        donePromise = null;
-        terminalSignal = null;
-        throw err;
-      }
+      // Persistence is the critical part; a log failure must not turn a completed done() into an error.
+      try { writeLog("done", result); } catch { /* best-effort */ }
     },
 
     async yield(reason) {
@@ -118,13 +115,10 @@ export function createContext(
       // The client exits the process after its first successful yield; here a
       // repeated call is simply a no-op.
       if (terminalSignal !== "yielded") {
-        assertSerializable(this.state, "ctx.state");
-        this.state.__trama_yield = { reason };
-        persist(this);
-
+        persistState(this, reason);
         // Settled only once persisted — a failed yield() leaves done() and yield() both open.
         terminalSignal = "yielded";
-        try { await this.log("yield", { reason }); } catch { /* best-effort */ }
+        try { writeLog("yield", { reason }); } catch { /* best-effort */ }
       }
       // Exiting is the client's job: this returns so the IPC handler can answer first.
       return undefined as never;

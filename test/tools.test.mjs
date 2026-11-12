@@ -384,3 +384,24 @@ test("createTools shell commands do not inherit the bridge's address or its init
   const result = await tools.shell('echo "[$TRAMA_PORT][$TRAMA_INIT][$HOME]"');
   assert.equal(result.stdout.trim(), `[][][${process.env.HOME}]`);
 });
+
+test("createTools write through a link to a file in a directory that is not there yet makes the directory", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+  symlinkSync(join(projectDir, "not-made", "dest.txt"), join(projectDir, "link.txt"));
+
+  await createTools(projectDir).write("link.txt", "hello");
+  assert.equal(readFileSync(join(projectDir, "not-made", "dest.txt"), "utf-8"), "hello");
+});
+
+test("superviseChild stops a child at once when it is asked to with a signal that has already fired", async () => {
+  const { spawn } = await import("child_process");
+  const { superviseChild } = await import("../packages/runtime/dist/child-process.js");
+  const child = spawn("sleep", ["30"], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+
+  const started = performance.now();
+  const exit = await superviseChild(child, { timeout: 30_000, stopSignal: AbortSignal.abort() });
+  assert.equal(exit.stopped, true);
+  assert.equal(exit.signal, "SIGTERM");
+  assert.ok(performance.now() - started < 5_000);
+});

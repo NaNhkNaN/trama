@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import {
-  copyToHistory, createBackend, loadConfig, loadState, runProgram, RUNTIME_TYPES, validateProgram,
+  copyToHistory, createBackend, installValidatedProgram, loadConfig, loadState, runProgram, RUNTIME_TYPES, validateProgram,
 } from "../packages/runtime/dist/runner.js";
 import {
   REPO_ROOT, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, readJson, startRunnerProcess, waitFor,
@@ -1346,4 +1346,175 @@ test("RUNTIME_TYPES stays in sync with types.ts public interfaces", () => {
     const promptSummary = normalizeInterface(extractInterface(RUNTIME_TYPES, iface, false));
     assert.equal(promptSummary, actual, `RUNTIME_TYPES interface drift for ${iface}`);
   }
+});
+
+// --- Installing a validated program ---
+
+/** What a project's history holds: its version files, and the reasons in its index. */
+function historyOf(projectDir) {
+  const indexPath = join(projectDir, "history", "index.jsonl");
+  return {
+    files: readdirSync(join(projectDir, "history")).filter(name => name.endsWith(".ts")).sort(),
+    reasons: existsSync(indexPath)
+      ? readFileSync(indexPath, "utf-8").split("\n").filter(Boolean).map(line => JSON.parse(line).reason)
+      : [],
+  };
+}
+const leftovers = (projectDir) => readdirSync(projectDir).filter(name => name.includes(".trama-new-"));
+
+test("installing a program records it and puts it in place, keeping the file's permissions", (t) => {
+  const projectDir = makeTempDir("trama-install-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { programSource: "OLD" });
+  chmodSync(join(projectDir, "program.ts"), 0o755);
+
+  installValidatedProgram(projectDir, { source: "NEW", repairedError: "it crashed" }, "update", "make it new");
+
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), "NEW");
+  assert.equal(statSync(join(projectDir, "program.ts")).mode & 0o777, 0o755);
+  assert.deepEqual(historyOf(projectDir), { files: ["0001.ts"], reasons: ["update-repair", "update"] });
+  assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), "NEW");
+  assert.deepEqual(leftovers(projectDir), []);
+});
+
+test("a program that cannot be put in place leaves no version of it on record", { skip: process.getuid?.() === 0 }, (t) => {
+  const projectDir = makeTempDir("trama-install-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { programSource: "OLD" });
+  copyToHistory(projectDir, "create", "the first version");
+  const indexBefore = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8");
+
+  // Its owner made it read-only: it is not replaced, and nothing else is touched.
+  chmodSync(join(projectDir, "program.ts"), 0o444);
+  assert.throws(() => installValidatedProgram(projectDir, { source: "NEW" }, "update", "p"), { code: "EACCES" });
+  chmodSync(join(projectDir, "program.ts"), 0o644);
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), "OLD");
+  assert.deepEqual(historyOf(projectDir).files, ["0001.ts"]);
+  assert.equal(readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8"), indexBefore);
+  assert.deepEqual(leftovers(projectDir), []);
+});
+
+test("a version recorded for a program that then cannot take its place is taken back", (t) => {
+  const projectDir = makeTempDir("trama-install-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { programSource: "OLD" });
+  copyToHistory(projectDir, "create", "the first version");
+  const indexBefore = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8");
+
+  // A directory where the program goes: everything up to the last step works, and the last step cannot.
+  rmSync(join(projectDir, "program.ts"));
+  mkdirSync(join(projectDir, "program.ts"));
+  assert.throws(() => installValidatedProgram(projectDir, { source: "NEW", repairedError: "e" }, "update", "p"));
+
+  assert.deepEqual(historyOf(projectDir).files, ["0001.ts"], "the version file written for it is gone");
+  assert.equal(readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8"), indexBefore, "and so are its lines in the index");
+  assert.deepEqual(leftovers(projectDir), []);
+});
+
+test("a version that cannot be recorded is not installed", { skip: process.getuid?.() === 0 }, (t) => {
+  const projectDir = makeTempDir("trama-install-");
+  t.after(() => { chmodSync(join(projectDir, "history", "index.jsonl"), 0o644); cleanupTempDir(projectDir); });
+  createProjectFixture(projectDir, { programSource: "OLD" });
+  writeText(join(projectDir, "history", "index.jsonl"), "");
+  chmodSync(join(projectDir, "history", "index.jsonl"), 0o444);
+
+  assert.throws(() => installValidatedProgram(projectDir, { source: "NEW" }, "create", "p"), { code: "EACCES" });
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), "OLD");
+  assert.deepEqual(historyOf(projectDir), { files: [], reasons: [] });
+  assert.deepEqual(leftovers(projectDir), []);
+});
+
+test("a program that is a link inside the project is written through the link", (t) => {
+  const projectDir = makeTempDir("trama-install-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { programSource: "OLD" });
+  rmSync(join(projectDir, "program.ts"));
+  writeText(join(projectDir, "src", "real.ts"), "OLD");
+  symlinkSync(join("src", "real.ts"), join(projectDir, "program.ts"));
+
+  installValidatedProgram(projectDir, { source: "NEW" }, "update", "p");
+
+  assert.equal(lstatSync(join(projectDir, "program.ts")).isSymbolicLink(), true);
+  assert.equal(readFileSync(join(projectDir, "src", "real.ts"), "utf-8"), "NEW");
+});
+
+// --- meta.json ---
+
+test("a meta.json that is not what a run needs is refused by name", async (t) => {
+  const projectDir = makeTempDir("trama-meta-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false });
+  const run = () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+
+  writeText(join(projectDir, "meta.json"), "{ not json");
+  await assert.rejects(run, /Malformed meta\.json in .*Parse error/s);
+  writeText(join(projectDir, "meta.json"), "[]");
+  await assert.rejects(run, /Malformed meta\.json in .*expected a JSON object but got an array/s);
+  writeText(join(projectDir, "meta.json"), "null");
+  await assert.rejects(run, /Malformed meta\.json in .*expected a JSON object but got null/s);
+  writeJson(join(projectDir, "meta.json"), { createdAt: "2026-01-01" });
+  await assert.rejects(run, /Malformed meta\.json in .*"input" is missing/s);
+  // Nothing was run, and nothing recorded as a run.
+  assert.equal(existsSync(join(projectDir, "output.txt")), false);
+
+  // An input with nothing in it is still an input.
+  writeJson(join(projectDir, "meta.json"), { input: {} });
+  assert.equal((await run()).status, "done");
+});
+
+test("installing a program keeps the permissions of the one it replaces, whatever the umask", (t) => {
+  const projectDir = makeTempDir("trama-install-");
+  const umask = process.umask(0o022);
+  t.after(() => { process.umask(umask); cleanupTempDir(projectDir); });
+  createProjectFixture(projectDir, { programSource: "OLD" });
+  chmodSync(join(projectDir, "program.ts"), 0o664);
+
+  installValidatedProgram(projectDir, { source: "NEW" }, "update", "p");
+  assert.equal(statSync(join(projectDir, "program.ts")).mode & 0o777, 0o664);
+});
+
+test("taking a version back leaves alone what another run recorded meanwhile", async (t) => {
+  const fs = (await import("node:fs")).default;
+  const { syncBuiltinESMExports } = await import("node:module");
+  const projectDir = makeTempDir("trama-install-");
+  const realRename = fs.renameSync;
+  t.after(() => { fs.renameSync = realRename; syncBuiltinESMExports(); cleanupTempDir(projectDir); });
+  createProjectFixture(projectDir, { programSource: "OLD" });
+  const indexPath = join(projectDir, "history", "index.jsonl");
+
+  // The last step fails — after another run of the project has added a line of its own to the index.
+  const theirs = JSON.stringify({ version: 2, reason: "repair", error: "theirs" }) + "\n";
+  fs.renameSync = () => { fs.appendFileSync(indexPath, theirs); throw new Error("cannot take its place"); };
+  syncBuiltinESMExports();
+  assert.throws(() => installValidatedProgram(projectDir, { source: "NEW" }, "update", "p"), /cannot take its place/);
+
+  const lines = readFileSync(indexPath, "utf-8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+  assert.deepEqual(lines.map(line => line.reason), ["update", "repair"], "their line is still there — and so, then, is ours");
+  assert.equal(existsSync(join(projectDir, "history", "0001.ts")), true, "a line on record keeps the version it names");
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), "OLD");
+  assert.deepEqual(leftovers(projectDir), []);
+});
+
+test("a version is never recorded over a version file that is already there", (t) => {
+  const projectDir = makeTempDir("trama-install-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { programSource: "OLD" });
+  // Two runs that pick the same number: the file of the first must survive the second.
+  const fsPromise = import("node:fs");
+  return fsPromise.then(async ({ default: fs }) => {
+    const { syncBuiltinESMExports } = await import("node:module");
+    const realReaddir = fs.readdirSync;
+    writeText(join(projectDir, "history", "0001.ts"), "THEIRS");
+    fs.readdirSync = (path, ...rest) => String(path).endsWith("history") ? [] : realReaddir(path, ...rest);
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => installValidatedProgram(projectDir, { source: "NEW" }, "update", "p"), { code: "EEXIST" });
+    } finally {
+      fs.readdirSync = realReaddir;
+      syncBuiltinESMExports();
+    }
+    assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), "THEIRS");
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), "OLD");
+    assert.equal(existsSync(join(projectDir, "history", "index.jsonl")), false);
+  });
 });

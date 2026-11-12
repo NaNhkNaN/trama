@@ -1,20 +1,22 @@
 import {
-  readFileSync, writeFileSync, mkdirSync, readdirSync, readlinkSync,
-  realpathSync, lstatSync, statSync, renameSync, fdatasyncSync,
-  openSync, closeSync,
+  readFileSync, writeFileSync, mkdirSync, readdirSync,
+  statSync, renameSync, fdatasyncSync,
+  openSync, closeSync, rmSync,
 } from "fs";
 import { resolve, dirname, relative, sep } from "path";
 import type { Workspace } from "./types.js";
-import { guardPath, isInside, realRootOf, resolveBounded } from "./path-guard.js";
+import { onAbort } from "./abort.js";
+import { destinationOf, guardPath, guardWriteTarget, isInside, realRootOf, resolveBounded } from "./path-guard.js";
 
 const OBSERVE_POLL_MS = 250;
+let nextTmpId = 0;
 
 /**
- * Match a simple glob pattern against a relative path.
+ * Compile a simple glob pattern for matching relative paths.
  * Supports `*` (any segment chars), `?` (single char), and `**` (any path segments).
  * `** /` matches zero or more directory segments (including root).
  */
-function matchGlob(pattern: string, filePath: string): boolean {
+function compileGlob(pattern: string): RegExp {
   // Replace ** with placeholders before escaping
   let regex = pattern
     .replace(/\*\*\//g, "\x00GLOBSTARSLASH\x00")
@@ -28,7 +30,7 @@ function matchGlob(pattern: string, filePath: string): boolean {
   regex = regex
     .replace(/\x00GLOBSTARSLASH\x00/g, "(?:.+/)?")
     .replace(/\x00GLOBSTAR\x00/g, ".*");
-  return new RegExp(`^${regex}$`).test(filePath);
+  return new RegExp(`^${regex}$`);
 }
 
 /**
@@ -62,8 +64,10 @@ function listFilesRecursive(dir: string, root: string, realRoot: string, visited
   for (const entry of entries) {
     const full = resolve(dir, entry.name);
     if (entry.isSymbolicLink()) {
+      // Where the link really leads — worked out the way the guard does, so that
+      // what is listed is what can be read.
       let real: string;
-      try { real = realpathSync(full); } catch { continue; /* dangling symlink */ }
+      try { real = destinationOf(full); } catch { continue; /* a loop, or unreadable */ }
       if (!isInside(real, realRoot)) continue; // escapes workspace
       try {
         const stat = statSync(full);
@@ -87,15 +91,14 @@ function listFilesRecursive(dir: string, root: string, realRoot: string, visited
 /** Resolve after `ms`, or reject as soon as `signal` aborts. */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const onAbort = () => {
-      clearTimeout(timer);
-      reject(new Error("workspace.observe() aborted"));
-    };
     const timer = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
+      offAbort();
       resolve();
     }, ms);
-    signal?.addEventListener("abort", onAbort, { once: true });
+    const offAbort = onAbort(signal, () => {
+      clearTimeout(timer);
+      reject(new Error("workspace.observe() aborted"));
+    });
   });
 }
 
@@ -105,8 +108,10 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
   const realRoot = realRootOf(root);
 
   /** All artifact paths matching a glob, sorted. */
-  const listMatching = (pattern: string): string[] =>
-    listFilesRecursive(root, root, realRoot).filter(f => matchGlob(pattern, f)).sort();
+  const listMatching = (pattern: string): string[] => {
+    const re = compileGlob(pattern);
+    return listFilesRecursive(root, root, realRoot).filter(f => re.test(f)).sort();
+  };
 
   /** Read an artifact, or null if it is missing, unreadable, or escapes the workspace. */
   const readIfPresent = (path: string): string | null => {
@@ -129,37 +134,29 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
     },
 
     async write(path, content) {
-      const target = guardPath(root, path);
-      mkdirSync(dirname(target), { recursive: true });
-
-      // If the target is a symlink, write to what it points at rather than
-      // replacing the link (matches tools.write). guardPath has already
-      // verified the destination stays inside the workspace.
-      let writePath = target;
-      try {
-        if (lstatSync(target).isSymbolicLink()) {
-          try {
-            writePath = realpathSync(target);
-          } catch (e) {
-            if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-            // Dangling symlink — resolve the link destination manually
-            writePath = resolve(dirname(target), readlinkSync(target));
-            mkdirSync(dirname(writePath), { recursive: true });
-          }
-        }
-      } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+      // Write to what a symlink points at rather than replacing the link itself
+      // (matches tools.write). guardWriteTarget verifies the destination stays inside the workspace.
+      const writePath = guardWriteTarget(root, path);
+      // The temp file goes beside its target — which for the workspace itself would be outside it.
+      if (writePath === realRoot) throw new Error(`Not an artifact path: "${path}" is the workspace itself`);
+      mkdirSync(dirname(writePath), { recursive: true });
 
       // Atomic write: temp file in the same directory, fsync, rename.
       // Readers see either the old content or the new — never a partial file.
-      const tmpFile = writePath + `.trama-tmp-${process.pid}-${Date.now()}`;
+      const tmpFile = `${writePath}.trama-tmp-${process.pid}-${++nextTmpId}`;
       const fd = openSync(tmpFile, "w");
       try {
-        writeFileSync(fd, content);
-        fdatasyncSync(fd);
-      } finally {
-        closeSync(fd);
+        try {
+          writeFileSync(fd, content);
+          fdatasyncSync(fd);
+        } finally {
+          closeSync(fd);
+        }
+        renameSync(tmpFile, writePath);
+      } catch (err) {
+        try { rmSync(tmpFile, { force: true }); } catch { /* best-effort */ }
+        throw err;
       }
-      renameSync(tmpFile, writePath);
     },
 
     async list(pattern) {
@@ -189,14 +186,14 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
       };
 
       // Level-triggered: artifacts that already exist count immediately.
-      const startTime = Date.now();
+      const startTime = performance.now();
       while (true) {
         if (signal?.aborted) throw new Error("workspace.observe() aborted");
 
         const matches = collectMatches();
         if (matches.length >= needed) return single ? matches[0].content : matches;
 
-        if (timeout !== undefined && (Date.now() - startTime) >= timeout) {
+        if (timeout !== undefined && (performance.now() - startTime) >= timeout) {
           throw new Error(
             `workspace.observe("${pattern}") timed out after ${timeout}ms. ` +
             `Found ${matches.length}/${needed} matching artifacts.`

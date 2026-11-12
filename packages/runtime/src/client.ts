@@ -2,9 +2,11 @@
 // A thin wrapper that forwards every call to the runner's IPC server
 // (ipc-server.ts), which does the real work.
 
-import type { Ctx, Agent, Tools, Workspace } from "./types.js";
+import type { Ctx, Agent, ShellResult, Tools, ObserveResult, Workspace } from "./types.js";
 import { openBridge, remoteWorkspace } from "./bridge-client.js";
-import { assertSerializable } from "./serializable.js";
+import { assertSerializable, toLogData } from "./serializable.js";
+
+export type { Ctx, Agent, ShellResult, Tools, ObserveResult, Workspace };
 
 const PORT = process.env.TRAMA_PORT;
 if (!PORT) {
@@ -24,16 +26,6 @@ if (!INIT_PATH) {
 
 const { init: initData, call } = openBridge(PORT, INIT_PATH);
 
-/** Log payloads are best-effort: anything that can't be sent as JSON is replaced by its string form. */
-function sendable(data: Record<string, unknown> | undefined) {
-  try {
-    JSON.stringify(data);
-    return data;
-  } catch {
-    return { __trama_unserializable: String(data) };
-  }
-}
-
 // The lifecycle rules (ready once, done once, done and yield mutually exclusive)
 // are enforced by the runner. Here each call is checked for what only this
 // process can see — whether the values survive JSON — and then forwarded.
@@ -46,10 +38,10 @@ export const ctx: Ctx = {
   yieldReason: initData.yieldReason,
 
   async log(msg, data) {
-    await call("/ctx/log", { message: msg, data: sendable(data) });
+    await call("/ctx/log", { message: msg, data: toLogData(data) });
   },
   async ready(data) {
-    await call("/ctx/ready", { data: sendable(data) });
+    await call("/ctx/ready", { data: toLogData(data) });
   },
   async checkpoint() {
     assertSerializable(ctx.state, "ctx.state");

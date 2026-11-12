@@ -1,5 +1,6 @@
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import { rejectOnAbort, type AgentBackend, type AgentCall } from "./agent-backend.js";
+import { onAbort, rejectOnAbort } from "./abort.js";
+import type { AgentBackend, AgentCall } from "./agent-backend.js";
 import type { ModelConfig } from "./runner-types.js";
 
 /**
@@ -40,13 +41,11 @@ export class PiAdapter implements AgentBackend {
     });
 
     await raceAbort(resourceLoader.reload());
-    if (signal?.aborted) throw new Error("Aborted");
 
     // Resolve the model through pi's model runtime (built-in catalog plus the
     // user's models.json). An unknown provider/model resolves to undefined, in
     // which case pi falls back to its own default selection.
     const modelRuntime = await raceAbort(ModelRuntime.create({ signal }));
-    if (signal?.aborted) throw new Error("Aborted");
     const model = modelRuntime.getModel(this.config.provider, this.config.model);
 
     // Keep a reference to the raw promise so we can clean up a late-arriving session
@@ -109,25 +108,23 @@ export class PiAdapter implements AgentBackend {
   }
 
   /**
-   * Abort cancellation relies on session.dispose() interrupting session.prompt().
-   * This is an upstream contract of pi-coding-agent — if dispose() does not
-   * actually settle the in-flight prompt, the abort signal will not terminate the call.
-   * pi 1.x settles the prompt by resolving it (not rejecting), so abort is
-   * re-checked after prompt() returns.
+   * Run one prompt in a fresh session and return the assistant's text reply.
+   *
+   * Cancellation during `createSession` is handled step-by-step inside it; once
+   * `session.prompt()` is running, abort disposes the session so pi settles the
+   * in-flight prompt (pi 1.x resolves rather than rejects on dispose, so
+   * `signal.aborted` is checked again when `prompt()` returns).
    */
   async ask(prompt: string, call: AgentCall): Promise<string> {
     const { cwd, system, signal } = call;
     if (signal?.aborted) throw new Error("Aborted");
 
-    // Track session so abort can dispose it at any point — even during createSession
-    let session: AgentSession | null = null;
-    const onAbort = () => session?.dispose();
-    signal?.addEventListener("abort", onAbort, { once: true });
+    const session = await this.createSession(cwd, system, signal);
+    let offAbort = () => {};
 
     try {
-      session = await this.createSession(cwd, system, signal);
-      // Re-check: abort may have fired during createSession (before session existed)
       if (signal?.aborted) throw new Error("Aborted");
+      offAbort = onAbort(signal, () => session.dispose());
 
       await session.prompt(prompt);
       // An aborted prompt resolves with no usable answer — report it as an abort,
@@ -137,8 +134,8 @@ export class PiAdapter implements AgentBackend {
       if (!text) throw new Error("Empty response from LLM");
       return text;
     } finally {
-      signal?.removeEventListener("abort", onAbort);
-      session?.dispose();
+      offAbort();
+      session.dispose();
     }
   }
 }

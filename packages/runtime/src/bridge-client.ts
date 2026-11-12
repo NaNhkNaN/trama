@@ -12,11 +12,16 @@ export interface Bridge {
   call(endpoint: string, body: unknown): Promise<any>;
 }
 
+let cached: { port: string; initPath: string; bridge: Bridge | null } | undefined;
+
 /**
  * @param port - the runner's loopback port (TRAMA_PORT)
  * @param initPath - the file the runner wrote for this program (TRAMA_INIT)
  */
 export function openBridge(port: string, initPath: string): Bridge {
+  if (cached?.bridge && cached.port === port && cached.initPath === initPath) {
+    return cached.bridge;
+  }
   const init = JSON.parse(readFileSync(initPath, "utf-8"));
 
   // A call lasts as long as the work behind it — an agent run, or the whole
@@ -49,25 +54,27 @@ export function openBridge(port: string, initPath: string): Bridge {
       req.end(payload);
     });
 
-  return { init, call };
+  const bridge: Bridge = { init, call };
+  cached = { port, initPath, bridge };
+  return bridge;
 }
-
-let parent: Bridge | null | undefined;
 
 /**
  * The bridge to the runner that started this process as a program — or null
  * when this process is not a program, and so is itself where runs happen.
  */
 export function parentBridge(): Bridge | null {
-  if (parent === undefined) {
-    const { TRAMA_PORT: port, TRAMA_INIT: initPath } = process.env;
-    try {
-      parent = port && initPath ? openBridge(port, initPath) : null;
-    } catch {
-      parent = null; // a stale environment: there is no runner to ask
-    }
+  const { TRAMA_PORT: port, TRAMA_INIT: initPath } = process.env;
+  if (!port || !initPath) return null;
+  if (cached && cached.port === port && cached.initPath === initPath) {
+    return cached.bridge;
   }
-  return parent;
+  try {
+    return openBridge(port, initPath);
+  } catch {
+    cached = { port, initPath, bridge: null }; // a stale environment: there is no runner to ask
+    return null;
+  }
 }
 
 /**

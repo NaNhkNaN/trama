@@ -29,8 +29,9 @@ import { createProject, runProgram, updateProject } from "@trama-dev/runtime/run
 
 The runtime is what makes agent programs **self-contained and shareable**:
 
-- **Execution** — child process spawning, streaming output, timeout management, background process cleanup.
-- **IPC bridge** — a local HTTP server that every `ctx`, `agent`, `tools` and `workspace` call goes through: one point where the runtime validates each request and can cancel work in flight when a run ends.
+- **Execution** — child process spawning, streaming output, timeout management, watchdog-backed background process cleanup.
+- **IPC bridge** — a local HTTP server that every `ctx`, `agent`, `tools`, `workspace`, and nested run call goes through: one point where a single runner validates each request, records the tree of runs, and cancels work in flight when a run ends.
+- **Run journal** — an append-only per-run record (`logs/journal/*.jsonl`, viewable via `trama journal`) of every bridge call, attempt, repair, and exit.
 - **State persistence** — `ctx.state` survives across runs. Programs can be long-running, interruptible, and resumable.
 - **Auto-repair** — on crash, the runtime gets an LLM fix and tries it on a private copy of the project, installing it only if it works. Up to 3 attempts.
 - **Version history** — every create, update, and repair saves a snapshot to `history/`.
@@ -38,6 +39,6 @@ The runtime is what makes agent programs **self-contained and shareable**:
 
 ## Self-orchestration
 
-trama programs can create and run other trama programs through `tools.shell()`. The generated program becomes the orchestrator — decomposing tasks, spawning sub-programs, and synthesizing results. No orchestration framework needed. trama is the scheduler.
+trama programs can coordinate other trama programs — through `@trama-dev/session` (carried over the parent runner's bridge with a shared workspace and structured lifecycle) or through `tools.shell("trama ...")` for standalone CLI invocations. The generated program becomes the orchestrator — decomposing tasks, spawning sub-programs, and synthesizing results. No orchestration framework needed. trama is the scheduler.
 
 See the [main README](https://github.com/NaNhkNaN/trama) for examples, the full API reference, and design philosophy.

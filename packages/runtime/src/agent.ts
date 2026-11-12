@@ -1,5 +1,6 @@
 import type { Agent } from "./types.js";
 import type { AgentBackend } from "./agent-backend.js";
+import { isJsonObject } from "./serializable.js";
 
 /**
  * The program in an LLM reply that was asked to contain nothing else: the last
@@ -15,23 +16,42 @@ export function stripCodeFences(text: string): string {
   return trimmed;
 }
 
+const SUPPORTED_SCHEMA_TYPES = new Set(["string", "number", "boolean"]);
+type SchemaPrimitive = "string" | "number" | "boolean";
+
 /**
- * Minimal shape validation.
- * Checks all schema keys exist and values match declared primitive types.
+ * Parse and validate the caller's schema declaration up front.
  * The part after ":" is a description and is ignored during validation.
  */
-function validateShape(result: unknown, schema: Record<string, string>): string | null {
-  if (typeof result !== "object" || result === null) return "response is not an object";
-  const obj = result as Record<string, unknown>;
-  const supportedTypes = new Set(["string", "number", "boolean"]);
-  for (const [key, typeDesc] of Object.entries(schema)) {
-    if (!(key in obj)) return `missing key: ${key}`;
+function parseSchema(schema: Record<string, string>): Array<[string, SchemaPrimitive]> {
+  return Object.entries(schema).map(([key, typeDesc]) => {
     const expectedType = typeDesc.split(":")[0].trim();
-    if (!supportedTypes.has(expectedType)) return `unsupported schema type "${expectedType}" for key "${key}"`;
-    const actual = typeof obj[key];
-    if (actual !== expectedType) return `${key}: expected ${expectedType}, got ${actual}`;
+    if (!SUPPORTED_SCHEMA_TYPES.has(expectedType)) {
+      throw new Error(`Schema validation failed: unsupported schema type "${expectedType}" for key "${key}"`);
+    }
+    return [key, expectedType as SchemaPrimitive];
+  });
+}
+
+/**
+ * Minimal shape validation + projection: verifies every schema key exists with
+ * its declared primitive type, and returns an object containing only those keys.
+ */
+function extractBySchema(
+  result: unknown,
+  entries: Array<[string, SchemaPrimitive]>,
+): Record<string, unknown> {
+  if (!isJsonObject(result)) throw new Error("Schema validation failed: response is not an object");
+  const picked: Record<string, unknown> = {};
+  for (const [key, expectedType] of entries) {
+    if (!(key in result)) throw new Error(`Schema validation failed: missing key: ${key}`);
+    const actual = typeof result[key];
+    if (actual !== expectedType) {
+      throw new Error(`Schema validation failed: ${key}: expected ${expectedType}, got ${actual}`);
+    }
+    picked[key] = result[key];
   }
-  return null;
+  return picked;
 }
 
 /**
@@ -45,6 +65,7 @@ export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSi
     },
 
     async generate(input) {
+      const schemaEntries = parseSchema(input.schema);
       const schemaInstruction = `Respond with ONLY a JSON object matching this shape:\n${
         JSON.stringify(input.schema, null, 2)
       }\nNo markdown. No explanation. Just the JSON.`;
@@ -63,9 +84,7 @@ export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSi
           const fenceMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
           parsed = JSON.parse(fenceMatch ? fenceMatch[1].trim() : trimmed);
         }
-        const error = validateShape(parsed, input.schema);
-        if (error) throw new Error(`Schema validation failed: ${error}`);
-        return stripToSchema(parsed as Record<string, unknown>, input.schema);
+        return extractBySchema(parsed, schemaEntries);
       };
 
       // First attempt — backend errors (network/auth) propagate immediately.
@@ -80,13 +99,4 @@ export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSi
       }
     }
   };
-}
-
-/** Return a new object containing only the keys declared in the schema. */
-function stripToSchema(obj: Record<string, unknown>, schema: Record<string, string>): Record<string, unknown> {
-  const result: Record<string, unknown> = {};
-  for (const key of Object.keys(schema)) {
-    result[key] = obj[key];
-  }
-  return result;
 }

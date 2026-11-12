@@ -6,7 +6,10 @@ import { join, resolve } from "path";
 import { homedir } from "os";
 import { piVersion } from "./pi-adapter.js";
 import { stripCodeFences } from "./agent.js";
+import { onAbort } from "./abort.js";
 import type { AgentBackend } from "./agent-backend.js";
+import { LATEST_LOG_PATH } from "./context.js";
+import { readProjectMeta } from "./meta.js";
 import {
   loadConfig, loadProjectConfig, loadState, createBackend, validateProgram, installValidatedProgram,
   withTempDir, ensureProjectScaffold, RUNTIME_TYPES, runProgram as runHere,
@@ -39,9 +42,9 @@ export async function runProgram(options: RunOptions): Promise<ProgramResult> {
   // same as outside a program.
   const { signal, ...request } = options;
   const id = randomUUID();
-  const stop = () => { bridge.call("/run/stop", { id }).catch(() => { /* no runner left to tell */ }); };
-  if (signal?.aborted) stop();
-  else signal?.addEventListener("abort", stop, { once: true });
+  const offStop = onAbort(signal, () => {
+    bridge.call("/run/stop", { id }).catch(() => { /* no runner left to tell */ });
+  });
   try {
     return await bridge.call("/run/program", {
       ...request,
@@ -51,7 +54,7 @@ export async function runProgram(options: RunOptions): Promise<ProgramResult> {
       workspaceDir: request.workspaceDir && resolve(request.workspaceDir),
     });
   } finally {
-    signal?.removeEventListener("abort", stop);
+    offStop();
   }
 }
 
@@ -254,11 +257,10 @@ export async function updateProject(name: string, prompt: string): Promise<void>
   // A hand-written project may never have been run: give it history/ and the rest first.
   ensureProjectScaffold(projectDir);
 
-  const programPath = guardPath(projectDir, "program.ts");
-  const originalSource = readFileSync(programPath, "utf-8");
+  const originalSource = readFileSync(guardPath(projectDir, "program.ts"), "utf-8");
   const state = loadState(projectDir);
-  const meta = JSON.parse(readFileSync(guardPath(projectDir, "meta.json"), "utf-8"));
-  const config = loadProjectConfig(projectDir);
+  const meta = readProjectMeta(projectDir);
+  const config = loadProjectConfig(projectDir, meta);
   const backend = createBackend(config);
 
   const systemPrompt =
@@ -279,15 +281,10 @@ export async function updateProject(name: string, prompt: string): Promise<void>
 
     console.log("Validating updated program...");
     const validated = await validateProgram(projectDir, backend, candidate, validationOptions(config));
-    try {
-      installValidatedProgram(projectDir, validated, "update", prompt);
-    } catch (err) {
-      writeFileSync(programPath, originalSource); // recording the version failed: don't leave an unrecorded program behind
-      throw err;
-    }
+    installValidatedProgram(projectDir, validated, "update", prompt);
   } catch (err) {
     throw new Error(
-      `Update failed — the project is unchanged.\n` +
+      `Update failed — the program is unchanged.\n` +
       `${err instanceof Error ? err.message : err}`
     );
   }
@@ -316,7 +313,7 @@ export async function listProjects(): Promise<void> {
     let modified = "";
 
     try {
-      const meta = JSON.parse(readFileSync(guardPath(projectDir, "meta.json"), "utf-8"));
+      const meta = readProjectMeta(projectDir);
       prompt = meta.input?.prompt ?? "";
       if (prompt.length > 60) prompt = prompt.slice(0, 57) + "...";
     } catch { /* no meta or symlink escape */ }
@@ -332,14 +329,20 @@ export async function listProjects(): Promise<void> {
 
 export async function showLogs(name: string): Promise<void> {
   const projectDir = resolveProject(name);
-  const logsPath = guardPath(projectDir, join("logs", "latest.jsonl"));
+  const logsPath = guardPath(projectDir, LATEST_LOG_PATH);
 
-  if (!existsSync(logsPath)) {
-    console.log("No logs found.");
-    return;
+  let raw: string;
+  try {
+    raw = readFileSync(logsPath, "utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      console.log("No logs found.");
+      return;
+    }
+    throw err;
   }
 
-  const content = readFileSync(logsPath, "utf-8").trim();
+  const content = raw.trim();
   if (!content) {
     console.log("No log entries.");
     return;

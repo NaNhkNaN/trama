@@ -144,3 +144,10 @@ try {
     { url: "/ctx/ready", body: { data: { url: "ignored" } } },
   ]);
 });
+
+test("the types of the program-facing API can be imported from where the API is", async () => {
+  const { readFileSync } = await import("fs");
+  const declarations = readFileSync(join(REPO_ROOT, "packages", "runtime", "dist", "client.d.ts"), "utf-8");
+  const exported = /export type \{([^}]*)\}/.exec(declarations)?.[1].split(",").map(name => name.trim()).sort();
+  assert.deepEqual(exported, ["Agent", "Ctx", "ObserveResult", "ShellResult", "Tools", "Workspace"]);
+});

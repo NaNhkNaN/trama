@@ -117,9 +117,11 @@ test("createAgent generate surfaces the second failure when retries are exhauste
   );
 });
 
-test("createAgent generate rejects unsupported schema types", async () => {
+test("createAgent generate rejects unsupported schema types, before anything is asked", async () => {
+  let asked = 0;
   const adapter = {
     async ask() {
+      asked += 1;
       return '{"items": [1,2,3]}';
     },
   };
@@ -133,6 +135,8 @@ test("createAgent generate rejects unsupported schema types", async () => {
     }),
     /unsupported schema type "array"/,
   );
+  // What is wrong is the program's own schema: no reply could satisfy it, so none is paid for.
+  assert.equal(asked, 0);
 });
 
 test("createAgent generate does NOT retry on adapter.ask() errors (network/auth)", async () => {

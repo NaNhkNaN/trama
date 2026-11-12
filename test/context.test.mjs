@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync } from "fs";
+import { existsSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 import { createContext } from "../packages/runtime/dist/context.js";
 import { cleanupTempDir, createProjectFixture, makeTempDir, readJson, readText } from "./helpers.mjs";
@@ -338,3 +338,34 @@ function readJsonLines(path) {
   if (!content) return [];
   return content.split("\n").map(line => JSON.parse(line));
 }
+
+test("createContext: a state that could not be written leaves ctx as it was", async (t) => {
+  const projectDir = makeTempDir("trama-ctx-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+  const ctx = createContext(projectDir, { __trama_yield: { reason: "earlier" }, n: 1 }, { print() {} });
+
+  // A directory where the state file goes: writing it fails.
+  mkdirSync(join(projectDir, "state.json"));
+  await assert.rejects(ctx.checkpoint());
+  await assert.rejects(ctx.done("result"));
+  assert.deepEqual(ctx.state, { __trama_yield: { reason: "earlier" }, n: 1 }, "neither the counter nor the yield marker was touched");
+  assert.equal(ctx.iteration, 0);
+
+  // Nothing was settled either: the run can still end either way.
+  rmSync(join(projectDir, "state.json"), { recursive: true });
+  await ctx.yield("later");
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { __trama_yield: { reason: "later" }, n: 1, __trama_iteration: 1 });
+});
+
+test("createContext: done called several times at once is done once", async (t) => {
+  const projectDir = makeTempDir("trama-ctx-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+  const ctx = createContext(projectDir, {}, { print() {} });
+
+  await Promise.all([ctx.done(1), ctx.done(2)]);
+  await ctx.done(3);
+  assert.equal(ctx.iteration, 1);
+  assert.equal(readText(join(projectDir, "logs", "latest.jsonl")).trim().split("\n").length, 1);
+});

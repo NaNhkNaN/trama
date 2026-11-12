@@ -1,5 +1,5 @@
-import { existsSync, realpathSync, lstatSync, readlinkSync } from "fs";
-import { resolve, dirname, sep } from "path";
+import { lstatSync, readlinkSync } from "fs";
+import { dirname, isAbsolute, join, parse, resolve, sep } from "path";
 
 /**
  * Keep file access inside a bounded root directory (a project directory or a
@@ -29,77 +29,107 @@ export function resolveBounded(rootDir: string, relativePath: string): string {
   return resolved;
 }
 
-function verifyRealPath(realPath: string, realRoot: string, originalPath: string): void {
-  if (!isInside(realPath, realRoot)) {
-    throw new Error(`Path escapes project directory via symlink: ${originalPath}`);
+/** The most links followed on the way to one path. More than this is a loop. */
+const MAX_LINKS = 40;
+
+const stepsOf = (path: string) => path.split(sep).filter(Boolean);
+
+/** What a link says, as text — refused if the text is not what the link holds (a name that is not valid UTF-8). */
+function readLink(link: string): string {
+  const raw = readlinkSync(link, "buffer");
+  const text = raw.toString("utf-8");
+  if (!Buffer.from(text, "utf-8").equals(raw)) {
+    throw new Error(`Path escapes project directory via symlink: ${link} (its target is not readable as text)`);
   }
+  return text;
 }
 
 /**
- * Walk up from `resolved` to find the deepest existing ancestor,
- * then verify its real path is inside the root.
- * This catches symlink escapes BEFORE any mkdir side effects.
+ * Where an absolute, normalized path leads once every symlink on the way is
+ * followed — step by step, the way the system itself walks a path. So a ".."
+ * in what a link says is taken from where the walk has got to, which after
+ * another link is not where the text of the path would suggest.
+ *
+ * Like realpath, but through what does not exist yet: a link whose
+ * destination is missing is still followed to where it points — and from
+ * there on, if that is a link too — and once nothing is there, the rest is
+ * taken as it is named. This is where a write to the path lands, and where a
+ * mkdir on the way to it creates directories.
  */
-function verifyNearestAncestor(resolved: string, realRoot: string, originalPath: string): void {
-  let cur = resolved;
-  while (!existsSync(cur)) {
-    const parent = dirname(cur);
-    if (parent === cur) return; // reached filesystem root — nothing to verify
-    cur = parent;
+export function destinationOf(path: string): string {
+  let at = parse(path).root;     // always free of links
+  let steps = stepsOf(path.slice(at.length));
+  let links = 0;
+  let missing = false;           // nothing is there from here on, so nothing is a link either
+  while (steps.length > 0) {
+    const step = steps.shift()!;
+    if (step === ".") continue;
+    if (step === "..") {
+      // Up from something that is not there leads nowhere the system would go.
+      if (missing) throw new Error(`Path escapes project directory via symlink: ${path} (it leads up from what does not exist)`);
+      at = dirname(at);
+      continue;
+    }
+    const next = join(at, step);
+    if (missing) {
+      at = next;
+      continue;
+    }
+    let isLink: boolean;
+    try {
+      isLink = lstatSync(next).isSymbolicLink();
+    } catch (e) {
+      const code = (e as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw e;
+      missing = true;
+      at = next;
+      continue;
+    }
+    if (!isLink) {
+      at = next;
+      continue;
+    }
+    if (++links > MAX_LINKS) throw new Error(`Too many levels of symbolic links: ${path}`);
+    const target = readLink(next);
+    if (isAbsolute(target)) at = parse(target).root;
+    steps = [...stepsOf(target), ...steps];
   }
-  verifyRealPath(realpathSync(cur), realRoot, originalPath);
+  return at;
 }
 
-/**
- * Verify that an existing symlink's target resolves inside the root.
- * For dangling symlinks, falls back to verifyNearestAncestor on the link target.
- */
-function verifySymlink(target: string, realRoot: string, originalPath: string): void {
-  try {
-    verifyRealPath(realpathSync(target), realRoot, originalPath);
-  } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-    // Dangling symlink — resolve what we can via nearest existing ancestor
-    const linkDest = resolve(dirname(target), readlinkSync(target));
-    verifyNearestAncestor(linkDest, realRoot, originalPath);
-  }
-}
-
-/** The real (symlink-resolved) location of a root directory, or its normalized path if it doesn't exist yet. */
+/** The real (symlink-resolved) location of a root directory, whether or not it exists yet. */
 export function realRootOf(rootDir: string): string {
-  const normalizedDir = resolve(rootDir);
-  try { return realpathSync(normalizedDir); } catch { return normalizedDir; }
+  return destinationOf(resolve(rootDir));
+}
+
+/** A path under a root, as it is named and as where it leads — refused if either is outside the root. */
+function guarded(rootDir: string, relativePath: string): { resolved: string; destination: string } {
+  const resolved = resolveBounded(rootDir, relativePath);
+  const destination = destinationOf(resolved);
+  if (!isInside(destination, realRootOf(rootDir))) {
+    throw new Error(`Path escapes project directory via symlink: ${relativePath}`);
+  }
+  return { resolved, destination };
 }
 
 /**
  * The guard for reading or writing a path under a bounded root.
- * Checks both the logical path (".." segments) and symlink resolution,
- * and returns the resolved absolute path.
+ * Checks both the logical path (".." segments) and where symlinks lead —
+ * every link on the way, whether or not its destination exists — and returns
+ * the resolved absolute path.
  *
- * For paths that don't exist yet, checks the nearest existing ancestor —
- * so a caller can safely mkdir and write afterwards.
+ * A path that does not exist yet is checked as far as it does, so a caller can
+ * safely mkdir and write afterwards.
  */
 export function guardPath(rootDir: string, relativePath: string): string {
-  const realRoot = realRootOf(rootDir);
-  const resolved = resolveBounded(rootDir, relativePath);
+  return guarded(rootDir, relativePath).resolved;
+}
 
-  // Use lstatSync (not existsSync) to detect dangling symlinks.
-  // existsSync returns false for dangling symlinks, which would skip the
-  // symlink check and allow writes to follow the link to an external target.
-  let stat;
-  try { stat = lstatSync(resolved); } catch (e) {
-    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-    // Path truly doesn't exist (not even as a dangling symlink)
-    // — verify nearest ancestor is inside the root
-    verifyNearestAncestor(resolved, realRoot, relativePath);
-    return resolved;
-  }
-
-  if (stat.isSymbolicLink()) {
-    verifySymlink(resolved, realRoot, relativePath);
-  } else {
-    verifyRealPath(realpathSync(resolved), realRoot, relativePath);
-  }
-
-  return resolved;
+/**
+ * Like `guardPath`, but returns where the path leads rather than the path
+ * itself — for a write that replaces its target (temp file and rename), which
+ * must replace what the links point at, not a link on the way.
+ */
+export function guardWriteTarget(rootDir: string, relativePath: string): string {
+  return guarded(rootDir, relativePath).destination;
 }

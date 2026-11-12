@@ -7,7 +7,7 @@ import { timingSafeEqual } from "crypto";
 import type { Ctx, Agent, Tools, Workspace } from "./types.js";
 import type { ProgramResult, RunRequest } from "./runner-types.js";
 import type { Journal } from "./journal.js";
-import { assertSerializable } from "./serializable.js";
+import { assertSerializable, isJsonObject } from "./serializable.js";
 
 const MAX_IPC_BODY = 50 * 1024 * 1024; // 50 MB
 
@@ -54,8 +54,6 @@ export interface IpcBackends {
   onTerminalSignal(result: ProgramResult): void;
 }
 
-const isPlainObject = (v: unknown) => typeof v === "object" && v !== null && !Array.isArray(v);
-
 function validate(body: Body, fields: Record<string, FieldType>): void {
   for (const [name, type] of Object.entries(fields)) {
     const value = body[name];
@@ -66,7 +64,7 @@ function validate(body: Body, fields: Record<string, FieldType>): void {
       continue;
     }
     const expected = optional ? type.slice("optional ".length) : type;
-    if (expected === "object" ? !isPlainObject(value) : typeof value !== expected) {
+    if (expected === "object" ? !isJsonObject(value) : typeof value !== expected) {
       throw new BadRequest(optional
         ? `Invalid field: ${name} (expected ${expected} or undefined)`
         : `Missing or invalid field: ${name} (expected ${expected})`);
@@ -95,7 +93,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, onTermina
   /** The workspace a call is about: the directory it names, or else the one this run was started with. */
   const workspaceOf = (body: Body): Workspace => {
     if (body.dir !== undefined) {
-      if (typeof body.dir !== "string" || body.dir === "") throw new BadRequest("Invalid field: dir (expected a directory path)");
+      if (body.dir === "") throw new BadRequest("Invalid field: dir (expected a directory path)");
       return workspaceAt(body.dir);
     }
     if (!workspace) throw new BadRequest("Workspace is only available when running in a session");
@@ -192,14 +190,20 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, onTermina
       },
     },
 
-    "/workspace/read": { fields: { path: "string" }, handle: b => workspaceOf(b).read(b.path) },
+    "/workspace/read": {
+      fields: { path: "string", dir: "optional string" },
+      handle: b => workspaceOf(b).read(b.path),
+    },
     "/workspace/write": {
-      fields: { path: "string", content: "string" },
+      fields: { path: "string", content: "string", dir: "optional string" },
       handle: b => workspaceOf(b).write(b.path, b.content),
     },
-    "/workspace/list": { fields: { pattern: "string" }, handle: b => workspaceOf(b).list(b.pattern) },
+    "/workspace/list": {
+      fields: { pattern: "string", dir: "optional string" },
+      handle: b => workspaceOf(b).list(b.pattern),
+    },
     "/workspace/observe": {
-      fields: { pattern: "string" },
+      fields: { pattern: "string", dir: "optional string" },
       handle: b => workspaceOf(b).observe(b.pattern, { expect: b.expect, timeout: b.timeout }),
     },
   };
@@ -270,6 +274,7 @@ export function listen(server: Server): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
+      server.removeListener("error", reject);
       const addr = server.address();
       if (addr && typeof addr === "object") resolve(addr.port);
       else reject(new Error("Failed to get server port"));

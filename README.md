@@ -120,7 +120,7 @@ trama run counter         # prints 3
 
 ## The bigger picture
 
-trama is small — five CLI commands, three packages. But the thing it enables is not small.
+trama is small — six CLI commands, three packages. But the thing it enables is not small.
 
 ### No ceiling
 
@@ -568,9 +568,10 @@ trama run scraper
 trama update scraper "also include the comment count for each story"
 trama list
 trama logs scraper
+trama journal scraper
 ```
 
-Five commands. `create` turns intent into code, `run` executes it, `update` rewrites it. `list` and `logs` for visibility. Projects are stored at `~/.trama/projects/{name}/`.
+Six commands. `create` turns intent into code, `run` executes it, `update` rewrites it. `list`, `logs`, and `journal` for visibility. Projects are stored at `~/.trama/projects/{name}/`.
 
 ### CLI reference
 
@@ -661,7 +662,7 @@ await tools.fetch(url, { method?, headers?, body? })
                                           // -> { status, body, headers }
 ```
 
-`read` and `write` are path-guarded to the project directory (traversal and symlink escape attempts throw). `shell` defaults to a 30-second timeout; pass `{ timeout: 60000 }` for longer commands. A command is given no input: one that reads standard input finds it at an end. `fetch` returns the response body as a string (capped at 10MB).
+`read` and `write` are path-guarded to the project directory (traversal and symlink escape attempts throw — every link on the way to a path is followed, whether or not what it points at exists yet). `shell` defaults to a 30-second timeout; pass `{ timeout: 60000 }` for longer commands. A command is given no input: one that reads standard input finds it at an end. `fetch` returns the response body as a string (capped at 10MB).
 
 Long-running programs should call `ctx.ready()` once startup completes so `create`/`update` smoke validation can treat "server is up" as success instead of waiting for process exit.
 
@@ -837,4 +838,4 @@ trama uses [pi](https://github.com/earendil-works/pi) as its intelligence substr
 
 ## Status
 
-Early development. Three packages (`runtime`, `session`, `cli`), five CLI commands, four runtime objects (`ctx`, `agent`, `tools`, `workspace`). The single-agent runtime is stable. The session layer (`@trama-dev/session`) for multi-agent coordination is functional — workspace I/O, cooperative yield/resume, and structured program results are implemented and tested. What comes next is shaped by what people build with it.
+Early development. Three packages (`runtime`, `session`, `cli`), six CLI commands, four runtime objects (`ctx`, `agent`, `tools`, `workspace`). The single-agent runtime is stable. The session layer (`@trama-dev/session`) for multi-agent coordination is functional — workspace I/O, cooperative yield/resume, and structured program results are implemented and tested. What comes next is shaped by what people build with it.

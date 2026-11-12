@@ -2,6 +2,29 @@
 
 All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`) are released together under one version.
 
+## Unreleased
+
+### Fixed
+
+- **A file could be written outside the project through two links.** With `first` a link to `second`, and `second` a link to a file outside the project that did not exist yet, `tools.write("first", …)` created that file. The guard followed only one link whose destination was missing, and looked for the nearest existing directory with a check that cannot see such a link — so a path below a directory link pointing outside and at nothing passed too. It now follows every link on the way to a path, whether or not what it points at exists, and refuses links that lead back to themselves. `workspace.write` was not led outside, but through a chain of links it replaced the link in the middle with the file; it now writes where the chain ends.
+- **A file outside the project could be read through a link whose target goes up after another link.** With `here` a link to `.` and `a` a link to `here/../secret.txt`, every link points inside the project as text — but the system takes `..` from where `here` leads, and reads the file beside the project. `tools.read`, `workspace.read`, `workspace.observe`, a `shell` `cwd`, and the runtime's own files (`state.json`, `history/`, `.gitignore`) all went by the text. The guard now walks a path the way the system does, one step at a time, and `workspace.list` resolves links the same way, so what is listed is what can be read. A link target that is not valid UTF-8 is refused rather than guessed at.
+- **A `create` or `update` that fails while installing the program leaves the project as it was.** The new program is written beside the old one, the version is recorded in `history/`, and only then does the new program take the old one's place, in one move — and if any of that fails, what was done is taken back. Before, `program.ts` was overwritten first: a `create` whose version could not be recorded left a program installed that was not in the history, and a write cut short left half a program. A `program.ts` its owner has made read-only is still not replaced. Taking a version back never removes what another run of the project recorded in the meantime, and a version is never written over a version file that is already there. The message of a failed `update` now says the program is unchanged — which is what it can promise — where it said the project was.
+- **`agent.generate` with a schema type it does not support fails before asking.** It used to ask the model, find that no reply could satisfy the schema, ask again, and only then report the schema.
+- **A `meta.json` that is not JSON, or has no `input` object, is reported as that,** naming the file and what it needs to hold, rather than as a syntax or type error from wherever its contents were first used.
+- **A state that cannot be written leaves `ctx` as it was.** A failed `checkpoint()`, `done()` or `yield()` had already advanced the iteration marker and cleared or set the yield marker in `ctx.state` before the write failed.
+- A stop asked for with a signal that had already fired when it was handed over now takes effect; it was only listened for from then on.
+- `workspace.write` that cannot put its file in place no longer leaves its temp file in the workspace, and refuses the workspace itself as an artifact path (`""`, `"."`) instead of briefly creating a temp file beside it. The timeout of `workspace.observe` is measured on a clock that cannot be set.
+
+### Added
+
+- **The types of the program-facing API can be imported from `@trama-dev/runtime`:** `Ctx`, `Agent`, `Tools`, `ShellResult`, `Workspace`, `ObserveResult`. The API reference shown to the model has always declared them there; only the values were exported.
+
+### Changed
+
+- `tools.write` through a link to a file in a directory that does not exist yet creates the directory, as `workspace.write` does. It used to fail.
+- `create` and `update` put the new program in place by renaming a new file over `program.ts` rather than writing into it. The file keeps its permissions; a second hard link to the old file keeps the old content.
+- Internal, no change in behaviour: one cancellation helper (`abort.ts`) in place of five hand-written listeners; `ctx.done()` without its in-flight lock, now that persisting is one synchronous step; one reader for `meta.json`; one place that decides where a write through links lands.
+
 ## 0.4.0 — 2026-11-11
 
 ### Added

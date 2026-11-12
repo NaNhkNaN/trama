@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, readFileSync, writeFileSync, mkdirSync, symlinkSync } from "fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, symlinkSync } from "fs";
 import { join } from "path";
 import { createWorkspace } from "../packages/runtime/dist/workspace.js";
 import { cleanupTempDir, makeTempDir, writeText } from "./helpers.mjs";
@@ -417,4 +417,26 @@ test("workspace creates directory if it does not exist", async (t) => {
 
   await ws.write("test.txt", "created");
   assert.equal(await ws.read("test.txt"), "created");
+});
+
+test("workspace.write that cannot put its file in place leaves no temp file behind", async (t) => {
+  const wsDir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(wsDir));
+  mkdirSync(join(wsDir, "taken")); // a directory where the artifact would go
+
+  await assert.rejects(createWorkspace(wsDir).write("taken", "content"));
+  assert.deepEqual(readdirSync(wsDir), ["taken"]);
+});
+
+test("workspace.write refuses the workspace itself as an artifact, and puts nothing beside it", async (t) => {
+  const parent = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(parent));
+  const wsDir = join(parent, "ws");
+  const workspace = createWorkspace(wsDir);
+  symlinkSync(".", join(wsDir, "self"));
+
+  for (const path of ["", ".", "self"]) {
+    await assert.rejects(workspace.write(path, "content"), /is the workspace itself/);
+  }
+  assert.deepEqual(readdirSync(parent), ["ws"]);
 });

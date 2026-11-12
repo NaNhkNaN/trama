@@ -4,6 +4,7 @@ import {
   readdirSync, copyFileSync, mkdirSync, existsSync, statSync,
   symlinkSync, rmSync, lstatSync, readlinkSync,
   cpSync, mkdtempSync, openSync, closeSync, realpathSync,
+  accessSync, chmodSync, constants, renameSync, truncateSync,
 } from "fs";
 import { join, dirname, relative } from "path";
 import { homedir, tmpdir } from "os";
@@ -11,13 +12,16 @@ import { fileURLToPath } from "url";
 import { createHash, randomBytes } from "crypto";
 import type { ShellResult, Workspace } from "./types.js";
 import type { RunOptions, TramaConfig, ProgramResult } from "./runner-types.js";
-import { rejectOnAbort, type AgentBackend } from "./agent-backend.js";
+import { onAbort, rejectOnAbort } from "./abort.js";
+import type { AgentBackend } from "./agent-backend.js";
 import { PiAdapter } from "./pi-adapter.js";
-import { createContext } from "./context.js";
+import { LATEST_LOG_PATH, appendLogEntry, createContext } from "./context.js";
 import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
-import { guardPath } from "./path-guard.js";
+import { guardPath, guardWriteTarget } from "./path-guard.js";
+import { readProjectMeta } from "./meta.js";
+import { isJsonObject } from "./serializable.js";
 import { createAllowance, superviseChild, type ChildExit } from "./child-process.js";
 import { removeTempDir, removeWithThisProcess, requireWatchdog, stopGroups, stopWithThisProcess } from "./stopping.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
@@ -97,17 +101,16 @@ function ensureModulePackageJson(projectDir: string): void {
       `Parse error: ${err instanceof Error ? err.message : err}`
     );
   }
-  if (typeof pkg !== "object" || pkg === null || Array.isArray(pkg)) {
+  if (!isJsonObject(pkg)) {
     throw new Error(
       `Malformed package.json at ${pkgPath} — expected a JSON object but got ${
         Array.isArray(pkg) ? "an array" : typeof pkg
       }. ${advice}`
     );
   }
-  const pkgObj = pkg as Record<string, unknown>;
-  if (pkgObj.type !== "module") {
-    pkgObj.type = "module";
-    writeFileSync(pkgPath, JSON.stringify(pkgObj, null, 2));
+  if (pkg.type !== "module") {
+    pkg.type = "module";
+    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
   }
 }
 
@@ -183,14 +186,14 @@ export function loadConfig(): TramaConfig {
       `Parse error: ${err instanceof Error ? err.message : err}`
     );
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+  if (!isJsonObject(parsed)) {
     throw new Error(
       `Malformed config at ${configPath} — expected a JSON object but got ${
         Array.isArray(parsed) ? "an array" : typeof parsed
       }. Fix or delete it to proceed.`
     );
   }
-  const merged: TramaConfig = { ...defaults, ...(parsed as Record<string, unknown>) };
+  const merged: TramaConfig = { ...defaults, ...parsed };
   const s = (v: unknown) => typeof v === "string" && v.length > 0;
   const pint = (v: unknown) => Number.isInteger(v) && (v as number) > 0;
   const checks: Array<[boolean, string]> = [
@@ -208,9 +211,8 @@ export function loadConfig(): TramaConfig {
 }
 
 /** The global config, with the model/provider a project was created with taking precedence. */
-export function loadProjectConfig(projectDir: string): TramaConfig {
+export function loadProjectConfig(projectDir: string, meta = readProjectMeta(projectDir)): TramaConfig {
   const config = loadConfig();
-  const meta = JSON.parse(readFileSync(guardPath(projectDir, "meta.json"), "utf-8"));
   if (meta.model) config.model = meta.model;
   if (meta.provider) config.provider = meta.provider;
   return config;
@@ -229,54 +231,101 @@ export function createBackend(config: TramaConfig): AgentBackend {
 
 export function loadState(projectDir: string): Record<string, unknown> {
   const statePath = guardPath(projectDir, "state.json");
-  if (!existsSync(statePath)) return {};
-  const raw = readFileSync(statePath, "utf-8");
-  const fail = (reason: string): never => {
+  let raw: string;
+  try {
+    raw = readFileSync(statePath, "utf-8");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
+    throw err;
+  }
+  function fail(reason: string): never {
     throw new Error(
       `Corrupt state.json in ${projectDir} — cannot safely continue.\n${reason}\n` +
       `Back up or delete state.json to reset state.`
     );
-  };
+  }
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch (err) {
     fail(`Parse error: ${err instanceof Error ? err.message : err}`);
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+  if (!isJsonObject(parsed)) {
     fail(`Expected a JSON object but got ${Array.isArray(parsed) ? "array" : typeof parsed}.`);
   }
-  return parsed as Record<string, unknown>;
+  return parsed;
 }
 
 // --- History management ---
-
-/** Append one metadata line to history/index.jsonl. */
-function appendHistoryIndex(projectDir: string, entry: Record<string, unknown>): void {
-  appendFileSync(guardPath(projectDir, join("history", "index.jsonl")), JSON.stringify(entry) + "\n");
-}
 
 /** The index.jsonl field that carries the detail for each kind of versioned change. */
 const HISTORY_DETAIL_FIELD: Record<string, string> = { create: "prompt", update: "prompt", repair: "error" };
 
 /**
- * Save the current program.ts as the next version: copy it to history/NNNN.ts
- * and record why in index.jsonl.
- *
- * (See installValidatedProgram for how a create or update is recorded.)
+ * Add a version to a project's history: its text as history/NNNN.ts, and a
+ * line in index.jsonl saying why (after `notes`, lines that belong with it).
+ * Either all of it is written or none of it. Returns how to take it back, for
+ * a caller whose own next step may still fail.
  */
-export function copyToHistory(projectDir: string, reason: string, detail?: string) {
+function recordVersion(
+  projectDir: string,
+  source: string | Buffer,
+  reason: string,
+  detail?: string,
+  notes: Array<Record<string, unknown>> = [],
+): () => void {
   const historyDir = guardPath(projectDir, "history");
+  const indexPath = guardPath(projectDir, join("history", "index.jsonl"));
   const versions = readdirSync(historyDir)
     .filter(f => /^\d+\.ts$/.test(f))
     .map(f => parseInt(f, 10));
   const version = versions.reduce((a, b) => Math.max(a, b), 0) + 1;
-  const fileName = `${String(version).padStart(4, "0")}.ts`;
-
-  copyFileSync(guardPath(projectDir, "program.ts"), guardPath(projectDir, join("history", fileName)));
+  const snapshot = guardPath(projectDir, join("history", `${String(version).padStart(4, "0")}.ts`));
 
   const entry: Record<string, unknown> = { version, reason, timestamp: new Date().toISOString() };
   const detailField = HISTORY_DETAIL_FIELD[reason];
   if (detailField && detail) entry[detailField] = detail;
-  appendHistoryIndex(projectDir, entry);
+
+  const lines = Buffer.from([...notes, entry].map(line => JSON.stringify(line) + "\n").join(""));
+  const sizeBefore = statSync(indexPath, { throwIfNoEntry: false })?.size;
+  let wroteSnapshot = false;
+
+  // Takes back what was written here and nothing else. Another run of the
+  // project may be recording a version of its own at the same moment: if the
+  // index no longer ends with these lines alone, they are left in it, and the
+  // version file with them — a version on record that was never installed,
+  // rather than someone else's record cut out of the history.
+  const undo = () => {
+    try {
+      const index = readFileSync(indexPath);
+      const start = sizeBefore ?? 0;
+      const sinceThen = index.subarray(Math.min(start, index.length));
+      // What was appended is the end of the index — whole, or as far as a failed write got.
+      const cutTo = index.subarray(-lines.length).equals(lines) ? index.length - lines.length
+        : lines.subarray(0, sinceThen.length).equals(sinceThen) ? start
+        : null;
+      if (cutTo === null) return;
+      if (cutTo === 0 && sizeBefore === undefined) rmSync(indexPath, { force: true });
+      else if (cutTo < index.length) truncateSync(indexPath, cutTo);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") return; // cannot tell: leave everything
+    }
+    if (wroteSnapshot) try { rmSync(snapshot, { force: true }); } catch { /* best-effort */ }
+  };
+  try {
+    // Never over a version file that is already there: that one is someone else's.
+    const fd = openSync(snapshot, "wx");
+    wroteSnapshot = true;
+    try { writeFileSync(fd, source); } finally { closeSync(fd); }
+    appendFileSync(indexPath, lines);
+  } catch (err) {
+    undo();
+    throw err;
+  }
+  return undo;
+}
+
+/** Save the current program.ts as the next version of the project, and record why. */
+export function copyToHistory(projectDir: string, reason: string, detail?: string): void {
+  recordVersion(projectDir, readFileSync(guardPath(projectDir, "program.ts")), reason, detail);
 }
 
 // --- Staging: run against a copy, merge back what worked ---
@@ -588,7 +637,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   });
   // Truncate logs only after preflight succeeds — preserves the prior run's
   // diagnostics if scaffolding, state loading, or context creation fails.
-  writeFileSync(guardPath(projectDir, join("logs", "latest.jsonl")), "");
+  writeFileSync(guardPath(projectDir, LATEST_LOG_PATH), "");
 
   // The program's own time. It stops while a run the program asked for is in flight.
   const allowance = createAllowance(timeout);
@@ -665,7 +714,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     runEnded.abort();
     if (programGroup) void stopGroups([programGroup]);
   };
-  signal?.addEventListener("abort", stopProgram, { once: true });
+  const offStop = onAbort(signal, stopProgram);
   try {
     const { child, exited } = await withTempDir("trama-init-", async (initDir) => {
       const port = await listen(server);
@@ -743,7 +792,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     // them — and stop what is left of its process group and of its shell
     // commands. Only once they are gone is the run over: whoever called will
     // merge or delete what they were writing to.
-    signal?.removeEventListener("abort", stopProgram);
+    offStop();
     out?.flush();
     err?.flush();
     if (readyTimer) clearTimeout(readyTimer);
@@ -970,13 +1019,31 @@ export function installValidatedProgram(
   reason: "create" | "update",
   prompt: string,
 ): void {
-  writeFileSync(guardPath(projectDir, "program.ts"), validated.source);
-  if (validated.repairedError) {
-    appendHistoryIndex(projectDir, {
-      reason: `${reason}-repair`, timestamp: new Date().toISOString(), error: validated.repairedError,
-    });
+  // Three steps, ordered so that a failure at any of them leaves the project
+  // as it was: the new program is written beside the old one (nothing else is
+  // touched if even that cannot be done), the version is recorded, and only
+  // then does the new program take the old one's place — in one move, so
+  // program.ts is never half-written, and never a program that is not on record.
+  // (It is a new file that takes the place: the old one's permissions are
+  // carried over, but not a second hard link to it, or its owner.)
+  const programPath = guardWriteTarget(projectDir, "program.ts");
+  const current = statSync(programPath, { throwIfNoEntry: false });
+  // A program its owner has made read-only is not replaced: a rename would not ask.
+  if (current) accessSync(programPath, constants.W_OK);
+  const pending = `${programPath}.trama-new-${process.pid}`;
+  let unrecord = () => {};
+  try {
+    writeFileSync(pending, validated.source);
+    if (current) chmodSync(pending, current.mode & 0o777);
+    unrecord = recordVersion(projectDir, validated.source, reason, prompt, validated.repairedError
+      ? [{ reason: `${reason}-repair`, timestamp: new Date().toISOString(), error: validated.repairedError }]
+      : []);
+    renameSync(pending, programPath);
+  } catch (err) {
+    unrecord();
+    try { rmSync(pending, { force: true }); } catch { /* best-effort */ }
+    throw err;
   }
-  copyToHistory(projectDir, reason, prompt);
 }
 
 // --- Core execution ---
@@ -1072,9 +1139,9 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   if (repair) {
     // The program is fixed and has run; failing to write this down must not turn that into an error.
     try {
-      const entry = { ts: Date.now(), message: `Repair attempt ${repair.attempt}/${maxRepairAttempts}`, data: { error: repair.error } };
-      appendFileSync(guardPath(projectDir, join("logs", "latest.jsonl")), JSON.stringify(entry) + "\n");
-      console.log(tagged(options.label, `[trama] Repair attempt ${repair.attempt}/${maxRepairAttempts}`));
+      const message = `Repair attempt ${repair.attempt}/${maxRepairAttempts}`;
+      appendLogEntry(guardPath(projectDir, LATEST_LOG_PATH), message, { error: repair.error });
+      console.log(tagged(options.label, `[trama] ${message}`));
       copyToHistory(projectDir, "repair", repair.error);
     } catch (err) {
       console.warn(tagged(options.label, `[trama] repair bookkeeping failed: ${err instanceof Error ? err.message : err}`));

@@ -8,7 +8,7 @@ The CLI for [trama](https://github.com/NaNhkNaN/trama) — the agentic runtime t
 npm install -g @trama-dev/cli
 ```
 
-Five commands. That's the whole interface.
+Six commands. That's the whole interface.
 
 ```bash
 trama create optimizer "improve sort.ts by benchmarking alternatives"
@@ -16,6 +16,7 @@ trama run optimizer
 trama update optimizer "also track memory usage"
 trama list
 trama logs optimizer
+trama journal optimizer
 ```
 
 `create` generates a complete agent program from one sentence. `run` executes it — with auto-repair if it crashes. `update` rewrites it with new requirements. The output is real TypeScript you can read, diff, and share. Anyone can `git clone && trama run`.

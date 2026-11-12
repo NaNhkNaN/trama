@@ -1,5 +1,6 @@
 import type { ChildProcess } from "child_process";
 import { StringDecoder } from "string_decoder";
+import { onAbort } from "./abort.js";
 import { stopGroups } from "./stopping.js";
 
 const MAX_OUTPUT = 10 * 1024 * 1024; // 10 MB
@@ -136,12 +137,11 @@ export function superviseChild(child: ChildProcess, options: SuperviseOptions): 
     // A child that failed to spawn has no pid, and nothing to stop.
     const terminate = () => { if (child.pid) void stopGroups([child.pid]); };
 
-    const onStopRequest = () => {
+    const offStop = onAbort(stopSignal, () => {
       if (exited || stopped || timedOut) return;
       stopped = true;
       terminate();
-    };
-    stopSignal?.addEventListener("abort", onStopRequest, { once: true });
+    });
 
     allowance.start(() => {
       if (exited) return;
@@ -152,7 +152,7 @@ export function superviseChild(child: ChildProcess, options: SuperviseOptions): 
     const cleanup = () => {
       allowance.cancel();
       if (drainTimer) clearTimeout(drainTimer);
-      stopSignal?.removeEventListener("abort", onStopRequest);
+      offStop();
     };
 
     child.stdout?.on("data", (chunk: Buffer) => emitOut(outDecoder.write(chunk)));

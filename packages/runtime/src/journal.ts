@@ -17,6 +17,7 @@ import { appendFileSync, closeSync, mkdirSync, openSync, readSync, readdirSync, 
 import { createHash, randomBytes } from "crypto";
 import { join } from "path";
 import { guardPath } from "./path-guard.js";
+import { isJsonObject } from "./serializable.js";
 
 /** The format of the records. Bump it when a reader of older journals would be misled. */
 export const JOURNAL_VERSION = 1;
@@ -159,7 +160,7 @@ function redactHeaders(headers: unknown): unknown {
     return headers.map(pair =>
       Array.isArray(pair) && typeof pair[0] === "string" && isSecretHeader(pair[0]) ? [pair[0], "[redacted]"] : pair);
   }
-  if (typeof headers !== "object" || headers === null) return headers;
+  if (!isJsonObject(headers)) return headers;
   return Object.fromEntries(
     Object.entries(headers).map(([name, value]) => [name, isSecretHeader(name) ? "[redacted]" : value]),
   );
@@ -172,8 +173,8 @@ function redactHeaders(headers: unknown): unknown {
  * like the rest: the journal cannot tell.
  */
 function recordable(endpoint: string, value: unknown): unknown {
-  if (endpoint === "/tools/fetch" && typeof value === "object" && value !== null && "headers" in value) {
-    return { ...value, headers: redactHeaders((value as { headers: unknown }).headers) };
+  if (endpoint === "/tools/fetch" && isJsonObject(value) && "headers" in value) {
+    return { ...value, headers: redactHeaders(value.headers) };
   }
   return value;
 }
@@ -272,6 +273,7 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
   let path: string;
   try {
     mkdirSync(guardPath(projectDir, JOURNAL_DIR), { recursive: true });
+    // Named as the reader names it: a journal is recognised as still being written by its path.
     const dir = journalDirOf(projectDir);
     makeRoom(dir, keep);
     path = journalIn(dir, run);

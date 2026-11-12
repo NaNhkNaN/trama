@@ -5,6 +5,7 @@
 
 import { readFileSync } from "fs";
 import { JOURNAL_VERSION, journalDirOf, journalIn, runsIn, stillBeingWritten } from "./journal.js";
+import { isJsonObject } from "./serializable.js";
 
 type JournalRecord = { kind: string; at: number } & Record<string, any>;
 
@@ -21,7 +22,7 @@ function readJournal(path: string): JournalRecord[] {
     if (!line) continue;
     try {
       const record = JSON.parse(line);
-      if (typeof record === "object" && record !== null) records.push(record);
+      if (isJsonObject(record)) records.push(record as JournalRecord);
     } catch { /* not a whole record */ }
   }
   return records;
@@ -51,7 +52,8 @@ function ending(path: string, records: JournalRecord[]): string {
 
 function printJournal(path: string, records: JournalRecord[]): void {
   const head = records[0];
-  console.log(`${head?.run ?? "?"}  ${head?.purpose ?? ""}${head?.label ? ` [${head.label}]` : ""}  ${ending(path, records)}`);
+  const howEnded = ending(path, records);
+  console.log(`${head?.run ?? "?"}  ${head?.purpose ?? ""}${head?.label ? ` [${head.label}]` : ""}  ${howEnded}`);
   if (head && head.v !== JOURNAL_VERSION) {
     console.log(`(recorded in format ${head.v}; this trama reads format ${JOURNAL_VERSION}, and shows what it can make of it)`);
   }
@@ -96,7 +98,7 @@ function printJournal(path: string, records: JournalRecord[]): void {
         console.log(`${at}  the journal is full: calls from here on were not recorded`);
         break;
       case "end":
-        console.log(`${at}  end: ${ending(path, records)}`);
+        console.log(`${at}  end: ${howEnded}`);
         break;
     }
   }
@@ -129,5 +131,6 @@ export function printJournals(projectDir: string, name: string, options: { run?:
   if (!runs.includes(run)) {
     throw new Error(`No journal for run "${run}". \`trama journal ${name} --list\` shows the runs that have one.`);
   }
-  printJournal(journalIn(dir, run), readJournal(journalIn(dir, run)));
+  const path = journalIn(dir, run);
+  printJournal(path, readJournal(path));
 }

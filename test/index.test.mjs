@@ -525,7 +525,7 @@ test("updateProject restores original program.ts when validation fails", async (
     await withEnv({ HOME: fakeHome }, async () => {
       await assert.rejects(
         async () => updateProject("gamma", "break it"),
-        /the project is unchanged/,
+        /the program is unchanged/,
       );
     });
   } finally {
@@ -568,7 +568,7 @@ throw new Error("boom");
     await withEnv({ HOME: fakeHome }, async () => {
       await assert.rejects(
         async () => updateProject("delta", "break state"),
-        /the project is unchanged/,
+        /the program is unchanged/,
       );
     });
   } finally {
@@ -609,7 +609,7 @@ throw new Error("boom");
     await withEnv({ HOME: fakeHome }, async () => {
       await assert.rejects(
         async () => updateProject("epsilon", "leave files"),
-        /the project is unchanged/,
+        /the program is unchanged/,
       );
     });
   } finally {
@@ -650,7 +650,7 @@ test("updateProject records no repair in history when the update fails", async (
     await withEnv({ HOME: fakeHome }, async () => {
       await assert.rejects(
         async () => updateProject("zeta", "break history"),
-        /the project is unchanged/,
+        /the program is unchanged/,
       );
     });
   } finally {
