@@ -460,3 +460,27 @@ test("workspace.write creates its temp file, and does not write through one that
   assert.equal(readFileSync(join(parent, "victim.txt"), "utf-8"), "VICTIM");
   assert.equal(existsSync(join(wsDir, "note.txt")), false);
 });
+
+test("a temp file left by a write that was cut off is not an artifact", async (t) => {
+  const wsDir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(wsDir));
+  const workspace = createWorkspace(wsDir);
+  await workspace.write("report.md", "whole");
+  // What a runner killed between writing and moving leaves behind.
+  writeFileSync(join(wsDir, "report.md.trama-tmp-0123456789ab"), "half of");
+
+  assert.deepEqual(await workspace.list("**"), ["report.md"]);
+  assert.deepEqual(await workspace.observe("report*", { timeout: 0 }), [{ path: "report.md", content: "whole" }]);
+});
+
+test("workspace.write keeps the permissions of the artifact it replaces", async (t) => {
+  const wsDir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(wsDir));
+  const workspace = createWorkspace(wsDir);
+  writeFileSync(join(wsDir, "run.sh"), "old", { mode: 0o755 });
+
+  await workspace.write("run.sh", "new");
+  const { statSync } = await import("fs");
+  assert.equal(statSync(join(wsDir, "run.sh")).mode & 0o777, 0o755);
+  assert.equal(readFileSync(join(wsDir, "run.sh"), "utf-8"), "new");
+});

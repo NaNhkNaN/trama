@@ -188,7 +188,9 @@ export function loadConfig(): TramaConfig {
       `Malformed config at ${configPath} — expected a JSON object but got ${describeJson(parsed)}. Fix or delete it to proceed.`
     );
   }
-  return checkedConfig({ ...defaults, ...parsed }, "config");
+  // null is how JSON says a field is not there.
+  const given = Object.fromEntries(Object.entries(parsed).filter(([, value]) => value !== null));
+  return checkedConfig({ ...defaults, ...given }, "config");
 }
 
 /** A config that holds what the runtime can work with — or an error naming what does not, and where it came from. */
@@ -289,6 +291,7 @@ function recordVersion(
   const lines = Buffer.from([...notes, entry].map(line => JSON.stringify(line) + "\n").join(""));
   const sizeBefore = statSync(indexPath, { throwIfNoEntry: false })?.size;
   let wroteSnapshot = false;
+  let appended = false;
 
   // Takes back what was written here and nothing else. Another run of the
   // project may be recording a version of its own at the same moment: if the
@@ -308,7 +311,9 @@ function recordVersion(
       if (cutTo === 0 && sizeBefore === undefined) rmSync(indexPath, { force: true });
       else if (cutTo < index.length) truncateSync(indexPath, cutTo);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") return; // cannot tell: leave everything
+      // The index cannot be looked at. If the lines went into it, they stay,
+      // and the version file with them; if they never did, there is only the file.
+      if (appended && (err as NodeJS.ErrnoException).code !== "ENOENT") return;
     }
     if (wroteSnapshot) try { rmSync(snapshot, { force: true }); } catch { /* best-effort */ }
   };
@@ -318,6 +323,7 @@ function recordVersion(
     wroteSnapshot = true;
     try { writeFileSync(fd, source); } finally { closeSync(fd); }
     appendFileSync(indexPath, lines);
+    appended = true;
   } catch (err) {
     undo();
     throw err;
@@ -372,12 +378,15 @@ const sameStat = (a: { size: number; mtimeMs: number }, b: { size: number; mtime
  * - Modified: copied only if the real file still matches realSeed.
  * - Deleted: deleted only if the real file still matches realSeed.
  * Best-effort: anything that cannot be merged safely is skipped, never thrown.
+ *
+ * @param leave - paths that are not merged, whatever happened to them in the copy
  */
 export function commitStagedChanges(
   stagedDir: string,
   realDir: string,
   stagedBefore: DirSnapshot,
   realSeed: DirSnapshot,
+  leave: string[] = [],
 ): void {
   const stagedAfter = snapshotDir(stagedDir);
   /** The real file as it is now — but only if nobody has touched it since the copy was taken. */
@@ -391,6 +400,7 @@ export function commitStagedChanges(
     const beforeStat = stagedBefore.get(relPath);
     const afterStat = stagedAfter.get(relPath);
     if (beforeStat && afterStat && sameStat(beforeStat, afterStat)) continue; // the run didn't touch it
+    if (leave.includes(relPath)) continue;
 
     try {
       // A symlink placed at this path, or in a parent directory, could point
@@ -443,19 +453,20 @@ function copyDirInto(srcDir: string, dstDir: string): void {
 /**
  * Run fn against a private copy of a directory. What fn does there stays
  * invisible to the real directory unless fn asks to commit it — then it is
- * merged back (see commitStagedChanges). If fn fails, or this process is
- * stopped half-way, the real directory was never touched.
+ * merged back (see commitStagedChanges), but for the paths fn says to leave.
+ * If fn fails, or this process is stopped half-way, the real directory was
+ * never touched.
  */
 async function withStagedCopy<T>(
   realDir: string,
-  fn: (stagedDir: string) => Promise<{ commit: boolean; value: T }>,
+  fn: (stagedDir: string) => Promise<{ commit: boolean; leave?: string[]; value: T }>,
 ): Promise<T> {
   const realSeed = snapshotDir(realDir);
   return withTempDir("trama-staged-", async (stagedDir) => {
     copyDirInto(realDir, stagedDir);
     const stagedBefore = snapshotDir(stagedDir);
-    const { commit, value } = await fn(stagedDir);
-    if (commit) commitStagedChanges(stagedDir, realDir, stagedBefore, realSeed);
+    const { commit, leave, value } = await fn(stagedDir);
+    if (commit) commitStagedChanges(stagedDir, realDir, stagedBefore, realSeed, leave);
     return value;
   });
 }
@@ -887,20 +898,24 @@ async function requestRepair(
  */
 async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): Promise<RunOnceResult> {
   const { projectDir } = options;
-  const run = await withStagedCopy(projectDir, async (stagedProject) => {
+  return withStagedCopy(projectDir, async (stagedProject) => {
     writeFileSync(guardPath(stagedProject, "program.ts"), fixed);
     // If the copy cannot be run at all, or is left unusable, this fix did not work either.
     const trial = await runProgramOnce({ ...options, projectDir: stagedProject, attempt }).catch((err): RunOnceResult => ({
       outcome: null,
       failure: `The repaired program could not be run: ${err instanceof Error ? err.message : err}`,
     }));
-    return { commit: trial.outcome !== null, value: trial };
-  });
+    if (trial.outcome === null) return { commit: false, value: trial };
 
-  // The merge above carries over what the run changed; the fix itself was
-  // written before the run started, so it is installed explicitly.
-  if (run.outcome) stageProgram(projectDir, fixed).commit();
-  return run;
+    // The fix worked. It becomes the project's program first, in one move —
+    // and only then is what its run wrote merged in. If the program cannot be
+    // put in place (the project cannot be written to), that is an error, and
+    // it is thrown from here with nothing of the run in the project: a state
+    // the old program did not write, beside the old program, is worse than
+    // either. The merge leaves program.ts alone: it has just been put there.
+    stageProgram(projectDir, fixed).commit();
+    return { commit: true, leave: ["program.ts"], value: trial };
+  });
 }
 
 /**
@@ -1022,7 +1037,7 @@ export async function validateProgram(
 function stageProgram(projectDir: string, source: string): StagedFile {
   const programPath = guardPath(projectDir, "program.ts");
   if (existsSync(programPath)) accessSync(programPath, constants.W_OK);
-  return stageFile(projectDir, "program.ts", source, { keepMode: true });
+  return stageFile(projectDir, "program.ts", source);
 }
 
 /**

@@ -3,7 +3,7 @@ import { resolve, relative, sep } from "path";
 import type { Workspace } from "./types.js";
 import { onAbort } from "./abort.js";
 import { destinationOf, guardPath, isInside, realRootOf, resolveBounded } from "./path-guard.js";
-import { stageFile } from "./replace-file.js";
+import { isStagedName, stageFile } from "./replace-file.js";
 
 const OBSERVE_POLL_MS = 250;
 
@@ -56,7 +56,8 @@ function listFilesRecursive(dir: string, root: string, realRoot: string, visited
   } catch {
     return results;
   }
-  const addFile = (full: string) => results.push(relative(root, full).split(sep).join("/"));
+  // A temp file left by a write that was cut off is not an artifact.
+  const addFile = (full: string) => { if (!isStagedName(full)) results.push(relative(root, full).split(sep).join("/")); };
   for (const entry of entries) {
     const full = resolve(dir, entry.name);
     if (entry.isSymbolicLink()) {

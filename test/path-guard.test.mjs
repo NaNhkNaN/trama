@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync, mkdirSync } from "fs";
-import { dirname, join } from "path";
+import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync, mkdirSync } from "fs";
+import { dirname, join, relative } from "path";
 import { destinationOf, guardPath, guardWriteTarget, isInside } from "../packages/runtime/dist/path-guard.js";
 import { createTools } from "../packages/runtime/dist/tools.js";
 import { createWorkspace } from "../packages/runtime/dist/workspace.js";
@@ -369,17 +369,27 @@ function walkAgainstTheSystem(start) {
   const random = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
   const pick = (list) => list[Math.floor(random() * list.length)];
   const names = ["a", "b", "c", "d", "e"];
-  const count = { same: 0, landed: 0, refused: 0 };
+  const count = { same: 0, landed: 0, refused: 0, escaped: 0 };
+  const mayLock = process.getuid?.() !== 0; // nothing is closed to root
 
   for (let round = 0; round < 100; round++) {
-    const base = realpathSync(makeTempDir("trama-walk-"));
+    // As it is given, the temp directory is reached through a link on some systems (/var on macOS).
+    const given = makeTempDir("trama-walk-");
+    const base = realpathSync(given);
+    const root = join(base, "root");
     try {
-      const root = join(base, "root");
       mkdirSync(root);
-      // What a link may say: names, ways up and round, sometimes from the top, sometimes ending in a slash.
+      // What a link may say: names, ways up and round — from here or from the top, by either of the
+      // top's names — with slashes doubled or left at the end; the top of everything; a file that is
+      // certainly outside; and nothing at all, where a link to nothing can be made.
       const target = () => {
+        const kind = random();
+        if (kind < 0.03) return "/";
+        if (kind < 0.06) return "/etc/hosts";
+        if (kind < 0.08) return "";
         const steps = Array.from({ length: 1 + Math.floor(random() * 4) }, () => pick([...names, ...names, "..", "..", ".", "."]));
-        return (random() < 0.15 ? pick([root, base]) + "/" : "") + steps.join("/") + (random() < 0.2 ? "/" : "");
+        const from = random() < 0.2 ? pick([root, base, join(given, "root")]) + "/" : "";
+        return from + steps.join(random() < 0.1 ? "//" : "/") + (random() < 0.2 ? "/" : "");
       };
       const dirs = [root];
       for (let i = 0; i < 16; i++) {
@@ -388,43 +398,111 @@ function walkAgainstTheSystem(start) {
         const kind = random();
         if (kind < 0.35) { mkdirSync(path); dirs.push(path); }
         else if (kind < 0.55) writeFileSync(path, "a file");
-        else symlinkSync(target(), path);
+        else try { symlinkSync(target(), path); } catch { /* not a link this system makes */ }
+      }
+      const asked = [...names];
+      // Now and then: a chain of links — as long as every system follows, or longer than any does —
+      // and a directory nobody may pass, with a link that goes in and comes back out.
+      if (random() < 0.3) {
+        const length = pick([28, 30, 32, 41, 43]);
+        symlinkSync(pick(names), join(root, "chain1"));
+        for (let k = 2; k <= length; k++) symlinkSync(`chain${k - 1}`, join(root, `chain${k}`));
+        asked.push(`chain${length}`, `chain${length}`);
+      }
+      if (mayLock && random() < 0.3) {
+        mkdirSync(join(root, "locked"));
+        writeFileSync(join(root, "locked", "inside"), "a file");
+        chmodSync(join(root, "locked"), 0o000);
+        symlinkSync(`locked/../${pick(names)}`, join(root, "via"));
+        asked.push("locked", "via", "via");
       }
 
       for (let q = 0; q < 120; q++) {
-        const query = join(root, ...Array.from({ length: 1 + Math.floor(random() * 4) }, () => pick(names)));
+        const query = join(root, ...Array.from({ length: 1 + Math.floor(random() * 4) }, () => pick(asked)));
+        const where = `[${start}/${round}] ${query}`;
         let ours, refused, system, systemCode;
-        try { ours = destinationOf(query); } catch (err) { refused = err; }
+        try { ours = guardWriteTarget(base, relative(base, query)); } catch (err) { refused = err; }
         // What the system makes of the path is what it does when asked to use it. (Its realpath is not
         // asked first: on macOS that is worked out by a library, which lets ".." follow a file.)
         try { statSync(query); system = realpathSync.native(query); } catch (err) { systemCode = err.code; }
 
-        if (system !== undefined) {
-          // Above the tree made here the names are not this test's: on a filesystem that
-          // ignores case, "c" is found where the directory is called "C".
-          if (!isInside(system, base)) continue;
-          assert.equal(ours, system, `[${start}/${round}] ${query}: the guard says ${ours ?? refused}, the system ${system}`);
+        if (system !== undefined && !isInside(system, base)) {
+          assert.ok(refused, `${where}: the system takes it outside, to ${system}; the guard says ${ours}`);
+          count.escaped += 1;
+        } else if (system !== undefined) {
+          // The guard stops at fewer links than some systems do. That refusal is its own to make.
+          if (refused && /Too many levels/.test(refused.message)) continue;
+          assert.equal(ours, system, `${where}: the guard says ${ours ?? refused}, the system ${system}`);
           count.same += 1;
-        } else if (systemCode === "ENOTDIR" || systemCode === "ELOOP") {
-          assert.ok(refused, `[${start}/${round}] ${query}: the system refuses it (${systemCode}), the guard says ${ours}`);
+        } else if (systemCode !== "ENOENT") {
+          assert.ok(refused, `${where}: the system refuses it (${systemCode}), the guard says ${ours}`);
           count.refused += 1;
-        } else if (systemCode === "ENOENT" && ours !== undefined && isInside(ours, base)) {
+        } else if (ours !== undefined) {
           // Nothing is there yet. Where the guard says a write would land is where it must land:
           // make the directories on the way, as a write does, and write through the path as given.
           mkdirSync(dirname(ours), { recursive: true });
           try {
             writeFileSync(query, "written");
           } catch (err) {
-            assert.fail(`[${start}/${round}] ${query}: the guard says a write lands at ${ours}, the system will not write it (${err.code})`);
+            assert.fail(`${where}: the guard says a write lands at ${ours}, the system will not write it (${err.code})`);
           }
-          assert.equal(realpathSync.native(query), ours, `[${start}/${round}] ${query}: written at ${realpathSync.native(query)}, the guard said ${ours}`);
+          assert.equal(realpathSync.native(query), ours, `${where}: written at ${realpathSync.native(query)}, the guard said ${ours}`);
           count.landed += 1;
         }
       }
     } finally {
-      cleanupTempDir(base);
+      try { chmodSync(join(root, "locked"), 0o700); } catch { /* there was none */ }
+      cleanupTempDir(given);
     }
   }
   // It has to have been a test of something.
-  assert.ok(count.same > 500 && count.landed > 100 && count.refused > 100, JSON.stringify(count));
+  assert.ok(count.same > 500 && count.landed > 100 && count.refused > 100 && count.escaped > 20, JSON.stringify(count));
 }
+
+test("as many links are followed as every system follows, and no more", (t) => {
+  // By its real name: a link on the way to the root (/var on macOS) counts as one of them.
+  const root = realpathSync(makeTempDir("trama-guard-"));
+  t.after(() => cleanupTempDir(root));
+  writeFileSync(join(root, "end.txt"), "the end");
+  symlinkSync("end.txt", join(root, "l1"));
+  for (let k = 2; k <= 33; k++) symlinkSync(`l${k - 1}`, join(root, `l${k}`));
+
+  assert.equal(guardWriteTarget(root, "l32"), join(root, "end.txt"));
+  // One more is a loop to macOS. A write must not go where a read cannot follow.
+  assert.throws(() => guardWriteTarget(root, "l33"), /Too many levels of symbolic links/);
+});
+
+test("a link to nothing is refused where one can be made", async (t) => {
+  const root = makeTempDir("trama-guard-");
+  t.after(() => cleanupTempDir(root));
+  writeFileSync(join(root, "state.json"), "ORIGINAL");
+  try { symlinkSync("", join(root, "z")); } catch { return t.skip("this system does not make a link to nothing"); }
+  symlinkSync("z/state.json", join(root, "alias"));
+
+  // The system refuses every use of such a link. Read as "here", it would lead a write to state.json.
+  for (const path of ["z/state.json", "alias", "z/new.txt"]) {
+    await assert.rejects(createTools(root).write(path, "OVERWRITTEN"), /it links to nothing/);
+    await assert.rejects(createWorkspace(root).write(path, "OVERWRITTEN"), /it links to nothing/);
+  }
+  assert.equal(readFileSync(join(root, "state.json"), "utf-8"), "ORIGINAL");
+});
+
+test("a way through a directory that may not be passed is refused, though it comes back out", { skip: process.getuid?.() === 0 }, async (t) => {
+  const root = makeTempDir("trama-guard-");
+  t.after(() => { chmodSync(join(root, "locked"), 0o700); cleanupTempDir(root); });
+  mkdirSync(join(root, "locked"));
+  writeFileSync(join(root, "f.txt"), "ORIGINAL");
+  symlinkSync("locked/../f.txt", join(root, "via"));
+  chmodSync(join(root, "locked"), 0o000);
+  assert.throws(() => readFileSync(join(root, "via")), { code: "EACCES" });
+
+  await assert.rejects(createWorkspace(root).write("via", "OVERWRITTEN"), { code: "EACCES" });
+  await assert.rejects(createTools(root).write("via", "OVERWRITTEN"), { code: "EACCES" });
+  assert.equal(readFileSync(join(root, "f.txt"), "utf-8"), "ORIGINAL");
+});
+
+test("isInside holds for the top of the filesystem too", () => {
+  assert.equal(isInside("/etc/hosts", "/"), true);
+  assert.equal(isInside("/", "/"), true);
+  assert.equal(isInside("/rootfile", "/root"), false);
+});

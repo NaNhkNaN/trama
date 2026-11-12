@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import {
@@ -1610,4 +1610,90 @@ test("a repair that worked takes the program's place in one move, keeping its pe
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixed.trim());
   assert.equal(statSync(join(projectDir, "program.ts")).mode & 0o777, 0o755);
   assert.deepEqual(leftovers(projectDir), []);
+});
+
+// --- A repair that worked, and a project that will not take it ---
+
+/** A project whose program fails, and a fix for it that writes state and a file. */
+function repairableProject(t) {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");', state: { n: 1 } });
+  const fixed = `import { ctx, tools } from "@trama-dev/runtime";
+ctx.state.n = 2;
+await tools.write("output.txt", "written by the fix");
+await ctx.done();
+`;
+  const originalRepair = llm.repair;
+  llm.repair = async () => fixed;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+  return { projectDir, fixed };
+}
+
+test("a fix that cannot be put in place leaves nothing of its run in the project", async (t) => {
+  const fs = (await import("node:fs")).default;
+  const { syncBuiltinESMExports } = await import("node:module");
+  const { projectDir } = repairableProject(t);
+  const realRename = fs.renameSync;
+  t.after(() => { fs.renameSync = realRename; syncBuiltinESMExports(); });
+
+  // The one move that puts the program in place fails.
+  fs.renameSync = (from, to) => {
+    if (String(to) === join(realpathSync(projectDir), "program.ts")) throw new Error("cannot take its place");
+    return realRename(from, to);
+  };
+  syncBuiltinESMExports();
+  await assert.rejects(runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }), /cannot take its place/);
+
+  // The fixed program ran to done — on a copy. The project has the old program, and so the old state.
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), 'throw new Error("boom");');
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { n: 1 });
+  assert.equal(existsSync(join(projectDir, "output.txt")), false);
+  assert.deepEqual(leftovers(projectDir), []);
+});
+
+test("a fix is put in place by one move only: the merge of what it wrote does not write the program", async (t) => {
+  const fs = (await import("node:fs")).default;
+  const { syncBuiltinESMExports } = await import("node:module");
+  const { projectDir, fixed } = repairableProject(t);
+  const realCopy = fs.copyFileSync;
+  t.after(() => { fs.copyFileSync = realCopy; syncBuiltinESMExports(); });
+
+  const copiedOver = [];
+  fs.copyFileSync = (from, to, ...rest) => {
+    if (String(to).startsWith(projectDir)) copiedOver.push(String(to).slice(projectDir.length + 1));
+    return realCopy(from, to, ...rest);
+  };
+  syncBuiltinESMExports();
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+
+  assert.equal(result.status, "done");
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixed.trim());
+  assert.deepEqual(readJson(join(projectDir, "state.json")).n, 2);
+  assert.equal(copiedOver.includes("program.ts"), false, `copied into the project: ${copiedOver}`);
+  assert.equal(copiedOver.includes("output.txt"), true);
+});
+
+test("a version whose line never reached the index is taken back, though the index cannot be read", { skip: process.getuid?.() === 0 }, (t) => {
+  const projectDir = makeTempDir("trama-install-");
+  const indexPath = join(projectDir, "history", "index.jsonl");
+  t.after(() => { chmodSync(indexPath, 0o644); cleanupTempDir(projectDir); });
+  createProjectFixture(projectDir, { programSource: "OLD" });
+  writeText(indexPath, "");
+  chmodSync(indexPath, 0o000);
+
+  assert.throws(() => installValidatedProgram(projectDir, { source: "NEW" }, "update", "p"), { code: "EACCES" });
+  assert.deepEqual(readdirSync(join(projectDir, "history")), ["index.jsonl"], "the version file written for it is gone");
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), "OLD");
+});
+
+test("null in the global config is a field left out, as it is in a project's", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+  writeJson(join(fakeHome, ".trama", "config.json"), { model: null, journalRuns: 3 });
+  await withEnv({ HOME: fakeHome }, async () => {
+    const config = loadConfig();
+    assert.equal(typeof config.model, "string");
+    assert.ok(config.model.length > 0);
+    assert.equal(config.journalRuns, 3);
+  });
 });

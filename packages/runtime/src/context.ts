@@ -92,6 +92,12 @@ export function createContext(
     },
 
     async checkpoint() {
+      // A checkpoint says the program has moved on from its last yield. After
+      // the yield that ends this run it would take back the very thing the
+      // next run resumes from.
+      if (terminalSignal === "yielded") {
+        throw new Error("Cannot call ctx.checkpoint() after ctx.yield() — the run has yielded.");
+      }
       persistState(this);
     },
 

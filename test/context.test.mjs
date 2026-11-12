@@ -369,3 +369,16 @@ test("createContext: done called several times at once is done once", async (t) 
   assert.equal(ctx.iteration, 1);
   assert.equal(readText(join(projectDir, "logs", "latest.jsonl")).trim().split("\n").length, 1);
 });
+
+test("createContext: a checkpoint after the yield that ends the run is refused, and the yield stands", async (t) => {
+  const projectDir = makeTempDir("trama-ctx-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+  const ctx = createContext(projectDir, {}, { print() {} });
+
+  await ctx.yield("waiting for review");
+  // A checkpoint means the program has moved on from its last yield. Taken now, it would
+  // erase what the next run resumes from.
+  await assert.rejects(ctx.checkpoint(), /Cannot call ctx\.checkpoint\(\) after ctx\.yield\(\)/);
+  assert.deepEqual(readJson(join(projectDir, "state.json")).__trama_yield, { reason: "waiting for review" });
+});

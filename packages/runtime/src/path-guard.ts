@@ -1,4 +1,4 @@
-import { lstatSync, readlinkSync } from "fs";
+import { lstatSync, readlinkSync, statSync, type BigIntStats } from "fs";
 import { dirname, isAbsolute, join, parse, resolve, sep } from "path";
 
 /**
@@ -12,7 +12,7 @@ import { dirname, isAbsolute, join, parse, resolve, sep } from "path";
 
 /** True if `path` is `root` itself or lies underneath it. Both must already be normalized. */
 export function isInside(path: string, root: string): boolean {
-  return path === root || path.startsWith(root + sep);
+  return path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
 }
 
 /**
@@ -29,8 +29,11 @@ export function resolveBounded(rootDir: string, relativePath: string): string {
   return resolved;
 }
 
-/** The most links followed on the way to one path. More than this is a loop. */
-const MAX_LINKS = 40;
+/**
+ * The most links followed on the way to one path. More than this is a loop —
+ * to the strictest of the systems this runs on (macOS stops at 32, Linux at 40).
+ */
+const MAX_LINKS = 32;
 
 /**
  * The steps of a path, one name at a time. A path that ends in a slash says
@@ -48,8 +51,10 @@ function readLink(link: string): string {
   const raw = readlinkSync(link, "buffer");
   const text = raw.toString("utf-8");
   if (!Buffer.from(text, "utf-8").equals(raw)) {
-    throw new Error(`Path escapes project directory via symlink: ${link} (its target is not readable as text)`);
+    throw new Error(`Path cannot be followed: ${link} (what it links to is not readable as text)`);
   }
+  // macOS lets a link to nothing be made, and then refuses every use of it.
+  if (text === "") throw new Error(`Path cannot be followed: ${link} (it links to nothing)`);
   return text;
 }
 
@@ -77,8 +82,10 @@ export function destinationOf(path: string): string {
       // there they lead nowhere the system would go — it cannot be created as
       // a file and be a directory too.
       if (missing) {
-        throw new Error(`Path escapes project directory via symlink: ${path} (it leads on from what does not exist)`);
+        throw new Error(`Path cannot be followed: ${path} (it leads on from what does not exist)`);
       }
+      // Asked of the system rather than assumed: it takes a directory, and leave to search it.
+      lstatSync(at + sep + step);
       if (step === "..") at = dirname(at);
       continue;
     }
@@ -124,6 +131,23 @@ function guarded(rootDir: string, relativePath: string): { resolved: string; des
   const destination = destinationOf(resolved);
   if (!isInside(destination, realRootOf(rootDir))) {
     throw new Error(`Path escapes project directory via symlink: ${relativePath}`);
+  }
+
+  // The walk above is this guard's own reading of the path. The system has
+  // the last word on it: where it can follow the path, it must arrive where
+  // the walk did, and where it cannot, that must be because nothing is there
+  // yet — not because it will not go (too many links, a name too long, no
+  // leave to pass), which the walk may not have noticed. A path the two read
+  // differently is one a write would put somewhere a read does not look.
+  let found: BigIntStats | undefined;
+  try {
+    found = statSync(resolved, { bigint: true });
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  const there = lstatSync(destination, { bigint: true, throwIfNoEntry: false });
+  if (found ? !(there && there.dev === found.dev && there.ino === found.ino) : there !== undefined) {
+    throw new Error(`Path cannot be followed: ${relativePath} (the system does not take it where its links say)`);
   }
   return { resolved, destination };
 }

@@ -11,6 +11,9 @@ import { randomBytes } from "crypto";
 import { dirname } from "path";
 import { guardWriteTarget, realRootOf } from "./path-guard.js";
 
+/** Whether a file name is that of a temp file made here — not content, though it sits among it for a moment. */
+export const isStagedName = (name: string) => /\.trama-tmp-[0-9a-f]{12}$/.test(name);
+
 export interface StagedFile {
   /** Where the content will be: the path given, with every link on the way followed. */
   destination: string;
@@ -28,16 +31,12 @@ export interface StagedFile {
  * through, not replaced. It must be a file's place: the root itself is
  * refused, since "beside" it is outside it. Directories on the way are
  * created. The temp file is created, never opened: a name that is already
- * there — a link somebody planted, say — is not written through.
- *
- * With `keepMode`, a file that is being replaced hands on its permissions.
+ * there — a link somebody planted, say — is not written through. A file that
+ * is being replaced hands on its permissions, as it would if it were written
+ * into; it is a new file all the same, so a second hard link to the old one,
+ * or its owner, are not carried over.
  */
-export function stageFile(
-  rootDir: string,
-  relativePath: string,
-  content: string | Buffer,
-  options: { keepMode?: boolean } = {},
-): StagedFile {
+export function stageFile(rootDir: string, relativePath: string, content: string | Buffer): StagedFile {
   const destination = guardWriteTarget(rootDir, relativePath);
   if (destination === realRootOf(rootDir)) {
     throw new Error(`Not a file path: "${relativePath}" is the directory itself`);
@@ -55,7 +54,7 @@ export function stageFile(
     } finally {
       closeSync(fd);
     }
-    const replaced = options.keepMode ? statSync(destination, { throwIfNoEntry: false }) : undefined;
+    const replaced = statSync(destination, { throwIfNoEntry: false });
     if (replaced) chmodSync(staged, replaced.mode & 0o777);
   } catch (err) {
     discard();
