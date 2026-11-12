@@ -3,9 +3,9 @@
 //
 // A program, and every shell command it runs, leads its own process group — so
 // that a timeout can take down everything it started. The cost is that none of
-// them die with the runner: without this, Ctrl-C on `trama run` would leave the
-// program running, and a program that coordinates others (a session) would
-// leave them running when it ended.
+// them die with the runner: without this, Ctrl-C on `trama run` would leave
+// them all running. One runner carries every run of a session, so the lists
+// kept here cover the whole tree.
 
 import { rmSync } from "fs";
 import { stopGroupsOnExit } from "./child-process.js";

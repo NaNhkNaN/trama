@@ -359,8 +359,8 @@ test("createTools shell commands do not inherit the bridge's address or its init
   const projectDir = makeTempDir("trama-tools-");
   t.after(() => cleanupTempDir(projectDir));
 
-  // A runner inside a program (a session's creator) has these in its own
-  // environment; the init file holds that program's bridge secret.
+  // A runner working inside a program (create or update, called by one) has
+  // these in its own environment; the init file holds that program's bridge secret.
   const saved = { port: process.env.TRAMA_PORT, init: process.env.TRAMA_INIT };
   process.env.TRAMA_PORT = "12345";
   process.env.TRAMA_INIT = "/somewhere/init.json";

@@ -3,7 +3,9 @@ import test from "node:test";
 import { readFileSync } from "fs";
 import { join } from "path";
 import { pathToFileURL } from "url";
-import { REPO_ROOT, cleanupTempDir, makeTempDir, runNodeCommand, writeJson, writeText } from "./helpers.mjs";
+import {
+  REPO_ROOT, cleanupTempDir, createProjectFixture, makeTempDir, runNodeCommand, writeJson, writeText,
+} from "./helpers.mjs";
 
 const CLI_ENTRY = join(REPO_ROOT, "packages", "cli", "dist", "index.js");
 
@@ -145,4 +147,37 @@ test("CLI run without --timeout uses config.defaultTimeout instead of a hardcode
   assert.equal(result.exitCode, 1);
   assert.match(result.stderr, /not found/);
   assert.doesNotMatch(result.stderr, /timeout must be a positive integer/i);
+});
+
+test("the trama command started by a program is a runner of its own", async (t) => {
+  const fakeHome = makeTempDir("trama-cli-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+
+  const projects = join(fakeHome, ".trama", "projects");
+  createProjectFixture(join(projects, "inner"), {
+    scaffold: false,
+    programSource: `import { ctx } from "@trama-dev/runtime";
+console.log("printed by the inner program");
+await ctx.done();`,
+  });
+  // The outer program starts the command itself, as it might any other tool,
+  // and reads what it prints. It inherits the outer program's bridge; it must
+  // not hand its run to that bridge's runner, which would print it elsewhere.
+  createProjectFixture(join(projects, "outer"), {
+    scaffold: false,
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+import { execFileSync } from "child_process";
+const printed = execFileSync(process.execPath, [${JSON.stringify(CLI_ENTRY)}, "run", "inner"], { encoding: "utf-8" });
+await tools.write("printed.txt", printed);
+await ctx.done();`,
+  });
+
+  const result = await runNodeCommand([CLI_ENTRY, "run", "outer"], {
+    cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome },
+  });
+  assert.equal(result.exitCode, 0, result.stderr);
+  assert.match(
+    readFileSync(join(projects, "outer", "printed.txt"), "utf-8"), /printed by the inner program/,
+    "the command's output should have reached the program that ran it",
+  );
 });

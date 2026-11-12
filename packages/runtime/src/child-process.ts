@@ -45,11 +45,12 @@ export function signalGroup(pgid: number, signal: NodeJS.Signals | 0): boolean {
 
 // --- Stopping ---
 //
-// Never SIGKILL first. A process group may hold a runner of its own — a program
-// that coordinates others, a shell command that runs trama — and that runner
-// has started process groups this one cannot see. SIGTERM is its chance to stop
-// them; killed outright, it leaves them running. So a group is asked to stop,
-// and killed only if it is still there when the grace period is over.
+// Never SIGKILL first. A process group may hold a runner of its own — a shell
+// command that runs trama, a program with processes it means to shut down
+// properly — which has started things this runner cannot see. SIGTERM is its
+// chance to stop them; killed outright, it leaves them running. So a group is
+// asked to stop, and killed only if it is still there when the grace period
+// is over.
 //
 // There are two ways to see that through, depending on whether the process
 // asking will be around to do it: stopGroups (it will) and stopGroupsOnExit

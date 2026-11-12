@@ -99,7 +99,7 @@ export class Session {
     const startRun = (runArgs?: Record<string, unknown>): Promise<ProgramResult> => {
       state = "running";
       lastArgs = runArgs;
-      const run = runProgram({ projectDir, timeout, maxRepairAttempts, args: runArgs, workspaceDir });
+      const run = runProgram({ projectDir, timeout, maxRepairAttempts, args: runArgs, workspaceDir, label: name });
       // An infrastructure error (the run could not happen at all) counts as failed.
       run.then(result => { state = result.status; }, () => { state = "failed"; });
       return run;

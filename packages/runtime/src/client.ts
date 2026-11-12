@@ -3,7 +3,7 @@
 // (ipc-server.ts), which does the real work.
 
 import type { Ctx, Agent, Tools, Workspace } from "./types.js";
-import { openBridge } from "./bridge-client.js";
+import { openBridge, remoteWorkspace } from "./bridge-client.js";
 import { assertSerializable } from "./serializable.js";
 
 const PORT = process.env.TRAMA_PORT;
@@ -81,16 +81,9 @@ export const tools: Tools = {
 };
 
 /** workspace.* exists only inside a session — everywhere else it fails clearly, without a round trip. */
-async function workspaceCall(endpoint: string, body: unknown) {
+export const workspace: Workspace = remoteWorkspace((endpoint, body) => {
   if (!initData.inSession) {
-    throw new Error("workspace is only available when running in a session");
+    return Promise.reject(new Error("workspace is only available when running in a session"));
   }
   return call(endpoint, body);
-}
-
-export const workspace: Workspace = {
-  read: (path) => workspaceCall("/workspace/read", { path }),
-  write: (path, content) => workspaceCall("/workspace/write", { path, content }),
-  list: (pattern) => workspaceCall("/workspace/list", { pattern }),
-  observe: (pattern, options) => workspaceCall("/workspace/observe", { pattern, ...options }),
-};
+});

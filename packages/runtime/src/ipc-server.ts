@@ -5,7 +5,7 @@
 import { createServer, type Server } from "http";
 import { timingSafeEqual } from "crypto";
 import type { Ctx, Agent, Tools, Workspace } from "./types.js";
-import type { ProgramResult } from "./runner-types.js";
+import type { ProgramResult, RunRequest } from "./runner-types.js";
 import { assertSerializable } from "./serializable.js";
 
 const MAX_IPC_BODY = 50 * 1024 * 1024; // 50 MB
@@ -35,12 +35,14 @@ export interface IpcBackends {
   ctx: Ctx;
   agent: Agent;
   tools: Tools;
-  /** Null when the program is not running in a session. */
+  /** The workspace of the session the program is running in — null when it is in none. */
   workspace: Workspace | null;
+  /** A workspace by directory, for a program that created a session rather than joined one. */
+  workspaceAt(dir: string): Workspace;
+  /** Run another project on the program's behalf, until it ends or `stop` says to stop it. */
+  run(request: RunRequest, stop: AbortSignal): Promise<ProgramResult>;
   /** Called once ctx.done() or ctx.yield() has been persisted for this run. */
   onTerminalSignal(result: ProgramResult): void;
-  /** Stop the program's clock until the returned function is called (see Allowance). */
-  holdClock(): () => void;
 }
 
 const isPlainObject = (v: unknown) => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -65,13 +67,23 @@ function isAuthorized(header: string | undefined, token: string): boolean {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-function buildRoutes({ ctx, agent, tools, workspace, onTerminalSignal, holdClock }: IpcBackends): Record<string, Route> {
+function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, onTerminalSignal }: IpcBackends): Record<string, Route> {
   /** The program owns ctx.state; each persisting call hands over its current copy. */
   const adoptState = (state: Record<string, unknown>) => {
     assertSerializable(state, "ctx.state");
     ctx.state = state;
   };
-  const inSession = (): Workspace => {
+  /** Runs the program has asked for and that have not ended, by the id it gave each. */
+  const runsAskedFor = new Map<string, AbortController>();
+  /** Ids the program asked to stop before their run was seen here: such a run starts stopped. */
+  const stoppedAhead = new Set<string>();
+
+  /** The workspace a call is about: the directory it names, or else the one this run was started with. */
+  const workspaceOf = (body: Body): Workspace => {
+    if (body.dir !== undefined) {
+      if (typeof body.dir !== "string" || body.dir === "") throw new BadRequest("Invalid field: dir (expected a directory path)");
+      return workspaceAt(body.dir);
+    }
     if (!workspace) throw new BadRequest("Workspace is only available when running in a session");
     return workspace;
   };
@@ -126,28 +138,51 @@ function buildRoutes({ ctx, agent, tools, workspace, onTerminalSignal, holdClock
       },
     },
 
-    // A run the program starts — a session participant — is under a timeout
-    // of its own, and the program's clock stops while it lasts (see
-    // holdParentClock). The hold is the connection: it ends when the caller
-    // closes it, and cannot outlast a caller that dies without doing so.
-    "/clock/hold": {
-      fields: {},
-      handle: async (_body, connectionClosed) => {
-        const release = holdClock();
-        await connectionClosed;
-        release();
+    // A program never runs another program: it asks its runner to. The call
+    // lasts as long as the run does, repairs included.
+    "/run/program": {
+      fields: { projectDir: "string", args: "optional object" },
+      handle: async (b, connectionClosed) => {
+        const stop = new AbortController();
+        // A caller that is gone — its process died, or it gave up — no longer wants the run.
+        void connectionClosed.then(() => stop.abort());
+        const id: string | undefined = typeof b.id === "string" ? b.id : undefined;
+        if (id && stoppedAhead.delete(id)) stop.abort();
+        if (id) runsAskedFor.set(id, stop);
+        try {
+          return await run({
+            projectDir: b.projectDir,
+            args: b.args,
+            timeout: b.timeout,
+            maxRepairAttempts: b.maxRepairAttempts,
+            workspaceDir: b.workspaceDir,
+            label: b.label,
+          }, stop.signal);
+        } finally {
+          if (id) runsAskedFor.delete(id);
+        }
+      },
+    },
+    // Stop a run asked for above. The call that asked for it still gets its
+    // answer — a failed run — once the run is over.
+    "/run/stop": {
+      fields: { id: "string" },
+      handle: b => {
+        const asked = runsAskedFor.get(b.id);
+        if (asked) asked.abort();
+        else stoppedAhead.add(b.id);
       },
     },
 
-    "/workspace/read": { fields: { path: "string" }, handle: b => inSession().read(b.path) },
+    "/workspace/read": { fields: { path: "string" }, handle: b => workspaceOf(b).read(b.path) },
     "/workspace/write": {
       fields: { path: "string", content: "string" },
-      handle: b => inSession().write(b.path, b.content),
+      handle: b => workspaceOf(b).write(b.path, b.content),
     },
-    "/workspace/list": { fields: { pattern: "string" }, handle: b => inSession().list(b.pattern) },
+    "/workspace/list": { fields: { pattern: "string" }, handle: b => workspaceOf(b).list(b.pattern) },
     "/workspace/observe": {
       fields: { pattern: "string" },
-      handle: b => inSession().observe(b.pattern, { expect: b.expect, timeout: b.timeout }),
+      handle: b => workspaceOf(b).observe(b.pattern, { expect: b.expect, timeout: b.timeout }),
     },
   };
 }

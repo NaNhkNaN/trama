@@ -11,6 +11,13 @@ import {
   resolveProject,
 } from "@trama-dev/runtime/runner";
 
+// The trama command is always a runner of its own, even when a program starts
+// it: what it runs it runs here, and shows here. (Code that is part of a
+// program asks that program's runner instead — see runProgram.) So it does not
+// go by a bridge it may have inherited, and neither does anything it starts.
+delete process.env.TRAMA_PORT;
+delete process.env.TRAMA_INIT;
+
 function collectArg(value: string, previous: string[]) {
   return [...previous, value];
 }

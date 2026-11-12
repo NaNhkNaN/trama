@@ -22,6 +22,8 @@ export function createContext(
     maxIterations?: number;
     argsOverride?: Record<string, unknown>;
     onReady?: (data?: Record<string, unknown>) => void;
+    /** Where the run's log lines are shown as they are written. Defaults to the console. */
+    print?: (line: string) => void;
   },
 ): Ctx {
   const logsPath = guardPath(projectDir, join("logs", "latest.jsonl"));
@@ -64,7 +66,7 @@ export function createContext(
       }
       const entry = { ts: Date.now(), message, data: safeData };
       appendFileSync(logsPath, JSON.stringify(entry) + "\n");
-      console.log(`[trama] ${message}`);
+      (options?.print ?? console.log)(`[trama] ${message}`);
     },
 
     async ready(data) {

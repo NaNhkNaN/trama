@@ -1,22 +1,67 @@
 // @trama-dev/runtime runner surface — exported via "@trama-dev/runtime/runner"
 
+import { randomUUID } from "crypto";
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, statSync, rmSync } from "fs";
-import { join } from "path";
+import { join, resolve } from "path";
 import { homedir } from "os";
-import { PI_VERSION } from "./pi-adapter.js";
+import { piVersion } from "./pi-adapter.js";
 import { stripCodeFences } from "./agent.js";
 import type { AgentBackend } from "./agent-backend.js";
 import {
   loadConfig, loadProjectConfig, loadState, createBackend, validateProgram, installValidatedProgram,
-  withTempDir, ensureProjectScaffold, RUNTIME_TYPES,
+  withTempDir, ensureProjectScaffold, RUNTIME_TYPES, runProgram as runHere,
 } from "./runner.js";
+import { createWorkspace as workspaceHere } from "./workspace.js";
+import { parentBridge, remoteWorkspace } from "./bridge-client.js";
 import { guardPath } from "./path-guard.js";
 
-export { runProgram } from "./runner.js";
-export { createWorkspace } from "./workspace.js";
 export type { ProgramResult, RunOptions } from "./runner-types.js";
-import type { TramaConfig } from "./runner-types.js";
+import type { ProgramResult, RunOptions, TramaConfig } from "./runner-types.js";
 export type { Workspace, ObserveResult } from "./types.js";
+import type { Workspace } from "./types.js";
+
+// --- Running a project, and reaching a workspace ---
+//
+// A program never runs another program: it asks its runner to. So these two do
+// their work in this process only when this process is not itself a program.
+// Inside one they are calls on the bridge, carried out by the one runner that
+// owns every run in the tree — which is how it can time them, stop them, and
+// see them.
+
+/** Run a project to an outcome: done, yielded, or failed. */
+export async function runProgram(options: RunOptions): Promise<ProgramResult> {
+  const bridge = parentBridge();
+  if (!bridge) return runHere(options);
+
+  // A signal cannot cross the bridge, but what it says can: the runner is told
+  // to stop the run, and this call still waits for the run to be over — the
+  // same as outside a program.
+  const { signal, ...request } = options;
+  const id = randomUUID();
+  const stop = () => { bridge.call("/run/stop", { id }).catch(() => { /* no runner left to tell */ }); };
+  if (signal?.aborted) stop();
+  else signal?.addEventListener("abort", stop, { once: true });
+  try {
+    return await bridge.call("/run/program", {
+      ...request,
+      id,
+      // The runner does not share this program's working directory.
+      projectDir: resolve(request.projectDir),
+      workspaceDir: request.workspaceDir && resolve(request.workspaceDir),
+    });
+  } finally {
+    signal?.removeEventListener("abort", stop);
+  }
+}
+
+/** The shared workspace in a directory, created if it does not exist: read, write, list, observe. */
+export function createWorkspace(dir: string): Workspace {
+  const bridge = parentBridge();
+  if (!bridge) return workspaceHere(dir);
+  const absolute = resolve(dir);
+  mkdirSync(absolute, { recursive: true }); // it exists from here on, as it does outside a program
+  return remoteWorkspace(bridge.call, absolute);
+}
 
 // --- Example programs (included in system prompt during create/update) ---
 
@@ -170,7 +215,7 @@ export async function createProject(
     const meta = {
       input: { prompt, args: options?.args ?? {} },
       createdAt: new Date().toISOString(),
-      piVersion: PI_VERSION,
+      piVersion: await piVersion(),
       model: config.model,
       provider: config.provider,
     };

@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
 import { join } from "path";
-import { pathToFileURL } from "url";
 import { llm } from "./fake-llm.mjs";
 import {
   copyToHistory, createBackend, loadConfig, loadState, runProgram, RUNTIME_TYPES, validateProgram,
@@ -762,39 +761,139 @@ test("an allowance can be longer than a single timer can measure", async () => {
   assert.equal(spent, false);
 });
 
-test("a hold on a program's clock ends with the process that asked for it", { timeout: 30_000 }, async (t) => {
+// --- Stopping a run from outside ---
+
+test("a run that is stopped ends as failed, with its program gone and no repair attempted", async (t) => {
   const projectDir = makeTempDir("trama-runner-");
   t.after(() => cleanupTempDir(projectDir));
 
-  // The program starts a process that holds its clock — as a runner started in
-  // a process of its own would — kills it outright a second and a half later,
-  // and then hangs. Nothing ever says the hold is over; the dead process's
-  // connection closing has to be enough.
-  const bridgeClientUrl = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "bridge-client.js")).href;
-  const holder = `import { writeFileSync } from "fs";
-import { openBridge } from ${JSON.stringify(bridgeClientUrl)};
-openBridge(process.env.TRAMA_PORT, process.env.TRAMA_INIT).hold("/clock/hold");
-writeFileSync("holding", "");
-setInterval(() => {}, 1000);`;
   createProjectFixture(projectDir, {
     scaffold: false,
-    programSource: `import { spawn } from "child_process";
-import { existsSync } from "fs";
-const holder = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(holder)}], { stdio: "ignore" });
-while (!existsSync("holding")) await new Promise(resolve => setTimeout(resolve, 20));
-await new Promise(resolve => setTimeout(resolve, 1500));
-holder.kill("SIGKILL");
+    programSource: `import { writeFileSync } from "fs";
+writeFileSync("program.pid", String(process.pid));
 setInterval(() => {}, 1000);
 await new Promise(() => {});`,
   });
 
-  const started = Date.now();
-  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 2_000 });
-  const elapsed = Date.now() - started;
+  const originalRepair = llm.repair;
+  let repairs = 0;
+  llm.repair = async () => { repairs += 1; throw new Error("no fix should have been asked for"); };
 
+  try {
+    const stop = new AbortController();
+    const run = runProgram({ projectDir, maxRepairAttempts: 2, timeout: 30_000, signal: stop.signal });
+    await waitFor(() => pidIn(join(projectDir, "program.pid")), "the program to start");
+    const programPid = pidIn(join(projectDir, "program.pid"));
+    stop.abort();
+
+    const result = await run;
+    assert.equal(result.status, "failed");
+    assert.match(result.reason, /was stopped/);
+    assert.equal(repairs, 0, "there is nothing to repair in a program that was stopped");
+    assert.equal(isAlive(programPid), false, "the program must be gone by the time the run returns");
+  } finally {
+    llm.repair = originalRepair;
+  }
+});
+
+test("a program that exits cleanly when stopped has still not finished", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  // Shutting down properly on SIGTERM is what a well-behaved program does. Its
+  // exit code then says nothing about whether it did what it was run for.
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    state: { __trama_yield: { reason: "earlier" } },
+    programSource: `import { writeFileSync } from "fs";
+process.on("SIGTERM", () => process.exit(0));
+writeFileSync("program.pid", String(process.pid));
+setInterval(() => {}, 1000);
+await new Promise(() => {});`,
+  });
+
+  const stop = new AbortController();
+  const run = runProgram({ projectDir, maxRepairAttempts: 0, timeout: 30_000, signal: stop.signal });
+  await waitFor(() => pidIn(join(projectDir, "program.pid")), "the program to start");
+  stop.abort();
+
+  const result = await run;
   assert.equal(result.status, "failed");
-  assert.match(result.reason, /timeout/, "once the holder is gone the program must be timed out again");
-  assert.ok(elapsed >= 3_000, `the clock should have stopped while it was held (the run took ${elapsed}ms)`);
+  assert.match(result.reason, /was stopped/);
+  // Nothing was concluded from the run: it is still the resumption it was.
+  assert.deepEqual(readJson(join(projectDir, "state.json")).__trama_yield, { reason: "earlier" });
+});
+
+test("a run stopped while a fix is being asked for gives up on the fix", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  const originalSource = 'throw new Error("original");';
+  createProjectFixture(projectDir, { scaffold: false, programSource: originalSource });
+
+  const stop = new AbortController();
+  const originalRepair = llm.repair;
+  let asked = false;
+  // An LLM that never answers — until the call is cancelled.
+  llm.repair = (_prompt, call) => new Promise((_resolve, reject) => {
+    asked = true;
+    call.signal.addEventListener("abort", () => reject(new Error("Aborted")), { once: true });
+    stop.abort();
+  });
+
+  try {
+    const result = await runProgram({ projectDir, maxRepairAttempts: 3, timeout: 30_000, signal: stop.signal });
+    assert.equal(asked, true);
+    assert.equal(result.status, "failed");
+    assert.match(result.reason, /was stopped/);
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
+  } finally {
+    llm.repair = originalRepair;
+  }
+});
+
+test("a run stopped while a fix is being tried leaves the project as it was", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  const signalDir = makeTempDir("trama-signal-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(signalDir); });
+
+  const originalSource = 'throw new Error("original");';
+  createProjectFixture(projectDir, { scaffold: false, programSource: originalSource, state: { kept: true } });
+
+  const originalRepair = llm.repair;
+  let fixes = 0;
+  // The proposed fix checkpoints new state, writes a file, announces itself and then hangs.
+  llm.repair = async () => {
+    fixes += 1;
+    return `import { ctx } from "@trama-dev/runtime";
+import { writeFileSync } from "fs";
+process.on("SIGTERM", () => process.exit(0)); // a clean exit must not pass for success
+ctx.state.kept = false;
+await ctx.checkpoint();
+writeFileSync("written-by-fix.txt", "x");
+writeFileSync(${JSON.stringify(join(signalDir, "fix.pid"))}, String(process.pid));
+setInterval(() => {}, 1000);
+await new Promise(() => {});`;
+  };
+
+  try {
+    const stop = new AbortController();
+    const run = runProgram({ projectDir, maxRepairAttempts: 3, timeout: 30_000, signal: stop.signal });
+    await waitFor(() => pidIn(join(signalDir, "fix.pid")), "the fix to be running");
+    const fixPid = pidIn(join(signalDir, "fix.pid"));
+    stop.abort();
+
+    const result = await run;
+    assert.equal(result.status, "failed");
+    assert.match(result.reason, /was stopped/);
+    assert.equal(fixes, 1, "no further fix may be asked for once the run is stopped");
+    assert.equal(isAlive(fixPid), false);
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), originalSource);
+    assert.deepEqual(readJson(join(projectDir, "state.json")), { kept: true });
+    assert.equal(existsSync(join(projectDir, "written-by-fix.txt")), false);
+  } finally {
+    llm.repair = originalRepair;
+  }
 });
 
 // --- Process lifetime, init file security, IPC limits ---
@@ -861,8 +960,7 @@ test("a program gets to act on being asked to stop, even when it is busy", async
   t.after(() => { cleanupTempDir(fakeHome); cleanupTempDir(projectDir); cleanupTempDir(signalDir); });
 
   // Working in stretches of a fifth of a second, the program cannot answer a
-  // signal at once. It still has the whole grace period to — which is what a
-  // program that coordinates others needs to stop what it started.
+  // signal at once. It still has the whole grace period to.
   createProjectFixture(projectDir, {
     scaffold: false,
     programSource: `import { writeFileSync } from "fs";

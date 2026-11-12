@@ -28,7 +28,17 @@ export interface RunOptions {
   args?: Record<string, unknown>;
   /** Shared workspace directory. When set, workspace.* API is enabled for the program. */
   workspaceDir?: string;
+  /** A name for this run — a participant's, say. Its output is shown under it. */
+  label?: string;
+  /**
+   * Stops the run: its program is stopped, no repair is attempted, and the
+   * run ends as failed. A fix that was being tried leaves no trace.
+   */
+  signal?: AbortSignal;
 }
+
+/** A run as one program asks its runner for it: everything in RunOptions that can cross the bridge. */
+export type RunRequest = Omit<RunOptions, "signal">;
 
 export interface TramaConfig extends ModelConfig {
   maxRepairAttempts: number;

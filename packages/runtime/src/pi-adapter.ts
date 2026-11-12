@@ -1,16 +1,16 @@
-import {
-  createAgentSession,
-  SessionManager,
-  DefaultResourceLoader,
-  ModelRuntime,
-  getAgentDir,
-  type AgentSession,
-} from "@earendil-works/pi-coding-agent";
-import type { AgentBackend, AgentCall } from "./agent-backend.js";
+import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import { rejectOnAbort, type AgentBackend, type AgentCall } from "./agent-backend.js";
 import type { ModelConfig } from "./runner-types.js";
 
+/**
+ * pi is loaded when it is first needed, not when this file is: it is most of
+ * what the runtime weighs, and listing projects, reading logs, or running a
+ * program that never calls the agent does not need it.
+ */
+const loadPi = () => import("@earendil-works/pi-coding-agent");
+
 /** The pi version this runtime is built against (recorded in each project's meta.json). */
-export { VERSION as PI_VERSION } from "@earendil-works/pi-coding-agent";
+export const piVersion = async (): Promise<string> => (await loadPi()).VERSION;
 
 /** provider/model pairs already warned about, so a loop of agent calls warns once per process. */
 const warnedUnknownModels = new Set<string>();
@@ -26,6 +26,10 @@ export class PiAdapter implements AgentBackend {
   private async createSession(cwd: string, systemPrompt?: string, signal?: AbortSignal): Promise<AgentSession> {
     if (signal?.aborted) throw new Error("Aborted");
 
+    // Each step below is given up on the moment the call is cancelled.
+    const raceAbort = <T>(step: Promise<T>) => rejectOnAbort(step, signal);
+
+    const { createAgentSession, SessionManager, DefaultResourceLoader, ModelRuntime, getAgentDir } = await raceAbort(loadPi());
     const agentDir = getAgentDir();
     const resourceLoader = new DefaultResourceLoader({
       cwd,
@@ -34,23 +38,6 @@ export class PiAdapter implements AgentBackend {
       noSkills: true,
       ...(systemPrompt && { appendSystemPrompt: [systemPrompt] }),
     });
-
-    // Race an async step against the abort signal.
-    // Returns the result on success, or rejects with "Aborted" on abort.
-    const raceAbort = <T>(promise: Promise<T>): Promise<T> => {
-      if (!signal) return promise;
-      let onAbort: (() => void) | null = null;
-      const cleanup = () => {
-        if (onAbort) { signal.removeEventListener("abort", onAbort); onAbort = null; }
-      };
-      return Promise.race([
-        promise.finally(cleanup),
-        new Promise<never>((_resolve, reject) => {
-          onAbort = () => reject(new Error("Aborted"));
-          signal.addEventListener("abort", onAbort, { once: true });
-        }),
-      ]);
-    };
 
     await raceAbort(resourceLoader.reload());
     if (signal?.aborted) throw new Error("Aborted");

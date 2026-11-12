@@ -2,6 +2,35 @@
 
 All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`) are released together under one version.
 
+## Unreleased
+
+### Changed
+
+- **One runner runs a whole session.** A program that spawned participants used to run them itself: `Session.spawn()` started a second, complete runner inside the program's own process, which the runner of that program could not see. Starting a run is now a call on the bridge, like any other the program makes, and the runner that is running the program carries it out. `Session`, `spawn()`, `wait()` and `resume()` are used as before. What follows from it:
+  - A participant is stopped with the program that spawned it by the runner itself. It no longer depends on that program being able to act: a coordinator that hangs, or is killed outright, does not strand its participants or their shell commands.
+  - A participant's output is written by the runner, each line under the participant's name. It is no longer part of its parent's output, and so no longer appears in the parent's failure report or repair prompt.
+  - A participant that cannot be run at all — its project is missing, say — makes `wait()` reject as before, but the message now starts with `trama runtime error:`.
+  - A participant runs with the runner's environment, not the environment of the program that spawned it. A program that changed `process.env` to affect the runs it starts no longer does.
+  - Programs may run programs up to 16 deep, and one runner carries up to 128 runs at a time. There was no bound before.
+  - A program that uses a session no longer loads the runner and the agent into its own process. Importing the session layer went from about 0.7 s and 80 MB to about 30 ms and 9 MB (measured once each, on one machine).
+- The program that creates a session reaches its workspace through the bridge too, instead of touching the directory itself.
+
+### Added
+
+- `runProgram({ signal })`: aborting the signal stops the run. Its program is stopped, no repair is attempted, and the run ends as failed once the program is gone; a fix that was being tried leaves no trace. A program that exits cleanly on being stopped has still not finished. It works the same from inside a program.
+- `runProgram({ label })`: a name for the run, shown in front of each line of its output. `Session.spawn()` passes the participant's name.
+
+### Fixed
+
+- Shell commands the agent ran on behalf of a participant could read the bridge secret of the program that spawned it. (0.2.2 closed this for `tools.shell()` only.) The agent no longer runs inside that program.
+
+- A cancelled agent call is given up on at once, whether or not the agent itself notices the cancellation. A run's end no longer depends on it noticing.
+
+### Internal
+
+- pi is loaded when the agent is first called, not when the runtime is. `trama list` and `trama logs`, and programs that never call the agent, do not load it.
+- The message by which a runner inside a program asked the outer runner to hold the program's clock is gone, with the inner runner.
+
 ## 0.3.0 — 2026-11-11
 
 ### Changed

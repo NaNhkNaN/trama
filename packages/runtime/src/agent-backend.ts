@@ -26,3 +26,22 @@ export interface AgentBackend {
    */
   ask(prompt: string, call: AgentCall): Promise<string>;
 }
+
+/**
+ * Hold a piece of work to the promise above: reject as soon as `signal` is
+ * aborted, whether or not the work itself notices. What the work goes on to do
+ * after that is no longer waited for.
+ */
+export function rejectOnAbort<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(new Error("Aborted"));
+    if (signal.aborted) onAbort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+    const settle = <V>(pass: (value: V) => void) => (value: V) => {
+      signal.removeEventListener("abort", onAbort);
+      pass(value);
+    };
+    work.then(settle(resolve), settle(reject));
+  });
+}

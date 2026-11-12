@@ -716,6 +716,14 @@ Each participant is a full trama program with its own lifecycle, repair loop, an
 
 Each participant also has its own timeout, and its time is charged to it alone. A program is never timed out for the time its participants take: its clock stops while one of them is running, so a participant that needs a repair does not bring down the program waiting for it. How long a session may run is therefore decided by the participants' timeouts, not by the entry program's.
 
+**One runner runs the whole session.** A program does not run its participants itself: `spawn()` asks the runner that is running the program — the `trama run` you started — to run them. So however deep a session goes, there is one process that owns every program in it:
+
+- A participant belongs to the program that spawned it. When that program's run ends — finished, failed, timed out, or yielded — its participants are stopped, whether or not the program is in a state to do anything about it. Stopping `trama run` stops all of them.
+- A participant's output appears in the runner's output, each line under the participant's name (`[check-sql] …`) — what it prints, and what the runner reports about it. It is not part of the output of the program that spawned it.
+- A participant runs with the runner's environment, not with the environment of the program that spawned it.
+- Programs may run programs up to 16 deep, and one runner carries up to 128 runs at a time. Past either, the participant is not run and `wait()` rejects — a program that spawns itself is stopped there rather than when the machine gives out.
+- The `trama` command is the exception: started by a program, as any other tool might be, it is a runner of its own, and what it runs is not part of the session.
+
 `runProgram()` (and so `handle.wait()`) returns a structured `ProgramResult`:
 
 ```typescript

@@ -33,10 +33,11 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
   };
 
   // Shell commands run here do not get the bridge's address or the init file
-  // (which holds its secret). A top-level runner has neither in its
-  // environment, but a runner inside a program — a session's creator —
-  // inherits both. (This covers tools.shell only: what the agent backend runs
-  // on its own takes its environment from this process.)
+  // (which holds its secret). A runner normally has neither in its
+  // environment; it does when it is working inside a program — which create
+  // and update still do when a program calls them. (This covers tools.shell
+  // only: what the agent backend runs on its own takes its environment from
+  // this process.)
   const { TRAMA_PORT: _port, TRAMA_INIT: _init, ...shellEnv } = process.env;
 
   const stopSweeping = () => {

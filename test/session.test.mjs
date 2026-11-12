@@ -4,9 +4,14 @@ import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { runProgram } from "../packages/runtime/dist/runner.js";
 import { Session } from "../packages/session/dist/index.js";
+import { pathToFileURL } from "url";
 import {
-  cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, startRunnerProcess, waitFor, withEnv,
+  REPO_ROOT, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, runNodeCommand, startRunnerProcess,
+  waitFor, withEnv,
 } from "./helpers.mjs";
+
+/** The runner as a program reaches it: the public surface, not the module the tests call directly. */
+const RUNNER_SURFACE_URL = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "index.js")).href;
 
 test("Session.spawn returns done ProgramResult", async (t) => {
   const projectDir = makeTempDir("trama-session-");
@@ -363,8 +368,7 @@ test("stopping the runner stops the participants of its program, and what they s
   t.after(() => { for (const dir of [fakeHome, entryDir, workerDir, signalDir]) cleanupTempDir(dir); });
 
   // Three levels down from the runner that gets stopped: its program, that
-  // program's participant, and the participant's shell command. The runner
-  // that started the last two lives inside the program.
+  // program's participant, and the participant's shell command.
   createProjectFixture(workerDir, {
     programSource: `import { tools } from "@trama-dev/runtime";
 import { writeFileSync } from "fs";
@@ -393,4 +397,209 @@ await ctx.done();`,
   await exited;
 
   await waitFor(() => !pids.some(isAlive), "everything the runner's program started to be gone", 5_000);
+});
+
+// --- One runner for the whole tree ---
+
+test("stopping the runner stops participants even when the program that spawned them cannot act", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const entryDir = makeTempDir("trama-session-entry-");
+  const workerDir = makeTempDir("trama-session-worker-");
+  const signalDir = makeTempDir("trama-session-signal-");
+  t.after(() => { for (const dir of [fakeHome, entryDir, workerDir, signalDir]) cleanupTempDir(dir); });
+
+  createProjectFixture(workerDir, {
+    programSource: `import { tools } from "@trama-dev/runtime";
+import { writeFileSync } from "fs";
+writeFileSync(${JSON.stringify(join(signalDir, "worker.pid"))}, String(process.pid));
+await tools.shell("echo $$ > ${join(signalDir, "shell.pid")}; sleep 60", { timeout: 60000 });`,
+  });
+  // Once its participant is under way, the program stops responding altogether:
+  // it will not run a signal handler, and has to be killed in the end. Its
+  // participant does not depend on it for being stopped.
+  createProjectFixture(entryDir, {
+    scaffold: false,
+    programSource: `import { existsSync, writeFileSync } from "fs";
+import { Session } from "@trama-dev/session";
+process.on("SIGTERM", () => {});
+writeFileSync(${JSON.stringify(join(signalDir, "entry.pid"))}, String(process.pid));
+const session = await Session.create({ workspace: ${JSON.stringify(join(signalDir, "workspace"))} });
+session.spawn("worker", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 60000 });
+while (!existsSync(${JSON.stringify(join(signalDir, "shell.pid"))})) await new Promise(resolve => setTimeout(resolve, 20));
+writeFileSync(${JSON.stringify(join(signalDir, "entry-is-stuck"))}, "");
+while (true) {}`,
+  });
+
+  const { child, exited } = startRunnerProcess(fakeHome, entryDir);
+  await waitFor(() => existsSync(join(signalDir, "entry-is-stuck")) && pidIn(join(signalDir, "shell.pid")), "the participant to be under way", 20_000);
+  const entryPid = pidIn(join(signalDir, "entry.pid"));
+  const others = ["worker.pid", "shell.pid"].map(name => pidIn(join(signalDir, name)));
+
+  child.kill("SIGINT");
+  await exited;
+
+  // The participant and its shell command go at once; the stuck program only when it is killed.
+  await waitFor(() => !others.some(isAlive), "the participant and its shell command to be gone", 2_500);
+  await waitFor(() => !isAlive(entryPid), "the stuck program to be killed", 12_000);
+});
+
+test("a run a program asked for is stopped when the one who asked is gone", { timeout: 40_000 }, async (t) => {
+  const entryDir = makeTempDir("trama-session-entry-");
+  const workerDir = makeTempDir("trama-session-worker-");
+  const signalDir = makeTempDir("trama-session-signal-");
+  t.after(() => { cleanupTempDir(entryDir); cleanupTempDir(workerDir); cleanupTempDir(signalDir); });
+
+  createProjectFixture(workerDir, {
+    programSource: `import { writeFileSync } from "fs";
+writeFileSync(${JSON.stringify(join(signalDir, "worker.pid"))}, String(process.pid));
+setInterval(() => {}, 1000);
+await new Promise(() => {});`,
+  });
+  // The program has a process of its own ask for the run, kills that process
+  // outright once the run is going, and then hangs. Nobody tells the runner
+  // the run is no longer wanted: the asker's connection closing has to do.
+  const asker = `import { runProgram } from ${JSON.stringify(RUNNER_SURFACE_URL)};
+await runProgram({ projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 60000 });`;
+  createProjectFixture(entryDir, {
+    scaffold: false,
+    programSource: `import { spawn } from "child_process";
+import { existsSync, readFileSync, writeFileSync } from "fs";
+const workerPid = ${JSON.stringify(join(signalDir, "worker.pid"))};
+const asker = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(asker)}], { stdio: "ignore" });
+while (!existsSync(workerPid) || !readFileSync(workerPid, "utf-8")) await new Promise(resolve => setTimeout(resolve, 20));
+asker.kill("SIGKILL");
+const alive = () => { try { process.kill(Number(readFileSync(workerPid, "utf-8")), 0); return true; } catch { return false; } };
+while (alive()) await new Promise(resolve => setTimeout(resolve, 20));
+writeFileSync(${JSON.stringify(join(signalDir, "worker-was-stopped"))}, "");
+setInterval(() => {}, 1000);
+await new Promise(() => {});`,
+  });
+
+  const result = await runProgram({ projectDir: entryDir, maxRepairAttempts: 0, timeout: 3_000 });
+
+  assert.equal(existsSync(join(signalDir, "worker-was-stopped")), true, "the run must be stopped once nobody waits for it");
+  // ...and with it gone, the program's clock runs again.
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /timeout/);
+});
+
+test("programs that run programs without end are refused", { timeout: 60_000 }, async (t) => {
+  const projectDir = makeTempDir("trama-session-");
+  const signalDir = makeTempDir("trama-session-signal-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(signalDir); });
+
+  // A program that runs itself, noting how deep it is each time.
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx } from "@trama-dev/runtime";
+import { runProgram } from "@trama-dev/runtime/runner";
+import { appendFileSync } from "fs";
+const depth = ctx.input.args.depth ?? 0;
+const log = ${JSON.stringify(join(signalDir, "depths.txt"))};
+appendFileSync(log, "depth " + depth + "\\n");
+try {
+  await runProgram({ projectDir: process.cwd(), args: { depth: depth + 1 }, maxRepairAttempts: 0, timeout: 60000 });
+} catch (err) {
+  appendFileSync(log, "refused: " + err.message + "\\n");
+}
+await ctx.done();`,
+  });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 60_000 });
+  assert.equal(result.status, "done");
+
+  const lines = readFileSync(join(signalDir, "depths.txt"), "utf-8").trim().split("\n");
+  const refusals = lines.filter(line => line.startsWith("refused"));
+  assert.equal(refusals.length, 1, "exactly one run should have been refused");
+  assert.match(refusals[0], /more than 16 deep/);
+  assert.equal(lines.filter(line => line.startsWith("depth")).length, 17, "the runs at depths 0 to 16 ran");
+});
+
+test("a participant's output is shown under its name, and is not its parent's output", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const entryDir = makeTempDir("trama-session-entry-");
+  const workerDir = makeTempDir("trama-session-worker-");
+  const wsDir = makeTempDir("trama-session-ws-");
+  t.after(() => { for (const dir of [fakeHome, entryDir, workerDir, wsDir]) cleanupTempDir(dir); });
+
+  createProjectFixture(workerDir, {
+    programSource: `import { ctx } from "@trama-dev/runtime";
+console.log("hello from the participant");
+await ctx.log("checking");
+process.stdout.write("and a last line without a newline");
+await ctx.done();`,
+  });
+  // The program that spawned it fails afterwards — so what it is reported to have printed can be checked.
+  createProjectFixture(entryDir, {
+    scaffold: false,
+    programSource: `import { Session } from "@trama-dev/session";
+const session = await Session.create({ workspace: ${JSON.stringify(wsDir)} });
+await session.spawn("scout", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 20000 }).wait();
+console.log("the entry program's own line");
+throw new Error("the entry program fails");`,
+  });
+
+  const runnerUrl = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "runner.js")).href;
+  const { stdout } = await runNodeCommand(["--input-type=module", "-e",
+    `import { runProgram } from ${JSON.stringify(runnerUrl)};
+const result = await runProgram({ projectDir: ${JSON.stringify(entryDir)}, maxRepairAttempts: 0, timeout: 30_000 });
+console.log("REASON " + JSON.stringify(result.reason));`,
+  ], { env: { ...process.env, HOME: fakeHome } });
+
+  assert.match(stdout, /^\[scout\] hello from the participant$/m);
+  assert.match(stdout, /^\[scout\] and a last line without a newline$/m);
+  assert.match(stdout, /^\[scout\] \[trama\] checking$/m, "what the runner prints for a participant is under its name too");
+  assert.match(stdout, /^the entry program's own line$/m);
+  const reason = stdout.split("\n").find(line => line.startsWith("REASON "));
+  assert.match(reason, /the entry program's own line/);
+  assert.doesNotMatch(reason, /hello from the participant/, "a participant's output must not be reported as its parent's");
+});
+
+test("inside a program, a session is what it is outside one", { timeout: 40_000 }, async (t) => {
+  const entryDir = makeTempDir("trama-session-entry-");
+  const workerDir = makeTempDir("trama-session-worker-");
+  const signalDir = makeTempDir("trama-session-signal-");
+  t.after(() => { cleanupTempDir(entryDir); cleanupTempDir(workerDir); cleanupTempDir(signalDir); });
+
+  createProjectFixture(workerDir, {
+    programSource: `import { writeFileSync } from "fs";
+writeFileSync(${JSON.stringify(join(signalDir, "worker.pid"))}, String(process.pid));
+setInterval(() => {}, 1000);
+await new Promise(() => {});`,
+  });
+  // Two things a program may rely on, which now happen through its runner:
+  // the workspace directory exists as soon as the session does, and stopping
+  // a run with a signal ends in a result — once the run is really over.
+  createProjectFixture(entryDir, {
+    scaffold: false,
+    programSource: `import { ctx } from "@trama-dev/runtime";
+import { runProgram } from "@trama-dev/runtime/runner";
+import { Session } from "@trama-dev/session";
+import { existsSync, readFileSync } from "fs";
+const workspace = ${JSON.stringify(join(signalDir, "ws", "nested"))};
+const session = await Session.create({ workspace });
+const workspaceExists = existsSync(session.workspaceDir);
+
+const workerPid = ${JSON.stringify(join(signalDir, "worker.pid"))};
+const stop = new AbortController();
+const run = runProgram({ projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 60000, signal: stop.signal });
+while (!existsSync(workerPid) || !readFileSync(workerPid, "utf-8")) await new Promise(resolve => setTimeout(resolve, 20));
+stop.abort();
+const stopped = await run;
+let workerAlive = true;
+try { process.kill(Number(readFileSync(workerPid, "utf-8")), 0); } catch { workerAlive = false; }
+
+const alreadyStopped = await runProgram({ projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, signal: stop.signal });
+await ctx.done({ workspaceExists, stopped, workerAlive, alreadyStopped });`,
+  });
+
+  const result = await runProgram({ projectDir: entryDir, maxRepairAttempts: 0, timeout: 30_000 });
+  assert.equal(result.status, "done", result.reason);
+  const stoppedRun = { status: "failed", reason: "The run was stopped before it finished." };
+  assert.deepEqual(result.result, {
+    workspaceExists: true,
+    stopped: stoppedRun,
+    workerAlive: false,
+    alreadyStopped: stoppedRun,
+  });
 });

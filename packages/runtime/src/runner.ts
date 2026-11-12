@@ -9,9 +9,9 @@ import { join, dirname } from "path";
 import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { randomBytes } from "crypto";
-import type { ShellResult } from "./types.js";
+import type { ShellResult, Workspace } from "./types.js";
 import type { RunOptions, TramaConfig, ProgramResult } from "./runner-types.js";
-import type { AgentBackend } from "./agent-backend.js";
+import { rejectOnAbort, type AgentBackend } from "./agent-backend.js";
 import { PiAdapter } from "./pi-adapter.js";
 import { createContext } from "./context.js";
 import { createAgent, stripCodeFences } from "./agent.js";
@@ -19,7 +19,6 @@ import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
 import { guardPath } from "./path-guard.js";
 import { createAllowance, stopGroups, superviseChild, type ChildExit } from "./child-process.js";
-import { openBridge } from "./bridge-client.js";
 import { removeTempDir, removeWithThisProcess, stopWithThisProcess } from "./lifetime.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
 
@@ -219,7 +218,10 @@ export function loadProjectConfig(projectDir: string): TramaConfig {
  * everything else is handed one and does not know which it is.
  */
 export function createBackend(config: TramaConfig): AgentBackend {
-  return new PiAdapter(config);
+  const backend = new PiAdapter(config);
+  // The interface promises that a cancelled call rejects, and a run's end
+  // waits on that. Every backend is held to it here, rather than trusted with it.
+  return { ask: (prompt, call) => rejectOnAbort(backend.ask(prompt, call), call.signal) };
 }
 
 export function loadState(projectDir: string): Record<string, unknown> {
@@ -411,6 +413,12 @@ interface RunOnceOptions {
   stopOnReady?: { graceMs: number };
   /** Shared workspace directory. When set, the workspace.* API is enabled. */
   workspaceDir?: string;
+  /** How many runs deep this one is: 0 for a run nobody's program asked for. */
+  depth: number;
+  /** Shown in front of each line of the program's output. */
+  label?: string;
+  /** Stops the run. */
+  signal?: AbortSignal;
 }
 
 interface RunOnceResult {
@@ -423,6 +431,35 @@ interface RunOnceResult {
 /** The end of a long output — where the error is — with a note of how much was dropped. */
 function tail(text: string, max = 20_000): string {
   return text.length <= max ? text : `[… ${text.length - max} earlier characters omitted]\n${text.slice(-max)}`;
+}
+
+/** A line as it is shown for a run: under the run's name, if it has one. */
+const tagged = (label: string | undefined, line: string) => label ? `[${label}] ${line}` : line;
+
+/** The longest stretch of output held back while waiting for its line to end. */
+const MAX_HELD_LINE = 64 * 1024;
+
+/** Put a label in front of each line written to a stream. `flush` writes out a last line that had no newline. */
+function labelled(label: string, write: (text: string) => void) {
+  let held = "";
+  const flush = () => {
+    if (held) write(tagged(label, held) + "\n");
+    held = "";
+  };
+  return {
+    sink(chunk: string) {
+      const end = chunk.lastIndexOf("\n");
+      if (end === -1) {
+        held += chunk;
+        if (held.length > MAX_HELD_LINE) flush(); // a line with no end in sight is shown in pieces
+        return;
+      }
+      const lines = (held + chunk.slice(0, end)).split("\n");
+      held = chunk.slice(end + 1);
+      write(lines.map(line => tagged(label, line) + "\n").join(""));
+    },
+    flush,
+  };
 }
 
 const describeFailure = (r: ShellResult) =>
@@ -482,8 +519,9 @@ function settle(projectDir: string, child: ShellResult, terminalSignal: ProgramR
  * (bad project, server or spawn failure) or left state.json unreadable.
  */
 async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
-  const { projectDir, backend, timeout, maxIterations, argsOverride, stopOnReady, workspaceDir } = options;
+  const { projectDir, backend, timeout, maxIterations, argsOverride, stopOnReady, workspaceDir, label, signal } = options;
 
+  if (signal?.aborted) return { outcome: null, failure: "The run was stopped before its program started." };
   ensureProjectScaffold(projectDir);
 
   // Cancels in-flight LLM calls, fetches and observes once the run is over.
@@ -499,13 +537,17 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     onReady: stopOnReady && (() => {
       readyTimer ??= setTimeout(() => readyStop.abort(), stopOnReady.graceMs).unref();
     }),
+    print: line => console.log(tagged(label, line)),
   });
   // Truncate logs only after preflight succeeds — preserves the prior run's
   // diagnostics if scaffolding, state loading, or context creation fails.
   writeFileSync(guardPath(projectDir, join("logs", "latest.jsonl")), "");
 
-  // The program's own time. It stops while a run the program started is in flight.
+  // The program's own time. It stops while a run the program asked for is in flight.
   const allowance = createAllowance(timeout);
+  // Runs the program has asked for and that are still going. They belong to this run.
+  const nestedRuns = new Set<Promise<unknown>>();
+  const workspaces = new Map<string, Workspace>();
   const tools = createTools(projectDir, runEnded.signal);
   // Known only to this run's program, through its init file.
   const token = randomBytes(32).toString("hex");
@@ -515,15 +557,51 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     agent: createAgent(backend, projectDir, runEnded.signal),
     tools,
     workspace: workspaceDir ? createWorkspace(workspaceDir, runEnded.signal) : null,
+    workspaceAt: (dir) => {
+      let workspace = workspaces.get(dir);
+      if (!workspace) workspaces.set(dir, workspace = createWorkspace(dir, runEnded.signal));
+      return workspace;
+    },
+    run: (request, stop) => {
+      // The program is waiting, not working: its clock stops for as long as
+      // the run it asked for lasts, which has a timeout of its own. That run
+      // is stopped when this one ends, or when the program no longer wants it.
+      const release = allowance.hold();
+      const nested = runProgram(
+        { ...request, signal: AbortSignal.any([runEnded.signal, stop]) },
+        options.depth + 1,
+      ).finally(() => {
+        release();
+        nestedRuns.delete(nested);
+      });
+      nestedRuns.add(nested);
+      return nested;
+    },
     // The first terminal signal wins; ctx itself rejects a conflicting second one.
     onTerminalSignal: result => { terminalSignal ??= result; },
-    holdClock: () => allowance.hold(),
   });
+
+  // A participant's output is shown under its name. It is not its parent's
+  // output: the runner writes it out itself, wherever in the tree it runs.
+  const out = label ? labelled(label, text => process.stdout.write(text)) : null;
+  const err = label ? labelled(label, text => process.stderr.write(text)) : null;
 
   // The program leads a process group of its own, so that everything it starts is in it.
   let programGroup: number | undefined;
   // If this process is stopped while the program is running, the program is stopped with it.
   let programSettled = () => {};
+  // Asked to stop while its program had not ended. Everything it has in flight
+  // goes at once — the runs it asked for among them, so that a tree of runs is
+  // stopped together rather than one level after another.
+  let programOver = false;
+  let stopped = false;
+  const stopProgram = () => {
+    if (programOver) return;
+    stopped = true;
+    runEnded.abort();
+    if (programGroup) void stopGroups([programGroup]);
+  };
+  signal?.addEventListener("abort", stopProgram, { once: true });
   try {
     const child = await withTempDir("trama-init-", async (initDir) => {
       const port = await listen(server);
@@ -546,25 +624,39 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       });
       programGroup = program.pid;
       if (programGroup) programSettled = stopWithThisProcess(programGroup);
+      if (signal?.aborted) stopProgram(); // asked to stop while the program was being started
 
-      return toChildResult(await superviseChild(program, {
+      const exit = await superviseChild(program, {
         timeout: allowance,
         stopSignal: stopOnReady ? readyStop.signal : undefined,
         sinks: {
-          stdout: chunk => { process.stdout.write(chunk); },
-          stderr: chunk => { process.stderr.write(chunk); },
+          stdout: out ? out.sink : chunk => { process.stdout.write(chunk); },
+          stderr: err ? err.sink : chunk => { process.stderr.write(chunk); },
         },
-      }));
+      });
+      programOver = true;
+      return toChildResult(exit);
     });
-    return { outcome: settle(projectDir, child, terminalSignal), failure: describeFailure(child) };
+    // A program that was stopped did not finish, whatever its exit code says —
+    // unless it had already said it was done.
+    const outcome = stopped && !terminalSignal ? null : settle(projectDir, child, terminalSignal);
+    return { outcome, failure: describeFailure(child) };
   } finally {
     // The program is gone (or never started). Nothing it started outlives its
-    // run: cancel the calls it left in flight, and stop what is left of its
-    // process group and of its shell commands. Only once they are gone is the
-    // run over — whoever called will merge or delete what they were writing to.
+    // run: cancel the calls it left in flight — the runs it asked for among
+    // them — and stop what is left of its process group and of its shell
+    // commands. Only once they are gone is the run over: whoever called will
+    // merge or delete what they were writing to.
+    signal?.removeEventListener("abort", stopProgram);
+    out?.flush();
+    err?.flush();
     if (readyTimer) clearTimeout(readyTimer);
     runEnded.abort();
-    await Promise.all([stopGroups(programGroup ? [programGroup] : []), tools.stopActiveShells()]);
+    await Promise.all([
+      stopGroups(programGroup ? [programGroup] : []),
+      tools.stopActiveShells(),
+      Promise.allSettled([...nestedRuns]),
+    ]);
     programSettled();
     server.closeAllConnections();
     await closeServer(server).catch(() => { /* best-effort */ });
@@ -608,11 +700,13 @@ async function requestRepair(
   return withTempDir("trama-repair-", async (tempDir) => {
     copyDirInto(options.projectDir, tempDir);
     writeFileSync(guardPath(tempDir, "program.ts"), input.programSource);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), options.timeout);
+    const timedOut = new AbortController();
+    const limit = createAllowance(options.timeout);
+    limit.start(() => timedOut.abort());
+    const signal = options.signal ? AbortSignal.any([timedOut.signal, options.signal]) : timedOut.signal;
     try {
       const fixed = stripCodeFences(await options.backend.ask(repairPrompt(input), {
-        cwd: tempDir, system: REPAIR_SYSTEM_PROMPT, signal: controller.signal,
+        cwd: tempDir, system: REPAIR_SYSTEM_PROMPT, signal,
       }));
       if (fixed.trim() === "") throw new Error("The repair returned an empty program.");
       if (fixed === input.programSource) throw new Error("The repair returned the program unchanged.");
@@ -621,7 +715,7 @@ async function requestRepair(
       repairErrors.push(err instanceof Error ? err.message : String(err));
       return null;
     } finally {
-      clearTimeout(timer);
+      limit.cancel();
     }
   });
 }
@@ -668,8 +762,16 @@ async function executeProgram(options: ExecuteOptions): Promise<Execution> {
   const { projectDir, maxRepairAttempts } = options;
   const failed = (reason: string): Execution => ({ result: { status: "failed", reason } });
 
+  // A run that is stopped fails without a repair — there is nothing wrong with
+  // the program. Checked after each step; a step that had already reached an
+  // outcome keeps it.
+  const stopped = () => options.signal?.aborted === true;
+  const wasStopped = () => failed("The run was stopped before it finished.");
+  if (stopped()) return wasStopped();
+
   const firstRun = await runProgramOnce(options);
   if (firstRun.outcome) return { result: firstRun.outcome };
+  if (stopped()) return wasStopped();
 
   let lastError = firstRun.failure;
   if (maxRepairAttempts === 0) return failed(`Program failed (repair disabled): ${lastError}`);
@@ -682,11 +784,13 @@ async function executeProgram(options: ExecuteOptions): Promise<Execution> {
 
   for (let attempt = 0; attempt < maxRepairAttempts; attempt++) {
     const fixed = await requestRepair(options, { programSource: currentSource, error: lastError }, repairErrors);
+    if (stopped()) return wasStopped();
     if (!fixed) return failed(`Failed after ${attempt + 1} repair attempt(s): ${lastError}${repairDetails()}`);
     currentSource = fixed;
 
     const run = await tryFix(options, fixed);
     if (run.outcome) return { result: run.outcome, repair: { attempt, error: lastError } };
+    if (stopped()) return wasStopped();
     lastError = run.failure;
   }
 
@@ -721,6 +825,7 @@ export async function validateProgram(
       ...options,
       projectDir: trialDir,
       backend,
+      depth: 0,
       stopOnReady: { graceMs: VALIDATION_READY_GRACE_MS },
     });
     if (result.status === "failed") {
@@ -752,39 +857,38 @@ export function installValidatedProgram(
 
 // --- Core execution ---
 
+/** How deep programs may run programs, and how many runs one runner carries at a time. */
+const MAX_RUN_DEPTH = 16;
+const MAX_RUNS_IN_FLIGHT = 128;
+let runsInFlight = 0;
+
 /**
- * A run started from inside a program — a session participant, typically — is
- * under a timeout of its own. Tell the runner of the program it was started
- * from, so that program's clock stops while this run lasts and it is not
- * killed for the time its participant was entitled to take.
+ * Run a project, in this process: this is what a runner does.
  *
- * Returns what ends the hold. Best-effort: if that runner cannot be reached
- * its program's run is over, and this one is about to be stopped with it.
- *
- * This exists only because the runner of a participant lives inside the
- * program that spawned it, where that program's own runner cannot see it. It
- * goes away once starting a run is itself a call on the bridge.
+ * `depth` is how many runs deep this one is — 0 unless a program asked for it
+ * (see the "/run/program" call), in which case it is one more than that
+ * program's own. One runner carries the whole tree, so it is also where the
+ * tree is kept from growing without bound.
  */
-function holdParentClock(): () => void {
-  const { TRAMA_PORT: port, TRAMA_INIT: initPath } = process.env;
-  if (port && initPath) {
-    try {
-      return openBridge(port, initPath).hold("/clock/hold");
-    } catch { /* not held */ }
+export async function runProgram(options: RunOptions, depth = 0): Promise<ProgramResult> {
+  if (depth > MAX_RUN_DEPTH) {
+    throw new Error(
+      `Not running ${options.projectDir}: programs are running programs more than ${MAX_RUN_DEPTH} deep. ` +
+      `A program that runs itself, or two that run each other, never ends.`
+    );
   }
-  return () => {};
-}
-
-export async function runProgram(options: RunOptions): Promise<ProgramResult> {
-  const releaseParentClock = holdParentClock();
+  if (runsInFlight >= MAX_RUNS_IN_FLIGHT) {
+    throw new Error(`Not running ${options.projectDir}: ${MAX_RUNS_IN_FLIGHT} runs are already in flight.`);
+  }
+  runsInFlight += 1;
   try {
-    return await runProject(options);
+    return await runProject(options, depth);
   } finally {
-    releaseParentClock();
+    runsInFlight -= 1;
   }
 }
 
-async function runProject(options: RunOptions): Promise<ProgramResult> {
+async function runProject(options: RunOptions, depth: number): Promise<ProgramResult> {
   const { projectDir } = options;
 
   if (!existsSync(join(projectDir, "meta.json"))) {
@@ -813,6 +917,9 @@ async function runProject(options: RunOptions): Promise<ProgramResult> {
     maxIterations: config.defaultMaxIterations,
     argsOverride: options.args,
     workspaceDir: options.workspaceDir,
+    depth,
+    label: options.label,
+    signal: options.signal,
   });
 
   if (repair) {
@@ -820,10 +927,10 @@ async function runProject(options: RunOptions): Promise<ProgramResult> {
     try {
       const entry = { ts: Date.now(), message: `Repair attempt ${repair.attempt + 1}/${maxRepairAttempts}`, data: { error: repair.error } };
       appendFileSync(guardPath(projectDir, join("logs", "latest.jsonl")), JSON.stringify(entry) + "\n");
-      console.log(`[trama] Repair attempt ${repair.attempt + 1}/${maxRepairAttempts}`);
+      console.log(tagged(options.label, `[trama] Repair attempt ${repair.attempt + 1}/${maxRepairAttempts}`));
       copyToHistory(projectDir, "repair", repair.error);
     } catch (err) {
-      console.warn(`[trama] repair bookkeeping failed: ${err instanceof Error ? err.message : err}`);
+      console.warn(tagged(options.label, `[trama] repair bookkeeping failed: ${err instanceof Error ? err.message : err}`));
     }
   }
   return result;
