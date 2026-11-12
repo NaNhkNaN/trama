@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { join } from "path";
-import { existsSync, mkdirSync, readFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync } from "fs";
 import { createProject, listProjects, showLogs, updateProject, validateProjectName } from "../packages/runtime/dist/index.js";
 import { llm } from "./fake-llm.mjs";
 import {
@@ -941,4 +941,27 @@ test("listProjects truncates long prompts at 60 characters", async (t) => {
   assert.match(line, /\.\.\./, "long prompt should be truncated with ...");
   // Should not contain the full 100 chars
   assert.ok(!line.includes("a".repeat(100)));
+});
+
+test("updateProject refuses a program that is read-only before a new one is asked for", { skip: process.getuid?.() === 0 }, async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+  const projectDir = join(fakeHome, ".trama", "projects", "locked");
+  createProjectFixture(projectDir, { packageJson: { type: "module" }, programSource: DEFAULT_PROGRAM });
+  chmodSync(join(projectDir, "program.ts"), 0o444);
+
+  let asked = 0;
+  const originalAsk = llm.ask;
+  llm.ask = async () => { asked += 1; return UPDATED_PROGRAM; };
+  t.after(() => { llm.ask = originalAsk; });
+
+  await withEnv({ HOME: fakeHome }, async () => {
+    await assert.rejects(
+      updateProject("locked", "change it"),
+      /the program is unchanged\.\nThe program cannot be replaced: .*program\.ts is read-only/,
+    );
+  });
+  // An update's only use is a new program: the model was not paid to write one that could not be installed.
+  assert.equal(asked, 0);
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), DEFAULT_PROGRAM);
 });

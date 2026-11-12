@@ -1,27 +1,53 @@
 import { writeFileSync, appendFileSync } from "fs";
 import { join } from "path";
 import type { Ctx } from "./types.js";
-import { assertSerializable, toLogData } from "./serializable.js";
+import type { ProgramResult } from "./runner-types.js";
+import { assertSerializable } from "./serializable.js";
 import { guardPath } from "./path-guard.js";
 import { readProjectMeta } from "./meta.js";
 
 /** Where a project's structured run log lives, relative to the project root. */
 export const LATEST_LOG_PATH = join("logs", "latest.jsonl");
 
-/** Append one structured JSONL entry to a run log file. */
+/** Append one structured JSONL entry to a run log file. `data` is what the program's side made of what it was given (see toLogData). */
 export function appendLogEntry(logsPath: string, message: string, data?: unknown): void {
-  const entry = { ts: Date.now(), message, data: toLogData(data ?? null) };
+  const entry = { ts: Date.now(), message, data: data ?? null };
   appendFileSync(logsPath, JSON.stringify(entry) + "\n");
 }
 
 /**
- * The runner-side ctx: owns state.json and the run log for one run of a
- * program. The program's own `ctx` (client.ts) forwards to this over IPC.
+ * The runner's side of a program's `ctx`: what the program is told when it
+ * starts, and the one place its state file and run log are written. The
+ * program's own `ctx` (client.ts) forwards to this over IPC.
  *
- * This is the one place the ctx lifecycle rules are enforced (ready once,
- * done once, done and yield mutually exclusive) — the client only forwards.
- *
- * Bookkeeping lives in ctx.state under reserved `__trama_*` keys:
+ * The state is the program's. It is handed over with each call that persists
+ * it and is not kept here: there is one copy of it in the program, and one on
+ * disk.
+ */
+export interface RunContext {
+  readonly input: Ctx["input"];
+  readonly maxIterations: number;
+  /** Whether this run takes up from a yield, and the reason that yield gave. */
+  readonly resumed: boolean;
+  readonly yieldReason: string | null;
+  /** How many times the state has been persisted — in this run and the ones before it. */
+  readonly iteration: number;
+  /** How the program ended the run: null until it has called done() or yield(). */
+  readonly ended: ProgramResult | null;
+
+  log(message: string, data?: unknown): void;
+  /** The first call is logged and passed on to `onReady`; any other does nothing. */
+  ready(data?: Record<string, unknown>): void;
+  /** Persist the program's state as it is now. Returns the iteration that makes it. */
+  checkpoint(state: Record<string, unknown>): number;
+  /** Persist the state and end the run as done. Returns the iteration it ended on. */
+  done(state: Record<string, unknown>, result?: unknown): number;
+  /** Persist the state, with the mark the next run resumes from, and end the run as yielded. */
+  yield(state: Record<string, unknown>, reason: string): void;
+}
+
+/**
+ * Bookkeeping lives in the state file under reserved `__trama_*` keys:
  * `__trama_iteration` (progress counter) and `__trama_yield` (set while the
  * program is suspended, cleared when it next advances).
  */
@@ -35,13 +61,10 @@ export function createContext(
     /** Where the run's log lines are shown as they are written. Defaults to the console. */
     print?: (line: string) => void;
   },
-): Ctx {
+): RunContext {
   const logsPath = guardPath(projectDir, LATEST_LOG_PATH);
   const statePath = guardPath(projectDir, "state.json");
   const meta = readProjectMeta(projectDir);
-
-  let readyCalled = false;
-  let terminalSignal: "done" | "yielded" | null = null;
 
   // The input is the project's own: it is handed on as the file has it.
   const input = (options?.argsOverride
@@ -52,82 +75,78 @@ export function createContext(
   const yieldMarker = initialState.__trama_yield as { reason: string } | undefined;
   const savedIteration = initialState.__trama_iteration;
 
+  let iteration = typeof savedIteration === "number" && Number.isInteger(savedIteration) && savedIteration >= 0
+    ? savedIteration : 0;
+  let readyCalled = false;
+  let ended: ProgramResult | null = null;
+
   const writeLog = (message: string, data?: unknown) => {
     appendLogEntry(logsPath, message, data);
     (options?.print ?? console.log)(`[trama] ${message}`);
   };
 
-  /** Validate ctx.state, write state.json, and advance in-memory state only once persisted. */
-  const persistState = (ctx: Ctx, yieldReason?: string) => {
-    assertSerializable(ctx.state, "ctx.state");
-    const nextIteration = ctx.iteration + 1;
-    const nextState: Record<string, unknown> = { ...ctx.state, __trama_iteration: nextIteration };
-    if (yieldReason !== undefined) nextState.__trama_yield = { reason: yieldReason };
-    else delete nextState.__trama_yield; // the program has moved on from its last yield
-    writeFileSync(statePath, JSON.stringify(nextState, null, 2));
-    if (yieldReason !== undefined) ctx.state.__trama_yield = { reason: yieldReason };
-    else delete ctx.state.__trama_yield;
-    ctx.state.__trama_iteration = nextIteration;
-    ctx.iteration = nextIteration;
+  /**
+   * The one way a state reaches the state file, and the one place the rules of
+   * a run's ending are kept. A run ends once, by done() or by yield(). After
+   * that its state is settled: the same ending said again does nothing, and
+   * any other call that would write the state is refused — it would take back
+   * what the run ended on, the mark the next run resumes from included.
+   *
+   * `ending` is how the call ends the run, if it does. Returns false for a call
+   * that had nothing left to do.
+   */
+  const persist = (call: "checkpoint" | "done" | "yield", state: Record<string, unknown>, ending?: ProgramResult): boolean => {
+    if (ended) {
+      if (ending?.status === ended.status) return false;
+      const endedBy = ended.status === "done" ? "done" : "yield";
+      throw new Error(`Cannot call ctx.${call}() after ctx.${endedBy}() — the run has ended, and its state is settled.`);
+    }
+    assertSerializable(state, "ctx.state");
+    const record: Record<string, unknown> = { ...state, __trama_iteration: iteration + 1 };
+    if (ending?.status === "yielded") record.__trama_yield = { reason: ending.reason };
+    else delete record.__trama_yield; // the program has moved on from its last yield
+    writeFileSync(statePath, JSON.stringify(record, null, 2));
+    // Settled only once persisted: a call that failed leaves every call open.
+    iteration += 1;
+    ended = ending ?? null;
+    return true;
+  };
+
+  /** Persistence is the critical part: a log line that cannot be written must not turn a completed ending into an error. */
+  const logEnding = (message: string, data?: unknown) => {
+    try { writeLog(message, data); } catch { /* best-effort */ }
   };
 
   return {
     input,
-    state: { ...initialState },
-    iteration: typeof savedIteration === "number" && Number.isInteger(savedIteration) && savedIteration >= 0
-      ? savedIteration : 0,
     maxIterations: options?.maxIterations ?? 100,
     resumed: yieldMarker != null,
     yieldReason: yieldMarker?.reason ?? null,
+    get iteration() { return iteration; },
+    get ended() { return ended; },
 
-    async log(message, data) {
-      writeLog(message, data);
-    },
+    log: writeLog,
 
-    async ready(data) {
+    ready(data) {
       if (readyCalled) return;
       writeLog("ready", data);
       options?.onReady?.(data);
       readyCalled = true;
     },
 
-    async checkpoint() {
-      // A checkpoint says the program has moved on from its last yield. After
-      // the yield that ends this run it would take back the very thing the
-      // next run resumes from.
-      if (terminalSignal === "yielded") {
-        throw new Error("Cannot call ctx.checkpoint() after ctx.yield() — the run has yielded.");
-      }
-      persistState(this);
+    checkpoint(state) {
+      persist("checkpoint", state);
+      return iteration;
     },
 
-    async done(result) {
-      if (terminalSignal === "yielded") {
-        throw new Error("Cannot call ctx.done() after ctx.yield() — yield already signaled.");
-      }
-      if (terminalSignal === "done") return;
-
-      persistState(this);
-      // Settled only once persisted — a failed done() leaves done() and yield() both open.
-      terminalSignal = "done";
-      // Persistence is the critical part; a log failure must not turn a completed done() into an error.
-      try { writeLog("done", result); } catch { /* best-effort */ }
+    done(state, result) {
+      if (persist("done", state, { status: "done", result: result ?? undefined })) logEnding("done", result);
+      return iteration;
     },
 
-    async yield(reason) {
-      if (terminalSignal === "done") {
-        throw new Error("Cannot call ctx.yield() after ctx.done() — done already signaled.");
-      }
-      // The client exits the process after its first successful yield; here a
-      // repeated call is simply a no-op.
-      if (terminalSignal !== "yielded") {
-        persistState(this, reason);
-        // Settled only once persisted — a failed yield() leaves done() and yield() both open.
-        terminalSignal = "yielded";
-        try { writeLog("yield", { reason }); } catch { /* best-effort */ }
-      }
-      // Exiting is the client's job: this returns so the IPC handler can answer first.
-      return undefined as never;
+    // Exiting is the program's job: this returns so that the call can be answered first.
+    yield(state, reason) {
+      if (persist("yield", state, { status: "yielded", reason })) logEnding("yield", { reason });
     },
   };
 }

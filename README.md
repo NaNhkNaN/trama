@@ -400,7 +400,7 @@ The runtime is what makes agent programs **self-contained and shareable**:
 - **IPC bridge** — programs communicate with the runtime through a local HTTP server. Every `ctx`, `agent`, `tools` and `workspace` call goes through this bridge, which gives the runtime a single point where it validates each request and can cancel work in flight when a run ends.
 - **State persistence** — `ctx.state` survives across runs via `checkpoint()` and `done()`. Programs can be long-running, interruptible, and resumable. `ctx.yield()` suspends a program cooperatively — persists state and exits, ready for the session layer to resume it later.
 - **Shared workspace** — when programs run in a session, they share a workspace for artifact I/O. Atomic writes, path guarding, and level-triggered observation (`workspace.observe()`) — without a message bus or coordination framework.
-- **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, and tries it on a private copy of the project. Only a fix that works is installed, along with what its run produced; one that fails never touches the project. Up to 3 attempts. In a session the fix runs against the live shared workspace, so a participant being repaired can still be heard and answered.
+- **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, and tries it on a private copy of the project. Only a fix that works is installed, along with what its run produced; one that fails never touches the project. Up to 3 attempts. A `program.ts` you have made read-only is never replaced: it is run, and if it fails no fix is asked for. In a session the fix runs against the live shared workspace, so a participant being repaired can still be heard and answered.
 - **A record of every run** — each call a program makes through the bridge is written down as it happens, with how it ended: what the agent was asked and answered, what was read and written, each command and its output, each program it started. `trama journal` shows it.
 - **Version history** — every create, update, and repair saves a snapshot. You can diff any two versions to see how the program evolved.
 - **Scaffolding** — the runtime creates package.json, the module symlink, gitignore, and the history and log directories, and checks them before every run. Recipients of a shared program don't need to set anything up.
@@ -507,7 +507,7 @@ for (let i = ctx.iteration; i < ctx.maxIterations; i++) {
 }
 
 await tools.write("target.ts", code);
-await ctx.done({ finalMetric: best });
+await ctx.done({ finalMetric: Number.isFinite(best) ? best : null });
 ```
 
 **Cooperative yield/resume:**
@@ -624,7 +624,7 @@ await ctx.done(result?)// signal completion — persists state, idempotent
 await ctx.yield(reason)// cooperative suspension — persists state, exits process
 ```
 
-`done()` and `yield()` are **mutually exclusive** terminal signals. The first one to succeed wins; a conflicting later call throws. A call that fails (for example because `ctx.state` isn't serializable) settles nothing — fix the problem and call either one.
+`done()` and `yield()` are **mutually exclusive** terminal signals. The first one to succeed wins; a conflicting later call throws. A call that fails (for example because `ctx.state` isn't serializable) settles nothing — fix the problem and call either one. Once a run has ended its state is settled: a `checkpoint()` after `done()` or `yield()` throws too.
 
 **State constraints:** `ctx.state` must be strictly JSON-serializable. No `Date`, `Map`, `Set`, circular references, `NaN`, or `Infinity`. `checkpoint()` will throw with a path to the offending value if validation fails. Keys starting with `__trama_` are reserved for internal use.
 
@@ -662,7 +662,7 @@ await tools.fetch(url, { method?, headers?, body? })
                                           // -> { status, body, headers }
 ```
 
-`read` and `write` are path-guarded to the project directory (traversal and symlink escape attempts throw — every link on the way to a path is followed, whether or not what it points at exists yet). `shell` defaults to a 30-second timeout; pass `{ timeout: 60000 }` for longer commands. A command is given no input: one that reads standard input finds it at an end. `fetch` returns the response body as a string (capped at 10MB).
+`read` and `write` are path-guarded to the project directory (traversal and symlink escape attempts throw — every link on the way to a path is followed, whether or not what it points at exists yet). A path is read the way the system reads it, so it names the same file as it would in the program's own `fs` calls: `dir/../file` goes up from where `dir` leads, and a path the system would not follow (`file.txt/`, `missing/..`) is refused. `shell` defaults to a 30-second timeout; pass `{ timeout: 60000 }` for longer commands. A command is given no input: one that reads standard input finds it at an end. `fetch` returns the response body as a string (capped at 10MB).
 
 Long-running programs should call `ctx.ready()` once startup completes so `create`/`update` smoke validation can treat "server is up" as success instead of waiting for process exit.
 

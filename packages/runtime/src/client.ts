@@ -26,8 +26,8 @@ if (!INIT_PATH) {
 
 const { init: initData, call } = openBridge(PORT, INIT_PATH);
 
-// The lifecycle rules (ready once, done once, done and yield mutually exclusive)
-// are enforced by the runner. Here each call is checked for what only this
+// The lifecycle rules (ready once; a run ends once, by done or by yield, and
+// nothing is persisted after that) are enforced by the runner. Here each call is checked for what only this
 // process can see — whether the values survive JSON — and then forwarded.
 export const ctx: Ctx = {
   input: initData.input,

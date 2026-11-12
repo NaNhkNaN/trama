@@ -44,15 +44,18 @@ export const isJsonObject = (value: unknown): value is Record<string, unknown> =
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 /**
- * Best-effort log payload sanitization: returns `data` unchanged when it
- * survives `JSON.stringify`, or a fallback wrapper when it cannot (e.g. a
- * circular reference or BigInt).
+ * Log data as a log line will hold it: what JSON makes of it — or, where JSON
+ * can make nothing of it (a circular reference, a BigInt), a note that says
+ * so. A log call does not fail over what it was handed.
  */
-export function toLogData<T>(data: T): T | { __trama_unserializable: string } {
+export function toLogData(data: unknown): unknown {
   try {
-    JSON.stringify(data);
-    return data;
+    const text = JSON.stringify(data);
+    return text === undefined ? undefined : JSON.parse(text);
   } catch {
-    return { __trama_unserializable: String(data) };
+    let described: string;
+    // An object with no prototype cannot even be turned into text.
+    try { described = String(data); } catch { described = Object.prototype.toString.call(data); }
+    return { __trama_unserializable: described };
   }
 }

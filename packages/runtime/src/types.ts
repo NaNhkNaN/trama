@@ -40,7 +40,10 @@ export interface Ctx {
    */
   ready(data?: Record<string, unknown>): Promise<void>;
 
-  /** Persist current ctx.state to disk */
+  /**
+   * Persist current ctx.state to disk.
+   * Throws once done() or yield() has been called: the run has ended, and its state is settled.
+   */
   checkpoint(): Promise<void>;
 
   /**

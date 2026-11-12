@@ -248,6 +248,34 @@ try {
   assert.equal(readJson(join(projectDir, "state.json")).__trama_yield, undefined);
 });
 
+test("runProgram refuses a checkpoint after done — what the run ended on stands", async (t) => {
+  const projectDir = makeTempDir("trama-result-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+ctx.state.answer = 1;
+await ctx.done({ final: true });
+ctx.state.answer = "changed after the end";
+let verdict;
+try {
+  await ctx.checkpoint();
+  verdict = "checkpoint was accepted";
+} catch (err) {
+  verdict = err.message;
+}
+await tools.write("verdict.txt", verdict + " / iteration " + ctx.iteration);
+`,
+  });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
+  assert.equal(result.status, "done");
+  assert.match(
+    readFileSync(join(projectDir, "verdict.txt"), "utf-8"),
+    /Cannot call ctx\.checkpoint\(\) after ctx\.done\(\).* \/ iteration 1$/,
+  );
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { answer: 1, __trama_iteration: 1 });
+});
+
 test("runProgram keeps the program's ctx.iteration in step with the runner", async (t) => {
   const projectDir = makeTempDir("trama-result-");
   t.after(() => cleanupTempDir(projectDir));

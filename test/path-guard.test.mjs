@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync, mkdirSync } from "fs";
-import { dirname, join, relative } from "path";
-import { destinationOf, guardPath, guardWriteTarget, isInside } from "../packages/runtime/dist/path-guard.js";
+import { dirname, join, sep } from "path";
+import { guardPath } from "../packages/runtime/dist/path-guard.js";
 import { createTools } from "../packages/runtime/dist/tools.js";
 import { createWorkspace } from "../packages/runtime/dist/workspace.js";
 import { loadState, ensureProjectScaffold } from "../packages/runtime/dist/runner.js";
@@ -71,9 +71,8 @@ test("guardPath allows symlinks that stay inside the project", (t) => {
   writeFileSync(join(projectDir, "data", "real.json"), "{}");
   symlinkSync(join(projectDir, "data", "real.json"), join(projectDir, "state.json"));
 
-  // Should not throw — symlink target is inside the project
-  const resolved = guardPath(projectDir, "state.json");
-  assert.ok(resolved.endsWith("state.json"));
+  // Should not throw — symlink target is inside the project. What comes back is where the link leads.
+  assert.equal(guardPath(projectDir, "state.json"), join(realpathSync(projectDir), "data", "real.json"));
 });
 
 // --- Integration tests: runner-level ops reject symlinks ---
@@ -208,8 +207,7 @@ test("guardPath allows dangling symlinks that stay inside the project", (t) => {
   symlinkSync(join(projectDir, "not-yet-created.json"), join(projectDir, "state.json"));
 
   // Should not throw — target is inside project even though it doesn't exist
-  const resolved = guardPath(projectDir, "state.json");
-  assert.ok(resolved.endsWith("state.json"));
+  assert.equal(guardPath(projectDir, "state.json"), join(realpathSync(projectDir), "not-yet-created.json"));
 });
 
 // --- chains of links ---
@@ -222,7 +220,7 @@ test("a link to a link that points outside is refused, though neither destinatio
   symlinkSync(join(projectDir, "second"), join(projectDir, "first"));   // points at the dangling link
 
   assert.throws(() => guardPath(projectDir, "first"), /Path escapes project directory via symlink/);
-  assert.throws(() => guardWriteTarget(projectDir, "first"), /Path escapes project directory via symlink/);
+  assert.throws(() => guardPath(projectDir, "first"), /Path escapes project directory via symlink/);
   // What a write would have done: follow both links and create the file outside.
   await assert.rejects(createTools(projectDir).write("first", "x"), /Path escapes project directory via symlink/);
   await assert.rejects(createWorkspace(projectDir).write("first", "x"), /Path escapes project directory via symlink/);
@@ -245,8 +243,7 @@ test("a chain of links that stays inside is followed to its end, and a write rep
   symlinkSync(join(workspaceDir, "deep", "target.txt"), join(workspaceDir, "second")); // nothing there yet
   symlinkSync("second", join(workspaceDir, "first"));                                   // a relative link
 
-  assert.equal(guardPath(workspaceDir, "first"), join(workspaceDir, "first"));
-  assert.equal(guardWriteTarget(workspaceDir, "first"), join(realpathSync(workspaceDir), "deep", "target.txt"));
+  assert.equal(guardPath(workspaceDir, "first"), join(realpathSync(workspaceDir), "deep", "target.txt"));
 
   await createWorkspace(workspaceDir).write("first", "through both");
   assert.equal(readFileSync(join(workspaceDir, "deep", "target.txt"), "utf-8"), "through both");
@@ -270,8 +267,10 @@ test("a root that does not exist yet is guarded like one that does", (t) => {
   t.after(() => cleanupTempDir(parent));
   const root = join(parent, "not", "made", "yet");
 
-  assert.equal(guardPath(root, "file.txt"), join(root, "file.txt"));
-  assert.throws(() => guardPath(root, "../../../../etc/passwd"), /Path escapes project directory/);
+  assert.equal(guardPath(root, "file.txt"), join(realpathSync(parent), "not", "made", "yet", "file.txt"));
+  // Up from a directory that is not there leads nowhere; a place of its own outside is outside.
+  assert.throws(() => guardPath(root, "../../../../etc/passwd"), /leads on from what does not exist/);
+  assert.throws(() => guardPath(root, "/etc/passwd"), /Path escapes project directory/);
 });
 
 test('".." in what a link says is taken from where the links before it lead', async (t) => {
@@ -304,7 +303,7 @@ test('".." that stays inside is followed, and one that leads up from nothing is 
   symlinkSync("sub/../file.txt", join(root, "back"));
   symlinkSync("not-there/../file.txt", join(root, "through-nothing"));
 
-  assert.equal(guardWriteTarget(root, "back"), join(realpathSync(root), "file.txt"));
+  assert.equal(guardPath(root, "back"), join(realpathSync(root), "file.txt"));
   // The system could not follow this either: there is no directory to go up from.
   assert.throws(() => guardPath(root, "through-nothing"), /leads on from what does not exist/);
 });
@@ -320,7 +319,7 @@ test("nothing lies beyond a file: a link that goes on from one is refused, for w
 
   // Taken as text, "regular.txt/.." is the root, and the write would land on other.txt.
   for (const path of ["bad", "dot", "regular.txt/child"]) {
-    assert.throws(() => guardWriteTarget(root, path), { code: "ENOTDIR" });
+    assert.throws(() => guardPath(root, path), { code: "ENOTDIR" });
     await assert.rejects(createTools(root).write(path, "OVERWRITTEN"), { code: "ENOTDIR" });
     await assert.rejects(createWorkspace(root).write(path, "OVERWRITTEN"), { code: "ENOTDIR" });
   }
@@ -348,7 +347,7 @@ test("a path that says a file is a directory, or leads on from nothing, is refus
   // A slash after a directory, or after a link to one, is only what it says.
   mkdirSync(join(root, "dir"));
   symlinkSync("dir/", join(root, "to-dir"));
-  assert.equal(guardWriteTarget(root, join("to-dir", "file.txt")), join(realpathSync(root), "dir", "file.txt"));
+  assert.equal(guardPath(root, join("to-dir", "file.txt")), join(realpathSync(root), "dir", "file.txt"));
 });
 
 test("the runtime resolves paths in one place", () => {
@@ -363,6 +362,8 @@ test("the guard's walk agrees with the system's, on random trees of directories,
   // Several starting points, not one: a single run of luck has passed for agreement here before.
   for (const start of [20261112, 1, 7, 1234567]) walkAgainstTheSystem(start);
 });
+
+const isInside = (path, root) => path === root || path.startsWith(root + sep);
 
 function walkAgainstTheSystem(start) {
   let seed = start;
@@ -417,11 +418,16 @@ function walkAgainstTheSystem(start) {
         asked.push("locked", "via", "via");
       }
 
+      // What is asked about is written as freely as what a link says: ways up and round, slashes
+      // doubled or left at the end. It is handed over as written — nothing tidies it first.
+      const steps = [...asked, ...asked, "..", "."];
       for (let q = 0; q < 120; q++) {
-        const query = join(root, ...Array.from({ length: 1 + Math.floor(random() * 4) }, () => pick(asked)));
+        const asking = "root/" + Array.from({ length: 1 + Math.floor(random() * 4) }, () => pick(steps)).join(random() < 0.1 ? "//" : "/")
+          + (random() < 0.15 ? "/" : "");
+        const query = base + "/" + asking;
         const where = `[${start}/${round}] ${query}`;
         let ours, refused, system, systemCode;
-        try { ours = guardWriteTarget(base, relative(base, query)); } catch (err) { refused = err; }
+        try { ours = guardPath(base, asking); } catch (err) { refused = err; }
         // What the system makes of the path is what it does when asked to use it. (Its realpath is not
         // asked first: on macOS that is worked out by a library, which lets ".." follow a file.)
         try { statSync(query); system = realpathSync.native(query); } catch (err) { systemCode = err.code; }
@@ -467,9 +473,9 @@ test("as many links are followed as every system follows, and no more", (t) => {
   symlinkSync("end.txt", join(root, "l1"));
   for (let k = 2; k <= 33; k++) symlinkSync(`l${k - 1}`, join(root, `l${k}`));
 
-  assert.equal(guardWriteTarget(root, "l32"), join(root, "end.txt"));
+  assert.equal(guardPath(root, "l32"), join(root, "end.txt"));
   // One more is a loop to macOS. A write must not go where a read cannot follow.
-  assert.throws(() => guardWriteTarget(root, "l33"), /Too many levels of symbolic links/);
+  assert.throws(() => guardPath(root, "l33"), /Too many levels of symbolic links/);
 });
 
 test("a link to nothing is refused where one can be made", async (t) => {
@@ -501,8 +507,95 @@ test("a way through a directory that may not be passed is refused, though it com
   assert.equal(readFileSync(join(root, "f.txt"), "utf-8"), "ORIGINAL");
 });
 
-test("isInside holds for the top of the filesystem too", () => {
-  assert.equal(isInside("/etc/hosts", "/"), true);
-  assert.equal(isInside("/", "/"), true);
-  assert.equal(isInside("/rootfile", "/root"), false);
+test("a path the system will not take is refused before anything is made on the way to it", async (t) => {
+  const root = realpathSync(makeTempDir("trama-guard-"));
+  t.after(() => cleanupTempDir(root));
+  // Each name is one the system takes; the whole is longer than any path it does. Nothing of it
+  // exists, so the guard's own walk has nothing to object to: it is the system that says no.
+  const tooLong = ("d".repeat(200) + "/").repeat(8) + "file.txt";
+  assert.throws(() => statSync(root + "/" + tooLong), { code: "ENAMETOOLONG" }, "the layout is what it is meant to be");
+
+  assert.throws(() => guardPath(root, tooLong), { code: "ENAMETOOLONG" });
+  await assert.rejects(createTools(root).write(tooLong, "x"), { code: "ENAMETOOLONG" });
+  await assert.rejects(createWorkspace(root).write(tooLong, "x"), { code: "ENAMETOOLONG" });
+  assert.deepEqual(readdirSync(root), [], "no directory was made for a file that cannot be written");
+});
+
+test("the top of the filesystem can be a root, and everything is inside it", () => {
+  assert.equal(guardPath("/", "etc/hosts"), realpathSync("/etc/hosts"));
+  assert.equal(guardPath("/", ""), "/");
+});
+
+test("the path a program gives is read as the system reads it, not tidied up as text first", async (t) => {
+  const root = realpathSync(makeTempDir("trama-guard-"));
+  t.after(() => { try { chmodSync(join(root, "locked"), 0o700); } catch { /* none */ } cleanupTempDir(root); });
+  const fresh = () => {
+    writeFileSync(join(root, "regular.txt"), "REGULAR");
+    writeFileSync(join(root, "other.txt"), "OTHER");
+  };
+  const mayLock = process.getuid?.() !== 0;
+  mkdirSync(join(root, "locked"));
+  if (mayLock) chmodSync(join(root, "locked"), 0o000);
+
+  // Each of these, tidied up as text, names a file that is there or could be. The system takes none of them.
+  const refusedBySystem = ["regular.txt/", "regular.txt/.", "missing/.", "missing/", "regular.txt/../other.txt", "missing/../other.txt"];
+  if (mayLock) refusedBySystem.push("locked/../other.txt");
+  for (const path of refusedBySystem) {
+    fresh();
+    assert.throws(() => writeFileSync(root + "/" + path, "x"), `the system writes ${path}`);
+    assert.throws(() => guardPath(root, path), `the guard lets ${path} through`);
+    for (const make of [() => createTools(root), () => createWorkspace(root)]) {
+      await assert.rejects(make().write(path, "OVERWRITTEN"), `a write to ${path} is carried out`);
+      await assert.rejects(make().read(path), `a read of ${path} is carried out`);
+    }
+    assert.equal(readFileSync(join(root, "regular.txt"), "utf-8"), "REGULAR");
+    assert.equal(readFileSync(join(root, "other.txt"), "utf-8"), "OTHER");
+    assert.equal(existsSync(join(root, "missing")), false);
+  }
+});
+
+test('".." after a link goes up from where the link leads — the same file the program\'s own fs would reach', async (t) => {
+  const parent = realpathSync(makeTempDir("trama-guard-"));
+  t.after(() => cleanupTempDir(parent));
+  const root = join(parent, "root");
+  mkdirSync(join(root, "a", "b"), { recursive: true });
+  writeFileSync(join(root, "item.txt"), "at the top");
+  writeFileSync(join(root, "a", "item.txt"), "in a");
+  symlinkSync("a/b", join(root, "deep"));
+  assert.equal(readFileSync(root + "/deep/../item.txt", "utf-8"), "in a", "the layout is what it is meant to be");
+
+  assert.equal(guardPath(root, "deep/../item.txt"), join(root, "a", "item.txt"));
+  assert.equal(await createTools(root).read("deep/../item.txt"), "in a");
+  assert.equal(await createWorkspace(root).read("deep/../item.txt"), "in a");
+  assert.equal((await createTools(root).shell("cat item.txt", { cwd: "deep/.." })).stdout, "in a");
+  await createTools(root).write("deep/../item.txt", "written");
+  assert.equal(readFileSync(join(root, "a", "item.txt"), "utf-8"), "written");
+  assert.equal(readFileSync(join(root, "item.txt"), "utf-8"), "at the top");
+
+  // As text this one leaves the root; followed, it never does. And the other way round.
+  assert.equal(guardPath(root, "deep/../../item.txt"), join(root, "item.txt"));
+  symlinkSync("..", join(root, "up"));
+  writeFileSync(join(parent, "secret.txt"), "outside");
+  assert.throws(() => guardPath(root, "up/secret.txt"), /Path escapes project directory via symlink/);
+  assert.throws(() => guardPath(root, "a/../../secret.txt"), /Path escapes project directory: /);
+});
+
+test("a link that names the root in other letters is still inside, where the file system takes the names for one", async (t) => {
+  const root = realpathSync(makeTempDir("trama-guard-Case-"));
+  t.after(() => cleanupTempDir(root));
+  writeFileSync(join(root, "data.txt"), "data");
+  if (!existsSync(join(root.toUpperCase(), "data.txt"))) return t.skip("this file system tells upper case from lower");
+  symlinkSync(join(root.toUpperCase(), "data.txt"), join(root, "shouted"));
+  symlinkSync(root.toUpperCase(), join(root, "self"));
+
+  // By the root's own name for it, whatever the link called it.
+  assert.equal(guardPath(root, "shouted"), join(root, "data.txt"));
+  assert.equal(await createTools(root).read("shouted"), "data");
+  assert.equal(guardPath(root, "self"), root);
+  // The root itself is still not a file's place: nothing is put beside it.
+  await assert.rejects(createWorkspace(root).write("self", "x"), /Not a file path/);
+  assert.deepEqual(readdirSync(dirname(root)).filter(name => name.includes(".trama-tmp-")), []);
+  // And what is outside is outside, however it is spelled.
+  symlinkSync(dirname(root).toUpperCase(), join(root, "out"));
+  assert.throws(() => guardPath(root, "out/anything"), /Path escapes project directory via symlink/);
 });

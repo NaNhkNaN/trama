@@ -9,7 +9,7 @@
 import { chmodSync, closeSync, fdatasyncSync, mkdirSync, openSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { randomBytes } from "crypto";
 import { dirname } from "path";
-import { guardWriteTarget, realRootOf } from "./path-guard.js";
+import { guardPath, realRootOf } from "./path-guard.js";
 
 /** Whether a file name is that of a temp file made here — not content, though it sits among it for a moment. */
 export const isStagedName = (name: string) => /\.trama-tmp-[0-9a-f]{12}$/.test(name);
@@ -37,7 +37,7 @@ export interface StagedFile {
  * or its owner, are not carried over.
  */
 export function stageFile(rootDir: string, relativePath: string, content: string | Buffer): StagedFile {
-  const destination = guardWriteTarget(rootDir, relativePath);
+  const destination = guardPath(rootDir, relativePath);
   if (destination === realRootOf(rootDir)) {
     throw new Error(`Not a file path: "${relativePath}" is the directory itself`);
   }

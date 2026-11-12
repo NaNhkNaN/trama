@@ -5,29 +5,15 @@ import { dirname, isAbsolute, join, parse, resolve, sep } from "path";
  * Keep file access inside a bounded root directory (a project directory or a
  * session workspace) — rejecting escapes via ".." segments or symlinks.
  *
+ * A path is read the way the system reads it: one step at a time, each link
+ * followed where it stands, ".." taken from where the walk has got to. It is
+ * never tidied up as text first — "dir/../file" is "file" only if "dir" is a
+ * directory that is not a link, and the text cannot know.
+ *
  * Not a security sandbox — just a footgun guard against malicious shared
  * projects where files like state.json or .gitignore are symlinks pointing
  * outside the project directory.
  */
-
-/** True if `path` is `root` itself or lies underneath it. Both must already be normalized. */
-export function isInside(path: string, root: string): boolean {
-  return path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
-}
-
-/**
- * Resolve `relativePath` against `rootDir` and verify the logical path
- * stays within the root. Returns the resolved absolute path.
- * Catches ".." traversal only — use guardPath to also catch symlink escapes.
- */
-export function resolveBounded(rootDir: string, relativePath: string): string {
-  const normalizedDir = resolve(rootDir);
-  const resolved = resolve(normalizedDir, relativePath);
-  if (!isInside(resolved, normalizedDir)) {
-    throw new Error(`Path escapes project directory: ${relativePath}`);
-  }
-  return resolved;
-}
 
 /**
  * The most links followed on the way to one path. More than this is a loop —
@@ -36,13 +22,16 @@ export function resolveBounded(rootDir: string, relativePath: string): string {
 const MAX_LINKS = 32;
 
 /**
- * The steps of a path, one name at a time. A path that ends in a slash says
- * that what it names is a directory — which is what a last step of "." says,
- * so that is what it is given.
+ * A step that is not a name: what the walk has come to must be a directory.
+ * A path says so by ending in a slash. (It is not the same as a last step of
+ * ".", which is looked up in the directory and so needs leave to search it.)
  */
+const A_DIRECTORY = sep;
+
+/** The steps of a path, one name at a time. */
 function stepsOf(path: string): string[] {
   const steps = path.split(sep).filter(Boolean);
-  if (steps.length > 0 && path.endsWith(sep)) steps.push(".");
+  if (steps.length > 0 && path.endsWith(sep)) steps.push(A_DIRECTORY);
   return steps;
 }
 
@@ -59,10 +48,8 @@ function readLink(link: string): string {
 }
 
 /**
- * Where an absolute, normalized path leads once every symlink on the way is
- * followed — step by step, the way the system itself walks a path. So a ".."
- * in what a link says is taken from where the walk has got to, which after
- * another link is not where the text of the path would suggest.
+ * Where an absolute path leads once every symlink on the way is followed. The
+ * path is taken as it is written, and may say "..", "." or end in a slash.
  *
  * Like realpath, but through what does not exist yet: a link whose
  * destination is missing is still followed to where it points — and from
@@ -70,20 +57,22 @@ function readLink(link: string): string {
  * taken as it is named. This is where a write to the path lands, and where a
  * mkdir on the way to it creates directories.
  */
-export function destinationOf(path: string): string {
+function destinationOf(path: string): string {
   let at = parse(path).root;     // always free of links
   let steps = stepsOf(path.slice(at.length));
   let links = 0;
   let missing = false;           // nothing is there from here on, so nothing is a link either
   while (steps.length > 0) {
     const step = steps.shift()!;
-    if (step === "." || step === "..") {
-      // "Here" and "up" are asked of a directory. Of something that is not
-      // there they lead nowhere the system would go — it cannot be created as
-      // a file and be a directory too.
+    if (step === "." || step === ".." || step === A_DIRECTORY) {
+      // "Here", "up" and "this is a directory" are said of a directory. Of
+      // something that is not there they lead nowhere the system would go —
+      // it cannot be created as a file and be a directory too. (Of a file
+      // they are refused further down, where the file is come to.)
       if (missing) {
         throw new Error(`Path cannot be followed: ${path} (it leads on from what does not exist)`);
       }
+      if (step === A_DIRECTORY) continue;
       // Asked of the system rather than assumed: it takes a directory, and leave to search it.
       lstatSync(at + sep + step);
       if (step === "..") at = dirname(at);
@@ -120,17 +109,63 @@ export function destinationOf(path: string): string {
   return at;
 }
 
-/** The real (symlink-resolved) location of a root directory, whether or not it exists yet. */
+/**
+ * The real (symlink-resolved) location of a root directory, whether or not it
+ * exists yet. A root is named by whoever runs the program, not by the
+ * program, and is read as the rest of Node reads a directory it is given.
+ */
 export function realRootOf(rootDir: string): string {
   return destinationOf(resolve(rootDir));
 }
 
-/** A path under a root, as it is named and as where it leads — refused if either is outside the root. */
-function guarded(rootDir: string, relativePath: string): { resolved: string; destination: string } {
-  const resolved = resolveBounded(rootDir, relativePath);
-  const destination = destinationOf(resolved);
-  if (!isInside(destination, realRootOf(rootDir))) {
-    throw new Error(`Path escapes project directory via symlink: ${relativePath}`);
+/** Whether one normalized path is another or lies under it — as text, which is all this can say. */
+const within = (path: string, root: string) =>
+  path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
+
+/** What tells one file or directory from every other, if it is there to be told. */
+function identityOf(path: string): BigIntStats | undefined {
+  try { return lstatSync(path, { bigint: true, throwIfNoEntry: false }); } catch { return undefined; }
+}
+const sameFile = (a: BigIntStats | undefined, b: BigIntStats | undefined) =>
+  a !== undefined && b !== undefined && a.dev === b.dev && a.ino === b.ino;
+
+/**
+ * A destination by the root's own name for it, if it is the root or lies
+ * under it — undefined if it does not.
+ *
+ * Under it by name, or by being there: a file system that takes "Data" and
+ * "data" for one name has many names for every directory, and a link may use
+ * any of them. So where the names do not say, each directory above the
+ * destination is asked whether it is the root.
+ */
+function underRoot(destination: string, realRoot: string): string | undefined {
+  if (within(destination, realRoot)) return destination;
+  const root = identityOf(realRoot);
+  if (!root) return undefined;
+  for (let at = destination; ; at = dirname(at)) {
+    if (sameFile(identityOf(at), root)) return join(realRoot, destination.slice(at.length));
+    if (at === dirname(at)) return undefined;
+  }
+}
+
+/**
+ * The guard for reading or writing a path under a bounded root: where the
+ * path leads, every link on the way followed — refused unless that is inside
+ * the root. What comes back has no link left in it, so using it goes where
+ * this looked.
+ *
+ * A path that does not exist yet is followed as far as it does, so a caller
+ * can safely mkdir and write afterwards: a write lands on what a link points
+ * at, not on a link on the way.
+ */
+export function guardPath(rootDir: string, path: string): string {
+  const root = resolve(rootDir);
+  // As it is given: under the root, unless it names a place of its own.
+  const given = isAbsolute(path) ? path : root + sep + path;
+  const destination = underRoot(destinationOf(given), destinationOf(root));
+  if (destination === undefined) {
+    // Said for whoever reads the refusal: if the text alone stays inside, it is the links that lead out.
+    throw new Error(`Path escapes project directory${within(resolve(given), root) ? " via symlink" : ""}: ${path}`);
   }
 
   // The walk above is this guard's own reading of the path. The system has
@@ -141,35 +176,13 @@ function guarded(rootDir: string, relativePath: string): { resolved: string; des
   // differently is one a write would put somewhere a read does not look.
   let found: BigIntStats | undefined;
   try {
-    found = statSync(resolved, { bigint: true });
+    found = statSync(given, { bigint: true });
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
   const there = lstatSync(destination, { bigint: true, throwIfNoEntry: false });
-  if (found ? !(there && there.dev === found.dev && there.ino === found.ino) : there !== undefined) {
-    throw new Error(`Path cannot be followed: ${relativePath} (the system does not take it where its links say)`);
+  if (found ? !sameFile(there, found) : there !== undefined) {
+    throw new Error(`Path cannot be followed: ${path} (the system does not take it where its links say)`);
   }
-  return { resolved, destination };
-}
-
-/**
- * The guard for reading or writing a path under a bounded root.
- * Checks both the logical path (".." segments) and where symlinks lead —
- * every link on the way, whether or not its destination exists — and returns
- * the resolved absolute path.
- *
- * A path that does not exist yet is checked as far as it does, so a caller can
- * safely mkdir and write afterwards.
- */
-export function guardPath(rootDir: string, relativePath: string): string {
-  return guarded(rootDir, relativePath).resolved;
-}
-
-/**
- * Like `guardPath`, but returns where the path leads rather than the path
- * itself — for a write that replaces its target (temp file and rename), which
- * must replace what the links point at, not a link on the way.
- */
-export function guardWriteTarget(rootDir: string, relativePath: string): string {
-  return guarded(rootDir, relativePath).destination;
+  return destination;
 }

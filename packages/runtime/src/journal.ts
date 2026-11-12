@@ -16,7 +16,7 @@
 import { appendFileSync, closeSync, mkdirSync, openSync, readSync, readdirSync, rmSync } from "fs";
 import { createHash, randomBytes } from "crypto";
 import { join } from "path";
-import { guardWriteTarget } from "./path-guard.js";
+import { guardPath } from "./path-guard.js";
 import { isJsonObject } from "./serializable.js";
 
 /** The format of the records. Bump it when a reader of older journals would be misled. */
@@ -32,7 +32,7 @@ export const JOURNAL_DIR = join("logs", "journal");
 export function journalDirOf(projectDir: string): string {
   // Where the path leads, by the guard's own reckoning — the same before the
   // directory exists as after, and never a place the guard did not check.
-  return guardWriteTarget(projectDir, JOURNAL_DIR);
+  return guardPath(projectDir, JOURNAL_DIR);
 }
 
 /** The ids of the runs that have a journal in `dir`, oldest first. (A run's id starts with when it started.) */

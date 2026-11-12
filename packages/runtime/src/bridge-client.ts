@@ -15,6 +15,22 @@ export interface Bridge {
 let cached: { port: string; initPath: string; bridge: Bridge | null } | undefined;
 
 /**
+ * A call's body as it goes over the bridge. JSON has no way to say NaN or
+ * Infinity: it writes null for them, which the other end reads as a field
+ * that was left out. So a number it cannot carry is refused here — a call is
+ * carried out as it was made, or not at all.
+ */
+function encode(endpoint: string, body: unknown): string {
+  return JSON.stringify(body, function (this: unknown, name: string, value: unknown) {
+    if (typeof value === "number" && !Number.isFinite(value)) {
+      const where = Array.isArray(this) ? `item ${name} of a list` : name;
+      throw new TypeError(`${where} is ${value}, which cannot be sent to the runner (${endpoint})`);
+    }
+    return value;
+  });
+}
+
+/**
  * @param port - the runner's loopback port (TRAMA_PORT)
  * @param initPath - the file the runner wrote for this program (TRAMA_INIT)
  */
@@ -29,7 +45,7 @@ export function openBridge(port: string, initPath: string): Bridge {
   // for the response. (fetch gives up after five minutes without response headers.)
   const call = (endpoint: string, body: unknown): Promise<any> =>
     new Promise((resolve, reject) => {
-      const payload = JSON.stringify(body);
+      const payload = encode(endpoint, body);
       const req = request({
         host: "127.0.0.1",
         port,

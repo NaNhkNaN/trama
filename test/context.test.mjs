@@ -3,6 +3,7 @@ import test from "node:test";
 import { existsSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 import { createContext } from "../packages/runtime/dist/context.js";
+import { toLogData } from "../packages/runtime/dist/serializable.js";
 import { cleanupTempDir, createProjectFixture, makeTempDir, readJson, readText } from "./helpers.mjs";
 
 test("createContext checkpoint persists state and increments iteration", async (t) => {
@@ -11,9 +12,8 @@ test("createContext checkpoint persists state and increments iteration", async (
   createProjectFixture(projectDir);
 
   const ctx = createContext(projectDir, { counter: 1 }, { maxIterations: 7 });
-  ctx.state.extra = { nested: true };
 
-  await ctx.checkpoint();
+  assert.equal(ctx.checkpoint({ counter: 1, extra: { nested: true } }), 1);
 
   assert.equal(ctx.iteration, 1);
   assert.equal(ctx.maxIterations, 7);
@@ -31,14 +31,17 @@ test("createContext done logs once and is idempotent", async (t) => {
 
   const ctx = createContext(projectDir, {});
 
-  await ctx.done({ result: "ok" });
-  await ctx.done({ result: "ignored" });
+  assert.equal(ctx.ended, null);
+  assert.equal(ctx.done({ kept: true }, { result: "ok" }), 1);
+  // Said again, it does nothing: not to the state, the log, or how the run ended.
+  assert.equal(ctx.done({ kept: false }, { result: "ignored" }), 1);
 
   const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
   assert.equal(lines.length, 1);
   assert.equal(lines[0].message, "done");
   assert.deepEqual(lines[0].data, { result: "ok" });
-  assert.equal(readJson(join(projectDir, "state.json")).__trama_iteration, 1);
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { kept: true, __trama_iteration: 1 });
+  assert.deepEqual(ctx.ended, { status: "done", result: { result: "ok" } });
 });
 
 test("createContext done logs completion even when no result is provided", async (t) => {
@@ -47,7 +50,7 @@ test("createContext done logs completion even when no result is provided", async
   createProjectFixture(projectDir);
 
   const ctx = createContext(projectDir, {});
-  await ctx.done();
+  ctx.done({});
 
   const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
   assert.equal(lines.length, 1);
@@ -68,8 +71,8 @@ test("createContext ready logs once, triggers onReady once, and does not checkpo
     },
   });
 
-  await ctx.ready({ url: "http://127.0.0.1:3000" });
-  await ctx.ready({ url: "ignored" });
+  ctx.ready({ url: "http://127.0.0.1:3000" });
+  ctx.ready({ url: "ignored" });
 
   const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
   assert.equal(lines.length, 1);
@@ -86,10 +89,9 @@ test("createContext checkpoint rejects non-serializable state with a useful path
   createProjectFixture(projectDir);
 
   const ctx = createContext(projectDir, {});
-  ctx.state.bad = { nested: [() => "nope"] };
 
-  await assert.rejects(
-    async () => ctx.checkpoint(),
+  assert.throws(
+    () => ctx.checkpoint({ bad: { nested: [() => "nope"] } }),
     /ctx\.state\.bad\.nested\[0\] is not JSON-serializable \(function\)/,
   );
 });
@@ -100,9 +102,9 @@ test("createContext allows shared object references that are not circular", asyn
   createProjectFixture(projectDir);
 
   const shared = { value: 42 };
-  const ctx = createContext(projectDir, { left: shared, right: shared });
+  const ctx = createContext(projectDir, {});
 
-  await ctx.checkpoint();
+  ctx.checkpoint({ left: shared, right: shared });
 
   assert.deepEqual(readJson(join(projectDir, "state.json")), {
     left: { value: 42 },
@@ -119,12 +121,8 @@ test("createContext checkpoint rejects circular references", async (t) => {
   const ctx = createContext(projectDir, {});
   const a = {};
   a.self = a;
-  ctx.state.loop = a;
 
-  await assert.rejects(
-    async () => ctx.checkpoint(),
-    /circular reference/,
-  );
+  assert.throws(() => ctx.checkpoint({ loop: a }), /circular reference/);
 });
 
 test("createContext checkpoint rejects Date, Map, and Set instances", async (t) => {
@@ -134,12 +132,7 @@ test("createContext checkpoint rejects Date, Map, and Set instances", async (t) 
 
   for (const [label, value] of [["Date", new Date()], ["Map", new Map()], ["Set", new Set()]]) {
     const ctx = createContext(projectDir, {});
-    ctx.state.bad = value;
-    await assert.rejects(
-      async () => ctx.checkpoint(),
-      /not a plain object/,
-      `should reject ${label}`,
-    );
+    assert.throws(() => ctx.checkpoint({ bad: value }), /not a plain object/, `should reject ${label}`);
   }
 });
 
@@ -150,11 +143,7 @@ test("createContext checkpoint rejects NaN and Infinity", async (t) => {
 
   for (const value of [NaN, Infinity, -Infinity]) {
     const ctx = createContext(projectDir, {});
-    ctx.state.num = value;
-    await assert.rejects(
-      async () => ctx.checkpoint(),
-      /not JSON-serializable/,
-    );
+    assert.throws(() => ctx.checkpoint({ num: value }), /not JSON-serializable/);
   }
 });
 
@@ -177,7 +166,7 @@ test("createContext resumes iteration from persisted __trama_iteration", async (
   const ctx = createContext(projectDir, { __trama_iteration: 5, data: "kept" });
   assert.equal(ctx.iteration, 5);
 
-  await ctx.checkpoint();
+  ctx.checkpoint({ __trama_iteration: 5, data: "kept" });
   assert.equal(ctx.iteration, 6);
 
   const saved = readJson(join(projectDir, "state.json"));
@@ -221,76 +210,19 @@ test("createContext resets negative and fractional __trama_iteration to zero", a
   assert.equal(ctx.iteration, 3);
 });
 
-test("createContext done coalesces concurrent unawaited calls", async (t) => {
-  const projectDir = makeTempDir("trama-context-");
-  t.after(() => cleanupTempDir(projectDir));
-  createProjectFixture(projectDir);
-
-  const ctx = createContext(projectDir, {});
-
-  // Fire two done() calls without awaiting the first — both should resolve
-  // to the same operation (one log entry, one checkpoint).
-  const a = ctx.done({ result: "first" });
-  const b = ctx.done({ result: "second" });
-  await Promise.all([a, b]);
-
-  const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
-  const doneLines = lines.filter(l => l.message === "done");
-  assert.equal(doneLines.length, 1, "done should be logged exactly once");
-  assert.deepEqual(doneLines[0].data, { result: "first" }, "first call's result wins");
-  assert.equal(readJson(join(projectDir, "state.json")).__trama_iteration, 1);
-});
-
-test("createContext done coalesces concurrent failures and still allows retry", async (t) => {
-  const projectDir = makeTempDir("trama-context-");
-  t.after(() => cleanupTempDir(projectDir));
-  createProjectFixture(projectDir);
-
-  const ctx = createContext(projectDir, {});
-  ctx.state.bad = () => "nope";
-
-  const a = ctx.done({ result: "first" }).catch(err => err.message);
-  const b = ctx.done({ result: "second" }).catch(err => err.message);
-  const [firstError, secondError] = await Promise.all([a, b]);
-
-  assert.match(firstError, /not JSON-serializable/);
-  assert.equal(secondError, firstError, "concurrent callers should observe the same failure");
-
-  // Persistence happens before logging — failed checkpoint means no log entries
-  const logPath = join(projectDir, "logs", "latest.jsonl");
-  const logExists = existsSync(logPath);
-  if (logExists) {
-    const doneLinesBefore = readJsonLines(logPath).filter(line => line.message === "done");
-    assert.equal(doneLinesBefore.length, 0, "failed done() should not log (persistence failed first)");
-  }
-
-  ctx.state = { fixed: true };
-  await ctx.done({ result: "retry" });
-
-  const doneLines = readJsonLines(logPath).filter(line => line.message === "done");
-  assert.equal(doneLines.length, 1, "successful retry should emit done log");
-  assert.deepEqual(doneLines[0].data, { result: "retry" });
-  assert.equal(readJson(join(projectDir, "state.json")).__trama_iteration, 1);
-  assert.equal(readJson(join(projectDir, "state.json")).fixed, true);
-});
-
 test("createContext done retries after checkpoint failure", async (t) => {
   const projectDir = makeTempDir("trama-context-");
   t.after(() => cleanupTempDir(projectDir));
   createProjectFixture(projectDir);
 
   const ctx = createContext(projectDir, {});
-  ctx.state.bad = () => "nope"; // non-serializable
 
-  // First done() should throw because checkpoint fails on non-serializable state
-  await assert.rejects(
-    async () => ctx.done({ result: "ok" }),
-    /not JSON-serializable/,
-  );
+  // First done() should throw because the state cannot be persisted
+  assert.throws(() => ctx.done({ bad: () => "nope" }, { result: "ok" }), /not JSON-serializable/);
+  assert.equal(ctx.ended, null);
 
-  // Fix state and retry — done() should succeed
-  ctx.state = { fixed: true };
-  await ctx.done({ result: "ok" });
+  // With a state that can be, done() succeeds
+  ctx.done({ fixed: true }, { result: "ok" });
 
   const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
   // Persistence happens before logging — first attempt fails at checkpoint,
@@ -300,22 +232,18 @@ test("createContext done retries after checkpoint failure", async (t) => {
   assert.equal(readJson(join(projectDir, "state.json")).fixed, true);
 });
 
-test("createContext log does not throw on non-serializable data", async (t) => {
-  const projectDir = makeTempDir("trama-context-");
-  t.after(() => cleanupTempDir(projectDir));
-  createProjectFixture(projectDir);
-
-  const ctx = createContext(projectDir, {});
+test("log data is what JSON makes of it, and a log call does not fail over what it was handed", () => {
+  // The program's side does this before the data is sent; the runner writes down what arrives.
   const circular = {};
   circular.self = circular;
-
-  // Should not throw — log should be a safe API
-  await ctx.log("test", circular);
-
-  const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
-  assert.equal(lines.length, 1);
-  assert.equal(lines[0].message, "test");
-  assert.ok(lines[0].data.__trama_unserializable);
+  assert.ok(toLogData(circular).__trama_unserializable);
+  assert.ok(toLogData(10n).__trama_unserializable);
+  // One that cannot even be turned into text.
+  const bare = Object.create(null);
+  bare.self = bare;
+  assert.ok(toLogData(bare).__trama_unserializable);
+  assert.deepEqual(toLogData({ n: NaN, when: new Date(0), gone: undefined }), { n: null, when: "1970-01-01T00:00:00.000Z" });
+  assert.equal(toLogData(undefined), undefined);
 });
 
 test("createContext checkpoint accepts null-prototype objects", async (t) => {
@@ -326,9 +254,8 @@ test("createContext checkpoint accepts null-prototype objects", async (t) => {
   const ctx = createContext(projectDir, {});
   const nullProto = Object.create(null);
   nullProto.key = "value";
-  ctx.state.data = nullProto;
 
-  await ctx.checkpoint();
+  ctx.checkpoint({ data: nullProto });
 
   assert.deepEqual(readJson(join(projectDir, "state.json")).data, { key: "value" });
 });
@@ -339,46 +266,48 @@ function readJsonLines(path) {
   return content.split("\n").map(line => JSON.parse(line));
 }
 
-test("createContext: a state that could not be written leaves ctx as it was", async (t) => {
+test("createContext: a state that could not be written settles nothing", (t) => {
   const projectDir = makeTempDir("trama-ctx-");
   t.after(() => cleanupTempDir(projectDir));
   createProjectFixture(projectDir);
   const ctx = createContext(projectDir, { __trama_yield: { reason: "earlier" }, n: 1 }, { print() {} });
+  const state = { __trama_yield: { reason: "earlier" }, n: 1 };
 
   // A directory where the state file goes: writing it fails.
   mkdirSync(join(projectDir, "state.json"));
-  await assert.rejects(ctx.checkpoint());
-  await assert.rejects(ctx.done("result"));
-  assert.deepEqual(ctx.state, { __trama_yield: { reason: "earlier" }, n: 1 }, "neither the counter nor the yield marker was touched");
+  assert.throws(() => ctx.checkpoint(state));
+  assert.throws(() => ctx.done(state, "result"));
   assert.equal(ctx.iteration, 0);
+  // The run can still end either way.
+  assert.equal(ctx.ended, null);
 
-  // Nothing was settled either: the run can still end either way.
   rmSync(join(projectDir, "state.json"), { recursive: true });
-  await ctx.yield("later");
+  ctx.yield(state, "later");
   assert.deepEqual(readJson(join(projectDir, "state.json")), { __trama_yield: { reason: "later" }, n: 1, __trama_iteration: 1 });
+  assert.deepEqual(ctx.ended, { status: "yielded", reason: "later" });
 });
 
-test("createContext: done called several times at once is done once", async (t) => {
-  const projectDir = makeTempDir("trama-ctx-");
-  t.after(() => cleanupTempDir(projectDir));
-  createProjectFixture(projectDir);
-  const ctx = createContext(projectDir, {}, { print() {} });
+test("createContext: once a run has ended its state is settled — nothing more is written, whichever call asks", (t) => {
+  for (const end of ["done", "yield"]) {
+    const projectDir = makeTempDir("trama-ctx-");
+    t.after(() => cleanupTempDir(projectDir));
+    createProjectFixture(projectDir);
+    const ctx = createContext(projectDir, {}, { print() {} });
 
-  await Promise.all([ctx.done(1), ctx.done(2)]);
-  await ctx.done(3);
-  assert.equal(ctx.iteration, 1);
-  assert.equal(readText(join(projectDir, "logs", "latest.jsonl")).trim().split("\n").length, 1);
-});
+    if (end === "done") ctx.done({ n: 1 }, "result");
+    else ctx.yield({ n: 1 }, "waiting for review");
+    const settled = readJson(join(projectDir, "state.json"));
+    const other = end === "done" ? "yield" : "done";
 
-test("createContext: a checkpoint after the yield that ends the run is refused, and the yield stands", async (t) => {
-  const projectDir = makeTempDir("trama-ctx-");
-  t.after(() => cleanupTempDir(projectDir));
-  createProjectFixture(projectDir);
-  const ctx = createContext(projectDir, {}, { print() {} });
+    // A checkpoint taken now would take back what the run ended on — after a yield, the very
+    // mark the next run resumes from.
+    assert.throws(() => ctx.checkpoint({ n: 2 }), new RegExp(`Cannot call ctx\\.checkpoint\\(\\) after ctx\\.${end}\\(\\)`));
+    assert.throws(() => ctx[other]({ n: 3 }, "too late"), new RegExp(`Cannot call ctx\\.${other}\\(\\) after ctx\\.${end}\\(\\)`));
+    // The same ending said again is not an error, and does nothing.
+    ctx[end]({ n: 4 }, "again");
 
-  await ctx.yield("waiting for review");
-  // A checkpoint means the program has moved on from its last yield. Taken now, it would
-  // erase what the next run resumes from.
-  await assert.rejects(ctx.checkpoint(), /Cannot call ctx\.checkpoint\(\) after ctx\.yield\(\)/);
-  assert.deepEqual(readJson(join(projectDir, "state.json")).__trama_yield, { reason: "waiting for review" });
+    assert.deepEqual(readJson(join(projectDir, "state.json")), settled);
+    assert.equal(ctx.iteration, 1);
+    assert.equal(readText(join(projectDir, "logs", "latest.jsonl")).trim().split("\n").length, 1);
+  }
 });

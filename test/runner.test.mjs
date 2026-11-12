@@ -4,7 +4,8 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync,
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import {
-  copyToHistory, createBackend, installValidatedProgram, loadConfig, loadState, runProgram, RUNTIME_TYPES, validateProgram,
+  copyToHistory, createBackend, ensureProjectScaffold, installValidatedProgram, loadConfig, loadState, runProgram, RUNTIME_TYPES,
+  validateProgram,
 } from "../packages/runtime/dist/runner.js";
 import {
   REPO_ROOT, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, readJson, startRunnerProcess, waitFor,
@@ -1386,7 +1387,8 @@ test("a program that cannot be put in place leaves no version of it on record", 
 
   // Its owner made it read-only: it is not replaced, and nothing else is touched.
   chmodSync(join(projectDir, "program.ts"), 0o444);
-  assert.throws(() => installValidatedProgram(projectDir, { source: "NEW" }, "update", "p"), { code: "EACCES" });
+  assert.throws(() => installValidatedProgram(projectDir, { source: "NEW" }, "update", "p"),
+    { code: "EACCES", message: /The program cannot be replaced: .*program\.ts is read-only/ });
   chmodSync(join(projectDir, "program.ts"), 0o644);
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), "OLD");
   assert.deepEqual(historyOf(projectDir).files, ["0001.ts"]);
@@ -1658,9 +1660,11 @@ test("a fix is put in place by one move only: the merge of what it wrote does no
   const realCopy = fs.copyFileSync;
   t.after(() => { fs.copyFileSync = realCopy; syncBuiltinESMExports(); });
 
+  // Files are written where their paths lead, and the temp directory is reached through a link on some systems.
+  const realDir = realpathSync(projectDir);
   const copiedOver = [];
   fs.copyFileSync = (from, to, ...rest) => {
-    if (String(to).startsWith(projectDir)) copiedOver.push(String(to).slice(projectDir.length + 1));
+    if (String(to).startsWith(realDir)) copiedOver.push(String(to).slice(realDir.length + 1));
     return realCopy(from, to, ...rest);
   };
   syncBuiltinESMExports();
@@ -1696,4 +1700,211 @@ test("null in the global config is a field left out, as it is in a project's", a
     assert.ok(config.model.length > 0);
     assert.equal(config.journalRuns, 3);
   });
+});
+
+// --- A program that may not be replaced ---
+
+test("a program its owner made read-only is run; when it fails, no fix is asked for or tried", { skip: process.getuid?.() === 0 }, async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
+  chmodSync(join(projectDir, "program.ts"), 0o444);
+  let asked = 0;
+  const originalRepair = llm.repair;
+  llm.repair = async () => { asked += 1; return `import { ctx } from "@trama-dev/runtime";\nawait ctx.done();\n`; };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  // A fix could not become the program, so the model is not paid for one and none is run.
+  const result = await runProgram({ projectDir, maxRepairAttempts: 2, timeout: 20_000 });
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /no repair was tried\. The program cannot be replaced: .*program\.ts is read-only\.\n[\s\S]*boom/);
+  assert.equal(asked, 0);
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), 'throw new Error("boom");');
+});
+
+test("a candidate is validated, and repaired, in a copy of a project whose own program is read-only", { skip: process.getuid?.() === 0 }, async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: "OLD" });
+  chmodSync(join(projectDir, "program.ts"), 0o444);
+  const fixed = `import { ctx } from "@trama-dev/runtime";\nawait ctx.done();\n`;
+  const originalRepair = llm.repair;
+  llm.repair = async () => fixed;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  // What the project's program may have done to it is said of the project. The copy's is the copy's own.
+  const validated = await validateProgram(projectDir, createBackend(loadConfig()), 'throw new Error("the candidate fails");', {
+    timeout: 20_000, maxRepairAttempts: 1, maxIterations: 10,
+  });
+  assert.equal(validated.source, fixed.trim());
+  assert.match(validated.repairedError, /the candidate fails/);
+
+  // The project was not touched — and still will not take a new program.
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), "OLD");
+  assert.equal(statSync(join(projectDir, "program.ts")).mode & 0o777, 0o444);
+  assert.throws(() => installValidatedProgram(projectDir, validated, "update", "p"), /The program cannot be replaced: .*program\.ts is read-only/);
+  assert.deepEqual(leftovers(projectDir), []);
+});
+
+// --- What a repair leaves as the program ---
+
+test("the program a repair leaves is the program as its run left it", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
+  const next = `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ generation: 2 });\n`;
+  // The fix writes its own successor, as a program that programs itself does.
+  const fixed = `import { ctx } from "@trama-dev/runtime";
+import { writeFileSync } from "fs";
+writeFileSync("program.ts", ${JSON.stringify(next)});
+await ctx.done({ generation: 1 });
+`;
+  const originalRepair = llm.repair;
+  llm.repair = async () => fixed;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.deepEqual(result.result, { generation: 1 });
+  // In an ordinary run the program it wrote would be the project's program. It is here too —
+  // and it is what goes on record as the repair.
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), next);
+  assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), next);
+  assert.deepEqual(leftovers(projectDir), []);
+});
+
+test("a repair of a program that is a link inside the project goes through the link, and nothing else writes it", async (t) => {
+  const fs = (await import("node:fs")).default;
+  const { syncBuiltinESMExports } = await import("node:module");
+  const { projectDir, fixed } = repairableProject(t);
+  rmSync(join(projectDir, "program.ts"));
+  writeText(join(projectDir, "src", "main.ts"), 'throw new Error("boom");');
+  symlinkSync(join("src", "main.ts"), join(projectDir, "program.ts"));
+  const realCopy = fs.copyFileSync;
+  t.after(() => { fs.copyFileSync = realCopy; syncBuiltinESMExports(); });
+
+  const realDir = realpathSync(projectDir);
+  const copiedOver = [];
+  fs.copyFileSync = (from, to, ...rest) => {
+    if (String(to).startsWith(realDir)) copiedOver.push(String(to).slice(realDir.length + 1));
+    return realCopy(from, to, ...rest);
+  };
+  syncBuiltinESMExports();
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+
+  assert.equal(result.status, "done");
+  assert.equal(lstatSync(join(projectDir, "program.ts")).isSymbolicLink(), true);
+  assert.equal(readFileSync(join(projectDir, "src", "main.ts"), "utf-8"), fixed.trim());
+  // The program was put in place once, by the one move. The merge carries what the run did, and
+  // putting the fix into the copy is not something the run did — under whatever name the file has.
+  assert.deepEqual(copiedOver.filter(path => path !== "output.txt" && path !== "state.json" && !path.startsWith("logs/")), []);
+  assert.equal(copiedOver.includes("output.txt"), true);
+  assert.deepEqual(readJson(join(projectDir, "state.json")).n, 2);
+});
+
+// --- What crosses the bridge ---
+
+test("the bridge holds every field of a call to the kind it is declared as", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+import { readFileSync } from "fs";
+const { token } = JSON.parse(readFileSync(process.env.TRAMA_INIT, "utf-8"));
+const post = (endpoint, body) => fetch("http://127.0.0.1:" + process.env.TRAMA_PORT + endpoint, {
+  method: "POST", headers: { Authorization: "Bearer " + token }, body: JSON.stringify(body),
+}).then(async res => res.status + " " + (await res.text()));
+const answers = [];
+for (const [endpoint, body] of [
+  ["/tools/shell", { command: "true", cwd: 7 }],
+  ["/tools/shell", { command: "true", timeout: "soon" }],
+  ["/agent/instruct", { prompt: "p", system: 7 }],
+  ["/tools/fetch", { url: "http://127.0.0.1:1/", headers: 7 }],
+  ["/workspace/observe", { pattern: "a", dir: "/nowhere", expect: "one" }],
+  ["/run/program", { projectDir: "/nowhere", timeout: "soon" }],
+  ["/run/program", { projectDir: "/nowhere", maxRepairAttempts: "many" }],
+  ["/ctx/done", { state: [] }],
+  // A field the call does not declare is not an error; an optional one given as null was left out.
+  ["/tools/shell", { command: "echo carried out", stdio: "inherit", cwd: null, timeout: null }],
+]) answers.push(await post(endpoint, body));
+await tools.write("answers.json", JSON.stringify(answers));
+await ctx.done();`,
+  });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.equal(result.status, "done");
+  assert.deepEqual(readJson(join(projectDir, "answers.json")), [
+    "400 Invalid field: cwd (expected string or undefined)",
+    "400 Invalid field: timeout (expected number or undefined)",
+    "400 Invalid field: system (expected string or undefined)",
+    "400 Invalid field: headers (expected object or undefined)",
+    "400 Invalid field: expect (expected number or undefined)",
+    "400 Invalid field: timeout (expected number or undefined)",
+    "400 Invalid field: maxRepairAttempts (expected number or undefined)",
+    "400 Missing or invalid field: state (expected object)",
+    '200 {"result":{"exitCode":0,"stdout":"carried out\\n","stderr":""}}',
+  ]);
+});
+
+test("a number JSON cannot carry is refused where the call is made, not sent on as a field left out", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  const other = makeTempDir("trama-runner-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(other); });
+  createProjectFixture(other, { scaffold: false, programSource: `import { ctx } from "@trama-dev/runtime";\nawait ctx.done();\n` });
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+import { runProgram } from "@trama-dev/runtime/runner";
+const said = (call) => call().then(() => "carried out", err => err.message);
+const outcome = {
+  shell: await said(() => tools.shell("true", { timeout: Infinity })),
+  run: await said(() => runProgram({ projectDir: ${JSON.stringify(other)}, timeout: NaN })),
+  args: await said(() => runProgram({ projectDir: ${JSON.stringify(other)}, args: { limit: -Infinity } })),
+  list: await said(() => runProgram({ projectDir: ${JSON.stringify(other)}, args: { limits: [1, NaN] } })),
+};
+// A log line is not a call that does anything: it takes what it is given, as JSON makes of it.
+await ctx.log("numbers", { n: NaN });
+await ctx.done(outcome);`,
+  });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.deepEqual(result.result, {
+    shell: "timeout is Infinity, which cannot be sent to the runner (/tools/shell)",
+    run: "timeout is NaN, which cannot be sent to the runner (/run/program)",
+    args: "limit is -Infinity, which cannot be sent to the runner (/run/program)",
+    list: "item 1 of a list is NaN, which cannot be sent to the runner (/run/program)",
+  });
+  const logged = readFileSync(join(projectDir, "logs", "latest.jsonl"), "utf-8").trim().split("\n").map(line => JSON.parse(line));
+  assert.deepEqual(logged.find(line => line.message === "numbers").data, { n: null });
+  // Outside a program the same run is refused too, by the runner itself.
+  await assert.rejects(runProgram({ projectDir: other, timeout: NaN }), /Invalid timeout: NaN/);
+});
+
+test("a project nothing can be created in is run; when its program fails, no fix is asked for", { skip: process.getuid?.() === 0 }, async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { programSource: 'throw new Error("boom");' });
+  ensureProjectScaffold(projectDir); // everything a run needs is there already
+  chmodSync(projectDir, 0o555);
+  let asked = 0;
+  const originalRepair = llm.repair;
+  llm.repair = async () => { asked += 1; return `import { ctx } from "@trama-dev/runtime";\nawait ctx.done();\n`; };
+  t.after(() => { llm.repair = originalRepair; chmodSync(projectDir, 0o755); cleanupTempDir(projectDir); });
+
+  // A new program is a new file beside the old one. Where none can be made, a fix has nowhere to go.
+  const result = await runProgram({ projectDir, maxRepairAttempts: 2, timeout: 20_000 });
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /no repair was tried\. The program cannot be replaced: nothing can be created in /);
+  assert.equal(asked, 0);
+});
+
+test("a candidate that removes its own program.ts while it is validated is still the candidate that ran", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false, programSource: "OLD" });
+  const candidate = `import { ctx } from "@trama-dev/runtime";
+import { rmSync } from "fs";
+rmSync("program.ts");
+await ctx.done();`;
+
+  const validated = await validateProgram(projectDir, createBackend(loadConfig()), candidate, {
+    timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10,
+  });
+  assert.equal(validated.source, candidate);
 });

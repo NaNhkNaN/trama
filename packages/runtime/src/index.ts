@@ -12,7 +12,7 @@ import { LATEST_LOG_PATH } from "./context.js";
 import { readProjectMeta } from "./meta.js";
 import {
   loadConfig, loadProjectConfig, loadState, createBackend, validateProgram, installValidatedProgram,
-  withTempDir, ensureProjectScaffold, RUNTIME_TYPES, runProgram as runHere,
+  withTempDir, ensureProjectScaffold, RUNTIME_TYPES, runProgram as runHere, whyNotReplaceable,
 } from "./runner.js";
 import { createWorkspace as workspaceHere } from "./workspace.js";
 import { parentBridge, remoteWorkspace } from "./bridge-client.js";
@@ -119,7 +119,7 @@ for (let i = ctx.iteration; i < ctx.maxIterations; i++) {
 }
 
 await tools.write("target.ts", code);
-await ctx.done({ finalMetric: bestMetric });
+await ctx.done({ finalMetric: Number.isFinite(bestMetric) ? bestMetric : null });
 
 // Example D: Long-running server.
 // Call ctx.ready() only after the server is actually listening.
@@ -273,6 +273,10 @@ export async function updateProject(name: string, prompt: string): Promise<void>
   // only written to once there is a program that works, so a failed update has
   // nothing to undo.
   try {
+    // Asked before a new program is written, not after: an update's only use is to replace this one.
+    const refusal = whyNotReplaceable(projectDir);
+    if (refusal) throw new Error(refusal);
+
     console.log(`Updating "${name}"...`);
     const candidate = stripCodeFences(await isolatedAsk(backend,
       `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,

@@ -138,6 +138,21 @@ test("workspace.observe times out when file never appears", async (t) => {
   );
 });
 
+test("workspace.observe refuses at once a single path that could never be read", async (t) => {
+  const wsDir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(wsDir));
+  writeText(join(wsDir, "file.txt"), "a file");
+  const ws = createWorkspace(wsDir);
+
+  // No timeout is given: without the refusal these would be waited for until the run ended.
+  const soon = (promise) => Promise.race([
+    promise.then(() => "answered", err => err.message),
+    new Promise(resolve => setTimeout(() => resolve("still waiting"), 2_000).unref()),
+  ]);
+  assert.match(await soon(ws.observe("../outside.txt")), /Path escapes project directory/);
+  assert.match(await soon(ws.observe("file.txt/below.txt")), /ENOTDIR/);
+});
+
 test("workspace.observe with expect waits for multiple files", async (t) => {
   const dir = makeTempDir("trama-ws-");
   t.after(() => cleanupTempDir(dir));

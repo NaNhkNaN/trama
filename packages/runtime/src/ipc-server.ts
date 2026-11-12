@@ -4,29 +4,77 @@
 
 import { createServer, type Server } from "http";
 import { timingSafeEqual } from "crypto";
-import type { Ctx, Agent, Tools, Workspace } from "./types.js";
+import type { Agent, Tools, Workspace } from "./types.js";
+import type { RunContext } from "./context.js";
 import type { ProgramResult, RunRequest } from "./runner-types.js";
 import type { Journal } from "./journal.js";
-import { assertSerializable, isJsonObject } from "./serializable.js";
+import { isJsonObject } from "./serializable.js";
 
 const MAX_IPC_BODY = 50 * 1024 * 1024; // 50 MB
 
 /** A request the program got wrong — answered with 400 rather than 500. */
 class BadRequest extends Error {}
 
-type FieldType = "string" | "object" | "optional string" | "optional object";
+/** The kinds of value a call's field may hold, and what each is to the code that carries the call out. */
+interface FieldKinds {
+  string: string;
+  number: number;
+  object: Record<string, unknown>;
+  /** Anything JSON can say. */
+  any: unknown;
+}
+type Kind = keyof FieldKinds;
+type Fields = Record<string, Kind | `optional ${Kind}`>;
 
-/** A request body: its fields are validated per route, then handled untyped. */
-type Body = Record<string, any>;
+/** A call's fields as its handler is given them: the ones it declares and no others, each of the kind declared. */
+type Args<F extends Fields> = {
+  [K in keyof F]: F[K] extends `optional ${infer T extends Kind}` ? FieldKinds[T] | undefined
+    : F[K] extends Kind ? FieldKinds[F[K]] : never;
+};
 
 interface Route {
-  /** Body fields checked before the handler runs. */
-  fields: Record<string, FieldType>;
   /**
-   * `connectionClosed` resolves when the caller's connection ends, answered or
-   * not. `seq` is the call's position among the run's calls.
+   * Carry a call out, given the body of its request. `connectionClosed`
+   * resolves when the caller's connection ends, answered or not. `seq` is the
+   * call's position among the run's calls.
    */
-  handle(body: Body, connectionClosed: Promise<void>, seq: number): unknown;
+  handle(body: unknown, connectionClosed: Promise<void>, seq: number): unknown;
+}
+
+const isOfKind = (value: unknown, kind: Kind): boolean =>
+  kind === "any" ? value !== undefined : kind === "object" ? isJsonObject(value) : typeof value === kind;
+
+/** Read a call's declared fields out of a request body — refusing a body that does not hold them as declared. */
+function read<F extends Fields>(body: unknown, fields: F): Args<F> {
+  if (!isJsonObject(body)) throw new BadRequest("The request body must be a JSON object");
+  const args: Record<string, unknown> = {};
+  for (const [name, field] of Object.entries(fields)) {
+    const optional = field.startsWith("optional ");
+    const kind = (optional ? field.slice("optional ".length) : field) as Kind;
+    const value = body[name];
+    // null is how JSON says a field is not there: an optional one given as null was left out.
+    if (optional && value == null) continue;
+    if (!isOfKind(value, kind)) {
+      throw new BadRequest(optional
+        ? `Invalid field: ${name} (expected ${kind} or undefined)`
+        : `Missing or invalid field: ${name} (expected ${kind})`);
+    }
+    args[name] = value;
+  }
+  return args as Args<F>;
+}
+
+/**
+ * A call: every field it takes, and what is done with them. The declaration
+ * is the whole of what a handler sees of a request — a field that is not
+ * declared does not reach it, and one that is arrives as the kind it says.
+ * (What is inside an object is the business of whoever it is handed to.)
+ */
+function route<F extends Fields>(
+  fields: F,
+  handle: (args: Args<F>, connectionClosed: Promise<void>, seq: number) => unknown,
+): Route {
+  return { handle: (body, connectionClosed, seq) => handle(read(body, fields), connectionClosed, seq) };
 }
 
 export interface IpcBackends {
@@ -36,7 +84,7 @@ export interface IpcBackends {
    * page the user happens to have open — could otherwise send commands to.
    */
   token: string;
-  ctx: Ctx;
+  ctx: RunContext;
   agent: Agent;
   tools: Tools;
   /** The workspace of the session the program is running in — null when it is in none. */
@@ -50,27 +98,6 @@ export interface IpcBackends {
   run(request: RunRequest, stop: AbortSignal, seq: number): Promise<ProgramResult>;
   /** Where every call, and how it ended, is written down. */
   journal: Journal;
-  /** Called once ctx.done() or ctx.yield() has been persisted for this run. */
-  onTerminalSignal(result: ProgramResult): void;
-}
-
-function validate(body: unknown, fields: Record<string, FieldType>): asserts body is Body {
-  if (!isJsonObject(body)) throw new BadRequest("The request body must be a JSON object");
-  for (const [name, type] of Object.entries(fields)) {
-    const value = body[name];
-    const optional = type.startsWith("optional ");
-    // null is how JSON says a field is not there: an optional one given as null was left out.
-    if (optional && value == null) {
-      delete body[name];
-      continue;
-    }
-    const expected = optional ? type.slice("optional ".length) : type;
-    if (expected === "object" ? !isJsonObject(value) : typeof value !== expected) {
-      throw new BadRequest(optional
-        ? `Invalid field: ${name} (expected ${expected} or undefined)`
-        : `Missing or invalid field: ${name} (expected ${expected})`);
-    }
-  }
 }
 
 /** Whether a request carries `Authorization: Bearer <token>`, compared in constant time. */
@@ -80,133 +107,91 @@ function isAuthorized(header: string | undefined, token: string): boolean {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, onTerminalSignal }: IpcBackends): Record<string, Route> {
-  /** The program owns ctx.state; each persisting call hands over its current copy. */
-  const adoptState = (state: Record<string, unknown>) => {
-    assertSerializable(state, "ctx.state");
-    ctx.state = state;
-  };
+function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run }: IpcBackends): Record<string, Route> {
   /** Runs the program has asked for and that have not ended, by the id it gave each. */
   const runsAskedFor = new Map<string, AbortController>();
   /** Ids the program asked to stop before their run was seen here: such a run starts stopped. */
   const stoppedAhead = new Set<string>();
 
   /** The workspace a call is about: the directory it names, or else the one this run was started with. */
-  const workspaceOf = (body: Body): Workspace => {
-    if (body.dir !== undefined) {
-      if (body.dir === "") throw new BadRequest("Invalid field: dir (expected a directory path)");
-      return workspaceAt(body.dir);
+  const workspaceOf = (dir: string | undefined): Workspace => {
+    if (dir !== undefined) {
+      if (dir === "") throw new BadRequest("Invalid field: dir (expected a directory path)");
+      return workspaceAt(dir);
     }
     if (!workspace) throw new BadRequest("Workspace is only available when running in a session");
     return workspace;
   };
 
   return {
-    "/agent/instruct": {
-      fields: { prompt: "string" },
-      handle: b => agent.instruct(b.prompt, { system: b.system }),
-    },
-    "/agent/generate": {
-      fields: { prompt: "string", schema: "object" },
-      handle: b => agent.generate(b as Parameters<Agent["generate"]>[0]),
-    },
+    "/agent/instruct": route(
+      { prompt: "string", system: "optional string" },
+      b => agent.instruct(b.prompt, { system: b.system }),
+    ),
+    "/agent/generate": route(
+      { prompt: "string", schema: "object", system: "optional string" },
+      b => agent.generate({ prompt: b.prompt, schema: b.schema as Record<string, string>, system: b.system }),
+    ),
 
-    "/tools/read": { fields: { path: "string" }, handle: b => tools.read(b.path) },
-    "/tools/write": { fields: { path: "string", content: "string" }, handle: b => tools.write(b.path, b.content) },
-    "/tools/shell": {
-      fields: { command: "string" },
-      handle: b => tools.shell(b.command, { cwd: b.cwd, timeout: b.timeout }),
-    },
-    "/tools/fetch": {
-      fields: { url: "string" },
-      handle: b => tools.fetch(b.url, { method: b.method, headers: b.headers, body: b.body }),
-    },
+    "/tools/read": route({ path: "string" }, b => tools.read(b.path)),
+    "/tools/write": route({ path: "string", content: "string" }, b => tools.write(b.path, b.content)),
+    "/tools/shell": route(
+      { command: "string", cwd: "optional string", timeout: "optional number" },
+      b => tools.shell(b.command, { cwd: b.cwd, timeout: b.timeout }),
+    ),
+    "/tools/fetch": route(
+      { url: "string", method: "optional string", headers: "optional object", body: "optional string" },
+      b => tools.fetch(b.url, { method: b.method, headers: b.headers as Record<string, string> | undefined, body: b.body }),
+    ),
 
-    "/ctx/log": { fields: { message: "string" }, handle: b => ctx.log(b.message, b.data) },
-    "/ctx/ready": { fields: { data: "optional object" }, handle: b => ctx.ready(b.data) },
-    "/ctx/checkpoint": {
-      fields: { state: "object" },
-      handle: async b => {
-        adoptState(b.state);
-        await ctx.checkpoint();
-        return ctx.iteration;
-      },
-    },
-    "/ctx/done": {
-      fields: { state: "object" },
-      handle: async b => {
-        adoptState(b.state);
-        await ctx.done(b.result);
-        onTerminalSignal({ status: "done", result: b.result ?? undefined });
-        return ctx.iteration;
-      },
-    },
-    "/ctx/yield": {
-      fields: { state: "object", reason: "string" },
-      handle: async b => {
-        adoptState(b.state);
-        // Persists the yield marker and returns; the program exits itself once we answer.
-        await ctx.yield(b.reason);
-        onTerminalSignal({ status: "yielded", reason: b.reason });
-      },
-    },
+    "/ctx/log": route({ message: "string", data: "optional any" }, b => ctx.log(b.message, b.data)),
+    "/ctx/ready": route({ data: "optional object" }, b => ctx.ready(b.data)),
+    // The state is the program's: each call that persists it hands over its current copy.
+    "/ctx/checkpoint": route({ state: "object" }, b => ctx.checkpoint(b.state)),
+    "/ctx/done": route({ state: "object", result: "optional any" }, b => ctx.done(b.state, b.result)),
+    // Persists the yield marker and returns; the program exits itself once it is answered.
+    "/ctx/yield": route({ state: "object", reason: "string" }, b => ctx.yield(b.state, b.reason)),
 
     // A program never runs another program: it asks its runner to. The call
     // lasts as long as the run does, repairs included.
-    "/run/program": {
-      fields: {
+    "/run/program": route(
+      {
         projectDir: "string", args: "optional object",
+        timeout: "optional number", maxRepairAttempts: "optional number",
         id: "optional string", label: "optional string", workspaceDir: "optional string",
       },
-      handle: async (b, connectionClosed, seq) => {
+      async ({ id, ...request }, connectionClosed, seq) => {
         const stop = new AbortController();
         // A caller that is gone — its process died, or it gave up — no longer wants the run.
         void connectionClosed.then(() => stop.abort());
-        // The name the program gave the run, to stop it by.
-        const id: string | undefined = b.id;
+        // `id` is the name the program gave the run, to stop it by.
         if (id && stoppedAhead.delete(id)) stop.abort();
         if (id) runsAskedFor.set(id, stop);
         try {
-          return await run({
-            projectDir: b.projectDir,
-            args: b.args,
-            timeout: b.timeout,
-            maxRepairAttempts: b.maxRepairAttempts,
-            workspaceDir: b.workspaceDir,
-            label: b.label,
-          }, stop.signal, seq);
+          return await run(request, stop.signal, seq);
         } finally {
           if (id) runsAskedFor.delete(id);
         }
       },
-    },
+    ),
     // Stop a run asked for above. The call that asked for it still gets its
     // answer — a failed run — once the run is over.
-    "/run/stop": {
-      fields: { id: "string" },
-      handle: b => {
-        const asked = runsAskedFor.get(b.id);
-        if (asked) asked.abort();
-        else stoppedAhead.add(b.id);
-      },
-    },
+    "/run/stop": route({ id: "string" }, b => {
+      const asked = runsAskedFor.get(b.id);
+      if (asked) asked.abort();
+      else stoppedAhead.add(b.id);
+    }),
 
-    "/workspace/read": {
-      fields: { path: "string", dir: "optional string" },
-      handle: b => workspaceOf(b).read(b.path),
-    },
-    "/workspace/write": {
-      fields: { path: "string", content: "string", dir: "optional string" },
-      handle: b => workspaceOf(b).write(b.path, b.content),
-    },
-    "/workspace/list": {
-      fields: { pattern: "string", dir: "optional string" },
-      handle: b => workspaceOf(b).list(b.pattern),
-    },
-    "/workspace/observe": {
-      fields: { pattern: "string", dir: "optional string" },
-      handle: b => workspaceOf(b).observe(b.pattern, { expect: b.expect, timeout: b.timeout }),
-    },
+    "/workspace/read": route({ path: "string", dir: "optional string" }, b => workspaceOf(b.dir).read(b.path)),
+    "/workspace/write": route(
+      { path: "string", content: "string", dir: "optional string" },
+      b => workspaceOf(b.dir).write(b.path, b.content),
+    ),
+    "/workspace/list": route({ pattern: "string", dir: "optional string" }, b => workspaceOf(b.dir).list(b.pattern)),
+    "/workspace/observe": route(
+      { pattern: "string", dir: "optional string", expect: "optional number", timeout: "optional number" },
+      b => workspaceOf(b.dir).observe(b.pattern, { expect: b.expect, timeout: b.timeout }),
+    ),
   };
 }
 
@@ -261,7 +246,6 @@ export function createIPCServer(backends: IpcBackends): Server {
         const route = req.url ? routes[req.url] : undefined;
         if (!route) return reply(404, "Not found");
         call = backends.journal.call(req.url!, body);
-        validate(body, route.fields);
         const result = (await route.handle(body, connectionClosed, call.seq)) ?? null;
         if (answerable()) call.end({ ok: true, result });
         reply(200, JSON.stringify({ result }), true);

@@ -8,8 +8,14 @@ import { REPO_ROOT, runNodeCommand } from "./helpers.mjs";
 
 const CLIENT_MODULE_URL = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "client.js")).href;
 
+// The directories made for the tests below, removed when the tests are over.
+const initDirs = [];
+process.on("exit", () => { for (const dir of initDirs) rmSync(dir, { recursive: true, force: true }); });
+
 function runtimeEnv() {
-  const initFile = mkdtempSync(join(tmpdir(), "trama-client-test-")) + "/init.json";
+  const initDir = mkdtempSync(join(tmpdir(), "trama-client-test-"));
+  initDirs.push(initDir);
+  const initFile = initDir + "/init.json";
   writeFileSync(initFile, JSON.stringify({
     input: { prompt: "test prompt", args: {} },
     state: {},

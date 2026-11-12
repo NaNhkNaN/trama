@@ -2,7 +2,7 @@ import { readFileSync, mkdirSync, readdirSync, statSync } from "fs";
 import { resolve, relative, sep } from "path";
 import type { Workspace } from "./types.js";
 import { onAbort } from "./abort.js";
-import { destinationOf, guardPath, isInside, realRootOf, resolveBounded } from "./path-guard.js";
+import { guardPath } from "./path-guard.js";
 import { isStagedName, stageFile } from "./replace-file.js";
 
 const OBSERVE_POLL_MS = 250;
@@ -39,16 +39,16 @@ function isExactPath(pattern: string): boolean {
 
 /**
  * Recursively list all files under a directory, as forward-slash paths relative to root.
- * Includes symlinks to files and follows symlinked directories, but only if
- * they resolve inside the bounded root (prevents symlink escapes).
+ * Includes symlinks to files and follows symlinked directories, but only
+ * those the guard lets through: what is listed is what can be read.
  *
  * Cycle detection: only symlinked directories are tracked in the `visited` set
- * (by their resolved realpath). Regular directories cannot create cycles on their
+ * (by where they really lead). Regular directories cannot create cycles on their
  * own, so they are traversed unconditionally. This allows legitimate directory
  * aliases (symlink pointing to another dir in the workspace) to produce their
  * own workspace-relative paths alongside the original directory's paths.
  */
-function listFilesRecursive(dir: string, root: string, realRoot: string, visited = new Set<string>()): string[] {
+function listFilesRecursive(dir: string, root: string, visited = new Set<string>()): string[] {
   const results: string[] = [];
   let entries;
   try {
@@ -61,23 +61,20 @@ function listFilesRecursive(dir: string, root: string, realRoot: string, visited
   for (const entry of entries) {
     const full = resolve(dir, entry.name);
     if (entry.isSymbolicLink()) {
-      // Where the link really leads — worked out the way the guard does, so that
-      // what is listed is what can be read.
       let real: string;
-      try { real = destinationOf(full); } catch { continue; /* a loop, or unreadable */ }
-      if (!isInside(real, realRoot)) continue; // escapes workspace
+      try { real = guardPath(root, full); } catch { continue; /* leads out of the workspace, or nowhere */ }
       try {
         const stat = statSync(full);
         if (stat.isDirectory()) {
           if (visited.has(real)) continue;
           visited.add(real);
-          results.push(...listFilesRecursive(full, root, realRoot, visited));
+          results.push(...listFilesRecursive(full, root, visited));
         } else if (stat.isFile()) {
           addFile(full);
         }
       } catch { /* stat failed */ }
     } else if (entry.isDirectory()) {
-      results.push(...listFilesRecursive(full, root, realRoot, visited));
+      results.push(...listFilesRecursive(full, root, visited));
     } else if (entry.isFile()) {
       addFile(full);
     }
@@ -102,12 +99,11 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Workspace {
   const root = resolve(workspaceDir);
   mkdirSync(root, { recursive: true });
-  const realRoot = realRootOf(root);
 
   /** All artifact paths matching a glob, sorted. */
   const listMatching = (pattern: string): string[] => {
     const re = compileGlob(pattern);
-    return listFilesRecursive(root, root, realRoot).filter(f => re.test(f)).sort();
+    return listFilesRecursive(root, root).filter(f => re.test(f)).sort();
   };
 
   /** Read an artifact, or null if it is missing, unreadable, or escapes the workspace. */
@@ -151,7 +147,7 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
       const needed = expect ?? 1;
       // One exact path, one artifact wanted → the caller gets its content as a string.
       const single = isExactPath(pattern) && needed === 1;
-      if (single) resolveBounded(root, pattern); // reject traversal up front rather than polling forever
+      if (single) guardPath(root, pattern); // a path that will never be read is refused now, rather than waited for
 
       const collectMatches = (): Array<{ path: string; content: string }> => {
         const matches: Array<{ path: string; content: string }> = [];

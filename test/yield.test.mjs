@@ -37,7 +37,6 @@ test("createContext sets resumed=true and yieldReason from yield marker", async 
   assert.equal(ctx.resumed, true);
   assert.equal(ctx.yieldReason, "waiting for approval");
   assert.equal(ctx.iteration, 3);
-  assert.equal(ctx.state.userKey, "preserved");
 });
 
 // --- ctx.yield() ---
@@ -48,11 +47,10 @@ test("createContext yield persists state with yield marker", async (t) => {
   createProjectFixture(projectDir);
 
   const ctx = createContext(projectDir, {});
-  ctx.state.pendingWork = "analysis";
 
-  // yield() calls process.exit(0) in client mode, but in server-side
-  // context it just persists and returns (for IPC handler to use).
-  await ctx.yield("waiting for counterparty");
+  // The program's own ctx.yield() ends its process. This side of it persists
+  // and returns, so that the call can be answered first.
+  ctx.yield({ pendingWork: "analysis" }, "waiting for counterparty");
 
   const saved = readJson(join(projectDir, "state.json"));
   assert.deepEqual(saved.__trama_yield, { reason: "waiting for counterparty" });
@@ -66,7 +64,7 @@ test("createContext yield logs the yield event", async (t) => {
   createProjectFixture(projectDir);
 
   const ctx = createContext(projectDir, {});
-  await ctx.yield("need input");
+  ctx.yield({}, "need input");
 
   const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
   const yieldLines = lines.filter(l => l.message === "yield");
@@ -80,12 +78,8 @@ test("createContext yield rejects non-serializable state", async (t) => {
   createProjectFixture(projectDir);
 
   const ctx = createContext(projectDir, {});
-  ctx.state.bad = () => "fn";
 
-  await assert.rejects(
-    () => ctx.yield("reason"),
-    /not JSON-serializable/,
-  );
+  assert.throws(() => ctx.yield({ bad: () => "fn" }, "reason"), /not JSON-serializable/);
 });
 
 // --- Mutual exclusivity ---
@@ -96,12 +90,9 @@ test("createContext done then yield throws", async (t) => {
   createProjectFixture(projectDir);
 
   const ctx = createContext(projectDir, {});
-  await ctx.done({ result: "ok" });
+  ctx.done({}, { result: "ok" });
 
-  await assert.rejects(
-    () => ctx.yield("too late"),
-    /Cannot call ctx\.yield\(\) after ctx\.done\(\)/,
-  );
+  assert.throws(() => ctx.yield({}, "too late"), /Cannot call ctx\.yield\(\) after ctx\.done\(\)/);
 });
 
 test("createContext yield then done throws", async (t) => {
@@ -110,12 +101,9 @@ test("createContext yield then done throws", async (t) => {
   createProjectFixture(projectDir);
 
   const ctx = createContext(projectDir, {});
-  await ctx.yield("waiting");
+  ctx.yield({}, "waiting");
 
-  await assert.rejects(
-    () => ctx.done({ result: "too late" }),
-    /Cannot call ctx\.done\(\) after ctx\.yield\(\)/,
-  );
+  assert.throws(() => ctx.done({}, { result: "too late" }), /Cannot call ctx\.done\(\) after ctx\.yield\(\)/);
 });
 
 // --- Yield marker lifecycle ---
@@ -135,8 +123,8 @@ test("createContext checkpoint clears yield marker", async (t) => {
 
   assert.equal(ctx.resumed, true);
 
-  // Checkpoint should clear the yield marker
-  await ctx.checkpoint();
+  // Checkpoint should clear the yield marker — which the program's state still carries, as it was started with it
+  ctx.checkpoint(state);
 
   const saved = readJson(join(projectDir, "state.json"));
   assert.equal(saved.__trama_yield, undefined);
@@ -156,7 +144,7 @@ test("createContext done clears yield marker and writes no marker of its own", a
   };
   const ctx = createContext(projectDir, state);
 
-  await ctx.done({ result: "finished" });
+  ctx.done(state, { result: "finished" });
 
   const saved = readJson(join(projectDir, "state.json"));
   assert.equal(saved.__trama_yield, undefined);
@@ -171,15 +159,13 @@ test("createContext a failed done settles nothing — yield is still available",
   createProjectFixture(projectDir);
 
   const ctx = createContext(projectDir, {});
-  ctx.state.bad = new Date();
-  await assert.rejects(async () => ctx.done(), /not a plain object/);
+  assert.throws(() => ctx.done({ bad: new Date() }), /not a plain object/);
 
   // Nothing was persisted, so the program may still choose to suspend instead.
-  delete ctx.state.bad;
-  await ctx.yield("changed my mind");
+  ctx.yield({}, "changed my mind");
 
   const saved = readJson(join(projectDir, "state.json"));
   assert.deepEqual(saved.__trama_yield, { reason: "changed my mind" });
   // ...and having yielded, done is now the one that is refused.
-  await assert.rejects(async () => ctx.done(), /Cannot call ctx\.done\(\) after ctx\.yield\(\)/);
+  assert.throws(() => ctx.done({}), /Cannot call ctx\.done\(\) after ctx\.yield\(\)/);
 });
