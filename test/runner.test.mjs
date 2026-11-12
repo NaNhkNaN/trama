@@ -1360,7 +1360,7 @@ function historyOf(projectDir) {
       : [],
   };
 }
-const leftovers = (projectDir) => readdirSync(projectDir).filter(name => name.includes(".trama-new-"));
+const leftovers = (projectDir) => readdirSync(projectDir).filter(name => name.includes(".trama-tmp-"));
 
 test("installing a program records it and puts it in place, keeping the file's permissions", (t) => {
   const projectDir = makeTempDir("trama-install-");
@@ -1438,6 +1438,31 @@ test("a program that is a link inside the project is written through the link", 
   assert.equal(readFileSync(join(projectDir, "src", "real.ts"), "utf-8"), "NEW");
 });
 
+test("a program whose place is the project directory itself is not installed, and nothing is put beside the project", (t) => {
+  const parent = makeTempDir("trama-install-");
+  t.after(() => cleanupTempDir(parent));
+  const projectDir = join(parent, "project");
+  createProjectFixture(projectDir, { programSource: "OLD" });
+  rmSync(join(projectDir, "program.ts"));
+  symlinkSync(".", join(projectDir, "program.ts"));
+
+  assert.throws(() => installValidatedProgram(projectDir, { source: "NEW" }, "update", "p"), /is the directory itself/);
+  assert.deepEqual(readdirSync(parent), ["project"]);
+  assert.deepEqual(historyOf(projectDir), { files: [], reasons: [] });
+});
+
+test("a program that is a link to a file in a directory not made yet is installed there", (t) => {
+  const projectDir = makeTempDir("trama-install-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { programSource: "OLD" });
+  rmSync(join(projectDir, "program.ts"));
+  symlinkSync(join("src", "main.ts"), join(projectDir, "program.ts"));
+
+  installValidatedProgram(projectDir, { source: "NEW" }, "create", "p");
+  assert.equal(readFileSync(join(projectDir, "src", "main.ts"), "utf-8"), "NEW");
+  assert.equal(lstatSync(join(projectDir, "program.ts")).isSymbolicLink(), true);
+});
+
 // --- meta.json ---
 
 test("a meta.json that is not what a run needs is refused by name", async (t) => {
@@ -1456,6 +1481,10 @@ test("a meta.json that is not what a run needs is refused by name", async (t) =>
   await assert.rejects(run, /Malformed meta\.json in .*"input" is missing/s);
   // Nothing was run, and nothing recorded as a run.
   assert.equal(existsSync(join(projectDir, "output.txt")), false);
+
+  // The model a project names is held to what the global config is held to.
+  writeJson(join(projectDir, "meta.json"), { input: {}, model: 5 });
+  await assert.rejects(run, /Invalid meta\.json in .*"model" must be a non-empty string \(got 5\)/s);
 
   // An input with nothing in it is still an input.
   writeJson(join(projectDir, "meta.json"), { input: {} });
@@ -1517,4 +1546,13 @@ test("a version is never recorded over a version file that is already there", (t
     assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), "OLD");
     assert.equal(existsSync(join(projectDir, "history", "index.jsonl")), false);
   });
+});
+
+test("a file that holds null where an object is expected is said to hold null", (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { state: "null" });
+  assert.throws(() => loadState(projectDir), /Expected a JSON object but got null/);
+  writeText(join(projectDir, "state.json"), "[]");
+  assert.throws(() => loadState(projectDir), /Expected a JSON object but got an array/);
 });

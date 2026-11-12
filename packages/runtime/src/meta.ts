@@ -3,7 +3,7 @@
 
 import { readFileSync } from "fs";
 import { guardPath } from "./path-guard.js";
-import { isJsonObject } from "./serializable.js";
+import { describeJson, isJsonObject } from "./serializable.js";
 
 export interface ProjectMeta {
   /** What the program is given as ctx.input. */
@@ -33,7 +33,7 @@ export function readProjectMeta(projectDir: string): ProjectMeta {
     throw fail(`Parse error: ${err instanceof Error ? err.message : err}`);
   }
   if (!isJsonObject(parsed)) {
-    throw fail(`expected a JSON object but got ${Array.isArray(parsed) ? "an array" : parsed === null ? "null" : typeof parsed}.`);
+    throw fail(`expected a JSON object but got ${describeJson(parsed)}.`);
   }
   if (!isJsonObject(parsed.input)) throw fail(`"input" is ${parsed.input === undefined ? "missing" : "not an object"}.`);
   return parsed as unknown as ProjectMeta;

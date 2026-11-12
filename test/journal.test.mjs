@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { createHash } from "crypto";
 import { createServer } from "http";
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import { createBackend, loadConfig, runProgram, validateProgram } from "../packages/runtime/dist/runner.js";
@@ -603,4 +603,22 @@ await ctx.done();`,
   const unknown = await trama("journal", "busy", "no-such-run");
   assert.equal(unknown.exitCode, 1);
   assert.match(unknown.stderr, /No journal for run "no-such-run"/);
+});
+
+test("a journal is kept where the system takes logs/journal, however the links on the way are written", async (t) => {
+  const parent = makeTempDir("trama-journal-");
+  t.after(() => cleanupTempDir(parent));
+  const projectDir = join(parent, "project");
+  createProjectFixture(projectDir, { scaffold: false });
+  // logs -> x/../.. with x -> deep/dir: as text that is the directory above the project, where
+  // something called journal happens to be. The system takes it to the project itself.
+  mkdirSync(join(projectDir, "deep", "dir"), { recursive: true });
+  symlinkSync(join("deep", "dir"), join(projectDir, "x"));
+  symlinkSync("x/../..", join(projectDir, "logs"));
+  mkdirSync(join(parent, "journal"));
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.equal(result.status, "done");
+  assert.deepEqual(readdirSync(join(parent, "journal")), [], "nothing was recorded beside the project");
+  assert.equal(readdirSync(join(projectDir, "journal")).filter(name => name.endsWith(".jsonl")).length, 1);
 });

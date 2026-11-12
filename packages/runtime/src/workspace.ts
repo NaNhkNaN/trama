@@ -1,15 +1,11 @@
-import {
-  readFileSync, writeFileSync, mkdirSync, readdirSync,
-  statSync, renameSync, fdatasyncSync,
-  openSync, closeSync, rmSync,
-} from "fs";
-import { resolve, dirname, relative, sep } from "path";
+import { readFileSync, mkdirSync, readdirSync, statSync } from "fs";
+import { resolve, relative, sep } from "path";
 import type { Workspace } from "./types.js";
 import { onAbort } from "./abort.js";
-import { destinationOf, guardPath, guardWriteTarget, isInside, realRootOf, resolveBounded } from "./path-guard.js";
+import { destinationOf, guardPath, isInside, realRootOf, resolveBounded } from "./path-guard.js";
+import { stageFile } from "./replace-file.js";
 
 const OBSERVE_POLL_MS = 250;
-let nextTmpId = 0;
 
 /**
  * Compile a simple glob pattern for matching relative paths.
@@ -134,29 +130,9 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
     },
 
     async write(path, content) {
-      // Write to what a symlink points at rather than replacing the link itself
-      // (matches tools.write). guardWriteTarget verifies the destination stays inside the workspace.
-      const writePath = guardWriteTarget(root, path);
-      // The temp file goes beside its target — which for the workspace itself would be outside it.
-      if (writePath === realRoot) throw new Error(`Not an artifact path: "${path}" is the workspace itself`);
-      mkdirSync(dirname(writePath), { recursive: true });
-
-      // Atomic write: temp file in the same directory, fsync, rename.
-      // Readers see either the old content or the new — never a partial file.
-      const tmpFile = `${writePath}.trama-tmp-${process.pid}-${++nextTmpId}`;
-      const fd = openSync(tmpFile, "w");
-      try {
-        try {
-          writeFileSync(fd, content);
-          fdatasyncSync(fd);
-        } finally {
-          closeSync(fd);
-        }
-        renameSync(tmpFile, writePath);
-      } catch (err) {
-        try { rmSync(tmpFile, { force: true }); } catch { /* best-effort */ }
-        throw err;
-      }
+      // One move, so that readers see either the old content or the new, never
+      // a partial file. A link is written through rather than replaced.
+      stageFile(root, path, content).commit();
     },
 
     async list(pattern) {

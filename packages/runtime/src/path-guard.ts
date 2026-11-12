@@ -75,17 +75,21 @@ export function destinationOf(path: string): string {
       at = next;
       continue;
     }
-    let isLink: boolean;
+    let stat;
     try {
-      isLink = lstatSync(next).isSymbolicLink();
+      stat = lstatSync(next);
     } catch (e) {
-      const code = (e as NodeJS.ErrnoException).code;
-      if (code !== "ENOENT" && code !== "ENOTDIR") throw e;
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
       missing = true;
       at = next;
       continue;
     }
-    if (!isLink) {
+    if (!stat.isSymbolicLink()) {
+      // Nothing lies beyond a file — not a name, and not "." or ".." either.
+      // The system refuses to go on, and so does this.
+      if (!stat.isDirectory() && steps.length > 0) {
+        throw Object.assign(new Error(`ENOTDIR: not a directory, ${next} (on the way to ${path})`), { code: "ENOTDIR" });
+      }
       at = next;
       continue;
     }

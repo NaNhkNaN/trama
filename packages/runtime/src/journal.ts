@@ -13,10 +13,10 @@
 //
 // It records. Nothing reads it back to change what a run does.
 
-import { appendFileSync, closeSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, rmSync } from "fs";
+import { appendFileSync, closeSync, mkdirSync, openSync, readSync, readdirSync, rmSync } from "fs";
 import { createHash, randomBytes } from "crypto";
 import { join } from "path";
-import { guardPath } from "./path-guard.js";
+import { guardWriteTarget } from "./path-guard.js";
 import { isJsonObject } from "./serializable.js";
 
 /** The format of the records. Bump it when a reader of older journals would be misled. */
@@ -30,8 +30,9 @@ export const JOURNAL_DIR = join("logs", "journal");
  * referred to: a journal is recognised as still being written by its path.
  */
 export function journalDirOf(projectDir: string): string {
-  const dir = guardPath(projectDir, JOURNAL_DIR);
-  try { return realpathSync(dir); } catch { return dir; /* not there yet */ }
+  // Where the path leads, by the guard's own reckoning — the same before the
+  // directory exists as after, and never a place the guard did not check.
+  return guardWriteTarget(projectDir, JOURNAL_DIR);
 }
 
 /** The ids of the runs that have a journal in `dir`, oldest first. (A run's id starts with when it started.) */
@@ -272,9 +273,9 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
   let fd: number | null;
   let path: string;
   try {
-    mkdirSync(guardPath(projectDir, JOURNAL_DIR), { recursive: true });
     // Named as the reader names it: a journal is recognised as still being written by its path.
     const dir = journalDirOf(projectDir);
+    mkdirSync(dir, { recursive: true });
     makeRoom(dir, keep);
     path = journalIn(dir, run);
     // Readable by its owner only: it holds what the program read, wrote and was told.

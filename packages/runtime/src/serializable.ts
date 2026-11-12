@@ -36,6 +36,10 @@ export function assertSerializable(value: unknown, path: string): void {
   check(value, path);
 }
 
+/** What a parsed JSON value is, for saying what was found where an object was expected. */
+export const describeJson = (value: unknown): string =>
+  Array.isArray(value) ? "an array" : value === null ? "null" : typeof value;
+
 export const isJsonObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 

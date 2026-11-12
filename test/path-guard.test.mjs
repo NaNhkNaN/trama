@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, lstatSync, readFileSync, realpathSync, symlinkSync, writeFileSync, mkdirSync } from "fs";
-import { join } from "path";
-import { guardPath, guardWriteTarget } from "../packages/runtime/dist/path-guard.js";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync, mkdirSync } from "fs";
+import { dirname, join } from "path";
+import { destinationOf, guardPath, guardWriteTarget, isInside } from "../packages/runtime/dist/path-guard.js";
 import { createTools } from "../packages/runtime/dist/tools.js";
 import { createWorkspace } from "../packages/runtime/dist/workspace.js";
 import { loadState, ensureProjectScaffold } from "../packages/runtime/dist/runner.js";
 import { createContext } from "../packages/runtime/dist/context.js";
-import { makeTempDir, cleanupTempDir, writeJson, writeText, createProjectFixture } from "./helpers.mjs";
+import { makeTempDir, cleanupTempDir, writeJson, writeText, createProjectFixture, REPO_ROOT } from "./helpers.mjs";
 
 // --- guardPath unit tests ---
 
@@ -307,4 +307,88 @@ test('".." that stays inside is followed, and one that leads up from nothing is 
   assert.equal(guardWriteTarget(root, "back"), join(realpathSync(root), "file.txt"));
   // The system could not follow this either: there is no directory to go up from.
   assert.throws(() => guardPath(root, "through-nothing"), /leads up from what does not exist/);
+});
+
+test("nothing lies beyond a file: a link that goes on from one is refused, for writing as for reading", async (t) => {
+  const root = makeTempDir("trama-guard-");
+  t.after(() => cleanupTempDir(root));
+  writeFileSync(join(root, "regular.txt"), "a file");
+  writeFileSync(join(root, "other.txt"), "ORIGINAL");
+  symlinkSync("regular.txt/../other.txt", join(root, "bad"));
+  symlinkSync("regular.txt/.", join(root, "dot"));
+  assert.throws(() => readFileSync(join(root, "bad")), { code: "ENOTDIR" }, "the system does not follow it");
+
+  // Taken as text, "regular.txt/.." is the root, and the write would land on other.txt.
+  for (const path of ["bad", "dot", "regular.txt/child"]) {
+    assert.throws(() => guardWriteTarget(root, path), { code: "ENOTDIR" });
+    await assert.rejects(createTools(root).write(path, "OVERWRITTEN"), { code: "ENOTDIR" });
+    await assert.rejects(createWorkspace(root).write(path, "OVERWRITTEN"), { code: "ENOTDIR" });
+  }
+  assert.equal(readFileSync(join(root, "other.txt"), "utf-8"), "ORIGINAL");
+});
+
+test("the runtime resolves paths in one place", () => {
+  // Node's realpathSync takes ".." in a link's target as text; the system does not. Anything that asks it
+  // where a path leads can be told somewhere the guard never checked.
+  const src = join(REPO_ROOT, "packages", "runtime", "src");
+  const users = readdirSync(src).filter(name => /realpathSync/.test(readFileSync(join(src, name), "utf-8")));
+  assert.deepEqual(users, []);
+});
+
+test("the guard's walk agrees with the system's, on random trees of directories, files and links", () => {
+  let seed = 20261112;
+  const random = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
+  const pick = (list) => list[Math.floor(random() * list.length)];
+  const names = ["a", "b", "c", "d", "e"];
+  const count = { same: 0, landed: 0, refused: 0 };
+
+  for (let round = 0; round < 60; round++) {
+    const base = realpathSync(makeTempDir("trama-walk-"));
+    try {
+      const root = join(base, "root");
+      mkdirSync(root);
+      // What a link may say: names, ways up and round, sometimes from the top.
+      const target = () => {
+        const steps = Array.from({ length: 1 + Math.floor(random() * 4) }, () => pick([...names, ...names, "..", "..", "."]));
+        return (random() < 0.15 ? pick([root, base]) + "/" : "") + steps.join("/");
+      };
+      const dirs = [root];
+      for (let i = 0; i < 16; i++) {
+        const path = join(pick(dirs), pick(names));
+        try { lstatSync(path); continue; } catch { /* free */ }
+        const kind = random();
+        if (kind < 0.35) { mkdirSync(path); dirs.push(path); }
+        else if (kind < 0.55) writeFileSync(path, "a file");
+        else symlinkSync(target(), path);
+      }
+
+      for (let q = 0; q < 120; q++) {
+        const query = join(root, ...Array.from({ length: 1 + Math.floor(random() * 4) }, () => pick(names)));
+        let ours, refused, system, systemCode;
+        try { ours = destinationOf(query); } catch (err) { refused = err; }
+        // What the system makes of the path is what it does when asked to use it. (Its realpath is not
+        // asked first: on macOS that is worked out by a library, which lets ".." follow a file.)
+        try { statSync(query); system = realpathSync.native(query); } catch (err) { systemCode = err.code; }
+
+        if (system !== undefined) {
+          assert.equal(ours, system, `${query}: the guard says ${ours ?? refused}, the system ${system}`);
+          count.same += 1;
+        } else if (systemCode === "ENOTDIR" || systemCode === "ELOOP") {
+          assert.ok(refused, `${query}: the system refuses it (${systemCode}), the guard says ${ours}`);
+          count.refused += 1;
+        } else if (systemCode === "ENOENT" && ours !== undefined && isInside(ours, base)) {
+          // Nothing is there yet. Where the guard says a write would land is where it must land:
+          // make the directories on the way, as a write does, and write through the path as given.
+          mkdirSync(dirname(ours), { recursive: true });
+          writeFileSync(query, "written");
+          assert.equal(realpathSync.native(query), ours, `${query}: written at ${realpathSync.native(query)}, the guard said ${ours}`);
+          count.landed += 1;
+        }
+      }
+    } finally {
+      cleanupTempDir(base);
+    }
+  }
+  // It has to have been a test of something.
+  assert.ok(count.same > 500 && count.landed > 100 && count.refused > 100, JSON.stringify(count));
 });

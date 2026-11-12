@@ -3,8 +3,8 @@ import {
   readFileSync, writeFileSync, appendFileSync,
   readdirSync, copyFileSync, mkdirSync, existsSync, statSync,
   symlinkSync, rmSync, lstatSync, readlinkSync,
-  cpSync, mkdtempSync, openSync, closeSync, realpathSync,
-  accessSync, chmodSync, constants, renameSync, truncateSync,
+  cpSync, mkdtempSync, openSync, closeSync,
+  accessSync, constants, truncateSync,
 } from "fs";
 import { join, dirname, relative } from "path";
 import { homedir, tmpdir } from "os";
@@ -19,9 +19,10 @@ import { LATEST_LOG_PATH, appendLogEntry, createContext } from "./context.js";
 import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
-import { guardPath, guardWriteTarget } from "./path-guard.js";
+import { guardPath, realRootOf } from "./path-guard.js";
+import { stageFile } from "./replace-file.js";
 import { readProjectMeta } from "./meta.js";
-import { isJsonObject } from "./serializable.js";
+import { describeJson, isJsonObject } from "./serializable.js";
 import { createAllowance, superviseChild, type ChildExit } from "./child-process.js";
 import { removeTempDir, removeWithThisProcess, requireWatchdog, stopGroups, stopWithThisProcess } from "./stopping.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
@@ -102,11 +103,7 @@ function ensureModulePackageJson(projectDir: string): void {
     );
   }
   if (!isJsonObject(pkg)) {
-    throw new Error(
-      `Malformed package.json at ${pkgPath} — expected a JSON object but got ${
-        Array.isArray(pkg) ? "an array" : typeof pkg
-      }. ${advice}`
-    );
+    throw new Error(`Malformed package.json at ${pkgPath} — expected a JSON object but got ${describeJson(pkg)}. ${advice}`);
   }
   if (pkg.type !== "module") {
     pkg.type = "module";
@@ -188,12 +185,14 @@ export function loadConfig(): TramaConfig {
   }
   if (!isJsonObject(parsed)) {
     throw new Error(
-      `Malformed config at ${configPath} — expected a JSON object but got ${
-        Array.isArray(parsed) ? "an array" : typeof parsed
-      }. Fix or delete it to proceed.`
+      `Malformed config at ${configPath} — expected a JSON object but got ${describeJson(parsed)}. Fix or delete it to proceed.`
     );
   }
-  const merged: TramaConfig = { ...defaults, ...parsed };
+  return checkedConfig({ ...defaults, ...parsed }, "config");
+}
+
+/** A config that holds what the runtime can work with — or an error naming what does not, and where it came from. */
+function checkedConfig(merged: TramaConfig, source: string): TramaConfig {
   const s = (v: unknown) => typeof v === "string" && v.length > 0;
   const pint = (v: unknown) => Number.isInteger(v) && (v as number) > 0;
   const checks: Array<[boolean, string]> = [
@@ -205,7 +204,7 @@ export function loadConfig(): TramaConfig {
     [Number.isInteger(merged.journalRuns) && merged.journalRuns >= 0, `"journalRuns" must be a non-negative integer (got ${merged.journalRuns})`],
   ];
   for (const [ok, msg] of checks) {
-    if (!ok) throw new Error(`Invalid config: ${msg}`);
+    if (!ok) throw new Error(`Invalid ${source}: ${msg}`);
   }
   return merged;
 }
@@ -215,7 +214,8 @@ export function loadProjectConfig(projectDir: string, meta = readProjectMeta(pro
   const config = loadConfig();
   if (meta.model) config.model = meta.model;
   if (meta.provider) config.provider = meta.provider;
-  return config;
+  // What a project says is held to what the global config is held to.
+  return checkedConfig(config, `meta.json in ${projectDir}`);
 }
 
 /**
@@ -249,7 +249,7 @@ export function loadState(projectDir: string): Record<string, unknown> {
     fail(`Parse error: ${err instanceof Error ? err.message : err}`);
   }
   if (!isJsonObject(parsed)) {
-    fail(`Expected a JSON object but got ${Array.isArray(parsed) ? "array" : typeof parsed}.`);
+    fail(`Expected a JSON object but got ${describeJson(parsed)}.`);
   }
   return parsed;
 }
@@ -429,8 +429,8 @@ export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promis
  * runs, not part of what a run works on, and a copy is where a run is tried.
  */
 function copyDirInto(srcDir: string, dstDir: string): void {
-  // realpath: a project directory may itself be a symlink.
-  const source = realpathSync(srcDir);
+  // Where the directory really is: a project directory may itself be a symlink.
+  const source = realRootOf(srcDir);
   cpSync(source, dstDir, {
     recursive: true,
     verbatimSymlinks: true,
@@ -1026,22 +1026,21 @@ export function installValidatedProgram(
   // program.ts is never half-written, and never a program that is not on record.
   // (It is a new file that takes the place: the old one's permissions are
   // carried over, but not a second hard link to it, or its owner.)
-  const programPath = guardWriteTarget(projectDir, "program.ts");
-  const current = statSync(programPath, { throwIfNoEntry: false });
+
   // A program its owner has made read-only is not replaced: a rename would not ask.
-  if (current) accessSync(programPath, constants.W_OK);
-  const pending = `${programPath}.trama-new-${process.pid}`;
+  const programPath = guardPath(projectDir, "program.ts");
+  if (existsSync(programPath)) accessSync(programPath, constants.W_OK);
+
+  const program = stageFile(projectDir, "program.ts", validated.source, { keepMode: true });
   let unrecord = () => {};
   try {
-    writeFileSync(pending, validated.source);
-    if (current) chmodSync(pending, current.mode & 0o777);
     unrecord = recordVersion(projectDir, validated.source, reason, prompt, validated.repairedError
       ? [{ reason: `${reason}-repair`, timestamp: new Date().toISOString(), error: validated.repairedError }]
       : []);
-    renameSync(pending, programPath);
+    program.commit();
   } catch (err) {
     unrecord();
-    try { rmSync(pending, { force: true }); } catch { /* best-effort */ }
+    program.discard();
     throw err;
   }
 }

@@ -436,7 +436,27 @@ test("workspace.write refuses the workspace itself as an artifact, and puts noth
   symlinkSync(".", join(wsDir, "self"));
 
   for (const path of ["", ".", "self"]) {
-    await assert.rejects(workspace.write(path, "content"), /is the workspace itself/);
+    await assert.rejects(workspace.write(path, "content"), /is the directory itself/);
   }
   assert.deepEqual(readdirSync(parent), ["ws"]);
+});
+
+test("workspace.write creates its temp file, and does not write through one that is already there", async (t) => {
+  const crypto = (await import("node:crypto")).default;
+  const { syncBuiltinESMExports } = await import("node:module");
+  const parent = makeTempDir("trama-ws-");
+  const realRandom = crypto.randomBytes;
+  t.after(() => { crypto.randomBytes = realRandom; syncBuiltinESMExports(); cleanupTempDir(parent); });
+  const wsDir = join(parent, "ws");
+  const workspace = createWorkspace(wsDir);
+  writeFileSync(join(parent, "victim.txt"), "VICTIM");
+
+  // The one name the temp file can have this time — and a link planted there, pointing outside.
+  crypto.randomBytes = (size) => Buffer.alloc(size, 0xab);
+  syncBuiltinESMExports();
+  symlinkSync(join(parent, "victim.txt"), join(wsDir, `note.txt.trama-tmp-${"ab".repeat(6)}`));
+
+  await assert.rejects(workspace.write("note.txt", "from the workspace"), { code: "EEXIST" });
+  assert.equal(readFileSync(join(parent, "victim.txt"), "utf-8"), "VICTIM");
+  assert.equal(existsSync(join(wsDir, "note.txt")), false);
 });
