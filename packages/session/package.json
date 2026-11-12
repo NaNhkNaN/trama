@@ -1,6 +1,6 @@
 {
   "name": "@trama-dev/session",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "type": "module",
   "exports": {
     ".": {
@@ -33,7 +33,7 @@
     "node": ">=22.19.0"
   },
   "dependencies": {
-    "@trama-dev/runtime": "0.3.1"
+    "@trama-dev/runtime": "0.4.0"
   },
   "devDependencies": {
     "@types/node": "26.6.6"
