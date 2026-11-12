@@ -8,6 +8,7 @@ import {
   updateProject,
   listProjects,
   showLogs,
+  showJournal,
   resolveProject,
 } from "@trama-dev/runtime/runner";
 
@@ -134,5 +135,13 @@ cli
   .command("logs <name>")
   .description("Show logs from last run")
   .action(command(showLogs));
+
+cli
+  .command("journal <name> [run]")
+  .description("Show what a run did, call by call (the latest run, or the one named)")
+  .option("--list", "List the runs that have a journal")
+  .action(command(async (name: string, run: string | undefined, opts: { list?: boolean }) => {
+    await showJournal(name, { run, list: opts.list });
+  }));
 
 cli.parse();

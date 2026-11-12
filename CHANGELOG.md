@@ -2,6 +2,18 @@
 
 All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`) are released together under one version.
 
+## Unreleased
+
+### Added
+
+- **The journal: a record of every run.** Each call a program makes through the bridge is written down as it happens — the request when it arrives, the result or the error when it is answered — along with which program was run, how each attempt exited and what it printed, each fix that was asked for and what came back, and how the run ended. One file per run, `logs/journal/<run>.jsonl` in the project, appended to as things happen, so the journal of a run that died is true up to where it died.
+  - A repair is recorded as part of the run it repairs, including an attempt whose fix did not work — which used to leave no trace at all, having run on a copy that was thrown away.
+  - A session is a tree of journals: the journal of a program says which run each of its `spawn()` calls started, and that run's journal says which call started it.
+  - `trama journal <name> [run] [--list]` shows a run call by call, or lists the runs on record.
+  - `"journalRuns"` in `~/.trama/config.json` sets how many runs of a project keep their journal (default 20; 0 records nothing).
+  - A journal holds what the program did — prompts and answers, file contents, commands and their output. Credential-looking headers of web requests are redacted; nothing else is. It is bounded: a text over 256 KB is cut short, a record holds about 1 MB, and a journal past 64 MB stops taking down calls. Journals are readable by their owner only and live under `logs/`, which is kept out of version control.
+  - Recording never changes a run: a journal that cannot be opened or written says so once, and the run goes on.
+
 ## 0.3.1 — 2026-11-11
 
 ### Changed

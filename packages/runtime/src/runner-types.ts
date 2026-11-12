@@ -44,4 +44,6 @@ export interface TramaConfig extends ModelConfig {
   maxRepairAttempts: number;
   defaultTimeout: number;
   defaultMaxIterations: number;
+  /** How many runs of a project keep their journal. 0 records nothing. */
+  journalRuns: number;
 }

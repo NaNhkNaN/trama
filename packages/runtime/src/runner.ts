@@ -5,10 +5,10 @@ import {
   symlinkSync, rmSync, lstatSync, readlinkSync,
   cpSync, mkdtempSync, openSync, closeSync, realpathSync,
 } from "fs";
-import { join, dirname } from "path";
+import { join, dirname, relative } from "path";
 import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
-import { randomBytes } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import type { ShellResult, Workspace } from "./types.js";
 import type { RunOptions, TramaConfig, ProgramResult } from "./runner-types.js";
 import { rejectOnAbort, type AgentBackend } from "./agent-backend.js";
@@ -21,6 +21,7 @@ import { guardPath } from "./path-guard.js";
 import { createAllowance, stopGroups, superviseChild, type ChildExit } from "./child-process.js";
 import { removeTempDir, removeWithThisProcess, requireWatchdog, stopWithThisProcess } from "./watchdog.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
+import { openJournal, type Journal } from "./journal.js";
 
 // --- Locating the runtime itself ---
 
@@ -164,6 +165,7 @@ export function loadConfig(): TramaConfig {
     maxRepairAttempts: 3,
     defaultTimeout: 300_000,
     defaultMaxIterations: 100,
+    journalRuns: 20,
   };
   let raw: string;
   try {
@@ -197,6 +199,7 @@ export function loadConfig(): TramaConfig {
     [Number.isInteger(merged.maxRepairAttempts) && merged.maxRepairAttempts >= 0, `"maxRepairAttempts" must be a non-negative integer (got ${merged.maxRepairAttempts})`],
     [Number.isFinite(merged.defaultTimeout) && merged.defaultTimeout > 0, `"defaultTimeout" must be a positive number (got ${merged.defaultTimeout})`],
     [pint(merged.defaultMaxIterations), `"defaultMaxIterations" must be a positive integer (got ${merged.defaultMaxIterations})`],
+    [Number.isInteger(merged.journalRuns) && merged.journalRuns >= 0, `"journalRuns" must be a non-negative integer (got ${merged.journalRuns})`],
   ];
   for (const [ok, msg] of checks) {
     if (!ok) throw new Error(`Invalid config: ${msg}`);
@@ -277,6 +280,9 @@ export function copyToHistory(projectDir: string, reason: string, detail?: strin
 }
 
 // --- Staging: run against a copy, merge back what worked ---
+
+/** Where a project keeps its journals, relative to the project. */
+const JOURNALS = join("logs", "journal");
 
 type DirSnapshot = Map<string, { size: number; mtimeMs: number }>;
 
@@ -371,10 +377,19 @@ export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promis
   }
 }
 
-/** Copy a directory's contents into an existing one, keeping symlinks as they are written. */
+/**
+ * Copy a directory's contents into an existing one, keeping symlinks as they
+ * are written. A project's journals stay behind: they are the record of its
+ * runs, not part of what a run works on, and a copy is where a run is tried.
+ */
 function copyDirInto(srcDir: string, dstDir: string): void {
   // realpath: a project directory may itself be a symlink.
-  cpSync(realpathSync(srcDir), dstDir, { recursive: true, verbatimSymlinks: true });
+  const source = realpathSync(srcDir);
+  cpSync(source, dstDir, {
+    recursive: true,
+    verbatimSymlinks: true,
+    filter: path => relative(source, path) !== JOURNALS,
+  });
 }
 
 /**
@@ -427,6 +442,10 @@ interface RunOnceOptions {
   label?: string;
   /** Stops the run. */
   signal?: AbortSignal;
+  /** Where the run is written down. One journal covers every attempt of a run. */
+  journal: Journal;
+  /** Which attempt of the run this is: 0 for the program as it was, 1 and up for fixes. */
+  attempt?: number;
 }
 
 interface RunOnceResult {
@@ -468,6 +487,19 @@ function labelled(label: string, write: (text: string) => void) {
     },
     flush,
   };
+}
+
+/** How much of each of a program's output streams goes into the journal. */
+const MAX_JOURNALLED_OUTPUT = 64 * 1024;
+
+/** What identifies a program text without quoting it. */
+function fingerprint(programPath: string): { sha256: string; bytes: number } | null {
+  try {
+    const source = readFileSync(programPath);
+    return { sha256: createHash("sha256").update(source).digest("hex"), bytes: source.length };
+  } catch {
+    return null; // no program to speak of; the attempt will say so itself
+  }
 }
 
 const describeFailure = (r: ShellResult) =>
@@ -527,7 +559,8 @@ function settle(projectDir: string, child: ShellResult, terminalSignal: ProgramR
  * (bad project, server or spawn failure) or left state.json unreadable.
  */
 async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
-  const { projectDir, backend, timeout, maxIterations, argsOverride, validating, workspaceDir, label, signal } = options;
+  const { projectDir, backend, timeout, maxIterations, argsOverride, validating, workspaceDir, label, signal, journal } = options;
+  const attempt = options.attempt ?? 0;
 
   if (signal?.aborted) return { outcome: null, failure: "The run was stopped before its program started." };
   requireWatchdog();
@@ -547,6 +580,14 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       readyTimer ??= setTimeout(() => validated.abort(), validating.readyGraceMs).unref();
     }),
     print: line => console.log(tagged(label, line)),
+  });
+  journal.note("attempt", {
+    attempt,
+    // Where it runs — a copy of the project, when a fix is being tried or a candidate validated.
+    dir: projectDir,
+    program: fingerprint(guardPath(projectDir, "program.ts")),
+    iteration: ctx.iteration,
+    resumed: ctx.resumed,
   });
   // Truncate logs only after preflight succeeds — preserves the prior run's
   // diagnostics if scaffolding, state loading, or context creation fails.
@@ -573,7 +614,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       if (!workspace) workspaces.set(dir, workspace = createWorkspace(dir, runEnded.signal));
       return workspace;
     },
-    run: (request, stop) => {
+    journal,
+    run: (request, stop, seq) => {
       if (validating) {
         // As far as a validation goes. The call is left unanswered — an answer
         // would only send the program on to do more — until the program,
@@ -586,10 +628,13 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       // the run it asked for lasts, which has a timeout of its own. That run
       // is stopped when this one ends, or when the program no longer wants it.
       const release = allowance.hold();
-      const nested = runProgram(
-        { ...request, signal: AbortSignal.any([runEnded.signal, stop]) },
-        options.depth + 1,
-      ).finally(() => {
+      const nested = runProgram({ ...request, signal: AbortSignal.any([runEnded.signal, stop]) }, {
+        depth: options.depth + 1,
+        // The two journals point at each other: this one says which run the call started…
+        started: (run, path) => { if (run) journal.note("child", { seq, run, journal: path }); },
+        // …and that run's journal says which call started it.
+        parent: { run: journal.run, journal: journal.path, seq },
+      }).finally(() => {
         release();
         nestedRuns.delete(nested);
       });
@@ -609,6 +654,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   let programGroup: number | undefined;
   // If this process ends while the program is running, the watchdog stops the program.
   let programSettled = () => {};
+  // How the program's process ended, for the record.
+  let exited: Record<string, unknown> = {};
   // Asked to stop while its program had not ended. Everything it has in flight
   // goes at once — the runs it asked for among them, so that a tree of runs is
   // stopped together rather than one level after another.
@@ -654,6 +701,13 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
         },
       });
       programOver = true;
+      exited = {
+        code: exit.code,
+        signal: exit.signal,
+        ...(exit.timedOut ? { timedOut: true } : {}),
+        // Stopped by the runner at the end of a validation: at a hand-off, or once it had been ready a while.
+        ...(exit.stopped ? { validated: handedOff ? "hand-off" : "ready" } : {}),
+      };
       // A validation that reached a hand-off in time was decided there.
       if (handedOff && !exit.timedOut) {
         console.log(tagged(label, "[trama] validated up to where it starts another program"));
@@ -663,7 +717,25 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     });
     // A program that was stopped did not finish, whatever its exit code says —
     // unless it had already said it was done.
-    const outcome = stopped && !terminalSignal ? null : settle(projectDir, child, terminalSignal);
+    // How the attempt ended goes on record whatever comes of it — also when
+    // what the program left behind cannot be made sense of.
+    const noteExit = (verdict: Record<string, unknown>) => journal.note("exit", {
+      attempt,
+      ...exited,
+      ...(stopped ? { stopped: true } : {}),
+      // What the program printed is part of what it did. The end of it, where a failure shows.
+      stdout: tail(child.stdout, MAX_JOURNALLED_OUTPUT),
+      stderr: tail(child.stderr, MAX_JOURNALLED_OUTPUT),
+      ...verdict,
+    });
+    let outcome: ProgramResult | null;
+    try {
+      outcome = stopped && !terminalSignal ? null : settle(projectDir, child, terminalSignal);
+    } catch (err) {
+      noteExit({ error: err instanceof Error ? err.message : String(err) });
+      throw err;
+    }
+    noteExit({ outcome });
     return { outcome, failure: describeFailure(child) };
   } finally {
     // The program is gone (or never started). Nothing it started outlives its
@@ -721,6 +793,7 @@ async function requestRepair(
   input: { programSource: string; error: string },
   repairErrors: string[],
 ): Promise<string | null> {
+  options.journal.note("fix-request", { error: input.error });
   return withTempDir("trama-repair-", async (tempDir) => {
     copyDirInto(options.projectDir, tempDir);
     writeFileSync(guardPath(tempDir, "program.ts"), input.programSource);
@@ -734,9 +807,12 @@ async function requestRepair(
       }));
       if (fixed.trim() === "") throw new Error("The repair returned an empty program.");
       if (fixed === input.programSource) throw new Error("The repair returned the program unchanged.");
+      options.journal.note("fix", { ok: true, source: fixed });
       return fixed;
     } catch (err) {
-      repairErrors.push(err instanceof Error ? err.message : String(err));
+      const error = err instanceof Error ? err.message : String(err);
+      options.journal.note("fix", { ok: false, error });
+      repairErrors.push(error);
       return null;
     } finally {
       limit.cancel();
@@ -760,12 +836,12 @@ async function requestRepair(
  * would wait for replies forever. So what a fix writes there is written,
  * whether or not the fix works: like anything a run wrote before it failed.
  */
-async function tryFix(options: ExecuteOptions, fixed: string): Promise<RunOnceResult> {
+async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): Promise<RunOnceResult> {
   const { projectDir } = options;
   const run = await withStagedCopy(projectDir, async (stagedProject) => {
     writeFileSync(guardPath(stagedProject, "program.ts"), fixed);
     // If the copy cannot be run at all, or is left unusable, this fix did not work either.
-    const trial = await runProgramOnce({ ...options, projectDir: stagedProject }).catch((err): RunOnceResult => ({
+    const trial = await runProgramOnce({ ...options, projectDir: stagedProject, attempt }).catch((err): RunOnceResult => ({
       outcome: null,
       failure: `The repaired program could not be run: ${err instanceof Error ? err.message : err}`,
     }));
@@ -812,7 +888,7 @@ async function executeProgram(options: ExecuteOptions): Promise<Execution> {
     if (!fixed) return failed(`Failed after ${attempt + 1} repair attempt(s): ${lastError}${repairDetails()}`);
     currentSource = fixed;
 
-    const run = await tryFix(options, fixed);
+    const run = await tryFix(options, fixed, attempt + 1);
     if (run.outcome) return { result: run.outcome, repair: { attempt, error: lastError } };
     if (stopped()) return wasStopped();
     lastError = run.failure;
@@ -826,8 +902,9 @@ async function executeProgram(options: ExecuteOptions): Promise<Execution> {
 const VALIDATION_READY_GRACE_MS = 2_000;
 
 /**
- * Validate a candidate program.ts for a project without touching the project:
- * run it (with repair) in a throwaway copy. Returns the program that worked —
+ * Validate a candidate program.ts for a project without touching what the
+ * project holds: run it (with repair) in a throwaway copy. The one thing left
+ * in the project is the journal of the validation. Returns the program that worked —
  * the candidate itself, or a repaired version of it, with the failure that was
  * repaired. Throws if it cannot be made to run.
  *
@@ -840,25 +917,40 @@ export async function validateProgram(
   projectDir: string,
   backend: AgentBackend,
   candidate: string,
-  options: { timeout: number; maxRepairAttempts: number; maxIterations: number },
+  options: { timeout: number; maxRepairAttempts: number; maxIterations: number; journalRuns?: number },
 ): Promise<{ source: string; repairedError?: string }> {
-  return withTempDir("trama-validate-", async (trialDir) => {
-    copyDirInto(projectDir, trialDir);
-    const programPath = guardPath(trialDir, "program.ts");
-    writeFileSync(programPath, candidate);
+  const { journalRuns = 0, ...limits } = options;
+  // Recorded with the project, though run in a copy of it.
+  const journal = openJournal(projectDir, journalRuns, { purpose: "validate", ...limits });
+  let ended = false;
+  try {
+    return await withTempDir("trama-validate-", async (trialDir) => {
+      copyDirInto(projectDir, trialDir);
+      const programPath = guardPath(trialDir, "program.ts");
+      writeFileSync(programPath, candidate);
 
-    const { result, repair } = await executeProgram({
-      ...options,
-      projectDir: trialDir,
-      backend,
-      depth: 0,
-      validating: { readyGraceMs: VALIDATION_READY_GRACE_MS },
+      const { result, repair } = await executeProgram({
+        ...limits,
+        projectDir: trialDir,
+        backend,
+        depth: 0,
+        validating: { readyGraceMs: VALIDATION_READY_GRACE_MS },
+        journal,
+      });
+      journal.note("end", { result });
+      ended = true;
+      if (result.status === "failed") {
+        throw new Error(`Program failed: ${result.reason}`);
+      }
+      return { source: readFileSync(programPath, "utf-8"), repairedError: repair?.error };
     });
-    if (result.status === "failed") {
-      throw new Error(`Program failed: ${result.reason}`);
-    }
-    return { source: readFileSync(programPath, "utf-8"), repairedError: repair?.error };
-  });
+  } catch (err) {
+    // The validation could not be carried out at all.
+    if (!ended) journal.note("end", { error: err instanceof Error ? err.message : String(err) });
+    throw err;
+  } finally {
+    journal.close();
+  }
 }
 
 /**
@@ -888,15 +980,25 @@ const MAX_RUN_DEPTH = 16;
 const MAX_RUNS_IN_FLIGHT = 128;
 let runsInFlight = 0;
 
+/** What a run is told when a program asked for it, rather than a person or a host. */
+interface AskedFor {
+  /** How many runs deep it is: one more than the run that asked. */
+  depth: number;
+  /** The call that asked for it: which run's, and which of that run's calls. */
+  parent: { run: string; journal: string; seq: number };
+  /** Called once this run has a journal of its own. */
+  started(run: string, journal: string): void;
+}
+
 /**
  * Run a project, in this process: this is what a runner does.
  *
- * `depth` is how many runs deep this one is — 0 unless a program asked for it
- * (see the "/run/program" call), in which case it is one more than that
- * program's own. One runner carries the whole tree, so it is also where the
+ * `askedFor` is set when a program asked for the run (see the "/run/program"
+ * call). One runner carries the whole tree of runs, so it is also where the
  * tree is kept from growing without bound.
  */
-export async function runProgram(options: RunOptions, depth = 0): Promise<ProgramResult> {
+export async function runProgram(options: RunOptions, askedFor?: AskedFor): Promise<ProgramResult> {
+  const depth = askedFor?.depth ?? 0;
   if (depth > MAX_RUN_DEPTH) {
     throw new Error(
       `Not running ${options.projectDir}: programs are running programs more than ${MAX_RUN_DEPTH} deep. ` +
@@ -908,13 +1010,13 @@ export async function runProgram(options: RunOptions, depth = 0): Promise<Progra
   }
   runsInFlight += 1;
   try {
-    return await runProject(options, depth);
+    return await runProject(options, depth, askedFor);
   } finally {
     runsInFlight -= 1;
   }
 }
 
-async function runProject(options: RunOptions, depth: number): Promise<ProgramResult> {
+async function runProject(options: RunOptions, depth: number, askedFor?: AskedFor): Promise<ProgramResult> {
   const { projectDir } = options;
 
   if (!existsSync(join(projectDir, "meta.json"))) {
@@ -935,6 +1037,37 @@ async function runProject(options: RunOptions, depth: number): Promise<ProgramRe
     throw new Error(`Invalid maxRepairAttempts: ${maxRepairAttempts}. Must be a non-negative integer.`);
   }
 
+  const journal = openJournal(projectDir, config.journalRuns, {
+    purpose: "run",
+    label: options.label,
+    depth,
+    parent: askedFor?.parent,
+    workspace: options.workspaceDir,
+    timeout,
+    maxRepairAttempts,
+    args: options.args, // last: it is the one field of unknown size
+  });
+  askedFor?.started(journal.run, journal.path);
+  try {
+    return await runJournalled(options, depth, config, { timeout, maxRepairAttempts }, journal);
+  } catch (err) {
+    journal.note("end", { error: err instanceof Error ? err.message : String(err) });
+    throw err;
+  } finally {
+    journal.close();
+  }
+}
+
+async function runJournalled(
+  options: RunOptions,
+  depth: number,
+  config: TramaConfig,
+  limits: { timeout: number; maxRepairAttempts: number },
+  journal: Journal,
+): Promise<ProgramResult> {
+  const { projectDir } = options;
+  const { timeout, maxRepairAttempts } = limits;
+
   const { result, repair } = await executeProgram({
     projectDir,
     backend: createBackend(config),
@@ -946,7 +1079,9 @@ async function runProject(options: RunOptions, depth: number): Promise<ProgramRe
     depth,
     label: options.label,
     signal: options.signal,
+    journal,
   });
+  journal.note("end", { result });
 
   if (repair) {
     // The program is fixed and has run; failing to write this down must not turn that into an error.

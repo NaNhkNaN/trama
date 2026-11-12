@@ -401,6 +401,7 @@ The runtime is what makes agent programs **self-contained and shareable**:
 - **State persistence** — `ctx.state` survives across runs via `checkpoint()` and `done()`. Programs can be long-running, interruptible, and resumable. `ctx.yield()` suspends a program cooperatively — persists state and exits, ready for the session layer to resume it later.
 - **Shared workspace** — when programs run in a session, they share a workspace for artifact I/O. Atomic writes, path guarding, and level-triggered observation (`workspace.observe()`) — without a message bus or coordination framework.
 - **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, and tries it on a private copy of the project. Only a fix that works is installed, along with what its run produced; one that fails never touches the project. Up to 3 attempts. In a session the fix runs against the live shared workspace, so a participant being repaired can still be heard and answered.
+- **A record of every run** — each call a program makes through the bridge is written down as it happens, with how it ended: what the agent was asked and answered, what was read and written, each command and its output, each program it started. `trama journal` shows it.
 - **Version history** — every create, update, and repair saves a snapshot. You can diff any two versions to see how the program evolved.
 - **Scaffolding** — the runtime creates package.json, the module symlink, gitignore, and the history and log directories, and checks them before every run. Recipients of a shared program don't need to set anything up.
 
@@ -579,12 +580,14 @@ trama run <name> [--timeout <ms>] [--arg key=value ...]
 trama update <name> <prompt>
 trama list
 trama logs <name>
+trama journal <name> [run] [--list]
 ```
 
 - `--model` — override the LLM model for program generation (create only).
 - Ctrl-C (or SIGTERM) stops a run politely: the program is sent SIGTERM and given five seconds to finish what it must, and `trama run` returns once it is gone. Press Ctrl-C again to leave at once.
 - `--timeout` — per-phase timeout in milliseconds. Applies to each run and repair attempt separately. Default: `300000` (5 minutes). It limits the program's own time: while a participant it spawned is running — under a timeout of its own — the clock is stopped.
 - `--arg` — pass key-value arguments to the program, accessible via `ctx.input.args`. Repeatable.
+- `trama journal` — what a run did, call by call: the latest run of the project, or the one named. `--list` shows which runs are on record. See [The journal](#the-journal).
 
 ```bash
 # Example: pass arguments that the program can read via ctx.input.args
@@ -737,6 +740,35 @@ interface ProgramResult {
 
 The runner determines status by checking **terminal signals first, then exit code**. A `done()` or `yield()` the program completed takes precedence over a non-zero exit code.
 
+### The journal
+
+Every run is recorded. As a program runs, each call it makes through the bridge is appended to a journal — the request when it arrives, the result (or the error) when it is answered — together with what only the runtime knows: which program text was run, how each attempt exited and what it printed, each fix that was asked for and what came back, and how the run ended.
+
+```
+$ trama journal lead
+2026-11-12T01-54-59-389Z-0f38e7  run  done
+    0.003s  attempt 0  program 55ab701c
+    0.161s  #1   workspace/write    brief.md                                                      ok  8ms
+    0.172s  #2   run/program        scout (/home/you/.trama/projects/scout)                       ok  169ms
+    0.173s  #2   started run 2026-11-12T01-54-59-563Z-538f2c
+    0.176s  #3   workspace/observe  findings/*.md                                                 ok  253ms
+    0.430s  #4   tools/read         not-there.txt                                                 failed  0ms  Error: File not found: not-there.txt
+    0.431s  #5   ctx/done                                                                         ok  0ms
+    0.434s  attempt 0 over: exit code 0 → done
+    0.434s  end: done
+```
+
+- **One file per run**, `logs/journal/<run>.jsonl` in the project, one JSON record per line. A repair is part of the run it repairs: the failed attempt, the fix, and the attempt that tried the fix are in the same journal — including an attempt whose fix did not work and left no other trace.
+- **A session is a tree of journals.** A participant's run has a journal of its own, in its own project. The journal of the program that spawned it says which run that call started, and the participant's journal says which call started it.
+- **Written as things happen.** A journal says what had happened by the time of its last line. The journal of a run that died has no `end`; a call that nobody was left to answer — the program was gone — has no `result`.
+- **It is a record, not a control.** Nothing reads a journal back to change what a run does.
+
+What goes in it is what the program did: prompts and answers, the contents of files read and written, shell commands and their output. Keep that in mind before sharing one. One thing is held back on purpose: the values of credential-looking headers of a web request (`Authorization`, `Cookie`, `X-Api-Key`, anything with "key", "token" or "auth" in its name) are replaced by `[redacted]`. A secret a program puts anywhere else — in a URL, a prompt, a command — is recorded as written. Journals are readable by their owner only, and `logs/` is kept out of version control.
+
+It is bounded in size. A text longer than 256 KB is cut short, keeping its beginning, its length and a hash; a record holds about 1 MB, and says where something was left out. A journal that has grown past 64 MB goes on recording how the run goes — attempts, exits, the end — but no more of its calls.
+
+A project keeps the journals of its latest 20 runs — more for a while, if older ones are still being written. Change that with `"journalRuns"` in `~/.trama/config.json`; `0` records nothing. A journal that names another run's journal does not keep that one from being removed in its turn.
+
 ### Version history
 
 Every `create`, `update`, and successful `repair` saves a snapshot of program.ts to `history/`:
@@ -758,7 +790,7 @@ trama stores all projects at `~/.trama/projects/{name}/`. The runtime creates th
 - `package.json` — with `"type": "module"` (required for top-level await). If one already exists and is valid JSON, trama patches in the `type` field without touching the rest.
 - `node_modules/@trama-dev/runtime` and `node_modules/@trama-dev/session` — symlinks to the installed packages (re-pointed if they have moved), so `program.ts` can import both.
 - `history/` — version snapshots and metadata.
-- `logs/` — structured run logs (viewable via `trama logs`).
+- `logs/` — structured run logs (viewable via `trama logs`), and under `logs/journal/` the journals of the latest runs (viewable via `trama journal`).
 - `.gitignore` — creates or appends exclusions for generated files.
 - `state.json` — written when the program calls `ctx.checkpoint()`, `ctx.done()` or `ctx.yield()`.
 

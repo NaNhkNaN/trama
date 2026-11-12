@@ -6,6 +6,7 @@ import { createServer, type Server } from "http";
 import { timingSafeEqual } from "crypto";
 import type { Ctx, Agent, Tools, Workspace } from "./types.js";
 import type { ProgramResult, RunRequest } from "./runner-types.js";
+import type { Journal } from "./journal.js";
 import { assertSerializable } from "./serializable.js";
 
 const MAX_IPC_BODY = 50 * 1024 * 1024; // 50 MB
@@ -21,8 +22,11 @@ type Body = Record<string, any>;
 interface Route {
   /** Body fields checked before the handler runs. */
   fields: Record<string, FieldType>;
-  /** `connectionClosed` resolves when the caller's connection ends, answered or not. */
-  handle(body: Body, connectionClosed: Promise<void>): unknown;
+  /**
+   * `connectionClosed` resolves when the caller's connection ends, answered or
+   * not. `seq` is the call's position among the run's calls.
+   */
+  handle(body: Body, connectionClosed: Promise<void>, seq: number): unknown;
 }
 
 export interface IpcBackends {
@@ -39,8 +43,13 @@ export interface IpcBackends {
   workspace: Workspace | null;
   /** A workspace by directory, for a program that created a session rather than joined one. */
   workspaceAt(dir: string): Workspace;
-  /** Run another project on the program's behalf, until it ends or `stop` says to stop it. */
-  run(request: RunRequest, stop: AbortSignal): Promise<ProgramResult>;
+  /**
+   * Run another project on the program's behalf, until it ends or `stop` says
+   * to stop it. `seq` is the position of the call that asked for it.
+   */
+  run(request: RunRequest, stop: AbortSignal, seq: number): Promise<ProgramResult>;
+  /** Where every call, and how it ended, is written down. */
+  journal: Journal;
   /** Called once ctx.done() or ctx.yield() has been persisted for this run. */
   onTerminalSignal(result: ProgramResult): void;
 }
@@ -142,7 +151,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, onTermina
     // lasts as long as the run does, repairs included.
     "/run/program": {
       fields: { projectDir: "string", args: "optional object" },
-      handle: async (b, connectionClosed) => {
+      handle: async (b, connectionClosed, seq) => {
         const stop = new AbortController();
         // A caller that is gone — its process died, or it gave up — no longer wants the run.
         void connectionClosed.then(() => stop.abort());
@@ -157,7 +166,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, onTermina
             maxRepairAttempts: b.maxRepairAttempts,
             workspaceDir: b.workspaceDir,
             label: b.label,
-          }, stop.signal);
+          }, stop.signal, seq);
         } finally {
           if (id) runsAskedFor.delete(id);
         }
@@ -192,8 +201,10 @@ export function createIPCServer(backends: IpcBackends): Server {
 
   return createServer((req, res) => {
     const connectionClosed = new Promise<void>(resolve => res.once("close", resolve));
+    // An answer can be given once, and only while there is someone to give it to.
+    const answerable = () => !res.writableEnded && !res.destroyed;
     const reply = (status: number, body: string, json = false) => {
-      if (res.writableEnded || res.destroyed) return; // answered already, or nobody left to answer
+      if (!answerable()) return;
       res.writeHead(status, json ? { "Content-Type": "application/json" } : undefined);
       res.end(body);
     };
@@ -222,15 +233,24 @@ export function createIPCServer(backends: IpcBackends): Server {
     });
     req.on("end", async () => {
       if (overflow) return;
+      // Written down as soon as it can be read, and again when it is answered.
+      // What comes back for a caller that is gone is not an answer, and is not
+      // recorded as one: a call nobody was left to answer has no result.
+      let call: ReturnType<Journal["call"]> | undefined;
       try {
         const body: Body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
         const route = req.url ? routes[req.url] : undefined;
         if (!route) return reply(404, "Not found");
+        call = backends.journal.call(req.url!, body);
         validate(body, route.fields);
-        const result = await route.handle(body, connectionClosed);
-        reply(200, JSON.stringify({ result: result ?? null }), true);
+        const result = (await route.handle(body, connectionClosed, call.seq)) ?? null;
+        if (answerable()) call.end({ ok: true, result });
+        reply(200, JSON.stringify({ result }), true);
       } catch (err) {
-        reply(err instanceof BadRequest ? 400 : 500, err instanceof BadRequest ? err.message : String(err));
+        const refused = err instanceof BadRequest;
+        const error = refused ? err.message : String(err);
+        if (answerable()) call?.end({ ok: false, error });
+        reply(refused ? 400 : 500, error);
       }
     });
   });

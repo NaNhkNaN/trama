@@ -44,6 +44,7 @@ trama run <name> [--timeout <ms>] [--arg key=value ...]
 trama update <name> <prompt>
 trama list
 trama logs <name>
+trama journal <name> [run] [--list]
 ```
 
 See the [main README](https://github.com/NaNhkNaN/trama) for the full picture — why a runtime matters, what generated programs look like, and the runtime API.
