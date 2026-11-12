@@ -32,7 +32,16 @@ export function resolveBounded(rootDir: string, relativePath: string): string {
 /** The most links followed on the way to one path. More than this is a loop. */
 const MAX_LINKS = 40;
 
-const stepsOf = (path: string) => path.split(sep).filter(Boolean);
+/**
+ * The steps of a path, one name at a time. A path that ends in a slash says
+ * that what it names is a directory — which is what a last step of "." says,
+ * so that is what it is given.
+ */
+function stepsOf(path: string): string[] {
+  const steps = path.split(sep).filter(Boolean);
+  if (steps.length > 0 && path.endsWith(sep)) steps.push(".");
+  return steps;
+}
 
 /** What a link says, as text — refused if the text is not what the link holds (a name that is not valid UTF-8). */
 function readLink(link: string): string {
@@ -63,11 +72,14 @@ export function destinationOf(path: string): string {
   let missing = false;           // nothing is there from here on, so nothing is a link either
   while (steps.length > 0) {
     const step = steps.shift()!;
-    if (step === ".") continue;
-    if (step === "..") {
-      // Up from something that is not there leads nowhere the system would go.
-      if (missing) throw new Error(`Path escapes project directory via symlink: ${path} (it leads up from what does not exist)`);
-      at = dirname(at);
+    if (step === "." || step === "..") {
+      // "Here" and "up" are asked of a directory. Of something that is not
+      // there they lead nowhere the system would go — it cannot be created as
+      // a file and be a directory too.
+      if (missing) {
+        throw new Error(`Path escapes project directory via symlink: ${path} (it leads on from what does not exist)`);
+      }
+      if (step === "..") at = dirname(at);
       continue;
     }
     const next = join(at, step);

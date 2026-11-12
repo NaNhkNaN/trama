@@ -1486,6 +1486,17 @@ test("a meta.json that is not what a run needs is refused by name", async (t) =>
   writeJson(join(projectDir, "meta.json"), { input: {}, model: 5 });
   await assert.rejects(run, /Invalid meta\.json in .*"model" must be a non-empty string \(got 5\)/s);
 
+  // Not a quiet return to another model, either: an empty or mistyped name is said to be one.
+  for (const model of ["", 0, false]) {
+    writeJson(join(projectDir, "meta.json"), { input: {}, model });
+    await assert.rejects(run, /Invalid meta\.json in .*"model" must be a non-empty string/s, `model: ${JSON.stringify(model)}`);
+  }
+  writeJson(join(projectDir, "meta.json"), { input: {}, provider: "" });
+  await assert.rejects(run, /Invalid meta\.json in .*"provider" must be a non-empty string/s);
+  // null is a field left out.
+  writeJson(join(projectDir, "meta.json"), { input: {}, model: null, provider: null });
+  assert.equal((await run()).status, "done");
+
   // An input with nothing in it is still an input.
   writeJson(join(projectDir, "meta.json"), { input: {} });
   assert.equal((await run()).status, "done");
@@ -1555,4 +1566,48 @@ test("a file that holds null where an object is expected is said to hold null", 
   assert.throws(() => loadState(projectDir), /Expected a JSON object but got null/);
   writeText(join(projectDir, "state.json"), "[]");
   assert.throws(() => loadState(projectDir), /Expected a JSON object but got an array/);
+});
+
+test("the bridge answers a request it cannot read as a request with 400, and carries nothing out", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+import { readFileSync } from "fs";
+const { token } = JSON.parse(readFileSync(process.env.TRAMA_INIT, "utf-8"));
+const post = (endpoint, body) => fetch("http://127.0.0.1:" + process.env.TRAMA_PORT + endpoint, {
+  method: "POST", headers: { Authorization: "Bearer " + token }, body,
+}).then(async res => res.status + " " + (await res.text()));
+const answers = [];
+// Not an object, though each of these is JSON; and one that is not JSON at all.
+for (const body of ["null", '"text"', "[]", "7", "{ not json"]) answers.push(await post("/ctx/ready", body));
+await tools.write("answers.json", JSON.stringify(answers));
+await ctx.done();`,
+  });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 10_000 });
+  assert.equal(result.status, "done");
+  const answers = readJson(join(projectDir, "answers.json"));
+  for (const answer of answers.slice(0, 4)) assert.equal(answer, "400 The request body must be a JSON object");
+  assert.equal(answers[4], "400 The request body is not valid JSON");
+  // ready() was never called on the program's behalf.
+  assert.equal(readFileSync(join(projectDir, "logs", "latest.jsonl"), "utf-8").includes('"ready"'), false);
+});
+
+test("a repair that worked takes the program's place in one move, keeping its permissions", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
+  chmodSync(join(projectDir, "program.ts"), 0o755);
+  const fixed = `import { ctx } from "@trama-dev/runtime";\nawait ctx.done();\n`;
+  const originalRepair = llm.repair;
+  llm.repair = async () => fixed;
+  t.after(() => { llm.repair = originalRepair; });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.equal(result.status, "done");
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixed.trim());
+  assert.equal(statSync(join(projectDir, "program.ts")).mode & 0o777, 0o755);
+  assert.deepEqual(leftovers(projectDir), []);
 });

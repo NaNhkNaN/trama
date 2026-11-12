@@ -20,7 +20,7 @@ import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
 import { guardPath, realRootOf } from "./path-guard.js";
-import { stageFile } from "./replace-file.js";
+import { stageFile, type StagedFile } from "./replace-file.js";
 import { readProjectMeta } from "./meta.js";
 import { describeJson, isJsonObject } from "./serializable.js";
 import { createAllowance, superviseChild, type ChildExit } from "./child-process.js";
@@ -212,9 +212,11 @@ function checkedConfig(merged: TramaConfig, source: string): TramaConfig {
 /** The global config, with the model/provider a project was created with taking precedence. */
 export function loadProjectConfig(projectDir: string, meta = readProjectMeta(projectDir)): TramaConfig {
   const config = loadConfig();
-  if (meta.model) config.model = meta.model;
-  if (meta.provider) config.provider = meta.provider;
-  // What a project says is held to what the global config is held to.
+  // null is how JSON says a field is not there. Anything else a project says
+  // is taken, and held to what the global config is held to — an empty or
+  // mistyped name is an error here, not a quiet return to another model.
+  if (meta.model != null) config.model = meta.model;
+  if (meta.provider != null) config.provider = meta.provider;
   return checkedConfig(config, `meta.json in ${projectDir}`);
 }
 
@@ -897,7 +899,7 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
 
   // The merge above carries over what the run changed; the fix itself was
   // written before the run started, so it is installed explicitly.
-  if (run.outcome) writeFileSync(guardPath(projectDir, "program.ts"), fixed);
+  if (run.outcome) stageProgram(projectDir, fixed).commit();
   return run;
 }
 
@@ -1009,6 +1011,21 @@ export async function validateProgram(
 }
 
 /**
+ * Get a program ready to become a project's program.ts: written beside the
+ * one that is there, to take its place in one move — so program.ts is never
+ * half a program, whatever happens in the middle of writing it.
+ *
+ * It is a new file that takes the place: the old one's permissions are carried
+ * over, but not a second hard link to it, or its owner. A program its owner
+ * has made read-only is not replaced — a rename would not ask, so this does.
+ */
+function stageProgram(projectDir: string, source: string): StagedFile {
+  const programPath = guardPath(projectDir, "program.ts");
+  if (existsSync(programPath)) accessSync(programPath, constants.W_OK);
+  return stageFile(projectDir, "program.ts", source, { keepMode: true });
+}
+
+/**
  * Make a validated program the project's program.ts and record it as a new
  * version. A repair made while validating is not a version of its own — it is
  * noted in the history index only.
@@ -1024,14 +1041,7 @@ export function installValidatedProgram(
   // touched if even that cannot be done), the version is recorded, and only
   // then does the new program take the old one's place — in one move, so
   // program.ts is never half-written, and never a program that is not on record.
-  // (It is a new file that takes the place: the old one's permissions are
-  // carried over, but not a second hard link to it, or its owner.)
-
-  // A program its owner has made read-only is not replaced: a rename would not ask.
-  const programPath = guardPath(projectDir, "program.ts");
-  if (existsSync(programPath)) accessSync(programPath, constants.W_OK);
-
-  const program = stageFile(projectDir, "program.ts", validated.source, { keepMode: true });
+  const program = stageProgram(projectDir, validated.source);
   let unrecord = () => {};
   try {
     unrecord = recordVersion(projectDir, validated.source, reason, prompt, validated.repairedError

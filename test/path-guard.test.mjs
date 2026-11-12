@@ -306,7 +306,7 @@ test('".." that stays inside is followed, and one that leads up from nothing is 
 
   assert.equal(guardWriteTarget(root, "back"), join(realpathSync(root), "file.txt"));
   // The system could not follow this either: there is no directory to go up from.
-  assert.throws(() => guardPath(root, "through-nothing"), /leads up from what does not exist/);
+  assert.throws(() => guardPath(root, "through-nothing"), /leads on from what does not exist/);
 });
 
 test("nothing lies beyond a file: a link that goes on from one is refused, for writing as for reading", async (t) => {
@@ -327,6 +327,30 @@ test("nothing lies beyond a file: a link that goes on from one is refused, for w
   assert.equal(readFileSync(join(root, "other.txt"), "utf-8"), "ORIGINAL");
 });
 
+test("a path that says a file is a directory, or leads on from nothing, is refused for writing as the system refuses it", async (t) => {
+  const root = makeTempDir("trama-guard-");
+  t.after(() => cleanupTempDir(root));
+  writeFileSync(join(root, "regular.txt"), "ORIGINAL");
+  symlinkSync("regular.txt/", join(root, "slash"));   // a slash at the end asks for a directory
+  symlinkSync("missing/.", join(root, "dotmissing"));  // "here", of something that is not there
+  symlinkSync("missing/", join(root, "slashmissing"));
+  assert.throws(() => readFileSync(join(root, "slash")), { code: "ENOTDIR" });
+  assert.throws(() => writeFileSync(join(root, "dotmissing"), "x"), { code: "ENOENT" });
+
+  for (const make of [() => createTools(root), () => createWorkspace(root)]) {
+    await assert.rejects(make().write("slash", "OVERWRITTEN"), { code: "ENOTDIR" });
+    await assert.rejects(make().write("dotmissing", "x"), /leads on from what does not exist/);
+    await assert.rejects(make().write("slashmissing", "x"), /leads on from what does not exist/);
+  }
+  assert.equal(readFileSync(join(root, "regular.txt"), "utf-8"), "ORIGINAL");
+  assert.equal(existsSync(join(root, "missing")), false, "nothing was made of the name that is not a directory");
+
+  // A slash after a directory, or after a link to one, is only what it says.
+  mkdirSync(join(root, "dir"));
+  symlinkSync("dir/", join(root, "to-dir"));
+  assert.equal(guardWriteTarget(root, join("to-dir", "file.txt")), join(realpathSync(root), "dir", "file.txt"));
+});
+
 test("the runtime resolves paths in one place", () => {
   // Node's realpathSync takes ".." in a link's target as text; the system does not. Anything that asks it
   // where a path leads can be told somewhere the guard never checked.
@@ -336,21 +360,26 @@ test("the runtime resolves paths in one place", () => {
 });
 
 test("the guard's walk agrees with the system's, on random trees of directories, files and links", () => {
-  let seed = 20261112;
+  // Several starting points, not one: a single run of luck has passed for agreement here before.
+  for (const start of [20261112, 1, 7, 1234567]) walkAgainstTheSystem(start);
+});
+
+function walkAgainstTheSystem(start) {
+  let seed = start;
   const random = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 2 ** 32;
   const pick = (list) => list[Math.floor(random() * list.length)];
   const names = ["a", "b", "c", "d", "e"];
   const count = { same: 0, landed: 0, refused: 0 };
 
-  for (let round = 0; round < 60; round++) {
+  for (let round = 0; round < 100; round++) {
     const base = realpathSync(makeTempDir("trama-walk-"));
     try {
       const root = join(base, "root");
       mkdirSync(root);
-      // What a link may say: names, ways up and round, sometimes from the top.
+      // What a link may say: names, ways up and round, sometimes from the top, sometimes ending in a slash.
       const target = () => {
-        const steps = Array.from({ length: 1 + Math.floor(random() * 4) }, () => pick([...names, ...names, "..", "..", "."]));
-        return (random() < 0.15 ? pick([root, base]) + "/" : "") + steps.join("/");
+        const steps = Array.from({ length: 1 + Math.floor(random() * 4) }, () => pick([...names, ...names, "..", "..", ".", "."]));
+        return (random() < 0.15 ? pick([root, base]) + "/" : "") + steps.join("/") + (random() < 0.2 ? "/" : "");
       };
       const dirs = [root];
       for (let i = 0; i < 16; i++) {
@@ -371,17 +400,24 @@ test("the guard's walk agrees with the system's, on random trees of directories,
         try { statSync(query); system = realpathSync.native(query); } catch (err) { systemCode = err.code; }
 
         if (system !== undefined) {
-          assert.equal(ours, system, `${query}: the guard says ${ours ?? refused}, the system ${system}`);
+          // Above the tree made here the names are not this test's: on a filesystem that
+          // ignores case, "c" is found where the directory is called "C".
+          if (!isInside(system, base)) continue;
+          assert.equal(ours, system, `[${start}/${round}] ${query}: the guard says ${ours ?? refused}, the system ${system}`);
           count.same += 1;
         } else if (systemCode === "ENOTDIR" || systemCode === "ELOOP") {
-          assert.ok(refused, `${query}: the system refuses it (${systemCode}), the guard says ${ours}`);
+          assert.ok(refused, `[${start}/${round}] ${query}: the system refuses it (${systemCode}), the guard says ${ours}`);
           count.refused += 1;
         } else if (systemCode === "ENOENT" && ours !== undefined && isInside(ours, base)) {
           // Nothing is there yet. Where the guard says a write would land is where it must land:
           // make the directories on the way, as a write does, and write through the path as given.
           mkdirSync(dirname(ours), { recursive: true });
-          writeFileSync(query, "written");
-          assert.equal(realpathSync.native(query), ours, `${query}: written at ${realpathSync.native(query)}, the guard said ${ours}`);
+          try {
+            writeFileSync(query, "written");
+          } catch (err) {
+            assert.fail(`[${start}/${round}] ${query}: the guard says a write lands at ${ours}, the system will not write it (${err.code})`);
+          }
+          assert.equal(realpathSync.native(query), ours, `[${start}/${round}] ${query}: written at ${realpathSync.native(query)}, the guard said ${ours}`);
           count.landed += 1;
         }
       }
@@ -391,4 +427,4 @@ test("the guard's walk agrees with the system's, on random trees of directories,
   }
   // It has to have been a test of something.
   assert.ok(count.same > 500 && count.landed > 100 && count.refused > 100, JSON.stringify(count));
-});
+}

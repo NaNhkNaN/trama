@@ -54,7 +54,8 @@ export interface IpcBackends {
   onTerminalSignal(result: ProgramResult): void;
 }
 
-function validate(body: Body, fields: Record<string, FieldType>): void {
+function validate(body: unknown, fields: Record<string, FieldType>): asserts body is Body {
+  if (!isJsonObject(body)) throw new BadRequest("The request body must be a JSON object");
   for (const [name, type] of Object.entries(fields)) {
     const value = body[name];
     const optional = type.startsWith("optional ");
@@ -251,7 +252,12 @@ export function createIPCServer(backends: IpcBackends): Server {
       // recorded as one: a call nobody was left to answer has no result.
       let call: ReturnType<Journal["call"]> | undefined;
       try {
-        const body: Body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+        let body: unknown;
+        try {
+          body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+        } catch {
+          return reply(400, "The request body is not valid JSON");
+        }
         const route = req.url ? routes[req.url] : undefined;
         if (!route) return reply(404, "Not found");
         call = backends.journal.call(req.url!, body);
