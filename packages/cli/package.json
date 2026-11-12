@@ -6,7 +6,7 @@
     "trama": "dist/index.js"
   },
   "scripts": {
-    "build": "tsc && chmod +x dist/index.js"
+    "build": "rm -rf dist && tsc && chmod +x dist/index.js"
   },
   "publishConfig": {
     "access": "public"

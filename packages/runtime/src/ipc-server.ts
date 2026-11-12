@@ -14,7 +14,7 @@ const MAX_IPC_BODY = 50 * 1024 * 1024; // 50 MB
 /** A request the program got wrong — answered with 400 rather than 500. */
 class BadRequest extends Error {}
 
-type FieldType = "string" | "object" | "optional object";
+type FieldType = "string" | "object" | "optional string" | "optional object";
 
 /** A request body: its fields are validated per route, then handled untyped. */
 type Body = Record<string, any>;
@@ -59,12 +59,17 @@ const isPlainObject = (v: unknown) => typeof v === "object" && v !== null && !Ar
 function validate(body: Body, fields: Record<string, FieldType>): void {
   for (const [name, type] of Object.entries(fields)) {
     const value = body[name];
-    if (type === "optional object") {
-      if (value !== undefined && !isPlainObject(value)) {
-        throw new BadRequest(`Invalid field: ${name} (expected object or undefined)`);
-      }
-    } else if (type === "object" ? !isPlainObject(value) : typeof value !== type) {
-      throw new BadRequest(`Missing or invalid field: ${name} (expected ${type})`);
+    const optional = type.startsWith("optional ");
+    // null is how JSON says a field is not there: an optional one given as null was left out.
+    if (optional && value == null) {
+      delete body[name];
+      continue;
+    }
+    const expected = optional ? type.slice("optional ".length) : type;
+    if (expected === "object" ? !isPlainObject(value) : typeof value !== expected) {
+      throw new BadRequest(optional
+        ? `Invalid field: ${name} (expected ${expected} or undefined)`
+        : `Missing or invalid field: ${name} (expected ${expected})`);
     }
   }
 }
@@ -150,12 +155,16 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, onTermina
     // A program never runs another program: it asks its runner to. The call
     // lasts as long as the run does, repairs included.
     "/run/program": {
-      fields: { projectDir: "string", args: "optional object" },
+      fields: {
+        projectDir: "string", args: "optional object",
+        id: "optional string", label: "optional string", workspaceDir: "optional string",
+      },
       handle: async (b, connectionClosed, seq) => {
         const stop = new AbortController();
         // A caller that is gone — its process died, or it gave up — no longer wants the run.
         void connectionClosed.then(() => stop.abort());
-        const id: string | undefined = typeof b.id === "string" ? b.id : undefined;
+        // The name the program gave the run, to stop it by.
+        const id: string | undefined = b.id;
         if (id && stoppedAhead.delete(id)) stop.abort();
         if (id) runsAskedFor.set(id, stop);
         try {

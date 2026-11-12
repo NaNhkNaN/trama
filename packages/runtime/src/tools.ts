@@ -3,8 +3,8 @@ import { readFileSync, writeFileSync, mkdirSync } from "fs";
 import { resolve, dirname } from "path";
 import type { Tools, ShellResult } from "./types.js";
 import { guardPath } from "./path-guard.js";
-import { signalGroup, stopGroups, superviseChild } from "./child-process.js";
-import { stopWithThisProcess } from "./watchdog.js";
+import { superviseChild } from "./child-process.js";
+import { signalGroup, stopGroups, stopWithThisProcess } from "./stopping.js";
 
 const MAX_FETCH_BODY = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_SHELL_TIMEOUT = 30_000;
@@ -95,7 +95,8 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
       const child = spawn("sh", ["-c", command], {
         cwd,
         env: shellEnv,
-        stdio: ["pipe", "pipe", "pipe"],
+        // Nothing is ever sent to a command: one that reads its input finds it at an end, rather than waiting.
+        stdio: ["ignore", "pipe", "pipe"],
         detached: true,
       });
       const pgid = child.pid;

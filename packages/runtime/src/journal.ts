@@ -21,8 +21,32 @@ import { guardPath } from "./path-guard.js";
 /** The format of the records. Bump it when a reader of older journals would be misled. */
 export const JOURNAL_VERSION = 1;
 
-/** Where a project's journals are kept — under logs/, which trama keeps out of version control. */
-export const journalDirOf = (projectDir: string) => guardPath(projectDir, join("logs", "journal"));
+/** Where a project keeps its journals, relative to the project — under logs/, which trama keeps out of version control. */
+export const JOURNAL_DIR = join("logs", "journal");
+
+/**
+ * A project's journal directory, by its one real name however the project was
+ * referred to: a journal is recognised as still being written by its path.
+ */
+export function journalDirOf(projectDir: string): string {
+  const dir = guardPath(projectDir, JOURNAL_DIR);
+  try { return realpathSync(dir); } catch { return dir; /* not there yet */ }
+}
+
+/** The ids of the runs that have a journal in `dir`, oldest first. (A run's id starts with when it started.) */
+export function runsIn(dir: string): string[] {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return []; // no run has been recorded
+    throw err;
+  }
+  return names.filter(name => name.endsWith(".jsonl")).sort().map(name => name.slice(0, -".jsonl".length));
+}
+
+/** The journal of a run, in a journal directory. */
+export const journalIn = (dir: string, run: string) => join(dir, `${run}.jsonl`);
 
 /** The longest text kept whole. */
 const MAX_TEXT = 256 * 1024;
@@ -30,71 +54,93 @@ const MAX_TEXT = 256 * 1024;
 const MAX_RECORD = 1024 * 1024;
 /** How far into nested values a record goes. */
 const MAX_DEPTH = 12;
+/** The longest name a field is recorded under. */
+const MAX_NAME = 1024;
 /** How large a journal grows before it stops taking down calls. */
 const MAX_JOURNAL = 64 * 1024 * 1024;
+/**
+ * What a record lost to its limits. Each entry names a value by the path to it
+ * and says what was there; the value itself is still in its place, as far as
+ * it was kept:
+ *   "text"   — its beginning is; `length` and `sha256` are of the whole
+ *   "list"   — its first items are; `length` is how many it had
+ *   "object" — some of its fields are: those there was room for, with names of a recordable length
+ *   "bytes"  — binary data, none of it kept (null); `length` is its size
+ *   "depth"  — nested too deep to follow, none of it kept (null)
+ * The list is kept apart from the values, in the record's `cuts`, so that
+ * nothing a program passes can be mistaken for it — and a record without
+ * `cuts` is whole.
+ */
+type Cut = { path: Array<string | number>; cut: "text" | "list" | "object" | "bytes" | "depth"; length?: number; sha256?: string };
 
-/** Stands for what a record had no room left for. */
-const OMITTED = { clipped: "", omitted: true };
+/** What is left of a record's allowance, and what has been cut from it so far. */
+interface Room { left: number; cuts: Cut[] }
 
 /**
  * A value as it is written down: whole if there is room, and otherwise cut
- * short — a long text keeps its beginning, its real length and a hash to tell
- * what was there. `room` is what is left of the record's allowance; everything
- * written is counted against it, so a record stays about that size whatever
- * shape its contents have, and takes about that long to write.
+ * short, with a note of it in `room.cuts`. Everything written is counted
+ * against `room.left` — the notes too — so a record holds about that many
+ * characters whatever shape its contents have. (Its line can be longer: JSON
+ * writes some characters as escapes of up to six.)
  */
-function clip(value: unknown, room: { left: number }, depth = 0): unknown {
-  if (room.left <= 0) return OMITTED;
+function clip(value: unknown, room: Room, path: Array<string | number> = []): unknown {
+  const cut = (about: Omit<Cut, "path">) => {
+    room.cuts.push({ path, ...about });
+    room.left -= 128 + path.reduce((size: number, step) => size + String(step).length + 3, 0);
+  };
   if (typeof value === "string") {
-    const keep = Math.min(MAX_TEXT, room.left);
-    room.left -= Math.min(value.length, keep) + 2;
+    const keep = Math.max(0, Math.min(MAX_TEXT, room.left));
+    room.left -= Math.min(value.length, keep) + 3;
     if (value.length <= keep) return value;
-    return {
-      clipped: value.slice(0, keep),
-      length: value.length,
-      sha256: createHash("sha256").update(value).digest("hex"),
-    };
+    cut({ cut: "text", length: value.length, sha256: createHash("sha256").update(value).digest("hex") });
+    return value.slice(0, keep);
   }
   if (typeof value === "bigint") value = value.toString();
   if (value === null || typeof value !== "object") {
-    room.left -= 8;
+    room.left -= typeof value === "number" ? String(value).length + 1 : 8;
     return value;
   }
   // Binary data is recorded by its size: as text it would be a list of numbers.
   if (ArrayBuffer.isView(value)) {
-    room.left -= 32;
-    return { clipped: "", bytes: value.byteLength };
+    cut({ cut: "bytes", length: value.byteLength });
+    return null;
   }
   // Anything that knows how it wants to be written (a Date) is asked.
   if (typeof (value as { toJSON?: unknown }).toJSON === "function") {
-    return clip((value as { toJSON(): unknown }).toJSON(), room, depth);
+    return clip((value as { toJSON(): unknown }).toJSON(), room, path);
   }
-  if (depth >= MAX_DEPTH) {
-    room.left -= 32;
-    return { clipped: "", nested: true };
+  if (path.length >= MAX_DEPTH) {
+    cut({ cut: "depth" });
+    return null;
   }
+  room.left -= 3; // an empty list or object takes room too
   if (Array.isArray(value)) {
     const items: unknown[] = [];
     for (const item of value) {
       if (room.left <= 0) {
-        items.push({ ...OMITTED, items: value.length });
+        cut({ cut: "list", length: value.length });
         break;
       }
-      items.push(clip(item, room, depth + 1));
+      items.push(clip(item, room, [...path, items.length]));
     }
     return items;
   }
   const fields: Record<string, unknown> = {};
-  // Walked field by field rather than listed first: an object with millions
-  // of fields is left as soon as the room runs out.
+  let fieldsLeftOut = false;
   for (const key in value) {
     if (!Object.hasOwn(value, key)) continue;
-    if (room.left <= 0) {
-      fields["…"] = OMITTED;
-      break;
+    // A field goes in with its name, or not at all. A name that is too long
+    // is passed over — it would be repeated in the path of everything cut
+    // beneath it — and one there is no room for ends the object.
+    const noRoom = room.left <= key.length;
+    if (noRoom || key.length > MAX_NAME) {
+      if (!fieldsLeftOut) cut({ cut: "object" });
+      fieldsLeftOut = true;
+      if (noRoom) break;
+      continue;
     }
     room.left -= key.length + 3;
-    fields[key] = clip((value as Record<string, unknown>)[key], room, depth + 1);
+    fields[key] = clip((value as Record<string, unknown>)[key], room, [...path, key]);
   }
   return fields;
 }
@@ -163,7 +209,7 @@ function noJournal(): Journal {
 const beingWritten = new Set<string>();
 
 /** The process that started a journal — named at the start of its first record — or null if it cannot be told. */
-export function writerOf(path: string): number | null {
+function writerOf(path: string): number | null {
   let fd: number | null = null;
   try {
     fd = openSync(path, "r");
@@ -198,9 +244,9 @@ export function stillBeingWritten(path: string): boolean {
  * Such journals stay, and the project holds more than `keep` for a while.
  */
 function makeRoom(dir: string, keep: number): void {
-  const journals = readdirSync(dir).filter(name => name.endsWith(".jsonl")).sort();
-  for (const name of journals.slice(0, Math.max(0, journals.length - (keep - 1)))) {
-    const path = join(dir, name);
+  const runs = runsIn(dir);
+  for (const run of runs.slice(0, Math.max(0, runs.length - (keep - 1)))) {
+    const path = journalIn(dir, run);
     if (!stillBeingWritten(path)) rmSync(path, { force: true });
   }
 }
@@ -225,12 +271,10 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
   let fd: number | null;
   let path: string;
   try {
-    mkdirSync(journalDirOf(projectDir), { recursive: true });
-    // One name for one directory, however the project was referred to: a
-    // journal is recognised as still being written by its path.
-    const dir = realpathSync(journalDirOf(projectDir));
+    mkdirSync(guardPath(projectDir, JOURNAL_DIR), { recursive: true });
+    const dir = journalDirOf(projectDir);
     makeRoom(dir, keep);
-    path = join(dir, `${run}.jsonl`);
+    path = journalIn(dir, run);
     // Readable by its owner only: it holds what the program read, wrote and was told.
     fd = openSync(path, "a", 0o600);
     beingWritten.add(path);
@@ -256,7 +300,10 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
     const at = Math.round(performance.now() - t0);
     let line: string;
     try {
-      line = JSON.stringify(clip({ at, kind, ...compose() }, { left: MAX_RECORD }));
+      const room: Room = { left: MAX_RECORD, cuts: [] };
+      const record = clip({ at, kind, ...compose() }, room) as Record<string, unknown>;
+      if (room.cuts.length > 0) record.cuts = room.cuts;
+      line = JSON.stringify(record);
     } catch (err) {
       line = JSON.stringify({ at, kind, unrecordable: err instanceof Error ? err.message : String(err) });
     }

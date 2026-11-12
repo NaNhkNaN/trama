@@ -208,10 +208,16 @@ await ctx.done();`,
   await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
 
   const records = onlyJournal(projectDir);
-  const { content } = callAt(records, 1).call.request;
-  assert.equal(content.length, 1_000_000);
-  assert.equal(content.clipped, "a".repeat(256 * 1024));
-  assert.equal(content.sha256, createHash("sha256").update("a".repeat(1_000_000)).digest("hex"));
+  const { request, cuts } = callAt(records, 1).call;
+  // Its beginning is in its place; that it was cut, and what was there, is noted beside the record's values.
+  assert.equal(request.content, "a".repeat(256 * 1024));
+  assert.deepEqual(cuts, [{
+    path: ["request", "content"],
+    cut: "text",
+    length: 1_000_000,
+    sha256: createHash("sha256").update("a".repeat(1_000_000)).digest("hex"),
+  }]);
+  assert.equal(callAt(records, 1).result.cuts, undefined, "a record that lost nothing says nothing");
   assert.ok(statSync(join(journalDir(projectDir), journalFiles(projectDir)[0])).size < 400_000);
   // The file itself is whole: only the record of it is shortened.
   assert.equal(readFileSync(join(projectDir, "big.txt"), "utf-8").length, 1_000_000);
@@ -319,6 +325,25 @@ test("a journal that cannot be written does not get in the way of the run", asyn
   assert.equal(readFileSync(join(projectDir, "logs", "journal"), "utf-8"), "in the way");
 });
 
+test("journals that cannot be listed are not added to without saying so", { skip: process.getuid?.() === 0 }, async (t) => {
+  const { chmodSync } = await import("fs");
+  const projectDir = makeTempDir("trama-journal-");
+  t.after(() => { chmodSync(journalDir(projectDir), 0o700); cleanupTempDir(projectDir); });
+  createProjectFixture(projectDir, { scaffold: false });
+  await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+
+  // Writable, but its contents cannot be listed: older journals could never be made room among.
+  chmodSync(journalDir(projectDir), 0o300);
+  let result;
+  const { messages } = await captureConsole("warn", async () => {
+    result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  });
+  chmodSync(journalDir(projectDir), 0o700);
+  assert.equal(result.status, "done");
+  assert.equal(messages.filter(message => /not being recorded/.test(message)).length, 1);
+  assert.equal(journalFiles(projectDir).length, 1, "nothing was added that nothing would ever remove");
+});
+
 test("a record is about as big as it is allowed to be, whatever is put in it", async (t) => {
   const { openJournal } = await import("../packages/runtime/dist/journal.js");
   const projectDir = makeTempDir("trama-journal-");
@@ -343,14 +368,49 @@ test("a record is about as big as it is allowed to be, whatever is put in it", a
   assert.ok(took < 1_000, `writing it took ${Math.round(took)}ms`);
   assert.equal(checkpoint.small, "kept", "what comes first is kept");
   assert.equal(checkpoint.late, undefined);
-  assert.deepEqual(checkpoint["…"], { clipped: "", omitted: true }, "what there was no room for is said to be missing");
   assert.ok(Object.keys(checkpoint.many).length < 500_000);
+  // What there was no room for is said to be missing: the rest of `many`, and the rest of the record.
+  // (The last text that went in may itself have been cut where the room ran out.)
+  assert.deepEqual(checkpoint.cuts.filter(cut => cut.cut === "object"), [{ path: ["many"], cut: "object" }, { path: [], cut: "object" }]);
+  assert.ok(checkpoint.cuts.length <= 3, `${checkpoint.cuts.length} cuts noted`);
 
   assert.equal(odd.when, "1970-01-01T00:00:00.000Z");
   assert.equal(odd.size, "10");
-  assert.deepEqual(odd.raw, { clipped: "", bytes: 3 });
+  assert.equal(odd.raw, null);
+  assert.deepEqual(odd.cuts, [{ path: ["raw"], cut: "bytes", length: 3 }]);
   assert.match(unrecordable.unrecordable, /cannot be read/);
   assert.equal(after.kind, "after", "one record that could not be written does not end the journal");
+});
+
+test("no shape of value gets a record past its size, and none can pass for a note of what was cut", async (t) => {
+  const { openJournal } = await import("../packages/runtime/dist/journal.js");
+  const projectDir = makeTempDir("trama-journal-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  const journal = openJournal(projectDir, 5, { purpose: "test" });
+  // Things that are nearly nothing each, and a name that is far too much on its own.
+  journal.note("empties", { list: Array.from({ length: 3_000_000 }, () => []) });
+  journal.note("name", { ["k".repeat(5_000_000)]: 1 });
+  // A name too long to record is passed over; what comes after it is still taken down.
+  journal.note("long name", { ["n".repeat(5_000)]: 1, after: "kept" });
+  // A long name above a deep value that runs out of room: the name must not come back in every note.
+  let deep = { text: "s".repeat(2_000_000), late: 1 };
+  for (let i = 0; i < 10; i++) deep = { a: deep, late: 1 };
+  journal.note("deep", { data: { ["k".repeat(1_000)]: deep, late: 1 } });
+  journal.note("binary", { list: Array.from({ length: 200_000 }, () => Buffer.alloc(4)) });
+  // A value shaped like the runtime's own notes is a value like any other.
+  journal.note("lookalike", { request: { cut: "text", path: ["request"], length: 9, clipped: "mine" } });
+  journal.close();
+
+  const lines = readFileSync(journal.path, "utf-8").split("\n").filter(Boolean).slice(1);
+  for (const line of lines) assert.ok(line.length < 1_300_000, `a record of ${line.length} characters`);
+  const [empties, name, longName, , binary, lookalike] = lines.map(line => JSON.parse(line));
+  assert.deepEqual({ after: longName.after, cuts: longName.cuts }, { after: "kept", cuts: [{ path: [], cut: "object" }] });
+  assert.deepEqual(empties.cuts, [{ path: ["list"], cut: "list", length: 3_000_000 }]);
+  assert.deepEqual(name.cuts, [{ path: [], cut: "object" }], "a field goes in with its name, or not at all");
+  assert.deepEqual(binary.cuts.at(-1), { path: ["list"], cut: "list", length: 200_000 });
+  assert.deepEqual(lookalike.request, { cut: "text", path: ["request"], length: 9, clipped: "mine" });
+  assert.equal(lookalike.cuts, undefined, "nothing was cut, and the record says so by saying nothing");
 });
 
 test("a journal that is still being written is never the one to make room", async (t) => {

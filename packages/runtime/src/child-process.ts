@@ -1,12 +1,8 @@
 import type { ChildProcess } from "child_process";
 import { StringDecoder } from "string_decoder";
+import { stopGroups } from "./stopping.js";
 
 const MAX_OUTPUT = 10 * 1024 * 1024; // 10 MB
-/** How long a process group gets to exit after SIGTERM before it is sent SIGKILL. */
-const KILL_GRACE_MS = 5000;
-const STOP_POLL_MS = 25;
-/** How long a group is waited for after SIGKILL before it is given up on. */
-const KILL_SETTLE_MS = 1000;
 /** How long a child's output is waited for once the child itself has exited. */
 const DRAIN_MS = 1000;
 /** The longest delay a timer can be given; a longer one fires at once. */
@@ -28,83 +24,6 @@ export function cappedBuffer() {
     get value() { return buf; },
   };
 }
-
-/**
- * Send a signal to a whole process group. Children spawned with `detached: true`
- * lead their own group, so this also reaches whatever they started in the background.
- * Signal 0 only probes. Returns false if the group no longer exists.
- */
-export function signalGroup(pgid: number, signal: NodeJS.Signals | 0): boolean {
-  try {
-    process.kill(-pgid, signal);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// --- Stopping ---
-//
-// Never SIGKILL first. A group gets the chance to end properly — a program to
-// close what it opened, a `trama` command to stop its own run and report it.
-// Killed outright, nothing in it gets to finish anything. So a group is asked
-// to stop, and killed only if it is still there when the grace period is over.
-//
-// stopGroups does that for a runner that is there to see it through. When the
-// runner itself is gone, its watchdog does the same (see watchdog.ts).
-
-/** The timing of a stop, shared with the watchdog. */
-export const STOP_TIMINGS = { grace: KILL_GRACE_MS, settle: KILL_SETTLE_MS, poll: STOP_POLL_MS };
-
-/** Groups this process has asked to stop and is still watching. */
-const stopping = new Map<number, Promise<void>>();
-
-/** Called with each group as it is asked to stop — for the watchdog, which must not ask it again. */
-let onAsked: (pgid: number) => void = () => {};
-export function onGroupAskedToStop(listener: (pgid: number) => void): void {
-  onAsked = listener;
-}
-
-function stopGroup(pgid: number): Promise<void> {
-  // Asked once is enough: to some programs a second SIGTERM means "now".
-  const watched = stopping.get(pgid);
-  if (watched) return watched;
-  if (!signalGroup(pgid, "SIGTERM")) return Promise.resolve();
-  onAsked(pgid);
-
-  const gone = new Promise<void>((resolve) => {
-    let deadline = performance.now() + KILL_GRACE_MS;
-    let killed = false;
-    const poll = setInterval(() => {
-      const alive = signalGroup(pgid, 0);
-      if (alive && performance.now() < deadline) return;
-      if (alive && !killed) {
-        // Out of patience. A killed group is gone in a moment; allow it that
-        // moment, but do not wait on one that for some reason never goes.
-        signalGroup(pgid, "SIGKILL");
-        killed = true;
-        deadline = performance.now() + KILL_SETTLE_MS;
-        return;
-      }
-      clearInterval(poll);
-      stopping.delete(pgid);
-      resolve();
-    }, STOP_POLL_MS);
-  });
-  stopping.set(pgid, gone);
-  return gone;
-}
-
-/**
- * Stop process groups for good: SIGTERM now, SIGKILL after the grace period to
- * whichever are still there. Resolves when none is left — so that what follows
- * (merging a directory they were writing to, deleting it) finds them gone.
- */
-export async function stopGroups(pgids: number[]): Promise<void> {
-  await Promise.all(pgids.map(stopGroup));
-}
-
-// --- Time limits ---
 
 /**
  * A time limit that only runs down while nothing is holding it.
@@ -194,7 +113,7 @@ export interface ChildExit {
 /**
  * Collect a child's output and wait for it to exit, enforcing a time limit
  * and an optional stop request. Either one stops the child's whole process
- * group (see stopGroups).
+ * group (see stopping.ts).
  * Resolves on exit however it happened; rejects only if the child failed to spawn.
  */
 export function superviseChild(child: ChildProcess, options: SuperviseOptions): Promise<ChildExit> {

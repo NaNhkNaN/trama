@@ -245,7 +245,7 @@ test("runProgram surfaces repair failures after retries are exhausted", async (t
   try {
     const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 5_000 });
     assert.equal(result.status, "failed");
-    assert.match(result.reason, /Repair errors:[\s\S]*repair blew up/s);
+    assert.match(result.reason, /No fix came back: repair blew up/);
   } finally {
     llm.repair = originalRepair;
   }

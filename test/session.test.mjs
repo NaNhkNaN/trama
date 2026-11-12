@@ -515,6 +515,34 @@ await ctx.done();`,
   assert.equal(lines.filter(line => line.startsWith("depth")).length, 17, "the runs at depths 0 to 16 ran");
 });
 
+test("a field a program leaves out by giving null is left out, inside a program as outside one", async (t) => {
+  const entryDir = makeTempDir("trama-session-entry-");
+  const workerDir = makeTempDir("trama-session-worker-");
+  t.after(() => { cleanupTempDir(entryDir); cleanupTempDir(workerDir); });
+
+  // workspace.* must stay unavailable: null is not a workspace.
+  createProjectFixture(workerDir, {
+    programSource: `import { ctx, workspace } from "@trama-dev/runtime";
+const inSession = await workspace.list("*").then(() => true, () => false);
+await ctx.done({ args: ctx.input.args, inSession });`,
+  });
+  createProjectFixture(entryDir, {
+    programSource: `import { ctx } from "@trama-dev/runtime";
+import { runProgram } from "@trama-dev/runtime/runner";
+const result = await runProgram({
+  projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 20000,
+  label: null, workspaceDir: null, args: null,
+});
+await ctx.done(result);`,
+  });
+
+  const options = { maxRepairAttempts: 0, timeout: 30_000 };
+  const outside = await runProgram({ projectDir: workerDir, ...options, label: null, workspaceDir: null, args: null });
+  const inside = await runProgram({ projectDir: entryDir, ...options });
+  assert.deepEqual(outside, { status: "done", result: { args: {}, inSession: false } });
+  assert.deepEqual(inside, { status: "done", result: outside });
+});
+
 test("a participant's output is shown under its name, and is not its parent's output", async (t) => {
   const fakeHome = makeTempDir("trama-home-");
   const entryDir = makeTempDir("trama-session-entry-");

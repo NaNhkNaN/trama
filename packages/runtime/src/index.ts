@@ -14,7 +14,7 @@ import {
 import { createWorkspace as workspaceHere } from "./workspace.js";
 import { parentBridge, remoteWorkspace } from "./bridge-client.js";
 import { guardPath } from "./path-guard.js";
-import { journalDirOf, stillBeingWritten } from "./journal.js";
+import { printJournals } from "./journal-view.js";
 
 export type { ProgramResult, RunOptions } from "./runner-types.js";
 import type { ProgramResult, RunOptions, TramaConfig } from "./runner-types.js";
@@ -357,137 +357,10 @@ export async function showLogs(name: string): Promise<void> {
   }
 }
 
-// --- Reading a journal ---
-
-type JournalRecord = { kind: string; at: number } & Record<string, any>;
-
-/**
- * The records of a journal file. A line that is not a whole record — the last
- * one, if the runner died writing it — is left out, and so is a file that
- * cannot be read at all.
- */
-function readJournal(path: string): JournalRecord[] {
-  const records: JournalRecord[] = [];
-  let text = "";
-  try { text = readFileSync(path, "utf-8"); } catch { /* shown as a run with nothing on record */ }
-  for (const line of text.split("\n")) {
-    if (!line) continue;
-    try {
-      const record = JSON.parse(line);
-      if (typeof record === "object" && record !== null) records.push(record);
-    } catch { /* not a whole record */ }
-  }
-  return records;
-}
-
-/** The ids of a project's recorded runs, oldest first. */
-function journalledRuns(projectDir: string): string[] {
-  const dir = journalDirOf(projectDir);
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir).filter(name => name.endsWith(".jsonl")).sort().map(name => name.slice(0, -".jsonl".length));
-}
-
-const oneLine = (value: unknown, max: number): string => {
-  const text = (typeof value === "string" ? value : JSON.stringify(value) ?? "").replace(/\s+/g, " ").trim();
-  return text.length > max ? text.slice(0, max - 1) + "…" : text;
-};
-
-/** A recorded value that was cut short stands for its beginning. */
-const unclipped = (value: unknown): unknown =>
-  typeof value === "object" && value !== null && "clipped" in value ? (value as { clipped: unknown }).clipped : value;
-
-/** The one field of a request that says most about it. */
-function gist(request: Record<string, unknown> | undefined): string {
-  // A run that was asked for is best known by the name it was given.
-  if (typeof request?.label === "string") return oneLine(`${request.label}  (${request.projectDir})`, 60);
-  for (const field of ["prompt", "command", "path", "pattern", "url", "message", "projectDir", "reason"]) {
-    if (request?.[field] !== undefined) return oneLine(unclipped(request[field]), 60);
-  }
-  return "";
-}
-
-/** How a run ended, in a word or two — or that it has not, or never will. */
-function ending(path: string, records: JournalRecord[]): string {
-  const end = records.find(record => record.kind === "end");
-  if (!end) return stillBeingWritten(path) ? "still running" : "did not finish";
-  return end.result ? end.result.status : `could not run: ${oneLine(unclipped(end.error), 60)}`;
-}
-
-function printJournal(path: string, records: JournalRecord[]): void {
-  const head = records[0];
-  console.log(`${head?.run ?? "?"}  ${head?.purpose ?? ""}${head?.label ? ` [${head.label}]` : ""}  ${ending(path, records)}`);
-
-  const results = new Map<number, JournalRecord>();
-  for (const record of records) if (record.kind === "result") results.set(record.seq, record);
-
-  for (const record of records) {
-    const at = `${(record.at / 1000).toFixed(3).padStart(9)}s`;
-    switch (record.kind) {
-      case "attempt":
-        console.log(`${at}  attempt ${record.attempt}  program ${record.program?.sha256?.slice(0, 8) ?? "missing"}`);
-        break;
-      case "call": {
-        const result = results.get(record.seq);
-        const how = !result ? "never answered"
-          : result.ok ? `ok  ${result.ms}ms`
-          : `failed  ${result.ms}ms  ${oneLine(unclipped(result.error), 60)}`;
-        console.log(`${at}  #${String(record.seq).padEnd(3)} ${record.endpoint.slice(1).padEnd(18)} ${gist(record.request).padEnd(60)}  ${how}`);
-        break;
-      }
-      case "child":
-        console.log(`${at}  #${String(record.seq).padEnd(3)} started run ${record.run}`);
-        break;
-      case "fix-request":
-        console.log(`${at}  fix asked for: ${oneLine(unclipped(record.error), 80)}`);
-        break;
-      case "fix":
-        console.log(`${at}  fix ${record.ok ? "returned" : `not returned: ${oneLine(record.error, 80)}`}`);
-        break;
-      case "exit": {
-        const how = record.timedOut ? "timed out"
-          : record.validated ? `stopped, validated (${record.validated})`
-          : record.stopped ? "stopped"
-          : record.signal ? `killed by ${record.signal}`
-          : `exit code ${record.code}`;
-        const verdict = record.error ? `unusable: ${oneLine(unclipped(record.error), 60)}` : record.outcome ? record.outcome.status : "failed";
-        console.log(`${at}  attempt ${record.attempt} over: ${how} → ${verdict}`);
-        break;
-      }
-      case "full":
-        console.log(`${at}  the journal is full: calls from here on were not recorded`);
-        break;
-      case "end":
-        console.log(`${at}  end: ${ending(path, records)}`);
-        break;
-    }
-  }
-}
-
 /**
  * Show what a run of a project did, from its journal: the latest run, or the
  * one named. With `list`, show which runs have a journal instead.
  */
 export async function showJournal(name: string, options: { run?: string; list?: boolean } = {}): Promise<void> {
-  const projectDir = resolveProject(name);
-  const runs = journalledRuns(projectDir);
-  if (runs.length === 0) {
-    console.log("No runs have been recorded.");
-    return;
-  }
-  const pathOf = (run: string) => join(journalDirOf(projectDir), `${run}.jsonl`);
-
-  if (options.list) {
-    for (const run of runs) {
-      const records = readJournal(pathOf(run));
-      const calls = records.filter(record => record.kind === "call").length;
-      console.log(`${run}  ${String(records[0]?.purpose ?? "").padEnd(8)}  ${String(calls).padStart(4)} calls  ${ending(pathOf(run), records)}`);
-    }
-    return;
-  }
-
-  const run = options.run ?? runs[runs.length - 1];
-  if (!runs.includes(run)) {
-    throw new Error(`No journal for run "${run}". \`trama journal ${name} --list\` shows the runs that have one.`);
-  }
-  printJournal(pathOf(run), readJournal(pathOf(run)));
+  printJournals(resolveProject(name), name, options);
 }

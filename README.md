@@ -661,7 +661,7 @@ await tools.fetch(url, { method?, headers?, body? })
                                           // -> { status, body, headers }
 ```
 
-`read` and `write` are path-guarded to the project directory (traversal and symlink escape attempts throw). `shell` defaults to a 30-second timeout; pass `{ timeout: 60000 }` for longer commands. `fetch` returns the response body as a string (capped at 10MB).
+`read` and `write` are path-guarded to the project directory (traversal and symlink escape attempts throw). `shell` defaults to a 30-second timeout; pass `{ timeout: 60000 }` for longer commands. A command is given no input: one that reads standard input finds it at an end. `fetch` returns the response body as a string (capped at 10MB).
 
 Long-running programs should call `ctx.ready()` once startup completes so `create`/`update` smoke validation can treat "server is up" as success instead of waiting for process exit.
 
@@ -765,7 +765,7 @@ $ trama journal lead
 
 What goes in it is what the program did: prompts and answers, the contents of files read and written, shell commands and their output. Keep that in mind before sharing one. One thing is held back on purpose: the values of credential-looking headers of a web request (`Authorization`, `Cookie`, `X-Api-Key`, anything with "key", "token" or "auth" in its name) are replaced by `[redacted]`. A secret a program puts anywhere else — in a URL, a prompt, a command — is recorded as written. Journals are readable by their owner only, and `logs/` is kept out of version control.
 
-It is bounded in size. A text longer than 256 KB is cut short, keeping its beginning, its length and a hash; a record holds about 1 MB, and says where something was left out. A journal that has grown past 64 MB goes on recording how the run goes — attempts, exits, the end — but no more of its calls.
+It is bounded in size. A text longer than 256 KB is cut to its beginning, and a record holds about 1 MB. A record that lost something says so in its `cuts`: which value, and what was there — a text's full length and hash, how many items a list had. A record without `cuts` is whole. A journal that has grown past 64 MB goes on recording how the run goes — attempts, exits, the end — but no more of its calls.
 
 A project keeps the journals of its latest 20 runs — more for a while, if older ones are still being written. Change that with `"journalRuns"` in `~/.trama/config.json`; `0` records nothing. A journal that names another run's journal does not keep that one from being removed in its turn.
 

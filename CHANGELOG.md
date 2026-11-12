@@ -11,8 +11,17 @@ All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`
   - A session is a tree of journals: the journal of a program says which run each of its `spawn()` calls started, and that run's journal says which call started it.
   - `trama journal <name> [run] [--list]` shows a run call by call, or lists the runs on record.
   - `"journalRuns"` in `~/.trama/config.json` sets how many runs of a project keep their journal (default 20; 0 records nothing).
-  - A journal holds what the program did — prompts and answers, file contents, commands and their output. Credential-looking headers of web requests are redacted; nothing else is. It is bounded: a text over 256 KB is cut short, a record holds about 1 MB, and a journal past 64 MB stops taking down calls. Journals are readable by their owner only and live under `logs/`, which is kept out of version control.
+  - A journal holds what the program did — prompts and answers, file contents, commands and their output. Credential-looking headers of web requests are redacted; nothing else is. It is bounded: a text over 256 KB is cut to its beginning, a record holds about 1 MB and lists what it lost in its `cuts`, and a journal past 64 MB stops taking down calls. Journals are readable by their owner only and live under `logs/`, which is kept out of version control.
   - Recording never changes a run: a journal that cannot be opened or written says so once, and the run goes on.
+
+### Fixed
+
+- **A shell command that reads its input no longer waits for its timeout.** `tools.shell` gave every command an input that was never closed, so `cat`, or anything else that reads standard input, sat until it was killed. A command now has no input and finds it at an end.
+
+### Changed
+
+- When a program fails and no fix comes back, the reason reads `No fix came back: …` after the program's own failure. It used to be a numbered list headed `Repair errors:`, which could only ever hold one entry.
+- Internal, no change in behaviour: stopping process groups and the watchdog that does it when the runner is gone are one module; the journal's reader is apart from the runner surface; a run's journal is ended in one place.
 
 ## 0.3.1 — 2026-11-11
 

@@ -62,6 +62,16 @@ test("createTools shell enforces timeouts", async (t) => {
   assert.match(result.stderr, /timeout/);
 });
 
+test("createTools shell: a command that reads its input finds it at an end", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+  const tools = createTools(projectDir);
+
+  // Nothing is ever sent to a command. Left waiting for input, this would only end at its timeout.
+  const result = await tools.shell("cat; echo after", { timeout: 10_000 });
+  assert.deepEqual(result, { exitCode: 0, stdout: "after\n", stderr: "" });
+});
+
 test("createTools stopActiveShells terminates in-flight commands", async (t) => {
   const projectDir = makeTempDir("trama-tools-");
   t.after(() => cleanupTempDir(projectDir));
