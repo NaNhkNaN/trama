@@ -4,7 +4,7 @@ import { resolve, dirname } from "path";
 import type { Tools, ShellResult } from "./types.js";
 import { guardPath } from "./path-guard.js";
 import { signalGroup, stopGroups, superviseChild } from "./child-process.js";
-import { stopWithThisProcess } from "./lifetime.js";
+import { stopWithThisProcess } from "./watchdog.js";
 
 const MAX_FETCH_BODY = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_SHELL_TIMEOUT = 30_000;
@@ -22,7 +22,7 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
   // starts stay killable after the shell itself exits. A group is tracked from
   // spawn until it has no members left. `shellExited` marks groups whose shell
   // has exited — only those are probed, since a group that is still starting
-  // up may not be visible yet. `forget` tells the process-lifetime guard the
+  // up may not be visible yet. `forget` tells the watchdog the
   // group no longer needs killing if this process dies.
   const groups = new Map<number, { shellExited: boolean; forget: () => void }>();
   let sweeper: ReturnType<typeof setInterval> | null = null;

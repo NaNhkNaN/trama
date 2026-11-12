@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "child_process";
+import type { ChildProcess } from "child_process";
 import { StringDecoder } from "string_decoder";
 
 const MAX_OUTPUT = 10 * 1024 * 1024; // 10 MB
@@ -45,25 +45,32 @@ export function signalGroup(pgid: number, signal: NodeJS.Signals | 0): boolean {
 
 // --- Stopping ---
 //
-// Never SIGKILL first. A process group may hold a runner of its own — a shell
-// command that runs trama, a program with processes it means to shut down
-// properly — which has started things this runner cannot see. SIGTERM is its
-// chance to stop them; killed outright, it leaves them running. So a group is
-// asked to stop, and killed only if it is still there when the grace period
-// is over.
+// Never SIGKILL first. A group gets the chance to end properly — a program to
+// close what it opened, a `trama` command to stop its own run and report it.
+// Killed outright, nothing in it gets to finish anything. So a group is asked
+// to stop, and killed only if it is still there when the grace period is over.
 //
-// There are two ways to see that through, depending on whether the process
-// asking will be around to do it: stopGroups (it will) and stopGroupsOnExit
-// (it will not).
+// stopGroups does that for a runner that is there to see it through. When the
+// runner itself is gone, its watchdog does the same (see watchdog.ts).
+
+/** The timing of a stop, shared with the watchdog. */
+export const STOP_TIMINGS = { grace: KILL_GRACE_MS, settle: KILL_SETTLE_MS, poll: STOP_POLL_MS };
 
 /** Groups this process has asked to stop and is still watching. */
 const stopping = new Map<number, Promise<void>>();
+
+/** Called with each group as it is asked to stop — for the watchdog, which must not ask it again. */
+let onAsked: (pgid: number) => void = () => {};
+export function onGroupAskedToStop(listener: (pgid: number) => void): void {
+  onAsked = listener;
+}
 
 function stopGroup(pgid: number): Promise<void> {
   // Asked once is enough: to some programs a second SIGTERM means "now".
   const watched = stopping.get(pgid);
   if (watched) return watched;
   if (!signalGroup(pgid, "SIGTERM")) return Promise.resolve();
+  onAsked(pgid);
 
   const gone = new Promise<void>((resolve) => {
     let deadline = performance.now() + KILL_GRACE_MS;
@@ -95,57 +102,6 @@ function stopGroup(pgid: number): Promise<void> {
  */
 export async function stopGroups(pgids: number[]): Promise<void> {
   await Promise.all(pgids.map(stopGroup));
-}
-
-// What stopGroupsOnExit leaves behind to finish the job: a process of its own
-// that waits for the groups to go, kills whichever are still there when the
-// grace period is over, and then deletes the directories they were using.
-const REAPER = `
-const { rmSync } = require("fs");
-const { grace, settle, poll, groups, dirs } = JSON.parse(process.argv[1]);
-let left = groups;
-const alive = (pgid) => { try { process.kill(-pgid, 0); return true; } catch { return false; } };
-const finish = () => {
-  for (const dir of dirs) { try { rmSync(dir, { recursive: true, force: true }); } catch {} }
-  process.exit(0);
-};
-let deadline = performance.now() + grace;
-let killed = false;
-setInterval(() => {
-  // A group seen gone is never signalled again: its id may belong to another by now.
-  left = left.filter(alive);
-  if (left.length === 0) return finish();
-  if (performance.now() < deadline) return;
-  if (killed) return finish();
-  for (const pgid of left) { try { process.kill(-pgid, "SIGKILL"); } catch {} }
-  killed = true;
-  deadline = performance.now() + settle;
-}, poll);
-`;
-
-/**
- * The same as stopGroups, for a process that is itself on its way out and can
- * neither wait nor keep a timer: synchronous, with the grace period seen
- * through by a small detached process. Once the groups are gone it also
- * removes `dirs` — temp directories they may have been writing to until then.
- */
-export function stopGroupsOnExit(pgids: number[], dirs: string[]): void {
-  // Groups already asked to stop are not asked again, but still need seeing through.
-  const groups = pgids.filter(pgid => stopping.has(pgid) ? signalGroup(pgid, 0) : signalGroup(pgid, "SIGTERM"));
-  if (groups.length === 0) return;
-  // Without a reaper, do not leave them to chance.
-  const killNow = () => { for (const pgid of groups) signalGroup(pgid, "SIGKILL"); };
-  try {
-    const job = JSON.stringify({ grace: KILL_GRACE_MS, settle: KILL_SETTLE_MS, poll: STOP_POLL_MS, groups, dirs });
-    const reaper = spawn(process.execPath, ["-e", REAPER, job], { detached: true, stdio: "ignore" });
-    // A spawn that fails says so later, in an event this process will not be
-    // around for — but it has no pid from the start.
-    if (reaper.pid === undefined) killNow();
-    reaper.on("error", killNow);
-    reaper.unref();
-  } catch {
-    killNow();
-  }
 }
 
 // --- Time limits ---

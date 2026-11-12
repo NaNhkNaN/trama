@@ -19,7 +19,7 @@ import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
 import { guardPath } from "./path-guard.js";
 import { createAllowance, stopGroups, superviseChild, type ChildExit } from "./child-process.js";
-import { removeTempDir, removeWithThisProcess, stopWithThisProcess } from "./lifetime.js";
+import { removeTempDir, removeWithThisProcess, requireWatchdog, stopWithThisProcess } from "./watchdog.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
 
 // --- Locating the runtime itself ---
@@ -407,10 +407,18 @@ interface RunOnceOptions {
   maxIterations: number;
   argsOverride?: Record<string, unknown>;
   /**
-   * Treat the run as successful once the program has called ctx.ready() and
-   * stayed up for graceMs — used to validate long-running programs.
+   * The run is a validation: it only has to show that the program works, and
+   * goes no further than the program's own work. The program is stopped
+   *  - once it has called ctx.ready() and stayed up for readyGraceMs (a
+   *    program that runs until it is stopped). It passes if it then shuts
+   *    down properly: stopping cleanly is part of what such a program is for.
+   *  - the moment it asks for another program to be run. That run is not
+   *    started — what happens between programs is not what is being
+   *    validated, and would be a real run with real effects — and the program
+   *    has passed there and then. How it goes down, cut off in mid-flow, says
+   *    nothing about it.
    */
-  stopOnReady?: { graceMs: number };
+  validating?: { readyGraceMs: number };
   /** Shared workspace directory. When set, the workspace.* API is enabled. */
   workspaceDir?: string;
   /** How many runs deep this one is: 0 for a run nobody's program asked for. */
@@ -484,7 +492,7 @@ function writeInitFile(dir: string, payload: unknown): string {
 function toChildResult(exit: ChildExit): ShellResult {
   const { stdout, stderr } = exit;
   if (exit.timedOut) return { exitCode: 1, stdout, stderr: stderr + "\n[trama] program killed: timeout" };
-  // Stopped by us after ctx.ready() — going down on SIGTERM is the expected outcome.
+  // Stopped by us at the end of a validation — going down on SIGTERM is the expected outcome.
   if (exit.stopped && (exit.code === 0 || exit.signal === "SIGTERM")) return { exitCode: 0, stdout, stderr };
   return { exitCode: exit.code ?? 1, stdout, stderr };
 }
@@ -519,23 +527,24 @@ function settle(projectDir: string, child: ShellResult, terminalSignal: ProgramR
  * (bad project, server or spawn failure) or left state.json unreadable.
  */
 async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
-  const { projectDir, backend, timeout, maxIterations, argsOverride, stopOnReady, workspaceDir, label, signal } = options;
+  const { projectDir, backend, timeout, maxIterations, argsOverride, validating, workspaceDir, label, signal } = options;
 
   if (signal?.aborted) return { outcome: null, failure: "The run was stopped before its program started." };
+  requireWatchdog();
   ensureProjectScaffold(projectDir);
 
   // Cancels in-flight LLM calls, fetches and observes once the run is over.
   const runEnded = new AbortController();
-  // Asks the program to stop once it has been ready for the grace period.
-  const readyStop = new AbortController();
+  // Ends a validation: the program has shown what it had to, and is asked to stop.
+  const validated = new AbortController();
   let readyTimer: ReturnType<typeof setTimeout> | null = null;
   let terminalSignal: ProgramResult | null = null;
 
   const ctx = createContext(projectDir, loadState(projectDir), {
     maxIterations,
     argsOverride,
-    onReady: stopOnReady && (() => {
-      readyTimer ??= setTimeout(() => readyStop.abort(), stopOnReady.graceMs).unref();
+    onReady: validating && (() => {
+      readyTimer ??= setTimeout(() => validated.abort(), validating.readyGraceMs).unref();
     }),
     print: line => console.log(tagged(label, line)),
   });
@@ -545,6 +554,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
 
   // The program's own time. It stops while a run the program asked for is in flight.
   const allowance = createAllowance(timeout);
+  // Set when a validation ended because the program asked for another to be run.
+  let handedOff = false;
   // Runs the program has asked for and that are still going. They belong to this run.
   const nestedRuns = new Set<Promise<unknown>>();
   const workspaces = new Map<string, Workspace>();
@@ -563,6 +574,14 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       return workspace;
     },
     run: (request, stop) => {
+      if (validating) {
+        // As far as a validation goes. The call is left unanswered — an answer
+        // would only send the program on to do more — until the program,
+        // which is being stopped, lets go of it.
+        handedOff = true;
+        validated.abort();
+        return rejectOnAbort(new Promise<never>(() => {}), stop);
+      }
       // The program is waiting, not working: its clock stops for as long as
       // the run it asked for lasts, which has a timeout of its own. That run
       // is stopped when this one ends, or when the program no longer wants it.
@@ -588,7 +607,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
 
   // The program leads a process group of its own, so that everything it starts is in it.
   let programGroup: number | undefined;
-  // If this process is stopped while the program is running, the program is stopped with it.
+  // If this process ends while the program is running, the watchdog stops the program.
   let programSettled = () => {};
   // Asked to stop while its program had not ended. Everything it has in flight
   // goes at once — the runs it asked for among them, so that a tree of runs is
@@ -628,13 +647,18 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
 
       const exit = await superviseChild(program, {
         timeout: allowance,
-        stopSignal: stopOnReady ? readyStop.signal : undefined,
+        stopSignal: validating ? validated.signal : undefined,
         sinks: {
           stdout: out ? out.sink : chunk => { process.stdout.write(chunk); },
           stderr: err ? err.sink : chunk => { process.stderr.write(chunk); },
         },
       });
       programOver = true;
+      // A validation that reached a hand-off in time was decided there.
+      if (handedOff && !exit.timedOut) {
+        console.log(tagged(label, "[trama] validated up to where it starts another program"));
+        return { exitCode: 0, stdout: exit.stdout, stderr: exit.stderr };
+      }
       return toChildResult(exit);
     });
     // A program that was stopped did not finish, whatever its exit code says —
@@ -808,7 +832,9 @@ const VALIDATION_READY_GRACE_MS = 2_000;
  * repaired. Throws if it cannot be made to run.
  *
  * Only the project's own files are shielded. What the program does beyond
- * them — network calls, shell commands, other projects it runs — is real.
+ * them — network calls, shell commands, agent calls — is real. A run it asks
+ * its runner for is not started: the validation ends where it asks for the
+ * first.
  */
 export async function validateProgram(
   projectDir: string,
@@ -826,7 +852,7 @@ export async function validateProgram(
       projectDir: trialDir,
       backend,
       depth: 0,
-      stopOnReady: { graceMs: VALIDATION_READY_GRACE_MS },
+      validating: { readyGraceMs: VALIDATION_READY_GRACE_MS },
     });
     if (result.status === "failed") {
       throw new Error(`Program failed: ${result.reason}`);

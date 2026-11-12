@@ -396,7 +396,7 @@ trama could have stopped at code generation. But generated code without an execu
 
 The runtime is what makes agent programs **self-contained and shareable**:
 
-- **Execution** — spawns programs as child processes with streaming stdout/stderr, and manages timeouts. Nothing a program starts outlives its run: when the run ends — or the runner is stopped — its shell commands and its own child processes are asked to stop (SIGTERM) and killed if they have not gone five seconds later, and the run is not over until they are gone. A process the program detaches into a process group of its own is out of reach.
+- **Execution** — spawns programs as child processes with streaming stdout/stderr, and manages timeouts. Nothing a program starts outlives its run: when the run ends — or the runner goes, however it goes — its shell commands and its own child processes are asked to stop (SIGTERM) and killed if they have not gone five seconds later, and the run is not over until they are gone. A small watchdog process sees to it when the runner cannot: one that is killed outright, runs out of memory, or crashes. A process the program detaches into a process group of its own is out of reach.
 - **IPC bridge** — programs communicate with the runtime through a local HTTP server. Every `ctx`, `agent`, `tools` and `workspace` call goes through this bridge, which gives the runtime a single point where it validates each request and can cancel work in flight when a run ends.
 - **State persistence** — `ctx.state` survives across runs via `checkpoint()` and `done()`. Programs can be long-running, interruptible, and resumable. `ctx.yield()` suspends a program cooperatively — persists state and exits, ready for the session layer to resume it later.
 - **Shared workspace** — when programs run in a session, they share a workspace for artifact I/O. Atomic writes, path guarding, and level-triggered observation (`workspace.observe()`) — without a message bus or coordination framework.
@@ -582,6 +582,7 @@ trama logs <name>
 ```
 
 - `--model` — override the LLM model for program generation (create only).
+- Ctrl-C (or SIGTERM) stops a run politely: the program is sent SIGTERM and given five seconds to finish what it must, and `trama run` returns once it is gone. Press Ctrl-C again to leave at once.
 - `--timeout` — per-phase timeout in milliseconds. Applies to each run and repair attempt separately. Default: `300000` (5 minutes). It limits the program's own time: while a participant it spawned is running — under a timeout of its own — the clock is stopped.
 - `--arg` — pass key-value arguments to the program, accessible via `ctx.input.args`. Repeatable.
 
@@ -768,6 +769,11 @@ trama stores all projects at `~/.trama/projects/{name}/`. The runtime creates th
 trama does not sandbox generated programs. A program can do anything TypeScript can do: read/write files, run shell commands, make network requests.
 
 **`create` and `update` execute the generated program.** After generating code, trama runs it once to validate it works. If the program makes network requests, calls external APIs, or runs shell commands with side effects, those side effects happen during validation — before you ever run `trama run`.
+
+Two kinds of program are validated only part of the way, because running them to the end would not be a validation any more:
+
+- A program that runs until it is stopped passes once it has called `ctx.ready()` and stayed up for two seconds.
+- A program that runs other programs passes at the moment it asks for the first one. That program is not started: what a session does is not what is being checked, and its participants would run for real — in their own projects, at their own cost. What the program does after that point is first exercised by `trama run`, where a crash is repaired as usual.
 
 **`agent.instruct()` gives the LLM autonomous tool access.** When your program calls `agent.instruct()`, the underlying pi-coding-agent may autonomously read files, write files, and run shell commands to fulfill the request. This is not a simple text-in/text-out call — the LLM can take multi-step actions within the project directory.
 

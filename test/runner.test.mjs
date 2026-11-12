@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import {
@@ -926,6 +926,42 @@ await tools.shell("echo $$ > ${join(signalDir, "shell.pid")}; sleep 60", { timeo
   await waitFor(() => !isAlive(programPid) && !isAlive(shellPid), "the program and its shell command to be gone", 5_000);
 });
 
+test("a runner that is killed outright still leaves nothing behind", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const projectDir = makeTempDir("trama-runner-");
+  const signalDir = makeTempDir("trama-signal-");
+  const tempRoot = makeTempDir("trama-tmp-");
+  t.after(() => { for (const dir of [fakeHome, projectDir, signalDir, tempRoot]) cleanupTempDir(dir); });
+
+  // SIGKILL: the runner runs no code on its way out. Its program, a process the
+  // program started itself and a shell command in flight are all still going,
+  // and the runner's temp directory still holds the bridge secret.
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { tools } from "@trama-dev/runtime";
+import { spawn } from "child_process";
+import { writeFileSync } from "fs";
+const own = spawn("sleep", ["60"], { stdio: "ignore" });
+writeFileSync(${JSON.stringify(join(signalDir, "program.pid"))}, String(process.pid));
+writeFileSync(${JSON.stringify(join(signalDir, "own.pid"))}, String(own.pid));
+await tools.shell("echo $$ > ${join(signalDir, "shell.pid")}; sleep 60", { timeout: 60000 });`,
+  });
+
+  const { child, exited } = startRunnerProcess(fakeHome, projectDir, { env: { TMPDIR: tempRoot } });
+  const pidFiles = ["program.pid", "own.pid", "shell.pid"].map(name => join(signalDir, name));
+  await waitFor(() => pidFiles.every(pidIn), "the program and what it started to be running");
+  const pids = pidFiles.map(pidIn);
+  // (Other tools keep things in the temp directory too; trama's own are named for it.)
+  const ownTempDirs = () => readdirSync(tempRoot).filter(name => name.startsWith("trama-"));
+  assert.notDeepEqual(ownTempDirs(), [], "the runner should have a temp directory while it runs");
+
+  child.kill("SIGKILL");
+  await exited;
+
+  await waitFor(() => !pids.some(isAlive), "everything the runner started to be stopped", 5_000);
+  await waitFor(() => ownTempDirs().length === 0, "the runner's temp directories to be removed", 5_000);
+});
+
 test("a program that ignores being asked to stop does not survive a stopped runner", async (t) => {
   const fakeHome = makeTempDir("trama-home-");
   const projectDir = makeTempDir("trama-runner-");
@@ -1120,6 +1156,72 @@ test("a long-running program that does not handle SIGTERM is still a valid progr
 await ctx.ready();
 setInterval(() => {}, 1000);
 await new Promise(() => {});`;
+
+  const validated = await validateProgram(projectDir, createBackend(loadConfig()), candidate, {
+    timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10,
+  });
+  assert.equal(validated.source, candidate);
+});
+
+test("validating a program that runs others goes as far as its own work, and runs none of them", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  const participantDir = makeTempDir("trama-runner-participant-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(participantDir); });
+  createProjectFixture(projectDir, { scaffold: false });
+
+  // A participant that would leave a mark if it were run — and that is broken,
+  // so a real run would also send it to be repaired.
+  createProjectFixture(participantDir, {
+    scaffold: false,
+    programSource: `import { writeFileSync } from "fs";
+writeFileSync("was-run.txt", "");
+throw new Error("the participant is broken");`,
+  });
+
+  // The candidate does some work of its own, hands off to two participants at
+  // once — one that exists, one named by a path that does not resolve from
+  // where it is being validated — and would fail outright after that.
+  const candidate = `import { tools } from "@trama-dev/runtime";
+import { Session } from "@trama-dev/session";
+await tools.write("own-work.txt", "done before the hand-off");
+const session = await Session.create({ workspace: "./workspace" });
+const real = session.spawn("real", { projectDir: ${JSON.stringify(participantDir)} });
+const elsewhere = session.spawn("elsewhere", { projectDir: "../not-next-to-the-copy" });
+await Promise.all([real.wait(), elsewhere.wait()]);
+throw new Error("reached only when the program is run for real");`;
+
+  const originalRepair = llm.repair;
+  llm.repair = async () => { throw new Error("nothing should have been sent for repair"); };
+  try {
+    const validated = await validateProgram(projectDir, createBackend(loadConfig()), candidate, {
+      timeout: 20_000, maxRepairAttempts: 1, maxIterations: 10,
+    });
+    assert.equal(validated.source, candidate);
+    assert.equal(validated.repairedError, undefined);
+  } finally {
+    llm.repair = originalRepair;
+  }
+  assert.equal(existsSync(join(participantDir, "was-run.txt")), false, "a validation must not run other programs");
+  assert.equal(existsSync(join(projectDir, "own-work.txt")), false, "and it still leaves the project itself alone");
+});
+
+test("how a program goes down when a validation cuts it off at a hand-off does not count against it", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  const participantDir = makeTempDir("trama-runner-participant-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(participantDir); });
+  createProjectFixture(projectDir, { scaffold: false });
+  createProjectFixture(participantDir, { scaffold: false });
+
+  // A careful coordinator: on SIGTERM it waits for its participant before it
+  // leaves. Run for real, that wait ends when the runner stops the
+  // participant. In a validation the participant was never started, so the
+  // wait cannot end, and the program has to be killed. It is still a valid
+  // program: it got as far as a validation goes.
+  const candidate = `import { Session } from "@trama-dev/session";
+const session = await Session.create({ workspace: "./workspace" });
+const participant = session.spawn("p", { projectDir: ${JSON.stringify(participantDir)} });
+process.on("SIGTERM", async () => { await participant.wait().catch(() => {}); process.exit(0); });
+await participant.wait();`;
 
   const validated = await validateProgram(projectDir, createBackend(loadConfig()), candidate, {
     timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10,

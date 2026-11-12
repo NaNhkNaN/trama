@@ -14,6 +14,9 @@ All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`
   - Programs may run programs up to 16 deep, and one runner carries up to 128 runs at a time. There was no bound before.
   - A program that uses a session no longer loads the runner and the agent into its own process. Importing the session layer went from about 0.7 s and 80 MB to about 30 ms and 9 MB (measured once each, on one machine).
 - The program that creates a session reaches its workspace through the bridge too, instead of touching the directory itself.
+- **`create` and `update` no longer run a program's participants.** Validating a program meant running it to the end — and for a program that runs others, that ran them too: for real, in their own projects, at their own cost, and with a crash among them repaired in place. A participant named by a relative path was not found at all, so a correct program failed. A validation now ends, successfully, the moment the program asks for another program to be run. What the program does after that point is first exercised when it is run.
+- **The runner no longer handles signals.** It used to catch SIGINT, SIGTERM and SIGHUP to stop what it had started, and then pass the signal on. That is the watchdog's job now (see below); a process that embeds the runner keeps its own signal handling entirely.
+- **`trama run` stops politely on a signal.** The command now handles SIGINT, SIGTERM and SIGHUP itself: the program is asked to stop and waited for, and then the command ends as the signal would have ended it. A second signal does not wait. Ctrl-C used to return at once and leave the program its grace period in the background.
 
 ### Added
 
@@ -22,6 +25,7 @@ All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`
 
 ### Fixed
 
+- **A runner that is killed outright no longer leaves its programs running.** SIGKILL, running out of memory, a crash: the runner ran no code on its way out, so its programs, their shell commands and its temp directories — one of them holding the bridge secret — were all left as they were. A small watchdog process now holds a pipe from the runner and is told what the runner starts. When the pipe closes, however the runner went, it stops what is still running and removes the directories. (One thing it is not told about: a shell command the agent itself has running at that moment.)
 - Shell commands the agent ran on behalf of a participant could read the bridge secret of the program that spawned it. (0.2.2 closed this for `tools.shell()` only.) The agent no longer runs inside that program.
 
 - A cancelled agent call is given up on at once, whether or not the agent itself notices the cancellation. A run's end no longer depends on it noticing.
@@ -30,6 +34,7 @@ All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`
 
 - pi is loaded when the agent is first called, not when the runtime is. `trama list` and `trama logs`, and programs that never call the agent, do not load it.
 - The message by which a runner inside a program asked the outer runner to hold the program's clock is gone, with the inner runner.
+- The process that saw a stop through after the runner had exited is gone too: the watchdog is that process, started ahead of time.
 
 ## 0.3.0 — 2026-11-11
 

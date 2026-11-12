@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { readFileSync } from "fs";
+import { spawn } from "child_process";
+import { existsSync, readFileSync } from "fs";
 import { join } from "path";
 import { pathToFileURL } from "url";
 import {
-  REPO_ROOT, cleanupTempDir, createProjectFixture, makeTempDir, runNodeCommand, writeJson, writeText,
+  REPO_ROOT, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, runNodeCommand, waitFor, writeJson,
+  writeText,
 } from "./helpers.mjs";
 
 const CLI_ENTRY = join(REPO_ROOT, "packages", "cli", "dist", "index.js");
@@ -180,4 +182,36 @@ await ctx.done();`,
     readFileSync(join(projects, "outer", "printed.txt"), "utf-8"), /printed by the inner program/,
     "the command's output should have reached the program that ran it",
   );
+});
+
+test("a signal stops `trama run` politely: the program is asked, waited for, and the command dies of the signal", async (t) => {
+  const fakeHome = makeTempDir("trama-cli-home-");
+  const signalDir = makeTempDir("trama-cli-signal-");
+  t.after(() => { cleanupTempDir(fakeHome); cleanupTempDir(signalDir); });
+
+  createProjectFixture(join(fakeHome, ".trama", "projects", "patient"), {
+    scaffold: false,
+    programSource: `import { writeFileSync } from "fs";
+process.on("SIGTERM", () => {
+  writeFileSync(${JSON.stringify(join(signalDir, "closed-properly"))}, "");
+  process.exit(0);
+});
+writeFileSync(${JSON.stringify(join(signalDir, "program.pid"))}, String(process.pid));
+setInterval(() => {}, 1000);
+await new Promise(() => {});`,
+  });
+
+  const cli = spawn(process.execPath, [CLI_ENTRY, "run", "patient"], {
+    cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome }, stdio: "ignore",
+  });
+  const exited = new Promise(resolve => cli.on("close", (code, signal) => resolve({ code, signal })));
+  await waitFor(() => pidIn(join(signalDir, "program.pid")), "the program to start");
+  const programPid = pidIn(join(signalDir, "program.pid"));
+
+  cli.kill("SIGINT");
+  const { signal } = await exited;
+
+  assert.equal(signal, "SIGINT", "the command should end as the signal would have ended it");
+  assert.equal(existsSync(join(signalDir, "closed-properly")), true, "the program should have been asked to stop");
+  assert.equal(isAlive(programPid), false, "and gone before the command returned");
 });

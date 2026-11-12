@@ -18,6 +18,35 @@ import {
 delete process.env.TRAMA_PORT;
 delete process.env.TRAMA_INIT;
 
+// What a signal means is for this command to say: the runtime listens for none
+// (its watchdog cleans up after a process that simply dies). While a program
+// is being run, a signal stops the run the way a run should be stopped — its
+// program asked first, and waited for — and then this process goes the way the
+// signal would have had it go. A second signal does not wait. Without this the
+// command could not be stopped politely at all where it is process 1, as in a
+// container: there the kernel only delivers signals a process handles.
+const SIGNALS = { SIGINT: 2, SIGTERM: 15, SIGHUP: 1 } as const;
+type SignalName = keyof typeof SIGNALS;
+const stopRun = new AbortController();
+let running = false;
+let received: SignalName | null = null;
+
+for (const name of Object.keys(SIGNALS) as SignalName[]) {
+  process.on(name, () => {
+    if (!running || received) process.exit(128 + SIGNALS[name]);
+    received = name;
+    stopRun.abort();
+  });
+}
+
+/** End as the signal that stopped the run would have ended this process. */
+function leaveBySignal(name: SignalName): void {
+  process.removeAllListeners(name);
+  process.kill(process.pid, name);
+  // Still here a moment later: nothing kills this process that way (process 1).
+  setTimeout(() => process.exit(128 + SIGNALS[name]), 100);
+}
+
 function collectArg(value: string, previous: string[]) {
   return [...previous, value];
 }
@@ -81,7 +110,11 @@ cli
       }
     }
     const args = parseArgs(opts.arg);
-    const result = await runProgram({ projectDir: resolveProject(name), timeout, args });
+    const projectDir = resolveProject(name);
+    running = true;
+    const result = await runProgram({ projectDir, timeout, args, signal: stopRun.signal })
+      .finally(() => { running = false; });
+    if (received) return leaveBySignal(received);
     if (result.status === "failed") {
       throw new Error(`Program failed: ${result.reason}`);
     }

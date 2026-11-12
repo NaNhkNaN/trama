@@ -148,14 +148,14 @@ export async function waitFor(check, what, timeoutMs = 10_000) {
  * it the way a user (Ctrl-C) or a parent runner would. `setup` is code run
  * before the project is — to stub the LLM (`llm`, see fake-llm.mjs), say.
  */
-export function startRunnerProcess(fakeHome, projectDir, { setup = "", maxRepairAttempts = 0 } = {}) {
+export function startRunnerProcess(fakeHome, projectDir, { setup = "", maxRepairAttempts = 0, env = {} } = {}) {
   const urlOf = (...parts) => pathToFileURL(join(REPO_ROOT, ...parts)).href;
   const script = `import { runProgram } from ${JSON.stringify(urlOf("packages", "runtime", "dist", "runner.js"))};
 import { llm } from ${JSON.stringify(urlOf("test", "fake-llm.mjs"))};
 ${setup}
 await runProgram({ projectDir: ${JSON.stringify(projectDir)}, maxRepairAttempts: ${maxRepairAttempts}, timeout: 60_000 });`;
   const child = spawn(process.execPath, ["--input-type=module", "-e", script], {
-    env: { ...process.env, HOME: fakeHome },
+    env: { ...process.env, HOME: fakeHome, ...env },
     stdio: "ignore",
   });
   const exited = new Promise(resolve => child.on("close", (code, signal) => resolve({ code, signal })));
