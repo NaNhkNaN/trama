@@ -6,7 +6,7 @@ import {
   mkdtempSync, openSync, closeSync,
   accessSync, constants, truncateSync,
 } from "fs";
-import { join, dirname } from "path";
+import { join, dirname, relative } from "path";
 import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { createHash, randomBytes } from "crypto";
@@ -832,7 +832,8 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     // The fix in the copy, as the copy has it: under which name, at which place — which is the place of
     // the project's program in the project — and what it allows there.
     const fixAt = guardPath(stagedProject, "program.ts");
-    const itsName = pathAsListed(stagedProject, join(realRootOf(stagedProject), "program.ts")) ?? "program.ts";
+    const copyRoot = realRootOf(stagedProject);
+    const itsName = pathAsListed(stagedProject, join(copyRoot, "program.ts")) ?? "program.ts";
     const itsPlace = pathAsListed(stagedProject, fixAt);
     const allowed = statSync(fixAt).mode;
     // If the copy cannot be run at all, or is left unusable, this fix did not work either.
@@ -850,14 +851,17 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     // between the two leaves the fix beside the state it started from: the
     // program that would do the same again, not the one it turns into.)
     //
-    // The project is to have a program afterwards. One that removed itself is
-    // still the fix that ran: a file of its name is put back where the run
-    // ended (the name itself, not what a link left there leads to). A run that
-    // left, at program.ts, nothing that can be read as a program has not left
-    // a project that has one, and was no fix.
+    // The project is to have a program afterwards. One that removed itself —
+    // the system finds nothing at program.ts, however a link left there words
+    // the way to it — is still the fix that ran: a file of its name is put
+    // back where the run ended (the name itself, not what the link leads to).
+    // A run that left something there that cannot be read as a program has
+    // not left a project that has one, and was no fix.
     try {
-      if (programIn(stagedProject) === null) {
-        rmSync(join(realRootOf(stagedProject), itsName), { force: true });
+      if (statSync(join(copyRoot, itsName), { throwIfNoEntry: false })) {
+        programIn(stagedProject);
+      } else {
+        rmSync(join(copyRoot, itsName), { force: true });
         stageFile(stagedProject, itsName, fixed, allowed).commit();
       }
     } catch (err) {
@@ -872,9 +876,11 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     const program = stageProgram(projectDir, fixed);
     program.commit();
     // The project now holds, where its program was, what the copy held there before the run — and the merge is
-    // told so: that is what the place is taken to have held when the copy was made.
+    // told so: that is what the place is taken to have held when the copy was made. (If that is still the
+    // place program.ts leads to: where somebody has pointed it elsewhere meanwhile, the seed knows nothing new.)
     const installed = entryAt(program.destination);
-    if (itsPlace !== undefined && installed) held.set(itsPlace, installed);
+    const samePlace = relative(realRootOf(projectDir), program.destination) === relative(copyRoot, fixAt);
+    if (itsPlace !== undefined && installed && samePlace) held.set(itsPlace, installed);
     const unmerged = mergeTree(stagedProject, projectDir, before, held);
     if (unmerged.length > 0) {
       // The run is done and its program installed; what it did that is not in the project is said, not passed over.

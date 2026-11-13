@@ -516,7 +516,8 @@ test("a path the system will not take is refused before anything is made on the 
   t.after(() => cleanupTempDir(root));
   // Each name is one the system takes; the whole is longer than any path it does. Nothing of it
   // exists, so the guard's own walk has nothing to object to: it is the system that says no.
-  const tooLong = ("d".repeat(200) + "/").repeat(8) + "file.txt";
+  // (Longer than the longest any of the systems this runs on takes: 1024 on macOS, 4096 on Linux.)
+  const tooLong = ("d".repeat(200) + "/").repeat(24) + "file.txt";
   assert.throws(() => statSync(root + "/" + tooLong), { code: "ENAMETOOLONG" }, "the layout is what it is meant to be");
 
   assert.throws(() => guardPath(root, tooLong), { code: "ENAMETOOLONG" });

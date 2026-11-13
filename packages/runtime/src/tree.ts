@@ -15,18 +15,16 @@ import { identityOf, linksOf, linkText, realRootOf } from "./path-guard.js";
 import { stagedNameFor } from "./replace-file.js";
 
 /**
- * What is at one path. Of a file or a link, `id` says which one it is: it
+ * What is at one path. `id` says which file, directory or link it is: it
  * stays the same through being written to, renamed, or given other
- * permissions, and no other file or link of the same directory tree has it.
- * (It is the system's number for the file with the time the file was made — a
- * file system may give the number again once a file is gone. One that keeps
- * no such time tells a file that was moved from a new one in its place less
- * well, or not at all.)
+ * permissions, and nothing else in the same directory tree has it. (It is the
+ * system's number for it, which a file system may give again once what had
+ * it is gone: what was removed can so be taken for what was made after it.)
  */
 export type Entry =
   /** `stamp` is different after any change to the file — to what it holds or to what it allows — and cannot be set by a program. */
   | { kind: "file"; mode: number; size: number; stamp: string; id: string }
-  | { kind: "dir"; mode: number }
+  | { kind: "dir"; mode: number; id: string }
   | { kind: "link"; text: string; id: string }
   /** A pipe, a socket, a device, a link that says nothing a path can be made of: one end of something else, not content. */
   | { kind: "other" };
@@ -41,13 +39,13 @@ export function entryAt(path: string): Entry | undefined {
   const stat = lstatSync(path, { bigint: true, throwIfNoEntry: false });
   if (!stat) return undefined;
   const mode = Number(stat.mode & 0o7777n);
-  const id = `${stat.ino}:${stat.birthtimeNs}`;
+  const id = String(stat.ino);
   if (stat.isFile()) {
     // The time of the last change is the system's own: it moves when the file is written, replaced, or
     // has its permissions changed, and no program can put it back. (The time of the last write can be.)
     return { kind: "file", mode, size: Number(stat.size), stamp: `${stat.ino}:${stat.ctimeNs}:${stat.size}`, id };
   }
-  if (stat.isDirectory()) return { kind: "dir", mode };
+  if (stat.isDirectory()) return { kind: "dir", mode, id };
   if (stat.isSymbolicLink()) {
     let text;
     try {
@@ -63,8 +61,8 @@ export function entryAt(path: string): Entry | undefined {
   return NOT_CONTENT;
 }
 
-/** Which file or link an entry is — undefined of what is neither. */
-const idOf = (entry: Entry | undefined) => (entry?.kind === "file" || entry?.kind === "link" ? entry.id : undefined);
+/** Which file, directory or link an entry is — undefined of what is none. */
+const idOf = (entry: Entry | undefined) => (entry === undefined || entry.kind === "other" ? undefined : entry.id);
 
 /**
  * Whether two entries are the same thing, unchanged. Nothing is the same as
@@ -90,6 +88,8 @@ function namesIn(dir: string): string[] {
 }
 
 const gone = (err: unknown) => (err as NodeJS.ErrnoException).code === "ENOENT";
+/** Whether a refusal says that there is no such place: nothing is there, or the system takes no such name. */
+const noSuchPlace = (err: unknown) => ["ENOENT", "ENOTDIR", "ENAMETOOLONG"].includes((err as NodeJS.ErrnoException).code ?? "");
 
 /**
  * Go through everything under a directory, a directory before what it holds.
@@ -302,13 +302,28 @@ const reason = (err: unknown) => (err instanceof Error ? err.message : String(er
  * then left alone, with everything under it; and a directory the run removed,
  * or put something else in the place of, goes only if all that is in it goes
  * — if anything in it stays, or it holds something the run never saw, the
- * directory stays whole. A file or a link the run moved goes from where it
- * was only if it arrives where the run moved it: what it holds is not to be
- * in neither place. (What was moved is known by its `id`, see Entry. What
- * the run copied and then removed is a new file, and is not known to be the
- * old one's.) So what is returned as not arrived is as it was, at that path
- * and under it. (Unless the system itself fails part-way through
- * what had been found possible: then the reason given is the system's.)
+ * directory stays whole. What the run moved — a file, a link, a directory —
+ * goes from where it was only if it arrives where the run moved it: what it
+ * holds is not to be in neither place. (What was moved is known by its `id`,
+ * see Entry. What the run copied and then removed is a new file, and is not
+ * known to be the old one's.) So what is returned as not arrived is as it
+ * was, at that path and under it. That holds where the system refuses, in
+ * the doing, what had been found possible — see how it is done, below — as
+ * long as it does not also refuse to put back what was moved aside; then
+ * the report says where that is.
+ *
+ * Some things are told of besides, which are not that. What was moved aside
+ * to go, or made ready and not needed, and which the system will not have
+ * removed, is told of at the name it is left under — a path that is none of
+ * the run's. A directory the run removed which the system will not remove,
+ * or not with all that was in it, holds what is left, as it would had the
+ * run removed it there, and is told of so. A directory or a file that could
+ * not be given, at the end, what it is to allow is told of for that: what
+ * it holds has arrived, unless that is told of itself. A file that could not
+ * be written into, and had a new one put in its place, is told of for that.
+ * (If the system will not have the new one put there either, the file did
+ * not arrive, and the report says that what it held may be damaged, and
+ * where what it was to hold is.)
  *
  * Finding out is looking, and a directory that is closed cannot be looked
  * into. One of the real directory's is opened for it, as it is for what is
@@ -328,17 +343,33 @@ const reason = (err: unknown) => (err instanceof Error ? err.message : String(er
  * is there is known by what it is. All the names of a file that has several
  * are therefore left, where one would have done.)
  *
- * What is to be done is done in this order. A file or a link that takes the
- * place of something — unless that is a file it can be written into — is
- * made beside the place, and what could not be made there is, with what
- * follows from that, left alone like the rest; what the run removed is
- * removed, the deepest first; what it made is made, a directory before what
- * goes in it, and what was made beside its place is moved in in one step. It is where the run ended that is carried over, not the steps by
- * which it got there.
+ * What is to be done is done so that nothing is lost by its being done in
+ * part. A file or a link that is to be where something is, is made beside
+ * the place first. Then what the run made is made, a directory before what
+ * goes in it. What is in the place of it is not removed but moved aside,
+ * under a name of its own beside the place, and what was made beside the
+ * place is moved in. (Only a directory that stays a directory, and a file
+ * the run wrote into that can be written into, stay and are changed where
+ * they are. A file that is written into has what it is to hold made beside
+ * it first all the same: if the system will not have the writing — which it
+ * may have begun — that takes its place.) Where the system will not have a thing done, that
+ * thing is left alone like what was found impossible beforehand, with what
+ * follows from it — and what follows may be that something already done is
+ * not to stand: what the run moved from there did not arrive where it went.
+ * Then what was put there is removed again, and what was moved aside comes
+ * back. Only when all that is settled does what was moved aside go for good,
+ * and what the run removed, where it is. (A runner that is stopped in the
+ * middle leaves what it had moved aside, or made ready, where it is: under
+ * names that begin with .trama-tmp-.) It is where the run ended that is
+ * carried over, not the steps by which it got there.
  *
- * A file that already holds what the run left has only what it allows
- * changed, and stays the file it is; any other is written into if it may be,
- * and otherwise has a new one put in its place. A link is written as the run wrote it
+ * A file the run wrote into is written into, if it may be, and stays the
+ * file it is — as does one that holds what the run left already, and has
+ * only what it allows changed. Where the run put another file in the place,
+ * or the file may not be written into, or the system will not have it
+ * written into after all, a new one is put in its place — and then a second
+ * name of the old file is none of the new one, and holds whatever the
+ * writing left. A link is written as the run wrote it
  * — the run took its copy for the directory itself — unless its way comes to
  * the copy from outside: by the copy's full path, or out of the copy and
  * back in by its name. What such a link says from there on is said of the
@@ -352,8 +383,8 @@ const reason = (err: unknown) => (err instanceof Error ? err.message : String(er
  *
  * Nothing is thrown. What could not be carried over is returned, each path
  * with the reason, so that a run whose work did not all arrive is not passed
- * off as one whose work did. What lies under a path that did not arrive is
- * not listed again.
+ * off as one whose work did. Under a path that did not arrive, what was not
+ * looked at for that reason is not listed: it is as it was, with the path.
  */
 export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed: Tree): Unmerged[] {
   let copy: string;
@@ -374,21 +405,33 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
     // What the run left cannot be told. Nothing is merged — least of all as a removal of what cannot be seen.
     return [{ path: ".", why: `what the run left could not be read (${reason(err)}); none of it was merged` }];
   }
+  /**
+   * Whether what is at a path, though it looks the same, is something the run
+   * moved there from another place. (Something new that looks the same is no
+   * change: nothing depends on its being there.)
+   */
+  const wasSomewhere = new Set([...before.values()].map(idOf));
+  const movedHere = (path: string) => {
+    const id = idOf(after.get(path));
+    return id !== undefined && id !== idOf(before.get(path)) && wasSomewhere.has(id);
+  };
   // Sorted, a path comes before every path under it.
   const changed = [...new Set([...before.keys(), ...after.keys()])]
-    .filter((path) => !same(before.get(path), after.get(path)))
+    .filter((path) => !same(before.get(path), after.get(path)) || movedHere(path))
     .sort();
   const isChanged = new Set(changed);
 
   /** What did not arrive, and why: found out beforehand, or — once things are being done — told by the system. */
   const refused = new Map<string, string>();
-  /** Whether a path is one of those, or under one. */
-  const leftAlone = (path: string): boolean => {
-    for (let end = path.length; end !== -1; end = path.lastIndexOf("/", end - 1)) {
-      if (refused.has(path.slice(0, end))) return true;
+  /** Whether a path is under one of some paths. */
+  const underOne = (path: string, of: { has(path: string): boolean }): boolean => {
+    for (let end = path.lastIndexOf("/"); end !== -1; end = path.lastIndexOf("/", end - 1)) {
+      if (of.has(path.slice(0, end))) return true;
     }
     return false;
   };
+  /** Whether a path is one of those that did not arrive, or under one. */
+  const leftAlone = (path: string): boolean => refused.has(path) || underOne(path, refused);
 
   const said = linksOf(copy);
   /** What a link the run left at a path says in the real directory. */
@@ -414,13 +457,19 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
   };
 
   /** Whether a file of the real directory holds what the file the run left at a path holds. One that may not be read is not known to. */
+  const sameAlready = new Map<string, boolean>();
   const holdsBytes = (there: Entry, place: string, want: Entry & { kind: "file" }, path: string): boolean => {
     if (there.kind !== "file" || there.size !== want.size) return false;
-    try {
-      return sameBytes(stagedFile(path), place);
-    } catch {
-      return false;
+    let known = sameAlready.get(path);
+    if (known === undefined) {
+      try {
+        known = sameBytes(stagedFile(path), place);
+      } catch {
+        known = false;
+      }
+      sameAlready.set(path, known);
     }
+    return known;
   };
   /** Whether a place already holds what is wanted at a path. */
   const holds = (there: Entry | undefined, place: string, want: Entry, path: string): boolean => {
@@ -431,18 +480,27 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
 
   /**
    * Directories of the real one opened to be looked into or changed, and
-   * what each is to be left allowing: what it allowed, until what the run
-   * left it allowing arrives.
+   * those this merge makes: what each is to be left allowing — what it
+   * allowed, until what the run left it allowing arrives.
    */
-  const opened = new Set<string>();
-  const toClose = new Map<string, { place: string; mode: number }>();
+    const opened = new Set<string>();
+  /**
+   * Each with which directory it is, what it is to be left allowing, and what
+   * this merge has it allowing for now (-1: not known — it was made, and
+   * could not then be given what it was to allow while it is filled).
+   */
+  const toClose = new Map<string, { id: string | undefined; mode: number; has: number }>();
   const open = (dir: string): void => {
     if (dir === "." || opened.has(dir)) return;
     const place = join(real, dir);
     const there = entryAt(place);
     if (there?.kind === "dir") {
-      toClose.set(dir, { place, mode: there.mode });
-      if ((there.mode | 0o700) !== there.mode) chmodSync(place, there.mode | 0o700);
+      const closing = { id: identityOf(place), mode: there.mode, has: there.mode };
+      toClose.set(dir, closing);
+      if ((there.mode | 0o700) !== there.mode) {
+        chmodSync(place, there.mode | 0o700);
+        closing.has = there.mode | 0o700;
+      }
     } // (if it is no directory, what is done in it will say so)
     opened.add(dir); // only now: if it could not be opened, the next to need it open is told so too
   };
@@ -451,6 +509,10 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
 
   /** One thing to do: at a place holding `there`, to have `want` (nothing, for what the run removed). */
   interface Deed { path: string; place: string; want: Entry | undefined; there: Entry | undefined }
+  /** Whether a deed is at a directory that is to be a directory: what it allows is all that changes there. */
+  const staysADirectory = ({ want, there }: Pick<Deed, "want" | "there">) => want?.kind === "dir" && there?.kind === "dir";
+  /** Whether a deed is at a directory that is to go — removed, or with something else in its place. */
+  const goesAsADirectory = ({ want, there }: Pick<Deed, "want" | "there">) => there?.kind === "dir" && want?.kind !== "dir";
 
   /** Directories the run made that are to be made here: they are not in the real directory yet. */
   const toMake = new Set<string>();
@@ -478,11 +540,11 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
     return known;
   };
   /** Whether a directory lists a name as it is spelled. */
-  const listed = new Map<string, string[]>();
+  const listed = new Map<string, Set<string>>();
   const spells = (dir: string, name: string): boolean => {
     let names = listed.get(dir);
-    if (!names) listed.set(dir, names = namesIn(join(real, dir)));
-    return names.includes(name);
+    if (!names) listed.set(dir, names = new Set(namesIn(join(real, dir))));
+    return names.has(name);
   };
   /** What is in the real directory under a name that is not the directory's own for it: by what it is, the tree's path. */
   const otherwise = new Map<string, string>();
@@ -490,7 +552,8 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
   /**
    * What is to be done at a path — nothing, if the place is as the run left
    * it already. Throws if it cannot be done: with why, which is all that is
-   * done about it. It looks, and opens a directory to look; no more.
+   * done about it. It looks, and opens a directory to look; no more. (So
+   * every directory in which something is then done is open by then.)
    */
   const decide = (path: string): Deed | undefined => {
     const was = before.get(path);
@@ -526,7 +589,8 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
     }
     if (!is && !there) return undefined;
     const want = is && wanted(path, is);
-    // A place that holds what the run left needs nothing done — whoever made it so, and whatever became of its directory.
+    // A place that holds what the run left needs nothing done — whoever made it so, and whatever became of its
+    // directory, as long as it can still be looked into: one that somebody closed is not opened to find out.
     if (want && holds(there, place, want, path)) return undefined;
     if (notInIt) throw notInIt;
 
@@ -534,7 +598,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
     if (was && !same(there, seed.get(path))) {
       throw new Error(want ? "it was changed or removed in the project meanwhile" : "the run removed it, but it was changed in the project meanwhile");
     }
-    if (there?.kind === "dir" && want?.kind !== "dir") {
+    if (goesAsADirectory({ want, there })) {
       // It is to go — and can, if it holds nothing but what this merge removes from it.
       const goes = (child: string) => before.has(child) && !after.has(child);
       const kept = namesIn(place).find((name) => !goes(`${path}/${name}`));
@@ -568,76 +632,206 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
       }
     }
   }
-  /**
-   * What follows from what did not arrive, for what was to go — until nothing
-   * more follows. A file or a link the run moved goes from where it was only
-   * if it arrives where it went: what it holds is not to be in neither place.
-   * And a directory goes only if all that is in it goes. (The deepest first,
-   * so that what stays keeps everything above it.) Each can bring the other
-   * about: what stays in a directory keeps the directory, and a directory
-   * that stays is in the way of what was moved to its place.
-   */
-  /** Where each file and link is, as the run left things. */
+  /** Where each file, directory and link is, as the run left things. */
   const nowAt = new Map<string, string[]>();
   for (const [path, is] of after) {
     const id = idOf(is);
-    if (id !== undefined) nowAt.set(id, [...(nowAt.get(id) ?? []), path]);
+    if (id === undefined) continue;
+    const those = nowAt.get(id);
+    if (those) those.push(path);
+    else nowAt.set(id, [path]);
   }
+  /**
+   * Where the run has what is at a deed's place, if that is to go from there
+   * or be taken the place of. (If it is there still, among other places, it
+   * has not been moved from there. A directory that stays a directory is not
+   * one that goes, whichever directory the run has there: what it holds is
+   * seen to path by path.)
+   */
+  const wentTo = (deed: Deed): string[] => {
+    const id = staysADirectory(deed) ? undefined : idOf(before.get(deed.path));
+    return (id === undefined ? undefined : nowAt.get(id)) ?? [];
+  };
+  const deedAt = new Map(deeds.map((deed) => [deed.path, deed]));
+  /** By each place the run moved something to, the deeds at the places it moved it from. */
+  const cameFrom = new Map<string, Deed[]>();
+  /** Of each deed at a place the run moved something from, how many of the places it moved it to may yet arrive. */
+  const mayArriveAt = new Map<Deed, number>();
+  for (const deed of deeds) {
+    const all = wentTo(deed);
+    if (all.length > 0) mayArriveAt.set(deed, all.length);
+    for (const to of all) {
+      let those = cameFrom.get(to);
+      if (!those) cameFrom.set(to, those = []);
+      those.push(deed);
+    }
+  }
+  /** The places the run moved something to, in order. */
+  const arrivals = [...cameFrom.keys()].sort();
+  /**
+   * What follows from what did not arrive, for what was to go from where it
+   * was — until nothing more follows. What the run moved goes from where it
+   * was only if it arrives where it went: what it holds is not to be in
+   * neither place. And a directory goes only if all that is in it goes. Each
+   * can bring the other about: what stays in a directory keeps the directory,
+   * and a directory that stays is in the way of what was moved to its place.
+   * (Each path that did not arrive is followed up once, and each place
+   * something was moved to is counted out once.)
+   */
+  const followedUp = new Set<string>();
+  const countedOut = new Set<string>();
   const settle = () => {
-    for (let found = true; found;) {
-      found = false;
-      for (const { path, want, there } of [...deeds].reverse()) {
-        if (leftAlone(path)) continue;
-        // Where the run has what was here. (If that is here still, among other places, it has not been moved from here.)
-        const id = idOf(before.get(path));
-        const to = id !== undefined ? nowAt.get(id) : undefined;
-        const stays = there?.kind === "dir" && want?.kind !== "dir" ? [...refused.keys()].find((other) => other.startsWith(`${path}/`)) : undefined;
-        if (to?.every(leftAlone)) refused.set(path, `the run moved what was here to ${to.join(", ")}, which did not arrive: it is left as it was`);
-        else if (stays !== undefined) refused.set(path, `the run removed it, but not all that is in it can go (${stays})`);
-        else continue;
-        found = true;
+    const toFollowUp = [...refused.keys()].filter((path) => !followedUp.has(path));
+    const refuse = (path: string, why: () => string) => {
+      if (leftAlone(path)) return;
+      refused.set(path, why());
+      toFollowUp.push(path);
+    };
+    for (let path; (path = toFollowUp.pop()) !== undefined;) {
+      followedUp.add(path);
+      const stays = path;
+      // The directories it is in, which were to go.
+      for (let end = path.lastIndexOf("/"); end !== -1; end = path.lastIndexOf("/", end - 1)) {
+        const above = deedAt.get(path.slice(0, end));
+        if (above && goesAsADirectory(above)) refuse(above.path, () => `the run removed it, but not all that is in it can go (${stays})`);
+      }
+      // What was moved to it, or to somewhere under it, has not arrived there.
+      const under = `${path}/`;
+      const notArrived = cameFrom.has(path) ? [path] : [];
+      for (let at = firstNotBefore(arrivals, under); at < arrivals.length && arrivals[at].startsWith(under); at++) notArrived.push(arrivals[at]);
+      for (const to of notArrived) {
+        if (countedOut.has(to)) continue;
+        countedOut.add(to);
+        for (const from of cameFrom.get(to)!) {
+          const left = mayArriveAt.get(from)! - 1;
+          mayArriveAt.set(from, left);
+          if (left === 0) refuse(from.path, () => `the run moved what was here to ${wentTo(from).join(", ")}, which did not arrive: it is left as it was`);
+        }
       }
     }
   };
-  settle();
 
   // --- Doing it ---
 
-  /** Remove what was made beside a place and is not going to be moved in. Says so if it cannot be. */
-  const discard = (made: string): string => {
+  /** The deeds, by the directory each is in. */
+  const inDir = new Map<string, Deed[]>();
+  for (const deed of deeds) {
+    const dir = dirname(deed.path);
+    let those = inDir.get(dir);
+    if (!those) inDir.set(dir, those = []);
+    those.push(deed);
+  }
+  /** What there is to say besides what did not arrive (see above): by the path, what. */
+  const besides = new Map<string, string>();
+  const tell = (path: string, what: string) => besides.set(path, besides.has(path) ? `${besides.get(path)} — and ${what}` : what);
+  /** A place of the real directory, as a path of it. */
+  const pathOf = (place: string) => relative(real, place).split(sep).join("/");
+  const leftover = (path: string, failed: unknown) => `what was at ${path}, and was to go, is here: the system would not have it all removed (${reason(failed)})`;
+  /** Remove what was made beside a place and is not going to be moved in. What will not go is told of. Throws nothing. */
+  const discard = (made: string, madeFor: string) => {
     try {
       rmSync(made, { force: true });
-      return "";
-    } catch {
-      return ` — and ${basename(made)}, made ready beside it, could not be removed`;
+    } catch (err) {
+      // It is told of if it is there — or cannot be known not to be.
+      let there = true;
+      try {
+        there = lstatSync(made, { throwIfNoEntry: false }) !== undefined;
+      } catch (cannot) {
+        there = !noSuchPlace(cannot);
+      }
+      if (there) tell(pathOf(made), `it was made ready for ${madeFor}, and the system would not have it removed (${reason(err)})`);
     }
   };
-  /**
-   * Make a file or a link the run left beside its place, under a name of its
-   * own, ready to be moved in. What is put in place this way takes the place
-   * in one move: the place holds what it held, or what the run left, and at
-   * no moment neither.
-   */
+  /** Make a file or a link the run left beside its place, under a name of its own, ready to be moved in. */
   const beside = (path: string, want: Entry, place: string): string => {
     const made = stagedNameFor(place);
-    if (want.kind === "link") {
-      symlinkSync(want.text, made);
-    } else if (want.kind === "file") {
-      copyFileSync(stagedFile(path), made, constants.COPYFILE_EXCL);
-      if (modeAt(made) !== want.mode) chmodSync(made, want.mode);
+    try {
+      if (want.kind === "link") {
+        symlinkSync(want.text, made);
+      } else if (want.kind === "file") {
+        copyFileSync(stagedFile(path), made, constants.COPYFILE_EXCL);
+        if (modeAt(made) !== want.mode) chmodSync(made, want.mode);
+      }
+    } catch (err) {
+      discard(made, path);
+      throw err;
     }
     return made;
   };
-  const moveIn = (made: string, place: string) => {
-    try {
-      renameSync(made, place);
-    } catch (err) {
-      throw new Error(reason(err) + discard(made));
-    }
-  };
   /** What has been made beside its place and is yet to be moved in. */
   const ready = new Map<string, string>();
+  /**
+   * What was at a place and has been moved aside, under a name of its own
+   * beside it, for what the run left to take the place: by the path, where
+   * it is now. It is kept until all that follows from its going is known to
+   * have arrived, and comes back if not.
+   */
+  const aside = new Map<string, string>();
+  /** The places where this merge has put something in the place of what was there, or of nothing. */
+  const put = new Set<string>();
+  /** The directories that are not, now, where their path says: by the path, where they are — or were last, if they have gone since. */
+  const elsewhere = new Map<string, string>();
+  const setAside = ({ path, place, there }: Deed): string => {
+    const kept = stagedNameFor(place);
+    renameSync(place, kept);
+    if (there?.kind === "dir") elsewhere.set(path, kept);
+    return kept;
+  };
+  /**
+   * Remove from a directory what the run removed from it — all it held when
+   * that was looked at; more than that is not removed — and say what the
+   * system would not have removed, if anything. What will go, goes, whatever
+   * would not go before it.
+   */
+  const emptied = (dir: string, at: string): unknown => {
+    let failed: unknown;
+    for (const inIt of inDir.get(dir) ?? []) {
+      if (!inIt.there) continue;
+      const its = join(at, basename(inIt.path));
+      try {
+        if (inIt.there.kind === "dir") {
+          const inThat = emptied(inIt.path, its);
+          failed ??= inThat;
+          rmdirSync(its);
+        } else {
+          unlinkSync(its);
+        }
+      } catch (err) {
+        failed ??= err;
+      }
+    }
+    return failed;
+  };
+  /** The directories that were to go and have been seen to as one, with all that was under them. */
+  const seenTo = new Set<string>();
+  /** Remove what the run removed from a directory, and the directory, where it is. Says what the system would not have removed, if anything. */
+  const removed = (deed: Deed, at: string): unknown => {
+    seenTo.add(deed.path);
+    let failed = emptied(deed.path, at);
+    try {
+      rmdirSync(at);
+    } catch (err) {
+      failed ??= err;
+    }
+    return failed;
+  };
 
+  /**
+   * The places where what is there stays and takes what the run left into
+   * itself: a directory that is to be a directory; or a file the run wrote
+   * into — the same file, afterwards, not another put in its place — which
+   * may be written into, or holds what the run left already. Anything else
+   * that is there is taken the place of.
+   */
+  const takes = new Set<string>();
+  for (const { path, place, want, there } of deeds) {
+    if (!want || !there || leftAlone(path)) continue;
+    const itself = want.kind === "file" && there.kind === "file" && idOf(before.get(path)) === idOf(after.get(path))
+      && (mayBeWrittenTo(place) || holdsBytes(there, place, want, path));
+    if (itself || staysADirectory({ want, there })) takes.add(path);
+  }
+
+  /** Do one step of each deed that still stands. What the system will not have done is left alone. */
   const each = (list: Deed[], step: (deed: Deed) => void) => {
     for (const deed of list) {
       if (leftAlone(deed.path)) continue;
@@ -649,75 +843,174 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
     }
   };
 
-  // What is put where something is, is put there in one move, and is made first, beside the place: if the system
-  // will not have it made, nothing has been removed for its sake — not what is there, nor what was moved from
-  // somewhere else to be there. (All but a file that takes what the run left into itself: one that may be
-  // written to, or that holds it already.)
+  settle();
+  // What is to be put where something is, is made first, beside the place: if the system will not have it made,
+  // nothing has been touched for its sake. (Also what a file is to take into itself: see below.)
   each(deeds, ({ path, place, want, there }) => {
     if (!there || !want || want.kind === "dir") return;
-    if (want.kind === "file" && there.kind === "file" && (mayBeWrittenTo(place) || holdsBytes(there, place, want, path))) return;
-    open(dirname(path));
+    if (takes.has(path) && want.kind === "file" && holdsBytes(there, place, want, path)) return;
     ready.set(path, beside(path, want, place));
   });
-  settle();
+  settle(); // (so that what follows from what could not be made ready is not first done, and then undone)
 
-  // What the run removed — and what is in the way of what it made.
-  each([...deeds].reverse(), ({ path, place, want, there }) => {
-    if (!there || there.kind === want?.kind) return;
-    open(dirname(path));
-    if (there.kind === "dir") {
-      rmdirSync(place);
-      toClose.delete(path);
-    } else if (!ready.has(path)) {
-      unlinkSync(place); // (a file or a link that something is ready to take the place of stays until that is moved in)
-    }
-  });
-
-  // What the run made, or changed.
-  each(deeds, ({ path, place, want, there }) => {
+  // What the run made, or changed — a directory before what goes in it. What is in the place of it is moved aside.
+  each(deeds, (deed) => {
+    const { path, place, want, there } = deed;
     if (!want) return;
-    if (want.kind === "dir" && there?.kind === "dir") {
-      // What it allows is what changed: it is opened like any other, and closed to that.
-      open(path);
-      const closing = toClose.get(path);
-      if (!closing) throw new Error("it is no longer a directory in the project");
-      closing.mode = want.mode;
+    const made = ready.get(path);
+    if (takes.has(path)) {
+      if (want.kind === "dir") {
+        // What it allows is what changed: it is opened like any other, and closed to that.
+        open(path);
+        const closing = toClose.get(path);
+        if (!closing) throw new Error("it is no longer a directory in the project");
+        closing.mode = want.mode;
+        return;
+      }
+      if (want.kind !== "file") return;
+      if (made !== undefined) {
+        // It is written into, and stays the file it is. Should the system not have that — and it may have begun,
+        // and what the file held be gone — the new file, which is whole beside it, takes its place, and that is
+        // told of: it is another file then, and what was another name of the old one is none of this one.
+        try {
+          copyFileSync(stagedFile(path), place);
+        } catch (err) {
+          try {
+            renameSync(made, place);
+          } catch (again) {
+            ready.delete(path); // (it is not removed: it is the only whole one there is)
+            throw new Error(`${reason(err)} — and a new file could not be put in its place either (${reason(again)}): what it held may be damaged, and what it was to hold is beside it, as ${basename(made)}`);
+          }
+          ready.delete(path);
+          tell(path, `it could not be written into (${reason(err)}): a new file, holding what the run left, was put in its place`);
+        }
+        if (ready.delete(path)) discard(made, path);
+      }
+      try {
+        if (modeAt(place) !== want.mode) chmodSync(place, want.mode);
+      } catch (err) {
+        tell(path, `what it is to allow (${want.mode.toString(8)}) could not be set (${reason(err)}); what it holds arrived`);
+      }
       return;
     }
-    open(dirname(path));
-    const made = ready.get(path);
+    if (there) aside.set(path, setAside(deed));
     if (want.kind === "dir") {
       mkdirSync(place);
+      put.add(path);
+      const closing = { id: identityOf(place), mode: want.mode, has: -1 };
+      toClose.set(path, closing);
       chmodSync(place, want.mode | 0o700);
-      opened.add(path);
-      toClose.set(path, { place, mode: want.mode });
-    } else if (made) {
+      closing.has = want.mode | 0o700;
+    } else if (made !== undefined) {
+      renameSync(made, place);
       ready.delete(path);
-      moveIn(made, place);
+      put.add(path);
     } else if (want.kind === "link") {
       symlinkSync(want.text, place);
+      put.add(path);
     } else if (want.kind === "file") {
-      // Nothing is there — or a file that takes this into itself, and stays the file it is.
-      if (!there) copyFileSync(stagedFile(path), place, constants.COPYFILE_EXCL);
-      else if (!holdsBytes(there, place, want, path)) copyFileSync(stagedFile(path), place);
+      copyFileSync(stagedFile(path), place, constants.COPYFILE_EXCL);
+      put.add(path);
       if (modeAt(place) !== want.mode) chmodSync(place, want.mode);
     }
   });
+  settle();
 
-  // What was made ready and never moved in — the system refused something on the way — is not left lying there.
-  for (const [path, made] of ready) {
-    const left = discard(made);
-    if (left) refused.set(path, (refused.get(path) ?? "") + left);
+  // What was moved aside: where what took its place stands, it goes; where that did not stand after all — the
+  // system would not have it put there, or what was moved from there did not arrive where the run moved it — what
+  // was put there goes, and it comes back. The deepest first.
+  for (const deed of [...deeds].reverse()) {
+    const { path, place, want, there } = deed;
+    const kept = aside.get(path);
+    if (!leftAlone(path)) {
+      if (kept === undefined) continue;
+      let failed: unknown;
+      try {
+        if (there?.kind === "dir") failed = removed(deed, kept);
+        else unlinkSync(kept);
+      } catch (err) {
+        failed = err;
+      }
+      if (failed !== undefined) tell(pathOf(kept), leftover(path, failed));
+    } else if (kept !== undefined || put.has(path)) {
+      try {
+        // Only what this merge put there goes — of a directory, the directory, once what was put in it has gone.
+        if (put.has(path)) {
+          if (want?.kind === "dir") {
+            rmdirSync(place);
+            toClose.delete(path); // (it is gone: there is nothing of it to close)
+          } else {
+            unlinkSync(place);
+          }
+        }
+        if (kept !== undefined) {
+          renameSync(kept, place);
+          elsewhere.delete(path);
+        }
+      } catch (err) {
+        const where = kept === undefined ? "" : `: what was there is beside it, as ${basename(kept)}`;
+        refused.set(path, `${refused.get(path) ?? "it is not to stand"} — and it could not be put back as it was (${reason(err)})${where}`);
+      }
+    }
   }
-  // The directories that were opened, or made open, are closed — the deepest first.
-  for (const [path, { place, mode }] of [...toClose].sort(([a], [b]) => (a < b ? 1 : -1))) {
+
+  // And what the run removed, where it is: nothing waits for it any more, and nothing is to take its place. Of a
+  // directory the system will not have removed, or not with all that was in it, what is left is there — as it
+  // would be had the run removed it there.
+  each(deeds, (deed) => {
+    const { path, place, want, there } = deed;
+    if (want || !there || underOne(path, seenTo)) return;
+    if (there.kind !== "dir") return void unlinkSync(place);
+    const failed = removed(deed, place);
+    if (failed !== undefined) tell(path, `the run removed it, and the system would not have it removed, or not all that was in it (${reason(failed)}): what is left is there`);
+  });
+
+  // What was made ready and never moved in is not left lying there.
+  for (const [path, made] of ready) discard(made, path);
+  // The directories that this merge has allowing something else than they are to be left allowing are closed — the
+  // deepest first, each where it is now, and only if it is that directory: at the place of one that is gone there
+  // may be something else by now.
+  const placeNow = (path: string): string => {
+    for (let end = path.length; end !== -1; end = path.lastIndexOf("/", end - 1)) {
+      const moved = elsewhere.get(path.slice(0, end));
+      if (moved !== undefined) return moved + path.slice(end);
+    }
+    return join(real, path);
+  };
+  for (const [path, { id, mode, has }] of [...toClose].sort(([a], [b]) => (a < b ? 1 : -1))) {
+    if (has === mode) continue;
+    const place = placeNow(path);
+    try {
+      if (id === undefined || identityOf(place) !== id) continue;
+    } catch (err) {
+      // Where there is no such place there is nothing to close. Where it cannot be come to, it may be there, open.
+      if (!gone(err) && (err as NodeJS.ErrnoException).code !== "ENOTDIR") {
+        tell(pathOf(place), `it was opened, and cannot be come to to be given back what it is to allow (${mode.toString(8)}): ${reason(err)}`);
+      }
+      continue;
+    }
     try {
       if (modeAt(place) !== mode) chmodSync(place, mode);
     } catch (err) {
-      if (!leftAlone(path)) refused.set(path, reason(err));
+      // What it was to be left allowing did not arrive, or could not be put back. What is in it is another matter.
+      const why = `what it is to allow (${mode.toString(8)}) could not be set (${reason(err)})`;
+      const at = pathOf(place);
+      if (refused.has(at)) refused.set(at, `${refused.get(at)} — and ${why}`);
+      else tell(at, `${why}; what is in it is told of by itself, if it did not arrive`);
     }
   }
-  return [...refused].map(([path, why]) => ({ path, why }));
+  return [...refused, ...besides].map(([path, why]) => ({ path, why }));
+}
+
+/** Where, in a list in order, the first entry is that does not come before a given one. */
+function firstNotBefore(list: string[], given: string): number {
+  let low = 0;
+  for (let high = list.length; low < high;) {
+    const middle = (low + high) >> 1;
+    if (list[middle] < given) low = middle + 1;
+    else high = middle;
+  }
+  return low;
 }
 
 const mayBeWrittenTo = (path: string) => {

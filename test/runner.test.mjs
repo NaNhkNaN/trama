@@ -1798,7 +1798,10 @@ test("a repair of a program that is a link inside the project goes through the l
   assert.equal(readFileSync(join(projectDir, "src", "main.ts"), "utf-8"), fixed.trim());
   // The program was put in place once, by the one move. The merge carries what the run did, and
   // putting the fix into the copy is not something the run did — under whatever name the file has.
-  assert.deepEqual(copiedOver.filter(path => path !== "output.txt" && path !== "state.json" && !path.startsWith("logs/")), []);
+  // (What the merge writes into a file is made ready beside it first, under a name of the merge's own.)
+  const madeReady = (path) => /^\.trama-tmp-[0-9a-f]{12}$/.test(path);
+  assert.deepEqual(copiedOver.filter(path => path !== "output.txt" && path !== "state.json" && !path.startsWith("logs/") && !madeReady(path)), []);
+  assert.deepEqual(copiedOver.filter(path => path.startsWith("src/")), []);
   assert.equal(copiedOver.includes("output.txt"), true);
   assert.deepEqual(readJson(join(projectDir, "state.json")).n, 2);
 });
@@ -2507,7 +2510,7 @@ const projectWith = (program, { linked = false, spelled = false } = {}) => {
   if (linked) {
     rmSync(join(projectDir, "program.ts"));
     writeText(join(projectDir, "src", "app.ts"), program);
-    symlinkSync(spelled ? "SRC/app.ts" : "src/app.ts", join(projectDir, "program.ts"));
+    symlinkSync(typeof linked === "string" ? linked : spelled ? "SRC/app.ts" : "src/app.ts", join(projectDir, "program.ts"));
   } else if (spelled) {
     renameSync(join(projectDir, "program.ts"), join(projectDir, "Program.ts"));
   }
@@ -2563,6 +2566,10 @@ for (const [how, { spelled, linked, onlyWhereNamesFold, does = `fs.unlinkSync("p
   ", in a project that has it as Program.ts": { spelled: true, onlyWhereNamesFold: true, is: (fix) => ({ "Program.ts": `file 600 ${JSON.stringify(fix)}` }) },
   // The link is gone, and a file of its name is put back: the fix. Where the link led is as the run left it.
   ", where it was a link": { linked: true, is: (fix) => ({ "program.ts": `file 600 ${JSON.stringify(fix)}`, "src/app.ts": `file 600 ${JSON.stringify(fix)}` }) },
+  ", by removing the directory a link led into, however the link words the way": {
+    linked: "./src/../src/app.ts", does: `fs.rmSync("src", { recursive: true });`,
+    is: (fix) => ({ "program.ts": `file 600 ${JSON.stringify(fix)}`, "src": "nothing" }),
+  },
   ", by removing the directory a link in other letters led into": {
     linked: true, spelled: true, onlyWhereNamesFold: true, does: `fs.rmSync("src", { recursive: true });`,
     is: (fix) => ({ "program.ts": `file 600 ${JSON.stringify(fix)}`, "src": "nothing", "SRC": "nothing" }),
@@ -2600,6 +2607,22 @@ for (const [what, does, why] of [
     assert.deepEqual(shapeOf(projectDir, ["program.ts", "state.txt"]), { "program.ts": `file 600 ${JSON.stringify(BOOM)}`, "state.txt": "nothing" });
   });
 }
+
+test("where somebody points program.ts elsewhere while a fix is tried, what the fix did to the file it was is still carried there", async (t) => {
+  const projectDir = projectWith(BOOM, { linked: true });
+  writeText(join(projectDir, "other.ts"), "somebody's");
+  const originalRepair = llm.repair;
+  // The fix rewrites itself — and, standing in for somebody else, re-points the project's own program.ts.
+  const elsewhere = `fs.unlinkSync(${JSON.stringify(join(projectDir, "program.ts"))}); fs.symlinkSync("other.ts", ${JSON.stringify(join(projectDir, "program.ts"))});`;
+  llm.repair = fixThat(`${elsewhere}\nfs.writeFileSync("program.ts", ${JSON.stringify(SELF)});`);
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  // The fix went where program.ts leads now. Where it led when the copy was made is as the copy knew it, and takes the run's work.
+  assert.deepEqual(messages.filter(line => line.includes("src/app.ts")), []);
+  assert.equal(shapeOf(projectDir, ["src/app.ts"])["src/app.ts"], `file 600 ${JSON.stringify(SELF)}`);
+});
 
 test("a directory where a project's program should be is no program, and is said to be none", async (t) => {
   const projectDir = makeTempDir("trama-runner-");
