@@ -74,7 +74,10 @@ const topOf = (path: string): Place => ({ at: parse(path).root, links: 0, missin
  * among them, with the steps still to be taken from there, and may give the
  * place another name to go on by. `link` is asked about each link the walk
  * comes to — where it is, and whether the path ends there — and may say where
- * the walk is to be instead of following it.
+ * the walk is to be instead of following it. (A link so taken counts as one
+ * followed, however many it stands for: the count is then only what stops a
+ * walk that goes round. Whoever has links taken so, and needs to know whether
+ * the system would follow the words, asks the system.)
  */
 interface Watch {
   passing?(at: string, ahead: readonly string[]): string | undefined;
@@ -203,8 +206,6 @@ function underRoot(destination: string, realRoot: string): string | undefined {
 export interface Lead {
   /** The place they name. A link of the root that they end at is the place: what it names in turn is its own affair. */
   to: string;
-  /** That place by the root's own name for it, if it is in the root. */
-  inRoot: string | undefined;
   /**
    * Whether the way there is in the root at one point and out of it at
    * another: it steps out over the root's top, or into it from outside. If it
@@ -212,6 +213,15 @@ export interface Lead {
    * root, wherever the copy is.
    */
   strays: boolean;
+  /**
+   * What the words go on to say once they have come to the root from outside
+   * it (see `sinceRoot`) — provided they have not stepped out of it over its
+   * top again since. That much is said of the root, and says the same of a
+   * copy of it, wherever its links lead. Undefined if they never come to the
+   * root so, or step out of it afterwards: such a way, if it strays, ends
+   * outside the root.
+   */
+  home: string | undefined;
 }
 
 /**
@@ -238,14 +248,17 @@ export function linksOf(root: string): {
    */
   names(dir: string, text: string): Lead;
   /**
-   * For words that name a place from the top of the file system: what they
-   * go on to say once they have come to the root — a slash first, if any
-   * more is said — or undefined if they do not come to it. Where they come
-   * to it more than once, it is the last time that counts: what is said
-   * after it is said of the root. (Coming to it is a step into it from
-   * outside. A link of the root that names the root is a step within it.)
+   * What the same words go on to say once they have come to the root from
+   * outside it — a slash first, if any more is said — or undefined if they
+   * never do. Where they come to it more than once, it is the last time that
+   * counts. (Coming to it is a step into it from outside. A link of the root
+   * that names the root is a step within it.) Whatever they say from there
+   * on, and wherever that leads, it is said of the root: to one who takes a
+   * copy for the root itself, it is the copy's name that the words before it
+   * come to. Told as far as the way can be followed: one that cannot be
+   * followed to its end has still come as far as it has.
    */
-  beyond(text: string): string | undefined;
+  sinceRoot(dir: string, text: string): string | undefined;
 } {
   /** What each link of the root that a way has passed through names — null while that is being worked out. */
   const named = new Map<string, Place | null>();
@@ -267,15 +280,20 @@ export function linksOf(root: string): {
   };
   const isLink = (place: Place) => !place.missing && lstatSync(place.at, { throwIfNoEntry: false })?.isSymbolicLink() === true;
 
-  /** `comingToTheRoot` is told what is still to be walked each time a step of the way arrives at the root from outside it. */
-  const lead = (dir: string, text: string, comingToTheRoot?: (ahead: readonly string[]) => void): { place: Place; strays: boolean } => {
+  /** What a way has been seen to do, kept up to date as it is walked: it says how far the way came, also of one that then fails. */
+  interface Seen { sinceRoot?: string; stayed?: boolean }
+  const lead = (dir: string, text: string, seen: Seen = {}): { place: Place; strays: boolean } => {
     let inside = !isAbsolute(text) && underRoot(dir, root) !== undefined;
     let strays = false;
     const place = follow(text, { at: dir, links: 0, missing: false }, {
       passing(at, ahead) {
         const own = underRoot(at, root);
-        if ((own !== undefined) !== inside) strays = true;
-        if (own === root && !inside) comingToTheRoot?.(ahead);
+        if ((own !== undefined) !== inside) {
+          strays = true;
+          // A step into the root arrives at its top, with the rest still to be said.
+          seen.stayed = own === root;
+          if (own === root) seen.sinceRoot = ahead.length === 0 ? "" : sep + ahead.map((step) => (step === A_DIRECTORY ? "" : step)).join(sep);
+        }
         inside = own !== undefined;
         return own;
       },
@@ -296,19 +314,18 @@ export function linksOf(root: string): {
 
   return {
     names(dir, text) {
-      const { place, strays } = lead(dir, text);
-      return { to: place.at, inRoot: underRoot(place.at, root), strays };
+      const seen: Seen = {};
+      const { place, strays } = lead(dir, text, seen);
+      return { to: place.at, strays, home: seen.stayed ? seen.sinceRoot : undefined };
     },
-    beyond(text) {
-      let rest: string | undefined;
+    sinceRoot(dir, text) {
+      const seen: Seen = {};
       try {
-        lead(parse(text).root, text, (ahead) => {
-          rest = ahead.length === 0 ? "" : sep + ahead.map((step) => (step === A_DIRECTORY ? "" : step)).join(sep);
-        });
+        lead(dir, text, seen);
       } catch {
         // The way cannot be followed to its end. How far it came is known all the same, and is all that is asked.
       }
-      return rest;
+      return seen.sinceRoot;
     },
   };
 }

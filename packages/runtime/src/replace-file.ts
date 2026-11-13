@@ -8,14 +8,18 @@
 
 import { chmodSync, closeSync, fdatasyncSync, mkdirSync, openSync, renameSync, rmSync, statSync, writeFileSync } from "fs";
 import { randomBytes } from "crypto";
-import { dirname } from "path";
+import { dirname, join } from "path";
 import { guardPath, realRootOf } from "./path-guard.js";
 
 /** Whether a file name is that of a temp file made here — not content, though it sits among it for a moment. */
 export const isStagedName = (name: string) => /\.trama-tmp-[0-9a-f]{12}$/.test(name);
 
-/** A name beside a destination for what is to take its place. */
-export const stagedNameFor = (destination: string) => `${destination}.trama-tmp-${randomBytes(6).toString("hex")}`;
+/**
+ * A name beside a destination for what is to take its place. It is not made
+ * of the destination's own: a name near the longest a directory takes leaves
+ * no room to add to.
+ */
+export const stagedNameFor = (destination: string) => join(dirname(destination), `.trama-tmp-${randomBytes(6).toString("hex")}`);
 
 export interface StagedFile {
   /** Where the content will be: the path given, with every link on the way followed. */

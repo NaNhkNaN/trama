@@ -6,7 +6,7 @@ import {
   mkdtempSync, openSync, closeSync,
   accessSync, constants, truncateSync,
 } from "fs";
-import { join, dirname, relative, sep } from "path";
+import { join, dirname } from "path";
 import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { createHash, randomBytes } from "crypto";
@@ -20,7 +20,7 @@ import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
 import { guardPath, identityOf, realRootOf } from "./path-guard.js";
-import { copyTree, mergeTree, readTree, type Tree } from "./tree.js";
+import { copyTree, entryAt, mergeTree, pathAsListed, readTree, type Tree } from "./tree.js";
 import { stageFile, type StagedFile } from "./replace-file.js";
 import { readProjectMeta } from "./meta.js";
 import { describeJson, isJsonObject } from "./serializable.js";
@@ -366,9 +366,12 @@ export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promis
  * In everything else the copy is as the project is, so that what a program
  * can do in the one it can do in the other: what a run did in a copy is
  * merged back into the project, and must not have been possible only there.
- * The one exception is the program file, made afresh: whether the project's
- * may be written to is said of the project — it is asked where a program is
- * to take its place there (see whyNotReplaceable).
+ * The one exception is the program: the one to be tried, in the place of
+ * the project's. It allows what the project's allows — and its owner to
+ * replace it: a copy is where programs are tried and replaced, and whether
+ * the project's own may be is said of the project, where one is to take its
+ * place (see whyNotReplaceable). A project with a directory where its
+ * program should be has no place for one, and is not copied to try one in.
  */
 function copyProjectWith(projectDir: string, copyDir: string, program: string): Tree {
   // Two directories the copy must know when it comes to them — by what they are, since neither
@@ -389,8 +392,9 @@ function copyProjectWith(projectDir: string, copyDir: string, program: string): 
     }
     return identity === journals;
   });
-  rmSync(guardPath(copyDir, "program.ts"), { force: true });
-  stageFile(copyDir, "program.ts", program).commit();
+  const had = statSync(guardPath(copyDir, "program.ts"), { throwIfNoEntry: false });
+  if (had?.isDirectory()) throw new Error(`No program can be tried in a copy of ${realRootOf(projectDir)}: its program.ts is a directory.`);
+  stageFile(copyDir, "program.ts", program, had && (had.mode | 0o200)).commit();
   return held;
 }
 
@@ -806,11 +810,11 @@ async function requestRepair(
  * Try a proposed fix.
  *
  * The project is the program's own, so the fix runs on a private copy of it.
- * Only if it works does anything reach the real one — the program becomes
- * program.ts, and what the run wrote is merged back. A fix that fails, or a
- * runner that is stopped half-way, leaves the project exactly as it was,
- * because it was never touched: its state is only ever written by code that
- * is, or becomes, its program.
+ * Only if it works does anything reach the real one — the fix becomes
+ * program.ts, and what its run did is merged back. A fix that fails, or a
+ * runner that is stopped while one is tried, leaves the project exactly as
+ * it was, because it was never touched: its state is only ever written by
+ * code that is, or becomes, its program.
  *
  * The shared workspace is not copied. It is how the participants of a session
  * talk to each other, and a program that is being fixed still has to be heard
@@ -825,6 +829,12 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     const held = copyProjectWith(projectDir, stagedProject, fixed);
     // Taken with the fix in place: what differs from this afterwards is what the run did.
     const before = readTree(stagedProject);
+    // The fix in the copy, as the copy has it: under which name, at which place — which is the place of
+    // the project's program in the project — and what it allows there.
+    const fixAt = guardPath(stagedProject, "program.ts");
+    const itsName = pathAsListed(stagedProject, join(realRootOf(stagedProject), "program.ts")) ?? "program.ts";
+    const itsPlace = pathAsListed(stagedProject, fixAt);
+    const allowed = statSync(fixAt).mode;
     // If the copy cannot be run at all, or is left unusable, this fix did not work either.
     const trial = await runProgramOnce({ ...options, projectDir: stagedProject, attempt }).catch((err): RunOnceResult => ({
       outcome: null,
@@ -832,20 +842,40 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     }));
     if (trial.outcome === null) return trial;
 
-    // The fix worked. What becomes the project's program is the program as
-    // its run left it — a program may rewrite itself, and here as in any run
-    // the one it wrote is the one it is. (One that removed itself is still the
-    // fix that ran.) It goes in first, in one move, and only then is what the
-    // run wrote merged in. If it cannot be put in place, that is an error, and
-    // it is thrown from here with nothing of the run in the project: a state
-    // the old program did not write, beside the old program, is worse than
-    // either.
-    const program = stageProgram(projectDir, programIn(stagedProject) ?? fixed);
+    // The fix worked, and becomes the project's program — as it ran, first,
+    // and in one move; only then is what its run did merged in. What the run
+    // did to its own file is among that: a program may rewrite itself, give
+    // itself other permissions, make program.ts lead elsewhere, and here as
+    // in any run what it made of itself is what it is. (So a runner stopped
+    // between the two leaves the fix beside the state it started from: the
+    // program that would do the same again, not the one it turns into.)
+    //
+    // The project is to have a program afterwards. One that removed itself is
+    // still the fix that ran: a file of its name is put back where the run
+    // ended (the name itself, not what a link left there leads to). A run that
+    // left, at program.ts, nothing that can be read as a program has not left
+    // a project that has one, and was no fix.
+    try {
+      if (programIn(stagedProject) === null) {
+        rmSync(join(realRootOf(stagedProject), itsName), { force: true });
+        stageFile(stagedProject, itsName, fixed, allowed).commit();
+      }
+    } catch (err) {
+      return {
+        outcome: null,
+        failure: `The repaired program ran, but left no program.ts that can be read: ${err instanceof Error ? err.message : err}`,
+      };
+    }
+    // If it cannot be put in place, that is an error, and it is thrown from
+    // here with nothing of the run in the project: a state the old program
+    // did not write, beside the old program, is worse than either.
+    const program = stageProgram(projectDir, fixed);
     program.commit();
-    // The program is installed, not merged. What the run did to its own file — rewrote it, removed
-    // it — has been dealt with above, and its path is no part of what is merged.
-    const programPath = relative(realRootOf(projectDir), program.destination).split(sep).join("/");
-    const unmerged = mergeTree(stagedProject, projectDir, before, held, programPath);
+    // The project now holds, where its program was, what the copy held there before the run — and the merge is
+    // told so: that is what the place is taken to have held when the copy was made.
+    const installed = entryAt(program.destination);
+    if (itsPlace !== undefined && installed) held.set(itsPlace, installed);
+    const unmerged = mergeTree(stagedProject, projectDir, before, held);
     if (unmerged.length > 0) {
       // The run is done and its program installed; what it did that is not in the project is said, not passed over.
       options.journal.note("unmerged", { attempt, files: unmerged });
@@ -965,12 +995,15 @@ export async function validateProgram(
   return { source: left, repairedError: repair?.error };
 }
 
-/** A project's program text — null if it has none. */
+/** A project's program text — null if it has none. Throws if what is in its place is no file. */
 function programIn(projectDir: string): string | null {
+  const place = guardPath(projectDir, "program.ts");
   try {
-    return readFileSync(guardPath(projectDir, "program.ts"), "utf-8");
+    return readFileSync(place, "utf-8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return null;
+    if (code === "EISDIR") throw new Error(`${place} is a directory, not a program.`);
     throw err;
   }
 }
@@ -980,8 +1013,9 @@ function programIn(projectDir: string): string | null {
  *
  * A program is replaced by a new file taking its place, which the system
  * allows whatever the old file's permissions say. So the old file is asked: a
- * program its owner has made read-only is not replaced. And the new file has
- * to be made beside it, in a directory that is there or can be made.
+ * program its owner has made read-only is not replaced. A directory in its
+ * place is no program, and no file takes the place of one. And the new file
+ * has to be made beside it, in a directory that is there or can be made.
  *
  * This is the rule stageProgram enforces. It is also asked before work whose
  * only use is a new program — an update, a repair — is begun.
@@ -991,7 +1025,9 @@ export function whyNotReplaceable(projectDir: string): string | null {
   const allows = (path: string, what: number) => {
     try { accessSync(path, what); return true; } catch { return false; }
   };
-  if (existsSync(place) && !allows(place, constants.W_OK)) return `The program cannot be replaced: ${place} is read-only.`;
+  const there = statSync(place, { throwIfNoEntry: false });
+  if (there?.isDirectory()) return `The program cannot be replaced: ${place} is a directory.`;
+  if (there && !allows(place, constants.W_OK)) return `The program cannot be replaced: ${place} is read-only.`;
   // The directory the new file is made in — or, if that is still to be made, the one it is made in.
   let dir = dirname(place);
   while (!existsSync(dir)) dir = dirname(dir);

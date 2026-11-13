@@ -510,7 +510,7 @@ test("workspace.write creates its temp file, and does not write through one that
   // The one name the temp file can have this time — and a link planted there, pointing outside.
   crypto.randomBytes = (size) => Buffer.alloc(size, 0xab);
   syncBuiltinESMExports();
-  symlinkSync(join(parent, "victim.txt"), join(wsDir, `note.txt.trama-tmp-${"ab".repeat(6)}`));
+  symlinkSync(join(parent, "victim.txt"), join(wsDir, `.trama-tmp-${"ab".repeat(6)}`));
 
   await assert.rejects(workspace.write("note.txt", "from the workspace"), { code: "EEXIST" });
   assert.equal(readFileSync(join(parent, "victim.txt"), "utf-8"), "VICTIM");
