@@ -6,7 +6,7 @@ import {
   mkdtempSync, openSync, closeSync, chmodSync,
   accessSync, constants, truncateSync,
 } from "fs";
-import { join, dirname, sep } from "path";
+import { join, dirname, isAbsolute, relative, sep } from "path";
 import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { createHash, randomBytes } from "crypto";
@@ -19,14 +19,14 @@ import { LATEST_LOG_PATH, appendLogEntry, createContext } from "./context.js";
 import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
-import { guardPath, realRootOf } from "./path-guard.js";
+import { guardPath, identityOf, realRootOf } from "./path-guard.js";
 import { stageFile, type StagedFile } from "./replace-file.js";
 import { readProjectMeta } from "./meta.js";
 import { describeJson, isJsonObject } from "./serializable.js";
 import { createAllowance, superviseChild, type ChildExit } from "./child-process.js";
 import { removeTempDir, removeWithThisProcess, requireWatchdog, stopGroups, stopWithThisProcess } from "./stopping.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
-import { JOURNAL_DIR, openJournal, type Journal } from "./journal.js";
+import { journalDirOf, openJournal, type Journal } from "./journal.js";
 
 // --- Locating the runtime itself ---
 
@@ -61,10 +61,14 @@ try {
  * so program.ts can import it. Replaces any existing symlink whose target
  * differs (including user-managed ones). Only refuses to touch a real
  * directory/file to avoid destroying user content.
+ *
+ * The link points outside the project, and is meant to. Where it is put is
+ * inside it, like everything else the runtime writes: a project whose
+ * node_modules leads somewhere else is refused, not followed there.
  */
 function linkPackage(projectDir: string, name: string, target: string): void {
-  // The link deliberately points OUTSIDE the project — do not apply guardPath here.
-  const linkDir = join(projectDir, "node_modules", "@trama-dev");
+  const linkDir = guardPath(projectDir, join("node_modules", "@trama-dev"));
+  // Not through the guard: it is the link itself that is looked at and replaced, not what it points at.
   const linkPath = join(linkDir, name);
 
   try {
@@ -340,11 +344,22 @@ export function copyToHistory(projectDir: string, reason: string, detail?: strin
 
 type DirSnapshot = Map<string, { size: number; mtimeMs: number }>;
 
-/** Record all files in a directory with their size and mtime for change detection. */
+/**
+ * Record all files in a directory with their size and mtime for change detection.
+ *
+ * A directory that is not there holds nothing. One that is there and cannot
+ * be read is not an empty one: it throws, rather than have every file under
+ * it taken for removed.
+ */
 export function snapshotDir(dir: string, prefix = ""): DirSnapshot {
   const result: DirSnapshot = new Map();
   let entries;
-  try { entries = readdirSync(dir, { withFileTypes: true }); } catch { return result; }
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return result;
+    throw err;
+  }
   for (const entry of entries) {
     const relPath = prefix ? `${prefix}/${entry.name}` : entry.name;
     const fullPath = join(dir, entry.name);
@@ -363,6 +378,9 @@ export function snapshotDir(dir: string, prefix = ""): DirSnapshot {
 const sameStat = (a: { size: number; mtimeMs: number }, b: { size: number; mtimeMs: number }) =>
   a.size === b.size && a.mtimeMs === b.mtimeMs;
 
+/** Something a run did in a copy that did not reach the real directory, and why. */
+export interface Unmerged { path: string; why: string }
+
 /**
  * Merge what a run did to a staged copy back into the real directory, with a
  * three-way check so that nothing changed in the real directory meanwhile —
@@ -375,48 +393,90 @@ const sameStat = (a: { size: number; mtimeMs: number }, b: { size: number; mtime
  *
  * For each file the run touched in the copy:
  * - Created: copied, unless that path has meanwhile appeared in the real directory.
- * - Modified: copied only if the real file still matches realSeed.
+ * - Modified: put in place only if the real file still matches realSeed.
  * - Deleted: deleted only if the real file still matches realSeed.
- * Best-effort: anything that cannot be merged safely is skipped, never thrown.
+ * A file that is already as the run left it needs nothing done.
+ *
+ * A modified file is written into if it may be, and otherwise replaced by a
+ * new one. The copy allows what the real directory allows, so one of the two
+ * is what the run did there: it wrote into a file it may write to, or — in a
+ * directory it may write to — put a new file where a read-only one was.
+ *
+ * Only regular files are merged. A link the run made or changed, a directory
+ * it left empty, and permissions it changed without touching content are not
+ * looked at, and so are neither merged nor returned.
+ *
+ * Best-effort: of what is looked at, what cannot be merged is skipped, never
+ * thrown — and returned, so that a run whose files did not all arrive is not
+ * passed off as one whose files did.
  */
 export function commitStagedChanges(
   stagedDir: string,
   realDir: string,
   stagedBefore: DirSnapshot,
   realSeed: DirSnapshot,
-): void {
-  const stagedAfter = snapshotDir(stagedDir);
+): Unmerged[] {
+  let stagedAfter: DirSnapshot;
+  try {
+    stagedAfter = snapshotDir(stagedDir);
+  } catch (err) {
+    // What the run left cannot be told. Nothing is merged — least of all as a removal of what cannot be seen.
+    return [{ path: ".", why: `what the run left could not be read (${err instanceof Error ? err.message : err}); none of it was merged` }];
+  }
+  const unmerged: Unmerged[] = [];
   /** The real file as it is now — but only if nobody has touched it since the copy was taken. */
   const untouchedSinceSeed = (relPath: string, dstPath: string): boolean => {
     const seedStat = realSeed.get(relPath);
     const realNow = statSync(dstPath, { throwIfNoEntry: false });
     return seedStat === undefined || (realNow !== undefined && sameStat(realNow, seedStat));
   };
+  const mayBeWrittenTo = (path: string) => {
+    try { accessSync(path, constants.W_OK); return true; } catch { return false; }
+  };
 
   for (const relPath of new Set([...stagedBefore.keys(), ...stagedAfter.keys()])) {
     const beforeStat = stagedBefore.get(relPath);
     const afterStat = stagedAfter.get(relPath);
     if (beforeStat && afterStat && sameStat(beforeStat, afterStat)) continue; // the run didn't touch it
+    const staged = join(stagedDir, relPath);
 
     try {
       // A symlink placed at this path, or in a parent directory, could point
       // outside the real directory — guardPath throws.
       const dstPath = guardPath(realDir, relPath);
+      /** Whether the real file already holds what the run left: then there is nothing to merge, whoever put it there. */
+      const alreadySo = () => {
+        const real = statSync(dstPath, { throwIfNoEntry: false });
+        return real?.isFile() === true && real.size === afterStat!.size && readFileSync(dstPath).equals(readFileSync(staged));
+      };
 
       if (!afterStat) {
+        if (!statSync(dstPath, { throwIfNoEntry: false })) continue; // already gone
         if (untouchedSinceSeed(relPath, dstPath)) rmSync(dstPath, { force: true });
+        else unmerged.push({ path: relPath, why: "the run removed it, but it was changed in the project meanwhile" });
       } else if (beforeStat) {
-        if (!untouchedSinceSeed(relPath, dstPath)) continue; // changed or removed concurrently
-        copyFileSync(join(stagedDir, relPath), dstPath);
+        if (!untouchedSinceSeed(relPath, dstPath)) {
+          if (!alreadySo()) unmerged.push({ path: relPath, why: "it was changed or removed in the project meanwhile" });
+        } else if (mayBeWrittenTo(dstPath)) {
+          copyFileSync(staged, dstPath);
+        } else {
+          stageFile(realDir, relPath, readFileSync(staged), statSync(staged).mode).commit();
+        }
       } else {
-        if (statSync(dstPath, { throwIfNoEntry: false })) continue; // someone else created it first — keep theirs
+        if (statSync(dstPath, { throwIfNoEntry: false })) {
+          // Someone else created it first — theirs is kept.
+          if (!alreadySo()) unmerged.push({ path: relPath, why: "it was created in the project meanwhile" });
+          continue;
+        }
         mkdirSync(dirname(dstPath), { recursive: true });
-        copyFileSync(join(stagedDir, relPath), dstPath);
+        copyFileSync(staged, dstPath);
       }
-    } catch {
-      // Escapes the directory, path-shape conflict, permissions — skip
+    } catch (err) {
+      // Escapes the directory, path-shape conflict, permissions.
+      unmerged.push({ path: relPath, why: err instanceof Error ? err.message : String(err) });
     }
   }
+  return unmerged;
 }
 
 /** Run fn in a temp directory, clean up afterwards regardless of outcome — including this process being stopped. */
@@ -436,7 +496,7 @@ export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promis
  * holds, with `program` as its program.ts.
  *
  * What a project holds is its files, its directories with what they allow,
- * and its links, kept as they are written. A socket or a pipe that a process
+ * and its links, kept as they are written (but see linkIn). A socket or a pipe that a process
  * left in it is not content — it is one end of something that is, or was,
  * running — and is not carried over. Nor are the project's journals: they are
  * the record of its runs, not part of what a run works on, and a copy is
@@ -450,20 +510,40 @@ export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promis
  * to take its place there (see whyNotReplaceable).
  */
 function copyProjectWith(projectDir: string, copyDir: string, program: string): void {
-  // Where the directories really are: either may be reached through a symlink.
+  // Where the directory really is: a project directory may itself be a symlink.
   const project = realRootOf(projectDir);
-  const into = realRootOf(copyDir);
-  if (into === project || into.startsWith(project + sep)) {
-    throw new Error(`A copy of ${project} cannot be made inside it, at ${into}. (Is the temp directory in the project?)`);
+  // Two directories the walk must know when it comes to them — by what they are, since
+  // neither need be spelled as the walk would spell it, or lie where its name suggests.
+  let journals: string | undefined;
+  try {
+    journals = identityOf(journalDirOf(projectDir));
+  } catch {
+    // Where the journals would be is no place the project may use (a link out of it, say): it has none to leave out.
   }
-  const journals = join(project, JOURNAL_DIR);
+  const theCopy = identityOf(copyDir);
+  /**
+   * What a link in the copy says. A link is kept as written — but one that
+   * names a place in the project by its full path would, in the copy, still
+   * lead to the project, and what a trial wrote through it would be written
+   * there, tried or not. It is made to lead to the same place in the copy.
+   */
+  const linkIn = (target: string): string => {
+    if (!isAbsolute(target)) return target;
+    let led: string;
+    try { led = guardPath(projectDir, target); } catch { return target; /* not into the project */ }
+    return join(copyDir, relative(project, led));
+  };
   const copy = (from: string, to: string) => {
     for (const entry of readdirSync(from, { withFileTypes: true })) {
       const source = join(from, entry.name);
       const copied = join(to, entry.name);
       try {
         if (entry.isDirectory()) {
-          if (source === journals) continue;
+          const identity = identityOf(source);
+          if (identity === journals) continue;
+          if (identity === theCopy) {
+            throw new Error(`A copy of ${project} cannot be made inside it, at ${source}. (Is the temp directory in the project?)`);
+          }
           const { mode } = lstatSync(source);
           mkdirSync(copied, { recursive: true });
           copy(source, copied);
@@ -472,7 +552,7 @@ function copyProjectWith(projectDir: string, copyDir: string, program: string): 
         } else if (entry.isFile()) {
           copyFileSync(source, copied);
         } else if (entry.isSymbolicLink()) {
-          symlinkSync(readlinkSync(source), copied);
+          symlinkSync(linkIn(readlinkSync(source)), copied);
         }
       } catch (err) {
         // A project may be in use while it is copied. What is gone by the time it is come to is not in the copy.
@@ -932,8 +1012,19 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     // it is thrown from here with nothing of the run in the project: a state
     // the old program did not write, beside the old program, is worse than
     // either.
-    stageProgram(projectDir, programIn(stagedProject) ?? fixed).commit();
-    commitStagedChanges(stagedProject, projectDir, stagedBefore, realSeed);
+    const program = stageProgram(projectDir, programIn(stagedProject) ?? fixed);
+    program.commit();
+    // The program was installed, not merged: what the run did to its own file — rewrote it, removed
+    // it — has been dealt with above, and is not among what did not arrive.
+    const programPath = relative(realRootOf(projectDir), program.destination).split(sep).join("/");
+    const unmerged = commitStagedChanges(stagedProject, projectDir, stagedBefore, realSeed)
+      .filter(file => file.path !== programPath);
+    if (unmerged.length > 0) {
+      // The run is done and its program installed; what it did that is not in the project is said, not passed over.
+      options.journal.note("unmerged", { attempt, files: unmerged });
+      console.warn(tagged(options.label, `[trama] ${unmerged.length} change(s) the repaired run made did not reach the project:`));
+      for (const { path, why } of unmerged) console.warn(tagged(options.label, `[trama]   ${path} — ${why}`));
+    }
     return trial;
   });
 }

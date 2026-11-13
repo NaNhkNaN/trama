@@ -10,8 +10,10 @@ import {
   copyToHistory, createBackend, ensureProjectScaffold, installValidatedProgram, loadConfig, loadState, runProgram, RUNTIME_TYPES,
   validateProgram,
 } from "../packages/runtime/dist/runner.js";
+import { printJournals } from "../packages/runtime/dist/journal-view.js";
+import { openJournal } from "../packages/runtime/dist/journal.js";
 import {
-  REPO_ROOT, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, readJson, startRunnerProcess, waitFor,
+  REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, readJson, startRunnerProcess, waitFor,
   withEnv, writeJson, writeText,
 } from "./helpers.mjs";
 
@@ -2123,4 +2125,227 @@ await ctx.done();`,
   const verdict = readJson(join(projectDir, "verdict.json"));
   assert.match(verdict.checkpoint, /Not a file or a directory: state\.json/);
   assert.match(verdict.log, /Not a file or a directory: logs\/latest\.jsonl/);
+});
+
+// --- Where the runtime writes, and what counts as the same place ---
+
+test("the links to the runtime are put inside the project: a node_modules that leads elsewhere is refused, not followed", (t) => {
+  for (const linked of ["node_modules", join("node_modules", "@trama-dev")]) {
+    const projectDir = makeTempDir("trama-runner-");
+    const outside = makeTempDir("trama-outside-");
+    const theirs = makeTempDir("trama-outside-");
+    t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(outside); cleanupTempDir(theirs); });
+    createProjectFixture(projectDir, { scaffold: false });
+    // Out there, somebody has a link of their own under the very name the runtime would use.
+    const there = linked === "node_modules" ? join(outside, "@trama-dev") : outside;
+    mkdirSync(there, { recursive: true });
+    symlinkSync(theirs, join(there, "runtime"));
+    mkdirSync(join(projectDir, linked, ".."), { recursive: true });
+    symlinkSync(outside, join(projectDir, linked));
+
+    assert.throws(() => ensureProjectScaffold(projectDir), /Path escapes project directory via symlink: node_modules\/@trama-dev/);
+    assert.deepEqual(readdirSync(there), ["runtime"], "nothing was added out there");
+    assert.equal(realpathSync(join(there, "runtime")), realpathSync(theirs), "and their link is as it was");
+  }
+});
+
+test("a project's journals stay out of its copies wherever logs/journal really is", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
+  // logs is a link to a directory elsewhere in the project: the journals are in data/logs/journal.
+  mkdirSync(join(projectDir, "data", "logs"), { recursive: true });
+  symlinkSync(join("data", "logs"), join(projectDir, "logs"));
+  const originalRepair = llm.repair;
+  llm.repair = async () => `import { ctx } from "@trama-dev/runtime";
+import { existsSync, writeFileSync } from "fs";
+writeFileSync("found.json", JSON.stringify(["logs/journal", "data/logs/journal"].map(dir => existsSync(dir))));
+await ctx.done();
+`;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.equal(result.status, "done");
+  assert.equal(readdirSync(join(projectDir, "data", "logs", "journal")).length, 1, "the run was recorded, through the link");
+  assert.deepEqual(readJson(join(projectDir, "found.json")), [false, false]);
+});
+
+test("a temp directory inside the project is known for what it is, however it is spelled", async (t) => {
+  const parent = makeTempDir("trama-runner-");
+  const projectDir = join(parent, "MyProject");
+  const fixed = `import { ctx } from "@trama-dev/runtime";\nawait ctx.done();\n`;
+  createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
+  mkdirSync(join(projectDir, "tmp"));
+  const inOtherLetters = join(parent, "myproject", "tmp");
+  let asked = 0;
+  const originalRepair = llm.repair;
+  llm.repair = async () => { asked += 1; return fixed; };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(parent); });
+  if (!existsSync(inOtherLetters)) return t.skip("this file system tells upper case from lower");
+
+  const result = await withEnv({ TMPDIR: inOtherLetters }, () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "failed");
+  // Refused where the walk came to it — not after the project had been copied into itself as deep as a path can go.
+  assert.match(result.reason, /No fix came back: A copy of .* cannot be made inside it/);
+  assert.equal(asked, 0);
+});
+
+// --- What a fix's run wrote, and what of it reached the project ---
+
+test("a file a fix put a new one in place of arrives as it did so, though the old one could not be written to", { skip: process.getuid?.() === 0 }, async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
+  for (const name of ["replaced.txt", "renamed-over.txt"]) {
+    writeText(join(projectDir, name), "OLD");
+    chmodSync(join(projectDir, name), 0o444);
+  }
+  // The other way round: a file that may be written to, in a directory that may not.
+  writeText(join(projectDir, "sealed", "inside.txt"), "OLD");
+  chmodSync(join(projectDir, "sealed"), 0o555);
+  const originalRepair = llm.repair;
+  llm.repair = async () => `import { ctx } from "@trama-dev/runtime";
+import { renameSync, rmSync, writeFileSync } from "fs";
+rmSync("replaced.txt");
+writeFileSync("replaced.txt", "NEW, in a new file", { mode: 0o640 });
+writeFileSync("next.txt", "NEW, moved into place");
+renameSync("next.txt", "renamed-over.txt");
+writeFileSync("sealed/inside.txt", "NEW, written into");
+await ctx.done();
+`;
+  t.after(() => { llm.repair = originalRepair; chmodSync(join(projectDir, "sealed"), 0o755); cleanupTempDir(projectDir); });
+
+  // Each of these the program may do in the project itself. Tried in a copy, they have to arrive too.
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  assert.equal(readFileSync(join(projectDir, "replaced.txt"), "utf-8"), "NEW, in a new file");
+  assert.equal(statSync(join(projectDir, "replaced.txt")).mode & 0o777, 0o640 & ~process.umask(), "a new file, with the new file's permissions");
+  assert.equal(readFileSync(join(projectDir, "renamed-over.txt"), "utf-8"), "NEW, moved into place");
+  assert.equal(readFileSync(join(projectDir, "sealed", "inside.txt"), "utf-8"), "NEW, written into");
+  assert.deepEqual(messages.filter(line => line.includes("did not reach the project")), []);
+  assert.deepEqual(leftovers(projectDir), []);
+});
+
+test("what a fix's run wrote that did not reach the project is said, and is on record", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
+  writeText(join(projectDir, "report.txt"), "as it was");
+  const real = join(realpathSync(projectDir), "report.txt");
+  const originalRepair = llm.repair;
+  // While it runs in its copy, the project's own file changes under it — here by its own hand, to be sure of the moment.
+  llm.repair = async () => `import { ctx } from "@trama-dev/runtime";
+import { writeFileSync } from "fs";
+writeFileSync("report.txt", "what the run wrote");
+writeFileSync("arrived.txt", "this one arrives");
+writeFileSync(${JSON.stringify(real)}, "changed by someone else meanwhile, and longer");
+await ctx.done();
+`;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  // The run is done, and the other's change is kept — as before. What is new is that it is not kept quiet.
+  assert.equal(result.status, "done");
+  assert.equal(readFileSync(real, "utf-8"), "changed by someone else meanwhile, and longer");
+  assert.equal(readFileSync(join(projectDir, "arrived.txt"), "utf-8"), "this one arrives");
+  assert.ok(messages.some(line => /1 change\(s\) the repaired run made did not reach the project/.test(line)), messages.join("\n"));
+  assert.ok(messages.some(line => /report\.txt — it was changed or removed in the project meanwhile/.test(line)), messages.join("\n"));
+
+  const [journal] = readdirSync(join(projectDir, "logs", "journal"));
+  const records = readFileSync(join(projectDir, "logs", "journal", journal), "utf-8").trim().split("\n").map(line => JSON.parse(line));
+  assert.deepEqual(records.find(record => record.kind === "unmerged").files,
+    [{ path: "report.txt", why: "it was changed or removed in the project meanwhile" }]);
+  // And whoever reads the journal is told.
+  const shown = await captureConsole("log", () => printJournals(projectDir, "the-project", {}));
+  assert.ok(shown.messages.some(line => /1 change\(s\) it made did not reach the project/.test(line)), shown.messages.join("\n"));
+  assert.ok(shown.messages.some(line => /report\.txt — it was changed or removed/.test(line)), shown.messages.join("\n"));
+});
+
+test("what a fix did to its own program.ts is not reported as work that did not arrive: the program is installed, not merged", async (t) => {
+  const next = `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ generation: 2 });\n`;
+  const rewrites = `import { ctx } from "@trama-dev/runtime";
+import { writeFileSync } from "fs";
+writeFileSync("program.ts", ${JSON.stringify(next)});
+await ctx.done();
+`;
+  const removes = `import { ctx } from "@trama-dev/runtime";
+import { rmSync } from "fs";
+rmSync("program.ts");
+await ctx.done();
+`;
+  const originalRepair = llm.repair;
+  t.after(() => { llm.repair = originalRepair; });
+  for (const [fixed, left] of [[rewrites, next], [removes, removes.trim()]]) {
+    const projectDir = makeTempDir("trama-runner-");
+    t.after(() => cleanupTempDir(projectDir));
+    createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
+    llm.repair = async () => fixed;
+
+    const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+    assert.equal(result.status, "done");
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), left);
+    assert.deepEqual(messages.filter(line => line.includes("did not reach the project")), []);
+  }
+});
+
+// --- A copy stands on its own ---
+
+test("a link that names a place in the project by its full path leads, in a copy, to the same place in the copy", async (t) => {
+  const projectDir = realpathSync(makeTempDir("trama-runner-"));
+  createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
+  writeText(join(projectDir, "data", "x.txt"), "AS IT WAS");
+  symlinkSync(join(projectDir, "data"), join(projectDir, "by-full-path"));
+  // The links to the runtime are made in a directory reached the same way.
+  mkdirSync(join(projectDir, "vendor"));
+  symlinkSync(join(projectDir, "vendor"), join(projectDir, "node_modules"));
+  const originalRepair = llm.repair;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  // A fix that fails after writing through the link. Tried in a copy, it must leave the project alone.
+  llm.repair = async () => `import { writeFileSync } from "fs";
+writeFileSync("by-full-path/x.txt", "written by a fix that then fails");
+throw new Error("still broken");
+`;
+  const failed = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.equal(failed.status, "failed");
+  assert.match(failed.reason, /still broken/);
+  assert.equal(readFileSync(join(projectDir, "data", "x.txt"), "utf-8"), "AS IT WAS");
+
+  // And one that works runs — its node_modules is inside the copy, as the project's is inside the project —
+  // and what it wrote through the link arrives where the link leads.
+  llm.repair = async () => `import { ctx } from "@trama-dev/runtime";
+import { writeFileSync } from "fs";
+writeFileSync("by-full-path/x.txt", "written by the fix");
+await ctx.done();
+`;
+  const done = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.equal(done.status, "done");
+  assert.equal(readFileSync(join(projectDir, "data", "x.txt"), "utf-8"), "written by the fix");
+  assert.equal(lstatSync(join(projectDir, "by-full-path")).isSymbolicLink(), true);
+});
+
+test("a project whose journals cannot be kept is still repaired: it has none to leave out of a copy", async (t) => {
+  const { projectDir, fixed } = repairableProject(t);
+  const outside = makeTempDir("trama-outside-");
+  t.after(() => cleanupTempDir(outside));
+  mkdirSync(join(projectDir, "logs"));
+  symlinkSync(outside, join(projectDir, "logs", "journal"));
+
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixed.trim());
+  assert.ok(messages.some(line => line.includes("this run is not being recorded")));
+  assert.deepEqual(readdirSync(outside), []);
+});
+
+test("a journal this process is writing is known for its own, however the project is named", (t) => {
+  const parent = realpathSync(makeTempDir("trama-runner-"));
+  t.after(() => cleanupTempDir(parent));
+  const projectDir = join(parent, "MyProject");
+  createProjectFixture(projectDir);
+  const inOtherLetters = join(parent, "myproject");
+  if (!existsSync(inOtherLetters)) return t.skip("this file system tells upper case from lower");
+
+  const first = openJournal(projectDir, 1, {});
+  // A second run of the same project, named in other letters, makes room for itself — one journal is kept.
+  const second = openJournal(inOtherLetters, 1, {});
+  t.after(() => { first.close(); second.close(); });
+  assert.equal(existsSync(first.path), true, "the journal still being written was removed to make room");
 });

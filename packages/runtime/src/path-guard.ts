@@ -136,12 +136,25 @@ export function realRootOf(rootDir: string): string {
 const within = (path: string, root: string) =>
   path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
 
-/** What tells one file or directory from every other, if it is there to be told. */
-function identityOf(path: string): BigIntStats | undefined {
-  try { return lstatSync(path, { bigint: true, throwIfNoEntry: false }); } catch { return undefined; }
+const identityIn = (stat: BigIntStats) => `${stat.dev}:${stat.ino}`;
+
+/**
+ * What tells one file or directory from every other — undefined if nothing is
+ * there to be told apart. Two paths with one identity are one place, however
+ * each is spelled; a link is itself, not what it points at.
+ *
+ * This is how the runtime asks whether two paths are the same. Their text
+ * cannot say: a file system that takes "Data" and "data" for one name has
+ * many names for every directory.
+ */
+export function identityOf(path: string): string | undefined {
+  try {
+    const stat = lstatSync(path, { bigint: true, throwIfNoEntry: false });
+    return stat && identityIn(stat);
+  } catch {
+    return undefined;
+  }
 }
-const sameFile = (a: BigIntStats | undefined, b: BigIntStats | undefined) =>
-  a !== undefined && b !== undefined && a.dev === b.dev && a.ino === b.ino;
 
 /**
  * A destination by the root's own name for it, if it is the root or lies
@@ -157,7 +170,7 @@ function underRoot(destination: string, realRoot: string): string | undefined {
   const root = identityOf(realRoot);
   if (!root) return undefined;
   for (let at = destination; ; at = dirname(at)) {
-    if (sameFile(identityOf(at), root)) return join(realRoot, destination.slice(at.length));
+    if (identityOf(at) === root) return join(realRoot, destination.slice(at.length));
     if (at === dirname(at)) return undefined;
   }
 }
@@ -198,7 +211,7 @@ export function guardPath(rootDir: string, path: string): string {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
   const there = lstatSync(destination, { bigint: true, throwIfNoEntry: false });
-  if (found ? !sameFile(there, found) : there !== undefined) {
+  if (found ? !(there && identityIn(there) === identityIn(found)) : there !== undefined) {
     throw new Error(`Path cannot be followed: ${path} (the system does not take it where its links say)`);
   }
   // What is there is content, or a place for it. A pipe, a socket or a device

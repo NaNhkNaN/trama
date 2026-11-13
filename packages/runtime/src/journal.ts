@@ -16,7 +16,7 @@
 import { appendFileSync, closeSync, mkdirSync, openSync, readSync, readdirSync, rmSync } from "fs";
 import { createHash, randomBytes } from "crypto";
 import { join } from "path";
-import { guardPath } from "./path-guard.js";
+import { guardPath, identityOf } from "./path-guard.js";
 import { isJsonObject } from "./serializable.js";
 
 /** The format of the records. Bump it when a reader of older journals would be misled. */
@@ -210,7 +210,11 @@ function noJournal(): Journal {
   return { run: "", path: "", note() {}, call: () => ({ seq: ++seq, end() {} }), close() {} };
 }
 
-/** Journals this process is writing. They are never the ones to make room. */
+/**
+ * Journals this process is writing, each by what it is (see identityOf): a
+ * project may be named in more ways than one, and its journals with it. They
+ * are never the ones to make room.
+ */
 const beingWritten = new Set<string>();
 
 /** The process that started a journal — named at the start of its first record — or null if it cannot be told. */
@@ -236,7 +240,8 @@ const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } ca
  * is finished, though the process lives on.)
  */
 export function stillBeingWritten(path: string): boolean {
-  if (beingWritten.has(path)) return true;
+  const journal = identityOf(path);
+  if (journal !== undefined && beingWritten.has(journal)) return true;
   const writer = writerOf(path);
   return writer !== null && writer !== process.pid && isAlive(writer);
 }
@@ -275,15 +280,16 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
   const run = `${started.toISOString().replace(/[:.]/g, "-")}-${randomBytes(3).toString("hex")}`;
   let fd: number | null;
   let path: string;
+  let identity: string | undefined;
   try {
-    // Named as the reader names it: a journal is recognised as still being written by its path.
     const dir = journalDirOf(projectDir);
     mkdirSync(dir, { recursive: true });
     makeRoom(dir, keep);
     path = journalIn(dir, run);
     // Readable by its owner only: it holds what the program read, wrote and was told.
     fd = openSync(path, "a", 0o600);
-    beingWritten.add(path);
+    identity = identityOf(path);
+    if (identity !== undefined) beingWritten.add(identity);
   } catch (err) {
     console.warn(`[trama] this run is not being recorded: ${err instanceof Error ? err.message : err}`);
     return noJournal();
@@ -297,7 +303,7 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
     if (fd === null) return;
     try { closeSync(fd); } catch { /* nothing more to do with it */ }
     fd = null;
-    beingWritten.delete(path);
+    if (identity !== undefined) beingWritten.delete(identity);
   };
 
   /** Write one record. `compose` builds it, and may fail: what cannot be written down is noted as such. */

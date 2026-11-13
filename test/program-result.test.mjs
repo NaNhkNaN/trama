@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, readdirSync, readFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, utimesSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import { runProgram } from "../packages/runtime/dist/runner.js";
@@ -712,4 +712,78 @@ throw new Error("post-done error");`;
   } finally {
     llm.repair = originalRepair;
   }
+});
+
+test("merging a staged copy returns what did not arrive, and why — and nothing that did", { skip: process.getuid?.() === 0 }, async (t) => {
+  const { commitStagedChanges, snapshotDir } = await import("../packages/runtime/dist/runner.js");
+  const staged = makeTempDir("trama-staged-");
+  const real = makeTempDir("trama-real-");
+  t.after(() => { chmodSync(join(real, "sealed"), 0o755); cleanupTempDir(staged); cleanupTempDir(real); });
+  const names = ["arrives", "changed-meanwhile", "same-meanwhile", "removed", "removed-and-gone", "removed-but-changed"];
+  for (const dir of [staged, real]) {
+    for (const name of names) writeText(join(dir, `${name}.txt`), "AS IT WAS");
+    writeText(join(dir, "sealed", "inside.txt"), "AS IT WAS");
+  }
+  const before = snapshotDir(staged);
+  const seed = snapshotDir(real);
+
+  // What the run did, in its copy.
+  for (const name of ["arrives", "changed-meanwhile", "same-meanwhile"]) writeText(join(staged, `${name}.txt`), "BY THE RUN");
+  for (const name of ["removed", "removed-and-gone", "removed-but-changed"]) rmSync(join(staged, `${name}.txt`));
+  writeText(join(staged, "new.txt"), "BY THE RUN");
+  writeText(join(staged, "new-here-too.txt"), "BY THE RUN");
+  writeText(join(staged, "new-same-here.txt"), "BY THE RUN");
+  writeText(join(staged, "sealed", "new.txt"), "BY THE RUN");
+
+  // What happened in the project meanwhile. The first is as long as what the run wrote, to the letter.
+  writeText(join(real, "changed-meanwhile.txt"), "BY ANOTHER");
+  writeText(join(real, "same-meanwhile.txt"), "BY THE RUN");
+  rmSync(join(real, "removed-and-gone.txt"));
+  writeText(join(real, "removed-but-changed.txt"), "CHANGED BY ANOTHER");
+  writeText(join(real, "new-here-too.txt"), "BY ANOTHER");
+  writeText(join(real, "new-same-here.txt"), "BY THE RUN");
+  chmodSync(join(real, "sealed"), 0o555); // and here nothing can be created
+
+  const unmerged = commitStagedChanges(staged, real, before, seed);
+  const why = Object.fromEntries(unmerged.map(file => [file.path, file.why]));
+  assert.deepEqual(Object.keys(why).sort(),
+    ["changed-meanwhile.txt", "new-here-too.txt", "removed-but-changed.txt", "sealed/new.txt"]);
+  assert.match(why["changed-meanwhile.txt"], /changed or removed in the project meanwhile/);
+  assert.match(why["new-here-too.txt"], /created in the project meanwhile/);
+  assert.match(why["removed-but-changed.txt"], /the run removed it, but it was changed in the project meanwhile/);
+  assert.match(why["sealed/new.txt"], /EACCES/);
+
+  const now = (name) => existsSync(join(real, name)) ? readFileSync(join(real, name), "utf-8") : null;
+  assert.equal(now("arrives.txt"), "BY THE RUN");
+  assert.equal(now("new.txt"), "BY THE RUN");
+  assert.equal(now("removed.txt"), null);
+  // Another's work is never written over, or removed.
+  assert.equal(now("changed-meanwhile.txt"), "BY ANOTHER");
+  assert.equal(now("new-here-too.txt"), "BY ANOTHER");
+  assert.equal(now("removed-but-changed.txt"), "CHANGED BY ANOTHER");
+});
+
+test("a directory of the copy that cannot be read is not taken for an empty one: nothing under it is removed from the project", { skip: process.getuid?.() === 0 }, async (t) => {
+  const { commitStagedChanges, snapshotDir } = await import("../packages/runtime/dist/runner.js");
+  const staged = makeTempDir("trama-staged-");
+  const real = makeTempDir("trama-real-");
+  t.after(() => { chmodSync(join(staged, "data"), 0o755); cleanupTempDir(staged); cleanupTempDir(real); });
+  for (const dir of [staged, real]) {
+    writeText(join(dir, "data", "a.csv"), "rows");
+    writeText(join(dir, "data", "deep", "b.csv"), "more rows");
+  }
+  const before = snapshotDir(staged);
+  const seed = snapshotDir(real);
+
+  // All the run did was close a directory. Its files are still in it.
+  chmodSync(join(staged, "data"), 0o300);
+  writeText(join(staged, "elsewhere.txt"), "BY THE RUN");
+  assert.throws(() => snapshotDir(staged), { code: "EACCES" });
+
+  const unmerged = commitStagedChanges(staged, real, before, seed);
+  assert.equal(readFileSync(join(real, "data", "a.csv"), "utf-8"), "rows");
+  assert.equal(readFileSync(join(real, "data", "deep", "b.csv"), "utf-8"), "more rows");
+  assert.equal(unmerged.length, 1);
+  assert.match(unmerged[0].why, /could not be read .*none of it was merged/);
+  assert.equal(existsSync(join(real, "elsewhere.txt")), false);
 });

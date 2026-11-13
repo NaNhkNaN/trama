@@ -33,10 +33,11 @@ export interface StagedFile {
  * created. The temp file is created, never opened: a name that is already
  * there — a link somebody planted, say — is not written through. A file that
  * is being replaced hands on its permissions, as it would if it were written
- * into; it is a new file all the same, so a second hard link to the old one,
- * or its owner, are not carried over.
+ * into — unless `mode` says what the new file's are. It is a new file all the
+ * same, so a second hard link to the old one, or its owner, are not carried
+ * over.
  */
-export function stageFile(rootDir: string, relativePath: string, content: string | Buffer): StagedFile {
+export function stageFile(rootDir: string, relativePath: string, content: string | Buffer, mode?: number): StagedFile {
   const destination = guardPath(rootDir, relativePath);
   if (destination === realRootOf(rootDir)) {
     throw new Error(`Not a file path: "${relativePath}" is the directory itself`);
@@ -54,8 +55,8 @@ export function stageFile(rootDir: string, relativePath: string, content: string
     } finally {
       closeSync(fd);
     }
-    const replaced = statSync(destination, { throwIfNoEntry: false });
-    if (replaced) chmodSync(staged, replaced.mode & 0o777);
+    const permissions = mode ?? statSync(destination, { throwIfNoEntry: false })?.mode;
+    if (permissions !== undefined) chmodSync(staged, permissions & 0o777);
   } catch (err) {
     discard();
     throw err;

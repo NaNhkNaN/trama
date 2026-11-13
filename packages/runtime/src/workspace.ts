@@ -38,48 +38,47 @@ function isExactPath(pattern: string): boolean {
 }
 
 /**
- * Recursively list all files under a directory, as forward-slash paths relative to root.
- * Includes symlinks to files and follows symlinked directories, but only
- * those the guard lets through: what is listed is what can be read.
+ * List the files under a directory of a workspace, as forward-slash paths
+ * relative to `root`, into `found`. Links to files are included, and links
+ * to directories followed, but only those the guard lets through: what is
+ * listed is what can be read.
  *
- * Cycle detection: only symlinked directories are tracked in the `visited` set
- * (by where they really lead). Regular directories cannot create cycles on their
- * own, so they are traversed unconditionally. This allows legitimate directory
- * aliases (symlink pointing to another dir in the workspace) to produce their
- * own workspace-relative paths alongside the original directory's paths.
+ * A link to a directory is an alias: what is in that directory is listed
+ * under the link's name too. It is followed where it really is — in a
+ * directory reached by no link — and not again where it is come upon by way
+ * of another link (`byLink`). So every alias of a shared directory is listed,
+ * a loop is gone round once, and the work is bounded by the links there are
+ * times what they lead to; following links found through links, it is
+ * bounded by nothing but the length of a path. What this leaves unlisted,
+ * though it can be read: a path through two links or more.
  */
-function listFilesRecursive(dir: string, root: string, visited = new Set<string>()): string[] {
-  const results: string[] = [];
+function listFiles(dir: string, root: string, found: string[], byLink = false): void {
   let entries;
   try {
     entries = readdirSync(dir, { withFileTypes: true });
   } catch {
-    return results;
+    return;
   }
   // A temp file left by a write that was cut off is not an artifact.
-  const addFile = (full: string) => { if (!isStagedName(full)) results.push(relative(root, full).split(sep).join("/")); };
+  const addFile = (full: string) => { if (!isStagedName(full)) found.push(relative(root, full).split(sep).join("/")); };
   for (const entry of entries) {
     const full = resolve(dir, entry.name);
     if (entry.isSymbolicLink()) {
-      let real: string;
-      try { real = guardPath(root, full); } catch { continue; /* leads out of the workspace, or nowhere */ }
+      let stat;
       try {
-        const stat = statSync(full);
-        if (stat.isDirectory()) {
-          if (visited.has(real)) continue;
-          visited.add(real);
-          results.push(...listFilesRecursive(full, root, visited));
-        } else if (stat.isFile()) {
-          addFile(full);
-        }
-      } catch { /* stat failed */ }
+        guardPath(root, full); // leads out of the workspace, or nowhere: not listed
+        stat = statSync(full);
+      } catch {
+        continue;
+      }
+      if (stat.isFile()) addFile(full);
+      else if (stat.isDirectory() && !byLink) listFiles(full, root, found, true);
     } else if (entry.isDirectory()) {
-      results.push(...listFilesRecursive(full, root, visited));
+      listFiles(full, root, found, byLink);
     } else if (entry.isFile()) {
       addFile(full);
     }
   }
-  return results;
 }
 
 /** Resolve after `ms`, or reject as soon as `signal` aborts. */
@@ -103,7 +102,9 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
   /** All artifact paths matching a glob, sorted. */
   const listMatching = (pattern: string): string[] => {
     const re = compileGlob(pattern);
-    return listFilesRecursive(root, root).filter(f => re.test(f)).sort();
+    const found: string[] = [];
+    listFiles(root, root, found);
+    return found.filter(f => re.test(f)).sort();
   };
 
   /** Read an artifact, or null if it is missing, unreadable, or escapes the workspace. */

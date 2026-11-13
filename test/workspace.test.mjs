@@ -420,6 +420,47 @@ test("workspace.list returns paths through directory alias symlinks", async (t) 
   assert.equal(results.length, 2);
 });
 
+test("every alias of a shared directory is listed and observed; a link come upon through a link is not followed", async (t) => {
+  const dir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(dir));
+  const ws = createWorkspace(dir);
+  await ws.write("shared/item.txt", "one item");
+  for (const name of ["a", "b"]) {
+    mkdirSync(join(dir, name));
+    symlinkSync("../shared", join(dir, name, "ref"));
+  }
+
+  // Two ways to one directory are not a loop: what can be read under each is listed under each.
+  assert.equal(await ws.read("b/ref/item.txt"), "one item");
+  assert.deepEqual(await ws.list("**"), ["a/ref/item.txt", "b/ref/item.txt", "shared/item.txt"]);
+  assert.deepEqual(await ws.observe("b/**", { timeout: 1000 }), [{ path: "b/ref/item.txt", content: "one item" }]);
+
+  // A way back up is a loop, and is gone round once: what is there is listed under it, and the
+  // links found there — its own among them — are left for where they really are.
+  symlinkSync("..", join(dir, "a", "up"));
+  assert.deepEqual(await ws.list("**"),
+    ["a/ref/item.txt", "a/up/shared/item.txt", "b/ref/item.txt", "shared/item.txt"]);
+  // Not listed, though it can be read.
+  assert.equal(await ws.read("a/up/b/ref/item.txt"), "one item");
+});
+
+test("directories that all link to one another are listed in the time it takes to visit each link once", async (t) => {
+  const dir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(dir));
+  const ws = createWorkspace(dir);
+  const names = Array.from({ length: 9 }, (_, i) => `d${i}`);
+  for (const name of names) await ws.write(`${name}/file.txt`, name);
+  for (const from of names) for (const to of names) if (from !== to) symlinkSync(`../${to}`, join(dir, from, `to-${to}`));
+
+  // Followed wherever they are come upon, these links make more paths than can be walked: every
+  // order of every choice of the nine. Followed where they really are, each is walked once.
+  const started = performance.now();
+  const listed = await ws.list("**");
+  assert.equal(listed.length, names.length + names.length * (names.length - 1));
+  assert.ok(listed.includes("d3/to-d7/file.txt"));
+  assert.ok(performance.now() - started < 5_000, "the listing took too long to be bounded");
+});
+
 test("workspace creates directory if it does not exist", async (t) => {
   const dir = makeTempDir("trama-ws-");
   t.after(() => cleanupTempDir(dir));

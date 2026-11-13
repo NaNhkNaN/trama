@@ -94,6 +94,10 @@ function printJournal(path: string, records: JournalRecord[]): void {
         console.log(`${at}  attempt ${record.attempt} over: ${how} → ${verdict}`);
         break;
       }
+      case "unmerged":
+        console.log(`${at}  attempt ${record.attempt}: ${record.files?.length ?? 0} change(s) it made did not reach the project`);
+        for (const file of record.files ?? []) console.log(`${" ".repeat(at.length)}    ${file.path} — ${oneLine(file.why, 80)}`);
+        break;
       case "full":
         console.log(`${at}  the journal is full: calls from here on were not recorded`);
         break;
