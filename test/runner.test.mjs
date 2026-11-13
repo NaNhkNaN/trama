@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
 import { join } from "path";
 import { tmpdir } from "os";
 import { execFileSync } from "child_process";
@@ -1945,7 +1945,7 @@ test("a pipe or a socket left in a project is no part of its copies: the program
   if (listening) assert.equal(lstatSync(join(projectDir, "app.sock")).isSocket(), true);
 });
 
-test("a copy of a project is as the project is: links as written, files and directories with what they allow, no journals", async (t) => {
+test("a copy of a project is as the project is: links leading where they lead, files and directories with what they allow, no journals", async (t) => {
   const projectDir = makeTempDir("trama-runner-");
   createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
   writeText(join(projectDir, ".hidden"), "a dotfile");
@@ -1987,9 +1987,13 @@ await ctx.done();
     privateMode: "700",
     empty: ["inside"],
     emptyInside: [],
-    links: ["bin/tool.sh", "bin", "../nowhere/at-all", "/etc/hosts"],
+    // Kept as written — but for the one that leaves the project by "..": from the copy that would be
+    // somewhere else, so it is made to say where it leads from here.
+    links: ["bin/tool.sh", "bin", join(realpathSync(projectDir), "..", "nowhere/at-all"), "/etc/hosts"],
     logs: ["latest.jsonl"],
   });
+  // What the run did not touch is as it was, in the project.
+  assert.equal(readlinkSync(join(projectDir, "dangling")), "../nowhere/at-all");
 });
 
 test("a fix cannot do in a copy what it could not do in the project: writing where the project forbids it fails the fix", { skip: process.getuid?.() === 0 }, async (t) => {
@@ -2034,11 +2038,17 @@ chmodSync("sealed", 0o500);
 await ctx.done();
 `;
   const before = new Set(copiesInTemp());
-  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+  t.after(() => {
+    llm.repair = originalRepair;
+    for (const dir of ["sealed", "sealed/deeper"]) if (existsSync(join(projectDir, dir))) chmodSync(join(projectDir, dir), 0o755);
+    cleanupTempDir(projectDir);
+  });
 
   const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
   assert.equal(result.status, "done");
   assert.equal(readFileSync(join(projectDir, "sealed", "deeper", "file.txt"), "utf-8"), "sealed in");
+  // The project's directories are closed as the run closed them: what it did to what they allow arrives too.
+  for (const dir of ["sealed", "sealed/deeper"]) assert.equal(statSync(join(projectDir, dir)).mode & 0o777, 0o500, dir);
   assert.deepEqual(copiesInTemp().filter(name => !before.has(name)), []);
 });
 
@@ -2348,4 +2358,126 @@ test("a journal this process is writing is known for its own, however the projec
   const second = openJournal(inOtherLetters, 1, {});
   t.after(() => { first.close(); second.close(); });
   assert.equal(existsSync(first.path), true, "the journal still being written was removed to make room");
+});
+
+// --- What a repaired run did reaches the project — all of it, or it is said ---
+
+const BOOM = 'throw new Error("boom");';
+const fixThat = (does) => async () => `import { ctx } from "@trama-dev/runtime";\nimport * as fs from "fs";\n${does}\nawait ctx.done();\n`;
+
+test("what a repaired run did to directories, links and permissions reaches the project like what it did to files", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: BOOM });
+  writeText(join(projectDir, "becomes-a-link.txt"), "PRECIOUS");
+  writeText(join(projectDir, "becomes-a-dir.txt"), "PRECIOUS");
+  writeText(join(projectDir, "target.txt"), "T");
+  writeText(join(projectDir, "config", "settings.json"), "{}");
+  writeText(join(projectDir, "old", "deep", "f.txt"), "f");
+  writeText(join(projectDir, "run.sh"), "#!/bin/sh\n");
+  writeText(join(projectDir, "count.txt"), "1");
+  const originalRepair = llm.repair;
+  llm.repair = fixThat(`
+fs.rmSync("becomes-a-link.txt"); fs.symlinkSync("target.txt", "becomes-a-link.txt");
+fs.rmSync("becomes-a-dir.txt"); fs.mkdirSync("becomes-a-dir.txt");
+fs.rmSync("config", { recursive: true }); fs.writeFileSync("config", "v2");
+fs.mkdirSync("cache");
+fs.rmSync("old", { recursive: true });
+fs.chmodSync("run.sh", 0o755);
+fs.symlinkSync(process.cwd() + "/target.txt", "latest");
+fs.mkdirSync("sealed"); fs.writeFileSync("sealed/inside.txt", "in"); fs.chmodSync("sealed", 0o555);
+const { atime, mtime } = fs.statSync("count.txt"); fs.writeFileSync("count.txt", "2"); fs.utimesSync("count.txt", atime, mtime);
+`);
+  t.after(() => { llm.repair = originalRepair; chmodSync(join(projectDir, "sealed"), 0o755); cleanupTempDir(projectDir); });
+
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  assert.deepEqual(messages.filter(line => line.includes("did not reach the project")), []);
+  const at = (name) => join(projectDir, name);
+  assert.equal(lstatSync(at("becomes-a-link.txt")).isSymbolicLink(), true);
+  assert.equal(readFileSync(at("becomes-a-link.txt"), "utf-8"), "T");
+  assert.deepEqual(readdirSync(at("becomes-a-dir.txt")), []);
+  assert.equal(readFileSync(at("config"), "utf-8"), "v2");
+  assert.deepEqual(readdirSync(at("cache")), []);
+  assert.equal(existsSync(at("old")), false);
+  assert.equal(statSync(at("run.sh")).mode & 0o777, 0o755);
+  // A link the run made by its working directory's full path names the project, not the copy that is gone.
+  assert.equal(realpathSync(at("latest")), join(realpathSync(projectDir), "target.txt"));
+  assert.equal(statSync(at("sealed")).mode & 0o777, 0o555);
+  assert.equal(readFileSync(at("sealed/inside.txt"), "utf-8"), "in");
+  assert.equal(readFileSync(at("count.txt"), "utf-8"), "2", "a change that kept the file's size and times");
+});
+
+test("a repaired run that leaves a directory it cannot be read from costs the project nothing: none of it is merged, and that is said", { skip: process.getuid?.() === 0 }, async (t) => {
+  // 0o400: the names in it can be listed, and none of them looked at.
+  for (const mode of ["0o400", "0o300"]) {
+    const projectDir = makeTempDir("trama-runner-");
+    createProjectFixture(projectDir, { scaffold: false, programSource: BOOM });
+    writeText(join(projectDir, "sub", "a.txt"), "A");
+    writeText(join(projectDir, "sub", "b.txt"), "B");
+    const originalRepair = llm.repair;
+    llm.repair = fixThat(`fs.chmodSync("sub", ${mode});`);
+    t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+    const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+    assert.equal(result.status, "done");
+    assert.deepEqual(readdirSync(join(projectDir, "sub")).sort(), ["a.txt", "b.txt"], mode);
+    assert.ok(messages.some(line => /could not be read .*none of it was merged/.test(line)), messages.join("\n"));
+    assert.deepEqual(leftovers(projectDir), []);
+  }
+});
+
+test("no link in a project lets a fix that fails write to the project from its copy", async (t) => {
+  // The temp directory is beside the project, so that "../<the project's name>" is the project from a copy too.
+  const parent = realpathSync(makeTempDir("trama-runner-"));
+  const projectDir = join(parent, "my-proj");
+  createProjectFixture(projectDir, { scaffold: false, programSource: BOOM });
+  writeText(join(projectDir, "data", "x.txt"), "X");
+  symlinkSync("../my-proj/data", join(projectDir, "out-and-back"));
+  symlinkSync(join(projectDir, "data"), join(projectDir, "by-full-path"));
+  symlinkSync(join(projectDir, "not-yet") + "/", join(projectDir, "to-come")); // cannot be followed until not-yet is made
+  const originalRepair = llm.repair;
+  llm.repair = async () => `import * as fs from "fs";
+for (const link of ["out-and-back", "by-full-path"]) fs.writeFileSync(link + "/leak.txt", "LEAK");
+for (const how of [() => fs.mkdirSync("to-come/"), () => fs.mkdirSync("to-come/", { recursive: true }), () => fs.writeFileSync("to-come/leak.txt", "LEAK")]) { try { how(); } catch {} }
+throw new Error("still broken");
+`;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(parent); });
+
+  const result = await withEnv({ TMPDIR: parent }, () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /still broken/, "the fix got as far as its own failure: the links led somewhere in its copy");
+  assert.deepEqual(readdirSync(join(projectDir, "data")), ["x.txt"]);
+  assert.equal(existsSync(join(projectDir, "not-yet")), false);
+});
+
+test("a program that reads through a link out of its project and back in is the same program in a copy", async (t) => {
+  const parent = realpathSync(makeTempDir("trama-runner-"));
+  const projectDir = join(parent, "my-proj");
+  const viaLink = `import { ctx, tools } from "@trama-dev/runtime";\nawait ctx.done({ read: await tools.read("out-and-back/x.txt") });\n`;
+  createProjectFixture(projectDir, { scaffold: false, programSource: viaLink });
+  writeText(join(projectDir, "data", "x.txt"), "X");
+  symlinkSync("../my-proj/data", join(projectDir, "out-and-back"));
+  t.after(() => cleanupTempDir(parent));
+
+  const direct = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.deepEqual(direct.result, { read: "X" });
+  // The copy is somewhere else, where "../my-proj" is nothing.
+  const validated = await validateProgram(projectDir, createBackend(loadConfig()), viaLink, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 });
+  assert.equal(validated.source, viaLink);
+});
+
+test("a project with a directory that cannot be looked into is not copied without it: the copy is refused", { skip: process.getuid?.() === 0 }, async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: BOOM });
+  mkdirSync(join(projectDir, "locked", "inner"), { recursive: true });
+  chmodSync(join(projectDir, "locked"), 0o444);
+  t.after(() => { chmodSync(join(projectDir, "locked"), 0o755); cleanupTempDir(projectDir); });
+  const lists = `import { ctx } from "@trama-dev/runtime";\nimport * as fs from "fs";\nawait ctx.done({ held: fs.readdirSync("locked") });\n`;
+
+  // Before any journal has been written for the project, and after: the answer is the same.
+  for (let again = 0; again < 2; again++) {
+    await assert.rejects(
+      validateProgram(projectDir, createBackend(loadConfig()), lists, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5, journalRuns: again }),
+      { code: "EACCES" });
+  }
 });

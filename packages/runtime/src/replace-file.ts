@@ -14,6 +14,9 @@ import { guardPath, realRootOf } from "./path-guard.js";
 /** Whether a file name is that of a temp file made here — not content, though it sits among it for a moment. */
 export const isStagedName = (name: string) => /\.trama-tmp-[0-9a-f]{12}$/.test(name);
 
+/** A name beside a destination for what is to take its place. */
+export const stagedNameFor = (destination: string) => `${destination}.trama-tmp-${randomBytes(6).toString("hex")}`;
+
 export interface StagedFile {
   /** Where the content will be: the path given, with every link on the way followed. */
   destination: string;
@@ -44,7 +47,7 @@ export function stageFile(rootDir: string, relativePath: string, content: string
   }
   mkdirSync(dirname(destination), { recursive: true });
 
-  const staged = `${destination}.trama-tmp-${randomBytes(6).toString("hex")}`;
+  const staged = stagedNameFor(destination);
   const discard = () => { try { rmSync(staged, { force: true }); } catch { /* best-effort */ } };
 
   const fd = openSync(staged, "wx");
