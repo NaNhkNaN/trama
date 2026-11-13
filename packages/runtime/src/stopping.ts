@@ -24,7 +24,7 @@
 // that hosts a runner keeps its own way of handling both.
 
 import { spawn, type ChildProcess } from "child_process";
-import { rmSync } from "fs";
+import * as fs from "fs";
 
 /** How long a process group gets to exit after SIGTERM before it is sent SIGKILL. */
 const KILL_GRACE_MS = 5000;
@@ -46,12 +46,39 @@ export function signalGroup(pgid: number, signal: NodeJS.Signals | 0): boolean {
   }
 }
 
+// --- Removing what was made ---
+
+/**
+ * Remove a directory tree, whatever has been done to it since it was made. A
+ * tree with a directory in it that may not be written to — a copy of a project
+ * that has one, or one a program made so — cannot be emptied as it stands; so
+ * where removing it fails, its directories are opened first.
+ *
+ * It runs in two processes, here and in the watchdog, which is handed its
+ * text: it may use nothing but its arguments.
+ */
+function removeTree(fs: Pick<typeof import("fs"), "rmSync" | "readdirSync" | "chmodSync">, dir: string): void {
+  const remove = () => fs.rmSync(dir, { recursive: true, force: true });
+  try { return remove(); } catch { /* opened below, and tried once more */ }
+  const open = (at: string) => {
+    try {
+      fs.chmodSync(at, 0o700);
+      for (const entry of fs.readdirSync(at, { withFileTypes: true })) {
+        if (entry.isDirectory()) open(at + "/" + entry.name); // not a link to one: only this tree is touched
+      }
+    } catch { /* what cannot be opened stays as it is */ }
+  };
+  open(dir);
+  try { remove(); } catch { /* left for the OS to reap */ }
+}
+
 // --- The watchdog ---
 
 // Run by the watchdog process: the same policy as stopGroups below. A group
 // the runner had already asked to stop is not asked a second time.
 const WATCHDOG = `
-const { rmSync } = require("fs");
+const fs = require("fs");
+${removeTree}
 const { grace, settle, poll } = JSON.parse(process.argv[1]);
 const lists = { g: new Set(), d: new Set(), asked: new Set() };
 const alive = (pgid) => { try { process.kill(-pgid, 0); return true; } catch { return false; } };
@@ -73,7 +100,7 @@ const takeOver = () => {
   if (leaving) return;
   leaving = true;
   const finish = () => {
-    for (const dir of lists.d) { try { rmSync(dir, { recursive: true, force: true }); } catch {} }
+    for (const dir of lists.d) removeTree(fs, dir);
     process.exit(0);
   };
   let left = [...lists.g].filter(alive);
@@ -190,7 +217,7 @@ export function removeWithThisProcess(dir: string): () => void {
 
 /** Remove a temp directory. Best-effort: failing to clean up must never change a run's outcome. */
 export function removeTempDir(dir: string): void {
-  try { rmSync(dir, { recursive: true, force: true }); } catch { /* left for the OS to reap */ }
+  removeTree(fs, dir);
 }
 
 // --- Stopping, while this process is there to see it through ---

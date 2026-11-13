@@ -62,8 +62,13 @@ export function createContext(
     print?: (line: string) => void;
   },
 ): RunContext {
-  const logsPath = guardPath(projectDir, LATEST_LOG_PATH);
-  const statePath = guardPath(projectDir, "state.json");
+  // Where the state and the log go is asked each time one is written, not once: the program
+  // can change what is there while it runs. Asked here too, so that a project that will not
+  // do is refused before its program is started.
+  const logsPath = () => guardPath(projectDir, LATEST_LOG_PATH);
+  const statePath = () => guardPath(projectDir, "state.json");
+  logsPath();
+  statePath();
   const meta = readProjectMeta(projectDir);
 
   // The input is the project's own: it is handed on as the file has it.
@@ -81,7 +86,7 @@ export function createContext(
   let ended: ProgramResult | null = null;
 
   const writeLog = (message: string, data?: unknown) => {
-    appendLogEntry(logsPath, message, data);
+    appendLogEntry(logsPath(), message, data);
     (options?.print ?? console.log)(`[trama] ${message}`);
   };
 
@@ -105,7 +110,7 @@ export function createContext(
     const record: Record<string, unknown> = { ...state, __trama_iteration: iteration + 1 };
     if (ending?.status === "yielded") record.__trama_yield = { reason: ending.reason };
     else delete record.__trama_yield; // the program has moved on from its last yield
-    writeFileSync(statePath, JSON.stringify(record, null, 2));
+    writeFileSync(statePath(), JSON.stringify(record, null, 2));
     // Settled only once persisted: a call that failed leaves every call open.
     iteration += 1;
     ended = ending ?? null;

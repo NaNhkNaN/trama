@@ -37,14 +37,17 @@ export function journalDirOf(projectDir: string): string {
 
 /** The ids of the runs that have a journal in `dir`, oldest first. (A run's id starts with when it started.) */
 export function runsIn(dir: string): string[] {
-  let names: string[];
+  let entries;
   try {
-    names = readdirSync(dir);
+    entries = readdirSync(dir, { withFileTypes: true });
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return []; // no run has been recorded
     throw err;
   }
-  return names.filter(name => name.endsWith(".jsonl")).sort().map(name => name.slice(0, -".jsonl".length));
+  // A journal is a file. Anything else that bears a journal's name — a directory, a link, a pipe,
+  // which would hold up whoever opened it — is not one, and is neither read nor removed in its turn.
+  return entries.filter(entry => entry.isFile() && entry.name.endsWith(".jsonl"))
+    .map(entry => entry.name.slice(0, -".jsonl".length)).sort();
 }
 
 /** The journal of a run, in a journal directory. */

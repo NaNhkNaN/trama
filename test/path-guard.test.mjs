@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync, mkdirSync } from "fs";
 import { dirname, join, sep } from "path";
+import { execFileSync } from "child_process";
 import { guardPath } from "../packages/runtime/dist/path-guard.js";
 import { createTools } from "../packages/runtime/dist/tools.js";
 import { createWorkspace } from "../packages/runtime/dist/workspace.js";
@@ -268,6 +269,9 @@ test("a root that does not exist yet is guarded like one that does", (t) => {
   const root = join(parent, "not", "made", "yet");
 
   assert.equal(guardPath(root, "file.txt"), join(realpathSync(parent), "not", "made", "yet", "file.txt"));
+  // A path with no steps leads to the root, there or not: nothing is said of it that was not written.
+  assert.equal(guardPath(root, ""), join(realpathSync(parent), "not", "made", "yet"));
+  assert.throws(() => guardPath(root, "."), /leads on from what does not exist/);
   // Up from a directory that is not there leads nowhere; a place of its own outside is outside.
   assert.throws(() => guardPath(root, "../../../../etc/passwd"), /leads on from what does not exist/);
   assert.throws(() => guardPath(root, "/etc/passwd"), /Path escapes project directory/);
@@ -523,6 +527,8 @@ test("a path the system will not take is refused before anything is made on the 
 
 test("the top of the filesystem can be a root, and everything is inside it", () => {
   assert.equal(guardPath("/", "etc/hosts"), realpathSync("/etc/hosts"));
+  // Even there, what a path leads to is a file or a directory: not a device.
+  assert.throws(() => guardPath("/", "dev/null"), /Not a file or a directory/);
   assert.equal(guardPath("/", ""), "/");
 });
 
@@ -598,4 +604,29 @@ test("a link that names the root in other letters is still inside, where the fil
   // And what is outside is outside, however it is spelled.
   symlinkSync(dirname(root).toUpperCase(), join(root, "out"));
   assert.throws(() => guardPath(root, "out/anything"), /Path escapes project directory via symlink/);
+});
+
+test("what a path leads to is a file, a directory, or nothing yet — a pipe is refused, not waited on", async (t) => {
+  const root = realpathSync(makeTempDir("trama-guard-"));
+  t.after(() => cleanupTempDir(root));
+  for (const name of ["pipe", "state.json"]) execFileSync("mkfifo", [join(root, name)]);
+  symlinkSync("pipe", join(root, "to-pipe"));
+
+  // Asked first, and of the guard alone: opening a pipe nobody is at the other end of never returns,
+  // and what waits is the one process that serves every program of a session.
+  for (const path of ["pipe", "to-pipe"]) assert.throws(() => guardPath(root, path), /Not a file or a directory/);
+
+  const tools = createTools(root);
+  const workspace = createWorkspace(root);
+  for (const path of ["pipe", "to-pipe"]) {
+    await assert.rejects(tools.read(path), /Not a file or a directory/);
+    await assert.rejects(tools.write(path, "x"), /Not a file or a directory/);
+    await assert.rejects(workspace.read(path), /Not a file or a directory/);
+    await assert.rejects(workspace.write(path, "x"), /Not a file or a directory/);
+    await assert.rejects(workspace.observe(path, { timeout: 200 }), /Not a file or a directory/);
+  }
+  // Nor is it listed as an artifact, by its own name or a link's.
+  assert.deepEqual(await workspace.list("**"), []);
+  // The runtime's own files are held to the same.
+  assert.throws(() => loadState(root), /Not a file or a directory: state\.json/);
 });

@@ -662,7 +662,7 @@ await tools.fetch(url, { method?, headers?, body? })
                                           // -> { status, body, headers }
 ```
 
-`read` and `write` are path-guarded to the project directory (traversal and symlink escape attempts throw — every link on the way to a path is followed, whether or not what it points at exists yet). A path is read the way the system reads it, so it names the same file as it would in the program's own `fs` calls: `dir/../file` goes up from where `dir` leads, and a path the system would not follow (`file.txt/`, `missing/..`) is refused. `shell` defaults to a 30-second timeout; pass `{ timeout: 60000 }` for longer commands. A command is given no input: one that reads standard input finds it at an end. `fetch` returns the response body as a string (capped at 10MB).
+`read` and `write` are path-guarded to the project directory (traversal and symlink escape attempts throw — every link on the way to a path is followed, whether or not what it points at exists yet). A path is read the way the system reads it, so it names the same file as it would in the program's own `fs` calls: `dir/../file` goes up from where `dir` leads, and a path the system would not follow (`file.txt/`, `missing/..`) is refused. So is a path that leads to something other than a file or a directory — a named pipe, a socket, a device. `shell` defaults to a 30-second timeout; pass `{ timeout: 60000 }` for longer commands. A command is given no input: one that reads standard input finds it at an end. `fetch` returns the response body as a string (capped at 10MB).
 
 Long-running programs should call `ctx.ready()` once startup completes so `create`/`update` smoke validation can treat "server is up" as success instead of waiting for process exit.
 

@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
 import { join } from "path";
+import { tmpdir } from "os";
+import { execFileSync } from "child_process";
+import { createServer } from "net";
 import { llm } from "./fake-llm.mjs";
 import {
   copyToHistory, createBackend, ensureProjectScaffold, installValidatedProgram, loadConfig, loadState, runProgram, RUNTIME_TYPES,
@@ -1907,4 +1910,217 @@ await ctx.done();`;
     timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10,
   });
   assert.equal(validated.source, candidate);
+});
+
+// --- What a copy of a project is ---
+
+/** The copies of projects there are in the temp directory right now. */
+const copiesInTemp = () => readdirSync(tmpdir()).filter(name => /^trama-(repair|staged|validate)-/.test(name));
+
+test("a pipe or a socket left in a project is no part of its copies: the program is repaired and validated all the same", async (t) => {
+  const { projectDir, fixed } = repairableProject(t);
+  execFileSync("mkfifo", [join(projectDir, "events.pipe")]);
+  // A socket's path may be no longer than the system allows; a temp directory's can be.
+  const server = createServer();
+  const listening = await new Promise(resolve => {
+    server.once("error", () => resolve(false));
+    server.listen(join(projectDir, "app.sock"), () => resolve(true));
+  });
+  t.after(() => new Promise(resolve => listening ? server.close(resolve) : resolve()));
+  if (!listening) t.diagnostic("no socket could be made here (the path is too long for one): only the pipe is tested");
+
+  const validated = await validateProgram(projectDir, createBackend(loadConfig()), fixed, {
+    timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10,
+  });
+  assert.equal(validated.source, fixed); // as given: a candidate is not a model's reply, and is not trimmed
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.equal(result.status, "done");
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixed.trim());
+  assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "written by the fix");
+  // Neither was touched, and neither was taken for something the run removed.
+  assert.equal(lstatSync(join(projectDir, "events.pipe")).isFIFO(), true);
+  if (listening) assert.equal(lstatSync(join(projectDir, "app.sock")).isSocket(), true);
+});
+
+test("a copy of a project is as the project is: links as written, files and directories with what they allow, no journals", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
+  writeText(join(projectDir, ".hidden"), "a dotfile");
+  writeText(join(projectDir, "bin", "tool.sh"), "#!/bin/sh");
+  chmodSync(join(projectDir, "bin", "tool.sh"), 0o750);
+  mkdirSync(join(projectDir, "empty", "inside"), { recursive: true });
+  mkdirSync(join(projectDir, "private"));
+  chmodSync(join(projectDir, "private"), 0o700);
+  symlinkSync("bin/tool.sh", join(projectDir, "to-file"));
+  symlinkSync("bin", join(projectDir, "to-dir"));
+  symlinkSync("../nowhere/at-all", join(projectDir, "dangling"));
+  symlinkSync("/etc/hosts", join(projectDir, "absolute"));
+  // The fix reports what it finds where it runs, which is the copy. What it writes is merged back.
+  const fixed = `import { ctx } from "@trama-dev/runtime";
+import { lstatSync, readlinkSync, existsSync, readdirSync, writeFileSync } from "fs";
+const mode = (path) => (lstatSync(path).mode & 0o777).toString(8);
+writeFileSync("found.json", JSON.stringify({
+  hidden: existsSync(".hidden"),
+  toolMode: mode("bin/tool.sh"),
+  privateMode: mode("private"),
+  empty: readdirSync("empty"),
+  emptyInside: readdirSync("empty/inside"),
+  links: ["to-file", "to-dir", "dangling", "absolute"].map(name => lstatSync(name).isSymbolicLink() && readlinkSync(name)),
+  logs: readdirSync("logs"),
+}));
+await ctx.done();
+`;
+  const originalRepair = llm.repair;
+  llm.repair = async () => fixed;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.equal(result.status, "done");
+  // The run has a journal by now, so the project has logs/journal — and the copy did not.
+  assert.equal(existsSync(join(projectDir, "logs", "journal")), true);
+  assert.deepEqual(readJson(join(projectDir, "found.json")), {
+    hidden: true,
+    toolMode: "750",
+    privateMode: "700",
+    empty: ["inside"],
+    emptyInside: [],
+    links: ["bin/tool.sh", "bin", "../nowhere/at-all", "/etc/hosts"],
+    logs: ["latest.jsonl"],
+  });
+});
+
+test("a fix cannot do in a copy what it could not do in the project: writing where the project forbids it fails the fix", { skip: process.getuid?.() === 0 }, async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
+  writeText(join(projectDir, "out", "deep", "sample.txt"), "kept");
+  chmodSync(join(projectDir, "out", "deep"), 0o555);
+  chmodSync(join(projectDir, "out"), 0o555);
+  const originalRepair = llm.repair;
+  llm.repair = async () => `import { ctx, tools } from "@trama-dev/runtime";
+await tools.write("out/result.txt", "a result");
+await ctx.done({ wrote: "out/result.txt" });
+`;
+  const before = new Set(copiesInTemp());
+  t.after(() => {
+    llm.repair = originalRepair;
+    chmodSync(join(projectDir, "out"), 0o755);
+    chmodSync(join(projectDir, "out", "deep"), 0o755);
+    cleanupTempDir(projectDir);
+  });
+
+  // Were the copy more open than the project, the fix would be done there, installed — and its
+  // result dropped where the merge could not write it.
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /EACCES/);
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), 'throw new Error("boom");');
+  // The copies held directories that may not be written to, and are gone all the same.
+  assert.deepEqual(copiesInTemp().filter(name => !before.has(name)), []);
+});
+
+test("a copy a run has closed against writing is removed all the same", { skip: process.getuid?.() === 0 }, async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: 'throw new Error("boom");' });
+  const originalRepair = llm.repair;
+  llm.repair = async () => `import { ctx } from "@trama-dev/runtime";
+import { chmodSync, mkdirSync, writeFileSync } from "fs";
+mkdirSync("sealed/deeper", { recursive: true });
+writeFileSync("sealed/deeper/file.txt", "sealed in");
+chmodSync("sealed/deeper", 0o500);
+chmodSync("sealed", 0o500);
+await ctx.done();
+`;
+  const before = new Set(copiesInTemp());
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.equal(result.status, "done");
+  assert.equal(readFileSync(join(projectDir, "sealed", "deeper", "file.txt"), "utf-8"), "sealed in");
+  assert.deepEqual(copiesInTemp().filter(name => !before.has(name)), []);
+});
+
+test("a temp directory inside the project is no place for a copy of it: no fix is asked for, and nothing is copied into itself", async (t) => {
+  const { projectDir } = repairableProject(t);
+  mkdirSync(join(projectDir, "tmp"));
+  let asked = 0;
+  const fix = llm.repair;
+  llm.repair = async (...args) => { asked += 1; return fix(...args); };
+
+  const result = await withEnv({ TMPDIR: join(projectDir, "tmp") }, () => runProgram({ projectDir, maxRepairAttempts: 2, timeout: 20_000 }));
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /boom[\s\S]*No fix came back: A copy of .* cannot be made inside it/);
+  assert.equal(asked, 0);
+  // (The loader that runs program.ts keeps a cache of its own there.)
+  assert.deepEqual(readdirSync(join(projectDir, "tmp")).filter(name => name.startsWith("trama-")), []);
+});
+
+test("a project that cannot be copied is not repaired: the run fails with the reason, and no fix is asked for", { skip: process.getuid?.() === 0 }, async (t) => {
+  const { projectDir } = repairableProject(t);
+  writeText(join(projectDir, "secret.txt"), "nobody may read this");
+  chmodSync(join(projectDir, "secret.txt"), 0o000);
+  let asked = 0;
+  const fix = llm.repair;
+  llm.repair = async (...args) => { asked += 1; return fix(...args); };
+  const before = new Set(copiesInTemp());
+
+  // The agent that writes a fix works in a copy. Where none can be made, that is why no fix came back —
+  // a result of the run, not an exception from it.
+  const result = await runProgram({ projectDir, maxRepairAttempts: 2, timeout: 20_000 });
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /boom[\s\S]*No fix came back: EACCES/);
+  assert.equal(asked, 0);
+  assert.deepEqual(copiesInTemp().filter(name => !before.has(name)), []);
+});
+
+test("a program that is a link into a directory still to be made needs somewhere that directory can be made", { skip: process.getuid?.() === 0 }, (t) => {
+  const projectDir = makeTempDir("trama-install-");
+  t.after(() => { chmodSync(projectDir, 0o755); cleanupTempDir(projectDir); });
+  createProjectFixture(projectDir, { programSource: "OLD" });
+  rmSync(join(projectDir, "program.ts"));
+  symlinkSync(join("src", "main.ts"), join(projectDir, "program.ts"));
+  chmodSync(projectDir, 0o555);
+
+  // Asked of the nearest directory that is there: it is where the first new thing would be made.
+  assert.throws(() => installValidatedProgram(projectDir, { source: "NEW" }, "update", "p"),
+    { code: "EACCES", message: /The program cannot be replaced: nothing can be created in / });
+  assert.deepEqual(historyOf(projectDir), { files: [], reasons: [] });
+
+  chmodSync(projectDir, 0o755);
+  installValidatedProgram(projectDir, { source: "NEW" }, "update", "p");
+  assert.equal(readFileSync(join(projectDir, "src", "main.ts"), "utf-8"), "NEW");
+});
+
+// --- A pipe where the runtime writes ---
+
+test("a program that puts a pipe where its state or its log goes is told so, and its runner is not held up", { skip: process.getuid?.() === 0 }, async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => { cleanupTempDir(fakeHome); cleanupTempDir(projectDir); });
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx } from "@trama-dev/runtime";
+import { execFileSync } from "child_process";
+import { rmSync, writeFileSync } from "fs";
+const said = (call) => call().then(() => "carried out", err => err.message);
+const pipeAt = (path) => { rmSync(path, { force: true }); execFileSync("mkfifo", [path]); };
+pipeAt("state.json");
+const checkpoint = await said(() => ctx.checkpoint());
+rmSync("state.json");
+pipeAt("logs/latest.jsonl");
+const log = await said(() => ctx.log("into the pipe"));
+rmSync("logs/latest.jsonl");
+writeFileSync("verdict.json", JSON.stringify({ checkpoint, log }));
+await ctx.done();`,
+  });
+
+  // In a process of its own: writing to a pipe nobody reads never returns, and takes with it
+  // the timeout that would have ended the run.
+  const { child, exited } = startRunnerProcess(fakeHome, projectDir);
+  const ended = await Promise.race([exited, new Promise(resolve => setTimeout(() => resolve(null), 20_000).unref())]);
+  if (ended === null) child.kill("SIGKILL");
+  assert.notEqual(ended, null, "the runner was held up");
+  const verdict = readJson(join(projectDir, "verdict.json"));
+  assert.match(verdict.checkpoint, /Not a file or a directory: state\.json/);
+  assert.match(verdict.log, /Not a file or a directory: logs\/latest\.jsonl/);
 });

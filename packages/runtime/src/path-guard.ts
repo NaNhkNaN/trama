@@ -47,9 +47,23 @@ function readLink(link: string): string {
   return text;
 }
 
+/** How far a walk has got: where it is, how many links it has followed, and whether anything is there. */
+interface Place {
+  /** Always free of links. */
+  at: string;
+  links: number;
+  /** Nothing is there from here on — so nothing is a link either. */
+  missing: boolean;
+}
+
+/** The top of the file system an absolute path starts from: where every walk begins. */
+const topOf = (path: string): Place => ({ at: parse(path).root, links: 0, missing: false });
+
 /**
- * Where an absolute path leads once every symlink on the way is followed. The
- * path is taken as it is written, and may say "..", "." or end in a slash.
+ * Where a path leads once every symlink on the way is followed. The path is
+ * taken as it is written, and may say "..", "." or end in a slash. One that
+ * starts at the top of the file system is walked from there; any other, on
+ * from `from` — so a path with no steps at all leads to where it started.
  *
  * Like realpath, but through what does not exist yet: a link whose
  * destination is missing is still followed to where it points — and from
@@ -57,11 +71,10 @@ function readLink(link: string): string {
  * taken as it is named. This is where a write to the path lands, and where a
  * mkdir on the way to it creates directories.
  */
-function destinationOf(path: string): string {
-  let at = parse(path).root;     // always free of links
-  let steps = stepsOf(path.slice(at.length));
-  let links = 0;
-  let missing = false;           // nothing is there from here on, so nothing is a link either
+function follow(path: string, from: Place): Place {
+  const fromTop = isAbsolute(path);
+  let { at, links, missing } = fromTop ? topOf(path) : from;
+  let steps = stepsOf(fromTop ? path.slice(at.length) : path);
   while (steps.length > 0) {
     const step = steps.shift()!;
     if (step === "." || step === ".." || step === A_DIRECTORY) {
@@ -106,7 +119,7 @@ function destinationOf(path: string): string {
     if (isAbsolute(target)) at = parse(target).root;
     steps = [...stepsOf(target), ...steps];
   }
-  return at;
+  return { at, links, missing };
 }
 
 /**
@@ -115,7 +128,8 @@ function destinationOf(path: string): string {
  * program, and is read as the rest of Node reads a directory it is given.
  */
 export function realRootOf(rootDir: string): string {
-  return destinationOf(resolve(rootDir));
+  const root = resolve(rootDir);
+  return follow(root, topOf(root)).at;
 }
 
 /** Whether one normalized path is another or lies under it — as text, which is all this can say. */
@@ -151,8 +165,8 @@ function underRoot(destination: string, realRoot: string): string | undefined {
 /**
  * The guard for reading or writing a path under a bounded root: where the
  * path leads, every link on the way followed — refused unless that is inside
- * the root. What comes back has no link left in it, so using it goes where
- * this looked.
+ * the root, and a file, a directory, or nothing yet. What comes back has no
+ * link left in it, so using it goes where this looked.
  *
  * A path that does not exist yet is followed as far as it does, so a caller
  * can safely mkdir and write afterwards: a write lands on what a link points
@@ -160,9 +174,12 @@ function underRoot(destination: string, realRoot: string): string | undefined {
  */
 export function guardPath(rootDir: string, path: string): string {
   const root = resolve(rootDir);
-  // As it is given: under the root, unless it names a place of its own.
+  // The root is walked first, and the path on from where that arrives: the
+  // way the system reads the two written one after the other.
+  const realRoot = follow(root, topOf(root));
+  const destination = underRoot(follow(path, realRoot).at, realRoot.at);
+  // The same, as the system is asked about it below.
   const given = isAbsolute(path) ? path : root + sep + path;
-  const destination = underRoot(destinationOf(given), destinationOf(root));
   if (destination === undefined) {
     // Said for whoever reads the refusal: if the text alone stays inside, it is the links that lead out.
     throw new Error(`Path escapes project directory${within(resolve(given), root) ? " via symlink" : ""}: ${path}`);
@@ -183,6 +200,12 @@ export function guardPath(rootDir: string, path: string): string {
   const there = lstatSync(destination, { bigint: true, throwIfNoEntry: false });
   if (found ? !sameFile(there, found) : there !== undefined) {
     throw new Error(`Path cannot be followed: ${path} (the system does not take it where its links say)`);
+  }
+  // What is there is content, or a place for it. A pipe, a socket or a device
+  // is the end of something else: reading one, or writing to one, can wait
+  // for ever on whoever is at the other end — and with it this whole process.
+  if (there && !there.isFile() && !there.isDirectory()) {
+    throw new Error(`Not a file or a directory: ${path}`);
   }
   return destination;
 }

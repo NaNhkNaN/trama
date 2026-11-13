@@ -965,3 +965,26 @@ test("updateProject refuses a program that is read-only before a new one is aske
   assert.equal(asked, 0);
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), DEFAULT_PROGRAM);
 });
+
+test("updateProject says a project nothing can be created in cannot be updated, before it prepares anything in it", { skip: process.getuid?.() === 0 }, async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const projectDir = join(fakeHome, ".trama", "projects", "sealed");
+  t.after(() => { chmodSync(projectDir, 0o755); cleanupTempDir(fakeHome); });
+  // Hand-written and never run: it has no history/ or logs/ yet.
+  createProjectFixture(projectDir, { scaffold: false, programSource: DEFAULT_PROGRAM });
+  chmodSync(projectDir, 0o555);
+
+  let asked = 0;
+  const originalAsk = llm.ask;
+  llm.ask = async () => { asked += 1; return UPDATED_PROGRAM; };
+  t.after(() => { llm.ask = originalAsk; });
+
+  await withEnv({ HOME: fakeHome }, async () => {
+    await assert.rejects(
+      updateProject("sealed", "change it"),
+      /the program is unchanged\.\nThe program cannot be replaced: nothing can be created in /,
+    );
+  });
+  assert.equal(asked, 0);
+  assert.equal(existsSync(join(projectDir, "history")), false);
+});

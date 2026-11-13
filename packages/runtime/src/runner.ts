@@ -3,10 +3,10 @@ import {
   readFileSync, writeFileSync, appendFileSync,
   readdirSync, copyFileSync, mkdirSync, existsSync, statSync,
   symlinkSync, rmSync, lstatSync, readlinkSync,
-  cpSync, mkdtempSync, openSync, closeSync,
+  mkdtempSync, openSync, closeSync, chmodSync,
   accessSync, constants, truncateSync,
 } from "fs";
-import { join, dirname, relative } from "path";
+import { join, dirname, sep } from "path";
 import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { createHash, randomBytes } from "crypto";
@@ -432,25 +432,56 @@ export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promis
 }
 
 /**
- * Make `copyDir` a copy of a project to try a program in: everything the
- * project holds, links kept as they are written, with `program` as its
- * program.ts.
+ * Make `copyDir` a copy of a project to try a program in: what the project
+ * holds, with `program` as its program.ts.
  *
- * The project's journals stay behind: they are the record of its runs, not
- * part of what a run works on, and a copy is where a run is tried.
+ * What a project holds is its files, its directories with what they allow,
+ * and its links, kept as they are written. A socket or a pipe that a process
+ * left in it is not content — it is one end of something that is, or was,
+ * running — and is not carried over. Nor are the project's journals: they are
+ * the record of its runs, not part of what a run works on, and a copy is
+ * where a run is tried.
  *
- * The program file is the copy's own, made afresh. Whether the project's may
- * be written to is said of the project — it is asked where a program is to
- * take its place there (see whyNotReplaceable) — and says nothing of a copy.
+ * In everything else the copy is as the project is, so that what a program
+ * can do in the one it can do in the other: what a run did in a copy is
+ * merged back into the project, and must not have been possible only there.
+ * The one exception is the program file, made afresh: whether the project's
+ * may be written to is said of the project — it is asked where a program is
+ * to take its place there (see whyNotReplaceable).
  */
 function copyProjectWith(projectDir: string, copyDir: string, program: string): void {
-  // Where the directory really is: a project directory may itself be a symlink.
-  const source = realRootOf(projectDir);
-  cpSync(source, copyDir, {
-    recursive: true,
-    verbatimSymlinks: true,
-    filter: path => relative(source, path) !== JOURNAL_DIR,
-  });
+  // Where the directories really are: either may be reached through a symlink.
+  const project = realRootOf(projectDir);
+  const into = realRootOf(copyDir);
+  if (into === project || into.startsWith(project + sep)) {
+    throw new Error(`A copy of ${project} cannot be made inside it, at ${into}. (Is the temp directory in the project?)`);
+  }
+  const journals = join(project, JOURNAL_DIR);
+  const copy = (from: string, to: string) => {
+    for (const entry of readdirSync(from, { withFileTypes: true })) {
+      const source = join(from, entry.name);
+      const copied = join(to, entry.name);
+      try {
+        if (entry.isDirectory()) {
+          if (source === journals) continue;
+          const { mode } = lstatSync(source);
+          mkdirSync(copied, { recursive: true });
+          copy(source, copied);
+          // Last: a directory that may not be written to has to be filled first.
+          chmodSync(copied, mode & 0o7777);
+        } else if (entry.isFile()) {
+          copyFileSync(source, copied);
+        } else if (entry.isSymbolicLink()) {
+          symlinkSync(readlinkSync(source), copied);
+        }
+      } catch (err) {
+        // A project may be in use while it is copied. What is gone by the time it is come to is not in the copy.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT" && !lstatSync(source, { throwIfNoEntry: false })) continue;
+        throw err;
+      }
+    }
+  };
+  copy(project, copyDir);
   rmSync(guardPath(copyDir, "program.ts"), { force: true });
   stageFile(copyDir, "program.ts", program).commit();
 }
@@ -840,12 +871,12 @@ async function requestRepair(
 ): Promise<{ fixed: string } | { error: string }> {
   options.journal.note("fix-request", { error: input.error });
   return withTempDir("trama-repair-", async (tempDir) => {
-    copyProjectWith(options.projectDir, tempDir, input.programSource);
     const timedOut = new AbortController();
     const limit = createAllowance(options.timeout);
-    limit.start(() => timedOut.abort());
     const signal = options.signal ? AbortSignal.any([timedOut.signal, options.signal]) : timedOut.signal;
     try {
+      copyProjectWith(options.projectDir, tempDir, input.programSource);
+      limit.start(() => timedOut.abort());
       const fixed = stripCodeFences(await options.backend.ask(repairPrompt(input), {
         cwd: tempDir, system: REPAIR_SYSTEM_PROMPT, signal,
       }));
@@ -1032,20 +1063,21 @@ function programIn(projectDir: string): string | null {
  * A program is replaced by a new file taking its place, which the system
  * allows whatever the old file's permissions say. So the old file is asked: a
  * program its owner has made read-only is not replaced. And the new file has
- * to be made beside it.
+ * to be made beside it, in a directory that is there or can be made.
  *
  * This is the rule stageProgram enforces. It is also asked before work whose
  * only use is a new program — an update, a repair — is begun.
  */
 export function whyNotReplaceable(projectDir: string): string | null {
   const place = guardPath(projectDir, "program.ts");
-  const allows = (path: string) => {
-    try { accessSync(path, constants.W_OK); return true; } catch { return false; }
+  const allows = (path: string, what: number) => {
+    try { accessSync(path, what); return true; } catch { return false; }
   };
-  if (existsSync(place) && !allows(place)) return `The program cannot be replaced: ${place} is read-only.`;
-  if (existsSync(dirname(place)) && !allows(dirname(place))) {
-    return `The program cannot be replaced: nothing can be created in ${dirname(place)}.`;
-  }
+  if (existsSync(place) && !allows(place, constants.W_OK)) return `The program cannot be replaced: ${place} is read-only.`;
+  // The directory the new file is made in — or, if that is still to be made, the one it is made in.
+  let dir = dirname(place);
+  while (!existsSync(dir)) dir = dirname(dir);
+  if (!allows(dir, constants.W_OK | constants.X_OK)) return `The program cannot be replaced: nothing can be created in ${dir}.`;
   return null;
 }
 

@@ -254,6 +254,12 @@ export async function createProject(
 
 export async function updateProject(name: string, prompt: string): Promise<void> {
   const projectDir = resolveProject(name);
+  const unchanged = (why: unknown) =>
+    new Error(`Update failed — the program is unchanged.\n${why instanceof Error ? why.message : why}`);
+  // Asked before anything else is done, the project's own preparation included: an update's only
+  // use is to replace the program, and where that cannot be done there is nothing to prepare for.
+  const refusal = whyNotReplaceable(projectDir);
+  if (refusal) throw unchanged(refusal);
   // A hand-written project may never have been run: give it history/ and the rest first.
   ensureProjectScaffold(projectDir);
 
@@ -273,10 +279,6 @@ export async function updateProject(name: string, prompt: string): Promise<void>
   // only written to once there is a program that works, so a failed update has
   // nothing to undo.
   try {
-    // Asked before a new program is written, not after: an update's only use is to replace this one.
-    const refusal = whyNotReplaceable(projectDir);
-    if (refusal) throw new Error(refusal);
-
     console.log(`Updating "${name}"...`);
     const candidate = stripCodeFences(await isolatedAsk(backend,
       `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
@@ -287,10 +289,7 @@ export async function updateProject(name: string, prompt: string): Promise<void>
     const validated = await validateProgram(projectDir, backend, candidate, validationOptions(config));
     installValidatedProgram(projectDir, validated, "update", prompt);
   } catch (err) {
-    throw new Error(
-      `Update failed — the program is unchanged.\n` +
-      `${err instanceof Error ? err.message : err}`
-    );
+    throw unchanged(err);
   }
 
   console.log(`Updated ${name}. Run with: trama run ${name}`);

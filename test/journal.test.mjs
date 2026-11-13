@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { createHash } from "crypto";
 import { createServer } from "http";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync } from "fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync } from "fs";
 import { join } from "path";
+import { execFileSync } from "child_process";
+import { runsIn } from "../packages/runtime/dist/journal.js";
 import { llm } from "./fake-llm.mjs";
 import { createBackend, loadConfig, runProgram, validateProgram } from "../packages/runtime/dist/runner.js";
 import {
@@ -621,4 +623,28 @@ test("a journal is kept where the system takes logs/journal, however the links o
   assert.equal(result.status, "done");
   assert.deepEqual(readdirSync(join(parent, "journal")), [], "nothing was recorded beside the project");
   assert.equal(readdirSync(join(projectDir, "journal")).filter(name => name.endsWith(".jsonl")).length, 1);
+});
+
+test("a journal is a file: a pipe, a directory or a link that bears a journal's name is neither read nor removed in its turn", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const projectDir = makeTempDir("trama-journal-");
+  t.after(() => { cleanupTempDir(fakeHome); cleanupTempDir(projectDir); });
+  createProjectFixture(projectDir, { programSource: `import { ctx } from "@trama-dev/runtime";\nawait ctx.done();\n` });
+  const dir = join(projectDir, "logs", "journal");
+  mkdirSync(dir, { recursive: true });
+  // Named so as to be the oldest on record, and so the first to make room.
+  execFileSync("mkfifo", [join(dir, "0000-a-pipe.jsonl")]);
+  mkdirSync(join(dir, "0000-a-directory.jsonl"));
+  symlinkSync("0000-a-pipe.jsonl", join(dir, "0000-a-link.jsonl"));
+
+  // Asked first, of the listing alone: opening the pipe to see who is writing it would never return.
+  assert.deepEqual(runsIn(dir), []);
+
+  await withEnv({ HOME: fakeHome }, async () => {
+    writeJson(join(fakeHome, ".trama", "config.json"), { journalRuns: 1 });
+    for (let i = 0; i < 2; i++) assert.equal((await runProgram({ projectDir, timeout: 20_000 })).status, "done");
+  });
+  assert.equal(runsIn(dir).length, 1, "the runs' own journals are kept and made room for as ever");
+  assert.equal(lstatSync(join(dir, "0000-a-pipe.jsonl")).isFIFO(), true);
+  assert.equal(existsSync(join(dir, "0000-a-directory.jsonl")), true);
 });
