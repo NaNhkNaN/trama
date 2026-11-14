@@ -1,4 +1,4 @@
-import { lstatSync, readlinkSync, statSync, type BigIntStats } from "fs";
+import { lstatSync, mkdirSync, readlinkSync, statSync, type BigIntStats } from "fs";
 import { dirname, isAbsolute, join, parse, resolve, sep } from "path";
 
 /**
@@ -328,6 +328,50 @@ export function linksOf(root: string): {
       return seen.sinceRoot;
     },
   };
+}
+
+/**
+ * The places under a root that make a path lead where it does: every place
+ * the way comes to there — each name it steps to, each link it follows, each
+ * directory it goes through (also one it leaves again with ".."), and the
+ * place it ends at. With any of them another thing, or gone, the path leads
+ * somewhere else, or nowhere. Told as far as the way can be followed, each
+ * as the way names it — which need not be how its directory lists it.
+ */
+export function wayTo(rootDir: string, path: string): string[] {
+  const root = realRootOf(rootDir);
+  const places = new Set<string>();
+  const cameTo = (at: string) => {
+    const own = underRoot(at, root);
+    if (own !== undefined && own !== root) places.add(own);
+  };
+  try {
+    follow(path, { at: root, links: 0, missing: false }, {
+      passing(at) { cameTo(at); return undefined; },
+      link(link) { cameTo(link); return undefined; },
+    });
+  } catch {
+    // The way cannot be followed to its end. How far it came is all that is known of it.
+  }
+  return [...places];
+}
+
+/**
+ * Make a directory under a root, with those on the way to it — in the root,
+ * which must be there: no root is made for the sake of what goes into it.
+ * This is for a root that is something in itself — a project, which
+ * somebody may have moved away since it was named: making the directory
+ * anew at its path would make another, and put into it what was meant for
+ * the first. (A workspace is nothing but its path, and is made as needed,
+ * with the way to it.)
+ * `dir` is a place the guard has passed.
+ */
+export function makeDirsIn(rootDir: string, dir: string): void {
+  const root = realRootOf(rootDir);
+  if (!statSync(root, { throwIfNoEntry: false })?.isDirectory()) {
+    throw Object.assign(new Error(`There is no directory at ${root}.`), { code: "ENOENT" });
+  }
+  mkdirSync(dir, { recursive: true });
 }
 
 /**

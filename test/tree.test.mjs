@@ -8,10 +8,11 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import {
-  appendFileSync, chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync,
+import fs, {
+  appendFileSync, chmodSync, copyFileSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync,
   realpathSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync,
 } from "fs";
+import { syncBuiltinESMExports } from "module";
 import { execFileSync } from "child_process";
 import { tmpdir } from "os";
 import { basename, dirname, join, resolve } from "path";
@@ -52,6 +53,43 @@ function wipe(dir) {
   open(dir);
   rmSync(dir, { recursive: true, force: true });
 }
+
+/**
+ * Do something with the system refusing some of what is asked of it — as it
+ * does where a file is locked, a name does not fit, a disk is full: what a
+ * merge cannot find out beforehand, and is told in the middle of its work.
+ * `refuses(call, place, from)` says what: the call, the place it would change
+ * (of a move or a copy, where the thing would be put), and of a move, where
+ * the thing is.
+ */
+const CHANGES = { mkdirSync: 0, symlinkSync: 1, renameSync: 1, copyFileSync: 1, unlinkSync: 0, rmdirSync: 0, rmSync: 0, chmodSync: 0 };
+function withTheSystemRefusing(refuses, what) {
+  const itsOwn = {};
+  for (const [call, place] of Object.entries(CHANGES)) {
+    itsOwn[call] = fs[call];
+    fs[call] = (...args) => {
+      if (refuses(call, String(args[place]), String(args[0]))) {
+        throw Object.assign(new Error(`EACCES: permission denied, ${call} '${args[place]}'`), { code: "EACCES" });
+      }
+      return itsOwn[call](...args);
+    };
+  }
+  syncBuiltinESMExports();
+  try {
+    return what();
+  } finally {
+    Object.assign(fs, itsOwn);
+    syncBuiltinESMExports();
+  }
+}
+/**
+ * What the system refuses in a directory that may not be written to: making
+ * anything in it, removing anything from it, moving anything into or out of
+ * it. (Not writing into a file that is there, nor changing what one allows.)
+ */
+const nothingMadeOrRemovedIn = (dir) => (call, place, from) =>
+  call !== "chmodSync" && (dirname(place) === dir || (call === "renameSync" && dirname(from) === dir))
+  && !(call === "copyFileSync" && lstatSync(place, { throwIfNoEntry: false }));
 
 function scratch(t, prefix = "trama-tree-") {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
@@ -117,6 +155,10 @@ function random(seed) {
 const NAMES = ["a", "b", "c", "d.txt", "e.txt"];
 const TEXTS = ["", "AAAA", "BBBB", "a longer piece of text\n", "CC"];
 const DIR_MODES = [0o755, 0o755, 0o750, 0o555, 0o500];
+/** What the directory itself may allow, which a tree is made in: mostly all its owner could want. */
+const MODES_OF_THE_DIRECTORY = [0o755, 0o755, 0o755, 0o755, 0o755, 0o700, 0o750, 0o555, 0o555, 0o500];
+/** What a directory allows. */
+const allowedBy = (dir) => lstatSync(dir).mode & 0o7777;
 const FILE_MODES = [0o644, 0o644, 0o600, 0o444, 0o755, 0o400];
 /** What a run may leave a file allowing — and a directory it is copied from may not hold: a file nobody may read cannot be copied. */
 const FILE_MODES_OF_A_RUN = [...FILE_MODES, 0o200, 0o000];
@@ -134,11 +176,12 @@ function somePath(rng, root) {
 
 /**
  * One thing a program might do to its directory, as it stands in `root`.
- * `links` says which kinds of link it may make.
+ * `links` says which kinds of link it may make. With `itself`, what it
+ * changes the permissions of is now and then the directory itself.
  */
-function step(rng, root, links, { fileModes = FILE_MODES, dirModes = DIR_MODES, inACopy = false } = {}) {
+function step(rng, root, links, { fileModes = FILE_MODES, dirModes = DIR_MODES, inACopy = false, itself = false } = {}) {
   let kind = rng.pick(["write", "write", "write", "append", "remove", "mkdir", "mkdir", "rmdir", "chmod", "chmod", "link", "relink", "rename", "rewrite", "respell"]);
-  const p = somePath(rng, root);
+  const p = itself && kind === "chmod" && rng.next() < 0.25 ? "." : somePath(rng, root);
   // The one thing a run in a copy does not do as it would directly: move a link that says "..". Where such a
   // link leaves the directory, the copy has it by full path, and it leads from its new place where it led
   // from the old — not where the same words lead from there. (Tested by itself, further down.)
@@ -218,8 +261,10 @@ function carryOut(root, outside, it) {
   } catch { /* refused: the same in any copy of this directory */ }
 }
 
+/** Whether a path is another or under it. Every path is under the directory itself. */
+const atOrUnder = (path, other) => path === other || other === "." || path.startsWith(`${other}/`);
 /** Whether a path is one that a report covers: the reported path, something under it, or something it is under. */
-const covered = (path, unmerged) => unmerged.some((it) => path === it.path || path.startsWith(`${it.path}/`) || it.path.startsWith(`${path}/`));
+const covered = (path, unmerged) => unmerged.some((it) => atOrUnder(path, it.path) || atOrUnder(it.path, path));
 
 /**
  * A trial: the same tree made twice, each in a directory of its own — one to
@@ -262,6 +307,9 @@ function trial(t, rng) {
     }
   }
   wipe(probe);
+  // What the directory itself allows — last, since one that may not be written to cannot be filled.
+  const itself = rng.pick(MODES_OF_THE_DIRECTORY);
+  for (const root of [direct, real]) chmodSync(root, itself);
   assert.deepEqual(describe(real), describe(direct), "the two trees start the same");
   return { base, outside, direct, real, copy };
 }
@@ -280,12 +328,13 @@ for (const seed of SEEDS) {
 
       const held = copyTree(real, copy);
       assert.deepEqual(describe(copy, real), asItWas, `round ${round}: the copy holds what the directory holds`);
+      assert.equal(allowedBy(copy), allowedBy(real), `round ${round}: the copy allows what the directory allows`);
       const before = readTree(copy);
 
       // A run does not know it is in a copy, and cannot name it: it makes no link by way of its directory's name.
       const run = [];
       for (let n = 0; n < 14; n++) {
-        const it = step(rng, direct, ["near", "up", "full", "away", "through", "fullThrough"], A_RUN);
+        const it = step(rng, direct, ["near", "up", "full", "away", "through", "fullThrough"], { ...A_RUN, itself: true });
         for (const root of [direct, copy]) carryOut(root, outside, it);
         run.push(it);
       }
@@ -296,6 +345,7 @@ for (const seed of SEEDS) {
       assert.deepEqual(unmerged, [], told);
       const now = describe(real), wanted = describe(direct);
       assert.deepEqual(now, wanted, told);
+      assert.equal(allowedBy(real), allowedBy(direct), `the directory itself, ${told}`);
     }
   });
 
@@ -305,22 +355,23 @@ for (const seed of SEEDS) {
       const { outside, direct, real, copy } = trial(t, rng);
       const held = copyTree(real, copy);
       const before = readTree(copy);
-      const asItWas = describe(real);
+      const asItWas = describe(real), allowed = allowedBy(real);
 
       const run = [];
       for (let n = 0; n < 12; n++) {
-        const it = step(rng, direct, ["near", "up", "full", "away", "through", "fullThrough"], A_RUN);
+        const it = step(rng, direct, ["near", "up", "full", "away", "through", "fullThrough"], { ...A_RUN, itself: true });
         for (const root of [direct, copy]) carryOut(root, outside, it);
         run.push(it);
       }
-      // Meanwhile, in the directory itself.
+      // Meanwhile, in the directory itself — and now and then to it.
       const theirs = [];
       for (let n = 1 + Math.floor(rng.next() * 4); n > 0; n--) {
         const it = { ...step(rng, real, ["near"], { dirModes: DIR_MODES_ALSO_CLOSED }), kind: rng.pick(["write", "write", "remove", "mkdir", "chmod", "rewrite", "append"]) };
+        if (it.kind === "chmod" && rng.next() < 0.15) it.p = ".";
         carryOut(real, outside, it);
         theirs.push(it);
       }
-      const asTheyLeftIt = describe(real);
+      const asTheyLeftIt = describe(real), allowedByThem = allowedBy(real);
       const touched = new Set([...Object.keys(asItWas), ...Object.keys(asTheyLeftIt)].filter((path) => asItWas[path] !== asTheyLeftIt[path]));
 
       const unmerged = mergeTree(copy, real, before, held);
@@ -330,17 +381,20 @@ for (const seed of SEEDS) {
       // What is told not to have arrived is as they left it, there and under it: nothing half done.
       for (const { path } of unmerged) {
         for (const other of new Set([...Object.keys(now), ...Object.keys(asTheyLeftIt)])) {
-          if (other !== path && !other.startsWith(`${path}/`)) continue;
+          if (!atOrUnder(other, path)) continue;
           if (now[other] !== asTheyLeftIt[other]) assert.fail(`${path} did not arrive, yet ${other} was ${asTheyLeftIt[other]} and is now ${now[other]}\n${told}`);
         }
       }
+      // The directory itself: as they left it, if they changed what it allows or it is told not to have arrived; as the run left it, if not.
+      const itselfLeftAlone = allowedByThem !== allowed || unmerged.some((it) => it.path === ".");
+      assert.equal(allowedBy(real), itselfLeftAlone ? allowedByThem : allowedBy(direct), `the directory itself\n${told}`);
       // Theirs stands, whatever the run did at the same place.
       for (const path of touched) {
         if (now[path] !== asTheyLeftIt[path]) assert.fail(`${path} was theirs (${asTheyLeftIt[path]}), and is now ${now[path]}\n${told}`);
       }
       for (const path of new Set([...Object.keys(now), ...Object.keys(wanted)])) {
         if (now[path] === wanted[path]) continue;
-        const explained = covered(path, unmerged) || [...touched].some((theirPath) => path === theirPath || path.startsWith(`${theirPath}/`) || theirPath.startsWith(`${path}/`));
+        const explained = covered(path, unmerged) || [...touched].some((theirPath) => atOrUnder(path, theirPath) || atOrUnder(theirPath, path));
         if (!explained) assert.fail(`${path} is ${now[path]}, not ${wanted[path]} as the run left it, and nothing says why\n${told}`);
       }
     }
@@ -386,7 +440,7 @@ for (const seed of SEEDS) {
       const told = `round ${round}\n the run: ${JSON.stringify(run.map(({ kind, p, q }) => `${kind} ${p} ${q}`))}\n unmerged: ${JSON.stringify(unmerged)}`;
       for (const { path } of unmerged) {
         for (const other of new Set([...Object.keys(now), ...Object.keys(asItWas)])) {
-          if (other !== path && !other.startsWith(`${path}/`)) continue;
+          if (!atOrUnder(other, path)) continue;
           if (now[other] !== asItWas[other] && !(other in now && oneOfTwo.has(other))) assert.fail(`${path} did not arrive, yet ${other} was ${asItWas[other]} and is now ${now[other]}\n${told}`);
         }
       }
@@ -620,9 +674,7 @@ test("what the run moved stays where it was if the system will not have it made 
     const before = readTree(copy);
     run(copy);
     const asItWas = describe(real);
-    chmodSync(real, 0o555);
-    const unmerged = mergeTree(copy, real, before, held);
-    chmodSync(real, 0o755);
+    const unmerged = withTheSystemRefusing(nothingMadeOrRemovedIn(real), () => mergeTree(copy, real, before, held));
     assert.deepEqual(describe(real), asItWas, what);
     assert.ok(unmerged.length > 0, what);
   }
@@ -688,9 +740,8 @@ test("a directory that was moved aside for a file, and came back, is closed wher
   renameSync(join(copy, "sub", "d", "shut", "x"), join(copy, "moved"));
   rmSync(join(copy, "sub", "d"), { recursive: true }); writeFileSync(join(copy, "sub", "d"), "a file now");
   const asItWas = describe(real);
-  chmodSync(real, 0o555); // nothing may be made at the top: what was moved there does not arrive, and the rest is undone
-  const unmerged = mergeTree(copy, real, before, held);
-  chmodSync(real, 0o755);
+  // Nothing may be made at the top: what was moved there does not arrive, and the rest is undone.
+  const unmerged = withTheSystemRefusing(nothingMadeOrRemovedIn(real), () => mergeTree(copy, real, before, held));
   assert.ok(unmerged.some((it) => it.path === "sub/d"), JSON.stringify(unmerged));
   assert.deepEqual(describe(real), asItWas);
 });
@@ -769,10 +820,9 @@ test("a directory made where a link was, and unmade because the link did not arr
     // The link goes to the top of the directory; where it was, a directory of that name with a closed one in it.
     renameSync(join(copy, "sub", "p"), join(copy, "moved"));
     mkdirSync(join(copy, "sub", "p", "s"), { recursive: true }); chmodSync(join(copy, "sub", "p", "s"), 0o500);
-    chmodSync(real, 0o555); // nothing may be made at the top: the link does not arrive
     if (closed) chmodSync(outside, 0o000);
-    const unmerged = mergeTree(copy, real, before, held);
-    chmodSync(real, 0o755);
+    // Nothing may be made at the top: the link does not arrive.
+    const unmerged = withTheSystemRefusing(nothingMadeOrRemovedIn(real), () => mergeTree(copy, real, before, held));
     if (closed) chmodSync(outside, 0o755);
     assert.deepEqual(unmerged.map((it) => it.path).sort(), ["moved", "sub/p"]);
     assert.equal(readlinkSync(join(real, "sub", "p")), outside);
@@ -817,10 +867,8 @@ test("a file the run wrote into is left as it was where nothing can be made besi
   const held = copyTree(real, copy);
   const before = readTree(copy);
   appendFileSync(join(copy, "journal.log"), ", and more");
-  chmodSync(real, 0o555);
   const was = identityOf(join(real, "journal.log"));
-  const unmerged = mergeTree(copy, real, before, held);
-  chmodSync(real, 0o755);
+  const unmerged = withTheSystemRefusing(nothingMadeOrRemovedIn(real), () => mergeTree(copy, real, before, held));
   assert.deepEqual(unmerged.map((it) => it.path), ["journal.log"]);
   assert.deepEqual(describe(real), { "journal.log": 'file 644 "what it held"' });
   assert.equal(identityOf(join(real, "journal.log")), was);
@@ -863,9 +911,8 @@ test("a directory the run moved away, with another made in its place: what was i
   const held = copyTree(real, copy);
   const before = readTree(copy);
   renameSync(join(copy, "d"), join(copy, "moved")); mkdirSync(join(copy, "d")); chmodSync(join(copy, "d"), 0o700); writeFileSync(join(copy, "d", "fresh"), "F");
-  chmodSync(real, 0o555); // nothing may be made in the directory itself: "moved" does not arrive
-  const unmerged = mergeTree(copy, real, before, held);
-  chmodSync(real, 0o755);
+  // Nothing may be made in the directory itself: "moved" does not arrive.
+  const unmerged = withTheSystemRefusing(nothingMadeOrRemovedIn(real), () => mergeTree(copy, real, before, held));
   assert.deepEqual(unmerged.map((it) => it.path).sort(), ["d/x", "moved"]);
   assert.deepEqual(describe(real), { "d": "dir 700", "d/fresh": 'file 644 "F"', "d/x": 'file 644 "X"' });
 });
@@ -927,12 +974,13 @@ test("a directory somebody closed meanwhile is told of as changed, and is left a
     chmodSync(join(real, "d"), mode); // meanwhile
     const asTheyLeftIt = describe(real);
     const unmerged = mergeTree(copy, real, before, held);
-    // What is in d is in a directory that was changed. What is deeper is in one that was not — if it can be come to:
-    // 0o300 still lets a path through. A directory somebody closed is not opened to come to it.
-    const through = mode === 0o300;
-    assert.deepEqual(unmerged.map((it) => it.path).sort(), ["d/a-new.txt", ...(through ? [] : ["d/e/deep.txt"]), "d/goes.txt", "d/new.txt"]);
+    // What is in d is in a directory that was changed. What is deeper is in one that was not — but the way to it
+    // is through d, and a directory somebody closed is not opened to come to it, or to be asked its names: where
+    // d still lets a path through and will not list what it holds (0o300), whether it still has "e" by that name
+    // cannot be asked, and nothing is done there either.
+    assert.deepEqual(unmerged.map((it) => it.path).sort(), ["d/a-new.txt", "d/e/deep.txt", "d/goes.txt", "d/new.txt"], mode.toString(8));
     for (const path of ["d/a-new.txt", "d/goes.txt", "d/new.txt"]) assert.match(unmerged.find((it) => it.path === path).why, /what d allows was changed in the project meanwhile/);
-    assert.deepEqual(describe(real), { ...asTheyLeftIt, ...(through ? { "d/e/deep.txt": 'file 644 "BY THE RUN"' } : {}) });
+    assert.deepEqual(describe(real), asTheyLeftIt);
   }
 });
 
@@ -1052,7 +1100,7 @@ test("what a copy is told to leave out is neither copied nor known of", (t) => {
   writeFileSync(join(real, "logs", "latest.jsonl"), "{}");
   const journal = identityOf(join(real, "logs", "journal"));
   const held = copyTree(real, copy, (at) => identityOf(at) === journal);
-  assert.deepEqual([...held.keys()].sort(), ["logs", "logs/latest.jsonl"]);
+  assert.deepEqual([...held.keys()].sort(), [".", "logs", "logs/latest.jsonl"]);
   assert.deepEqual(readdirSync(join(copy, "logs")), ["latest.jsonl"]);
 });
 
@@ -1902,3 +1950,796 @@ test("a merge keeps to the directory: a link put in the way meanwhile is not fol
   assert.deepEqual(readdirSync(outside), ["target.txt"]);
   assert.equal(readFileSync(join(real, "nested"), "utf-8"), "i am a file");
 });
+
+// --- The directory itself ---
+
+test("the stand-in for a directory that may not be written to refuses what the system refuses there", { skip: asRoot }, (t) => {
+  const asked = {
+    "make a directory": (dir) => mkdirSync(join(dir, "new")),
+    "make a link": (dir) => symlinkSync("f", join(dir, "new")),
+    "copy to a new name": (dir) => copyFileSync(join(dir, "f"), join(dir, "new")),
+    "copy into a file that is there": (dir, beside) => copyFileSync(join(beside, "theirs"), join(dir, "f")),
+    "move something in": (dir, beside) => renameSync(join(beside, "theirs"), join(dir, "new")),
+    "move something out": (dir, beside) => renameSync(join(dir, "f"), join(beside, "f")),
+    "give something another name": (dir) => renameSync(join(dir, "f"), join(dir, "g")),
+    "remove a file": (dir) => unlinkSync(join(dir, "f")),
+    "remove a directory": (dir) => rmdirSync(join(dir, "empty")),
+    "remove, whatever it is": (dir) => rmSync(join(dir, "f"), { force: true }),
+    "change what a file allows": (dir) => chmodSync(join(dir, "f"), 0o600),
+    "make something in a directory in it": (dir) => mkdirSync(join(dir, "empty", "new")),
+  };
+  for (const [what, ask] of Object.entries(asked)) {
+    const outcome = (closed) => {
+      const base = scratch(t), dir = join(base, "dir"), beside = join(base, "beside");
+      mkdirSync(join(dir, "empty"), { recursive: true }); mkdirSync(beside);
+      writeFileSync(join(dir, "f"), "F"); writeFileSync(join(beside, "theirs"), "T");
+      try {
+        closed(dir, () => ask(dir, beside));
+        return "done";
+      } catch (err) {
+        return err.code;
+      } finally {
+        chmodSync(dir, 0o755);
+      }
+    };
+    const bySystem = outcome((dir, it) => { chmodSync(dir, 0o555); it(); });
+    const byStandIn = outcome((dir, it) => withTheSystemRefusing(nothingMadeOrRemovedIn(dir), it));
+    assert.equal(byStandIn, bySystem, what);
+  }
+});
+
+test("a copy allows what the directory allows, and a tree says what that is", { skip: asRoot }, (t) => {
+  for (const mode of [0o755, 0o700, 0o555, 0o500, 0o2755 & ~0o2000 | 0o1000]) {
+    const real = scratch(t), copy = scratch(t);
+    writeFileSync(join(real, "f"), "F");
+    chmodSync(real, mode);
+    const held = copyTree(real, copy);
+    assert.equal(allowedBy(copy), mode);
+    assert.deepEqual({ ...held.get("."), id: undefined }, { kind: "dir", mode, id: undefined });
+    assert.equal(readTree(copy).get(".").mode, mode);
+    assert.equal(readFileSync(join(copy, "f"), "utf-8"), "F");
+  }
+});
+
+test("a directory that may not be written to is opened to be merged into — the directory itself like any in it — and left allowing what it allowed", { skip: asRoot }, (t) => {
+  for (const where of [".", "sub", "sub/deeper"]) {
+    const real = scratch(t), copy = scratch(t), direct = scratch(t);
+    for (const dir of [real, direct]) {
+      mkdirSync(join(dir, where), { recursive: true });
+      writeFileSync(join(dir, where, "notes.txt"), "OLD");
+      writeFileSync(join(dir, where, "goes.txt"), "G");
+      chmodSync(join(dir, where), 0o555);
+    }
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    const run = (dir) => {
+      // Into a file that is there: that asks nothing of its directory.
+      writeFileSync(join(dir, where, "notes.txt"), "WRITTEN BY THE RUN");
+      // What the directory forbids, it forbids in a copy of it too.
+      assert.throws(() => writeFileSync(join(dir, where, "new.txt"), "N"), { code: "EACCES" }, where);
+      chmodSync(join(dir, where), 0o755);
+      writeFileSync(join(dir, where, "new.txt"), "N"); rmSync(join(dir, where, "goes.txt"));
+      chmodSync(join(dir, where), 0o555);
+    };
+    run(copy); run(direct);
+    const was = identityOf(join(real, where, "notes.txt"));
+    assert.deepEqual(mergeTree(copy, real, before, held), [], where);
+    assert.deepEqual(describe(real), describe(direct), where);
+    assert.equal(allowedBy(join(real, where)), 0o555, where);
+    assert.equal(identityOf(join(real, where, "notes.txt")), was, `${where}: written into, not replaced`);
+  }
+});
+
+test("what the run left the directory itself allowing is what it is left allowing", { skip: asRoot }, (t) => {
+  for (const [from, to] of [[0o755, 0o700], [0o555, 0o755], [0o755, 0o555], [0o700, 0o500], [0o755, 0o000]]) {
+    const real = scratch(t), copy = scratch(t);
+    writeFileSync(join(real, "-first-by-its-letters"), "A"); // (a name that comes before "." as text: the directory is still seen to first)
+    chmodSync(real, from);
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    chmodSync(copy, 0o755);
+    writeFileSync(join(copy, "-first-by-its-letters"), "B"); writeFileSync(join(copy, "made.txt"), "M");
+    chmodSync(copy, to);
+    assert.deepEqual(mergeTree(copy, real, before, held), [], `${from.toString(8)} to ${to.toString(8)}`);
+    assert.equal(allowedBy(real), to);
+    assert.deepEqual(describe(real), { "-first-by-its-letters": 'file 644 "B"', "made.txt": 'file 644 "M"' });
+  }
+});
+
+test("the directory itself is closed last: one in it that was opened is closed while it can still be come to", { skip: asRoot }, (t) => {
+  const real = scratch(t), copy = scratch(t);
+  // (A name that comes before "." as text, which is how the directory itself is written.)
+  mkdirSync(join(real, "-d")); writeFileSync(join(real, "-d", "f"), "OLD"); chmodSync(join(real, "-d"), 0o555);
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  writeFileSync(join(copy, "-d", "f"), "NEW");
+  chmodSync(copy, 0o000); // the run leaves its own directory closed to everything
+  assert.deepEqual(mergeTree(copy, real, before, held), []);
+  assert.equal(allowedBy(real), 0o000);
+  assert.deepEqual(describe(real), { "-d": "dir 555", "-d/f": 'file 644 "NEW"' });
+});
+
+test("the directory itself, if it cannot be given back what it is to allow, is told of as that", { skip: asRoot }, (t) => {
+  const real = scratch(t), copy = scratch(t);
+  writeFileSync(join(real, "f"), "OLD");
+  chmodSync(real, 0o555);
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  writeFileSync(join(copy, "f"), "NEW");
+  // The system lets it be opened, and then will not have it closed again.
+  let asked = 0;
+  const unmerged = withTheSystemRefusing((call, place) => call === "chmodSync" && place === real && ++asked > 1, () => mergeTree(copy, real, before, held));
+  assert.deepEqual(unmerged.map((it) => it.path), ["."]);
+  assert.match(unmerged[0].why, /what it is to allow \(555\) could not be set/);
+  assert.deepEqual(describe(real), { "f": 'file 644 "NEW"' });
+});
+
+test("a directory somebody gave other permissions meanwhile is theirs — the directory itself too: nothing is made or removed in it, and that is told", { skip: asRoot }, (t) => {
+  for (const theirs of [0o555, 0o777, 0o700]) {
+    for (const runChangesItToo of [false, true]) {
+      const real = scratch(t), copy = scratch(t);
+      mkdirSync(join(real, "sub"));
+      writeFileSync(join(real, "a.txt"), "A"); writeFileSync(join(real, "goes.txt"), "G"); writeFileSync(join(real, "sub", "b.txt"), "B");
+      writeFileSync(join(real, "same.txt"), "S");
+      chmodSync(real, 0o755);
+      const held = copyTree(real, copy);
+      const before = readTree(copy);
+      appendFileSync(join(copy, "a.txt"), " and more"); rmSync(join(copy, "goes.txt")); writeFileSync(join(copy, "new.txt"), "N");
+      writeFileSync(join(copy, "sub", "b.txt"), "B2"); writeFileSync(join(copy, "same.txt"), "S2");
+      if (runChangesItToo) chmodSync(copy, 0o750);
+      // Meanwhile. (They also made one file what the run made it: that needs nothing done, whoever closed the door.)
+      writeFileSync(join(real, "same.txt"), "S2");
+      chmodSync(real, theirs);
+      const asTheyLeftIt = describe(real);
+      const unmerged = mergeTree(copy, real, before, held);
+      const told = `theirs ${theirs.toString(8)}, the run ${runChangesItToo ? "changed it too" : "left it"}: ${JSON.stringify(unmerged)}`;
+      assert.equal(allowedBy(real), theirs, told);
+      if (runChangesItToo) {
+        // What the directory allows is one of the things the run changed, and that did not arrive: nothing under it is looked at.
+        assert.deepEqual(unmerged.map((it) => it.path), ["."], told);
+        assert.match(unmerged[0].why, /changed or removed in the project meanwhile/);
+        assert.deepEqual(describe(real), asTheyLeftIt, told);
+      } else {
+        assert.deepEqual(unmerged.map((it) => it.path).sort(), ["a.txt", "goes.txt", "new.txt"], told);
+        for (const { why } of unmerged) assert.match(why, /what the project's own directory allows was changed meanwhile/);
+        // A directory in it is as it was, and what the run did there arrives.
+        assert.deepEqual(describe(real), { ...asTheyLeftIt, "sub/b.txt": 'file 644 "B2"' }, told);
+      }
+    }
+  }
+});
+
+// --- Things that are one thing ---
+
+/**
+ * How a caller of the merge says which things are one: each by what it is.
+ * Asked of the copy at some paths — once before the run, of what is there
+ * then, and again when what is returned is called, of what is there now.
+ */
+const oneThing = (copy, paths) => {
+  const whatIs = () => paths.flatMap((path) => identityOf(join(copy, path)) ?? []);
+  const was = whatIs();
+  return () => [[...was, ...whatIs()]];
+};
+
+test("paths that are one thing to whoever asks arrive together, or not at all: a link is not left without what it leads to", (t) => {
+  for (const asOne of [true, false]) {
+    const real = scratch(t), copy = scratch(t);
+    writeFileSync(join(real, "main.ts"), "AS IT RAN"); writeFileSync(join(real, "as-it-was.ts"), "NOTHING IS DONE HERE");
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    const asOneThing = oneThing(copy, ["main.ts", "lib/main.ts", "as-it-was.ts"]);
+    mkdirSync(join(copy, "lib")); writeFileSync(join(copy, "lib", "main.ts"), "WHAT IT MADE OF ITSELF");
+    unlinkSync(join(copy, "main.ts")); symlinkSync("lib/main.ts", join(copy, "main.ts"));
+    writeFileSync(join(copy, "other.txt"), "O");
+    writeFileSync(join(real, "lib"), "THEIRS"); // meanwhile: what the link leads to cannot arrive
+    const unmerged = mergeTree(copy, real, before, held, asOne ? asOneThing() : []);
+    if (asOne) {
+      // (A path of the one thing where nothing was to be done is not told of: nothing was to arrive there.)
+      assert.deepEqual(unmerged.map((it) => it.path).sort(), ["lib", "main.ts"]);
+      assert.match(unmerged.find((it) => it.path === "main.ts").why, /one thing with lib\/main\.ts, which is under lib, which did not arrive/);
+      assert.deepEqual(describe(real), { "as-it-was.ts": 'file 644 "NOTHING IS DONE HERE"', "lib": 'file 644 "THEIRS"', "main.ts": 'file 644 "AS IT RAN"', "other.txt": 'file 644 "O"' });
+    } else {
+      // (To a merge that is not told, they are two paths: the link arrives, and leads nowhere.)
+      assert.deepEqual(unmerged.map((it) => it.path), ["lib"]);
+      assert.equal(readlinkSync(join(real, "main.ts")), "lib/main.ts");
+    }
+  }
+});
+
+test("a part of one thing that the run left as it was is leaned on by the rest: if it is not as it was in the project, the rest does not arrive", (t) => {
+  const cases = {
+    "it is as it was": { meanwhile: () => {}, told: [], link: "./src/app.ts" },
+    "somebody removed it": { meanwhile: (real) => unlinkSync(join(real, "src", "app.ts")), told: ["main.ts", "src/app.ts"], link: "src/app.ts" },
+    "somebody put something else there": {
+      meanwhile: (real) => { unlinkSync(join(real, "src", "app.ts")); mkdirSync(join(real, "src", "app.ts")); }, told: ["main.ts", "src/app.ts"], link: "src/app.ts",
+    },
+    "somebody wrote the same into it again: it holds what it held": { meanwhile: (real) => writeFileSync(join(real, "src", "app.ts"), "AS IT RAN"), told: [], link: "./src/app.ts" },
+    "the directory it is in is somebody's now, and is not looked into": { meanwhile: (real) => chmodSync(join(real, "src"), 0o300), told: ["main.ts", "src/app.ts"], link: "src/app.ts" },
+  };
+  for (const [what, { meanwhile, told, link }] of Object.entries(cases)) {
+    const real = scratch(t), copy = scratch(t);
+    mkdirSync(join(real, "src")); writeFileSync(join(real, "src", "app.ts"), "AS IT RAN"); symlinkSync("src/app.ts", join(real, "main.ts"));
+    chmodSync(join(real, "src"), 0o755);
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    const asOneThing = oneThing(copy, ["main.ts", "src/app.ts"]);
+    // The run words its link otherwise, and leaves what it leads to as it was.
+    unlinkSync(join(copy, "main.ts")); symlinkSync("./src/app.ts", join(copy, "main.ts"));
+    meanwhile(real);
+    const unmerged = mergeTree(copy, real, before, held, asOneThing());
+    assert.deepEqual(unmerged.map((it) => it.path).sort(), told, `${what}: ${JSON.stringify(unmerged)}`);
+    assert.equal(readlinkSync(join(real, "main.ts")), link, what);
+  }
+});
+
+test("a part of one thing that the run left as it was is left as it is — also a link the copy has in other words", (t) => {
+  const base = scratch(t), real = join(base, "project"), copy = join(base, "elsewhere", "copy");
+  mkdirSync(real); mkdirSync(copy, { recursive: true });
+  writeFileSync(join(real, "app.ts"), "AS IT RAN"); symlinkSync("../project/app.ts", join(real, "main.ts")); // out of the directory, and back in by its name
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  assert.notEqual(readlinkSync(join(copy, "main.ts")), "../project/app.ts", "(the copy says it in words of its own)");
+  const asOneThing = oneThing(copy, ["main.ts", "app.ts", "other.ts"]);
+  writeFileSync(join(copy, "other.ts"), "MADE BY THE RUN");
+  const was = identityOf(join(real, "main.ts"));
+  assert.deepEqual(mergeTree(copy, real, before, held, asOneThing()), []);
+  assert.equal(readlinkSync(join(real, "main.ts")), "../project/app.ts");
+  assert.equal(identityOf(join(real, "main.ts")), was);
+  assert.equal(readFileSync(join(real, "other.ts"), "utf-8"), "MADE BY THE RUN");
+});
+
+test("of paths that are one thing, what was removed stays if what was to be there instead does not arrive", (t) => {
+  const real = scratch(t), copy = scratch(t);
+  mkdirSync(join(real, "src")); writeFileSync(join(real, "src", "app.ts"), "AS IT RAN"); symlinkSync("src/app.ts", join(real, "main.ts"));
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  const asOneThing = oneThing(copy, ["main.ts", "src/app.ts"]);
+  // The run removes what the link led to, and puts a file where the link was.
+  unlinkSync(join(copy, "src", "app.ts")); unlinkSync(join(copy, "main.ts")); writeFileSync(join(copy, "main.ts"), "AS IT RAN");
+  // Meanwhile somebody words the link otherwise: it is theirs now, and the file does not take its place.
+  unlinkSync(join(real, "main.ts")); symlinkSync("./src/app.ts", join(real, "main.ts"));
+  const unmerged = mergeTree(copy, real, before, held, asOneThing());
+  assert.deepEqual(unmerged.map((it) => it.path).sort(), ["main.ts", "src/app.ts"]);
+  assert.equal(readFileSync(join(real, "main.ts"), "utf-8"), "AS IT RAN", "the link still leads to what it led to");
+  assert.equal(readlinkSync(join(real, "main.ts")), "./src/app.ts");
+});
+
+test("of paths that are one thing, what was already put is taken back when the system will not have the rest", { skip: asRoot }, (t) => {
+  const real = scratch(t), copy = scratch(t);
+  writeFileSync(join(real, "a"), "AS IT RAN");
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  const asOneThing = oneThing(copy, ["a", "z/b"]);
+  mkdirSync(join(copy, "z")); writeFileSync(join(copy, "z", "b"), "WHAT IT MADE OF ITSELF"); writeFileSync(join(copy, "z", "beside"), "NOTHING TO THE LINK");
+  unlinkSync(join(copy, "a")); symlinkSync("z/b", join(copy, "a"));
+  const was = identityOf(join(real, "a"));
+  // The link is put first, by the order of the names; then the system will not have the file made that it leads to.
+  const unmerged = withTheSystemRefusing((call, place) => call === "copyFileSync" && place === join(real, "z", "b"),
+    () => mergeTree(copy, real, before, held, asOneThing()));
+  assert.deepEqual(unmerged.map((it) => it.path).sort(), ["a", "z/b"]);
+  assert.equal(identityOf(join(real, "a")), was, "the file that was there is there again");
+  // (The directory the file was to be in is nothing to the link: it arrives, with what else the run made in it.)
+  assert.deepEqual(describe(real), { "a": 'file 644 "AS IT RAN"', "z": "dir 755", "z/beside": 'file 644 "NOTHING TO THE LINK"' });
+});
+
+test("a file that is one thing with other paths is not written into: what the run left is put in its place, and what was there comes back if the rest does not arrive", { skip: asRoot }, (t) => {
+  for (const arrives of [true, false]) {
+    const real = scratch(t), copy = scratch(t);
+    writeFileSync(join(real, "a.ts"), "AS IT RAN"); symlinkSync("a.ts", join(real, "program.ts")); mkdirSync(join(real, "lib"));
+    mkdirSync(join(real, "dir")); writeFileSync(join(real, "dir", "f.ts"), "F"); chmodSync(join(real, "dir"), 0o755);
+    writeFileSync(join(real, "dir", "none-of-it.txt"), "OLD");
+    linkSync(join(real, "a.ts"), join(real, "its-second-name"));
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    const asOneThing = oneThing(copy, ["program.ts", "a.ts", "lib/b.ts", "dir", "dir/f.ts"]);
+    // The run writes into the file, changes what a file and a directory allow, and makes the link lead to a new file.
+    writeFileSync(join(copy, "a.ts"), "NO PROGRAM ANY MORE"); writeFileSync(join(copy, "lib", "b.ts"), "WHAT IT MADE OF ITSELF");
+    unlinkSync(join(copy, "program.ts")); symlinkSync("lib/b.ts", join(copy, "program.ts"));
+    writeFileSync(join(copy, "dir", "none-of-it.txt"), "NEW"); // (in a directory that is part of the thing, and none of it itself)
+    chmodSync(join(copy, "dir", "f.ts"), 0o600); chmodSync(join(copy, "dir"), 0o700);
+    const asItWas = describe(real), was = identityOf(join(real, "a.ts"));
+    const unmerged = withTheSystemRefusing((call, place) => !arrives && call === "copyFileSync" && place === join(real, "lib", "b.ts"),
+      () => mergeTree(copy, real, before, held, asOneThing()));
+    if (arrives) {
+      assert.deepEqual(unmerged, []);
+      assert.deepEqual(describe(real), {
+        "a.ts": 'file 644 "NO PROGRAM ANY MORE"', "dir": "dir 700", "dir/f.ts": 'file 600 "F"', "dir/none-of-it.txt": 'file 644 "NEW"', "its-second-name": 'file 644 "AS IT RAN"',
+        "lib": "dir 755", "lib/b.ts": 'file 644 "WHAT IT MADE OF ITSELF"', "program.ts": "link to <root>/lib/b.ts",
+      });
+    } else {
+      assert.deepEqual(unmerged.map((it) => it.path).sort(), ["a.ts", "dir", "dir/f.ts", "lib/b.ts", "program.ts"]);
+      assert.match(unmerged.find((it) => it.path === "dir").why, /what it was to allow \(700\) is one thing with lib\/b\.ts, which did not arrive: it is left allowing what it allowed/);
+      // Nothing of it is done: not what was written, nor what a file or a directory allows. What else the run did in
+      // the directory is none of it, and arrives: the directory is not left alone, only left allowing what it allowed.
+      assert.deepEqual(describe(real), { ...asItWas, "dir/none-of-it.txt": 'file 644 "NEW"' });
+      assert.equal(identityOf(join(real, "a.ts")), was, "and the file that was there is there again");
+    }
+  }
+});
+
+test("what is to go, of paths that are one thing, is moved aside first: it stays if the system will not let it go, and with it the rest", { skip: asRoot }, (t) => {
+  for (const refused of ["to move it aside", "to remove it for good"]) {
+    const real = scratch(t), copy = scratch(t);
+    writeFileSync(join(real, "old.ts"), "AS IT RAN"); symlinkSync("old.ts", join(real, "program.ts"));
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    const asOneThing = oneThing(copy, ["program.ts", "old.ts"]);
+    unlinkSync(join(copy, "old.ts")); unlinkSync(join(copy, "program.ts")); writeFileSync(join(copy, "program.ts"), "WHAT IT MADE OF ITSELF");
+    const asItWas = describe(real);
+    const refuses = refused === "to move it aside"
+      ? (call, place, from) => call === "renameSync" && from === join(real, "old.ts")
+      : (call, place) => call === "unlinkSync" && basename(place).startsWith(".trama-tmp-") && lstatSync(place).isFile() && readFileSync(place, "utf-8") === "AS IT RAN";
+    const unmerged = withTheSystemRefusing(refuses, () => mergeTree(copy, real, before, held, asOneThing()));
+    if (refused === "to move it aside") {
+      assert.deepEqual(unmerged.map((it) => it.path).sort(), ["old.ts", "program.ts"]);
+      assert.deepEqual(describe(real), asItWas);
+    } else {
+      // By then the rest has arrived, and it is gone from its place: what is left of it is told of where it is.
+      assert.equal(unmerged.length, 1);
+      assert.match(unmerged[0].path, /^\.trama-tmp-[0-9a-f]{12}$/);
+      assert.match(unmerged[0].why, /what was at old\.ts, and was to go, is here/);
+      assert.deepEqual(describe(real), { [unmerged[0].path]: 'file 644 "AS IT RAN"', "program.ts": 'file 644 "WHAT IT MADE OF ITSELF"' });
+    }
+  }
+});
+
+test("what goes of one thing, in a directory that goes whole and is none of it, is not removed a second time", (t) => {
+  const real = scratch(t), copy = scratch(t);
+  mkdirSync(join(real, "old", "deep"), { recursive: true }); writeFileSync(join(real, "old", "app.ts"), "AS IT RAN"); writeFileSync(join(real, "old", "other"), "O");
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  const asOneThing = oneThing(copy, ["program.ts", "old/app.ts", "old/deep"]);
+  rmSync(join(copy, "old"), { recursive: true }); writeFileSync(join(copy, "program.ts"), "WHAT IT MADE OF ITSELF");
+  assert.deepEqual(mergeTree(copy, real, before, held, asOneThing()), []);
+  assert.deepEqual(describe(real), { "program.ts": 'file 644 "WHAT IT MADE OF ITSELF"' });
+});
+
+test("a directory that goes, of paths that are one thing, goes with what is in it — or comes back with it", { skip: asRoot }, (t) => {
+  for (const arrives of [true, false]) {
+    const real = scratch(t), copy = scratch(t);
+    mkdirSync(join(real, "src", "deep"), { recursive: true });
+    writeFileSync(join(real, "src", "app.ts"), "AS IT RAN"); writeFileSync(join(real, "src", "deep", "x"), "X"); symlinkSync("src/app.ts", join(real, "program.ts"));
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    const asOneThing = oneThing(copy, ["program.ts", "src", "src/app.ts"]);
+    rmSync(join(copy, "src"), { recursive: true }); unlinkSync(join(copy, "program.ts")); writeFileSync(join(copy, "program.ts"), "WHAT IT MADE OF ITSELF");
+    const asItWas = describe(real);
+    // (The system will not have the file moved in where the link was — once: the link is let back.)
+    let asked = 0;
+    const unmerged = withTheSystemRefusing((call, place) => !arrives && call === "renameSync" && place === join(real, "program.ts") && ++asked === 1,
+      () => mergeTree(copy, real, before, held, asOneThing()));
+    if (arrives) {
+      assert.deepEqual(unmerged, []);
+      assert.deepEqual(describe(real), { "program.ts": 'file 644 "WHAT IT MADE OF ITSELF"' });
+    } else {
+      assert.deepEqual(unmerged.map((it) => it.path).sort(), ["program.ts", "src"]);
+      assert.deepEqual(describe(real), asItWas);
+    }
+  }
+});
+
+test("whether the system will have a directory of one thing changed is known while the rest can be taken back", { skip: asRoot }, (t) => {
+  const real = scratch(t), copy = scratch(t);
+  mkdirSync(join(real, "dir")); chmodSync(join(real, "dir"), 0o755); writeFileSync(join(real, "g"), "OLD");
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  const asOneThing = oneThing(copy, ["dir", "g", "h"]);
+  chmodSync(join(copy, "dir"), 0o555); writeFileSync(join(copy, "g"), "NEW"); writeFileSync(join(copy, "h"), "NEW");
+  const asItWas = describe(real);
+  // The system will not have what the directory allows changed — which, left to the end, would be found out too late.
+  const unmerged = withTheSystemRefusing((call, place) => call === "chmodSync" && place === join(real, "dir"), () => mergeTree(copy, real, before, held, asOneThing()));
+  assert.deepEqual(unmerged.map((it) => it.path).sort(), ["dir", "g", "h"]);
+  assert.deepEqual(describe(real), asItWas);
+});
+
+test("a part of one thing that the run left as it was is looked at, and no more: its directory is not opened for it", { skip: asRoot }, (t) => {
+  const real = scratch(t), copy = scratch(t);
+  mkdirSync(join(real, "d")); writeFileSync(join(real, "d", "u"), "U"); writeFileSync(join(real, "v"), "OLD"); chmodSync(join(real, "d"), 0o555);
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  const asOneThing = oneThing(copy, ["d/u", "v"]);
+  writeFileSync(join(copy, "v"), "NEW");
+  // (The system would not have it opened, or closed again: nothing asks it to.)
+  const unmerged = withTheSystemRefusing((call, place) => call === "chmodSync" && place === join(real, "d"), () => mergeTree(copy, real, before, held, asOneThing()));
+  assert.deepEqual(unmerged, []);
+  assert.equal(readFileSync(join(real, "v"), "utf-8"), "NEW");
+  assert.equal(allowedBy(join(real, "d")), 0o555);
+});
+
+test("of a thing the run left wholly as it was nothing is told, whatever somebody did to it: nothing was to arrive", (t) => {
+  const real = scratch(t), copy = scratch(t);
+  writeFileSync(join(real, "app.ts"), "AS IT RAN"); symlinkSync("app.ts", join(real, "main.ts"));
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  const asOneThing = oneThing(copy, ["main.ts", "app.ts"]);
+  writeFileSync(join(copy, "state.txt"), "BY THE RUN");
+  unlinkSync(join(real, "app.ts")); // meanwhile
+  assert.deepEqual(mergeTree(copy, real, before, held, asOneThing()), []);
+  assert.deepEqual(describe(real), { "main.ts": "link to <root>/app.ts", "state.txt": 'file 644 "BY THE RUN"' });
+});
+
+test("a directory that is part of one thing, and that somebody changed, keeps the thing from arriving — and nothing else that is in it", { skip: asRoot }, (t) => {
+  const real = scratch(t), copy = scratch(t);
+  mkdirSync(join(real, "s", "deep"), { recursive: true }); chmodSync(join(real, "s"), 0o755);
+  writeFileSync(join(real, "s", "main"), "AS IT RAN"); writeFileSync(join(real, "s", "deep", "y"), "OLD"); symlinkSync("s/main", join(real, "prog"));
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  const asOneThing = oneThing(copy, ["prog", "s", "s/main"]);
+  // The run words its link otherwise, and writes a file further down that is none of the thing.
+  unlinkSync(join(copy, "prog")); symlinkSync("./s/main", join(copy, "prog")); writeFileSync(join(copy, "s", "deep", "y"), "NEW");
+  chmodSync(join(real, "s"), 0o750); // meanwhile
+  const unmerged = mergeTree(copy, real, before, held, asOneThing());
+  assert.deepEqual(unmerged.map((it) => it.path).sort(), ["prog", "s"]);
+  assert.match(unmerged.find((it) => it.path === "s").why, /the run left it as it was, but it was changed or removed in the project meanwhile/);
+  assert.match(unmerged.find((it) => it.path === "prog").why, /it is one thing with s, which is not as it was in the project/);
+  assert.equal(readlinkSync(join(real, "prog")), "s/main");
+  assert.equal(readFileSync(join(real, "s", "deep", "y"), "utf-8"), "NEW", "what is under it, in a directory of its own that is as it was, arrives");
+});
+
+test("a directory that is part of two things, and is held back with the one, holds back the other", { skip: asRoot }, (t) => {
+  const real = scratch(t), copy = scratch(t);
+  mkdirSync(join(real, "d")); writeFileSync(join(real, "x"), "OLD"); writeFileSync(join(real, "y"), "OLD"); chmodSync(join(real, "d"), 0o500);
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  const one = oneThing(copy, ["d", "x"]), other = oneThing(copy, ["d", "y", "d/prog"]);
+  chmodSync(join(copy, "d"), 0o755); writeFileSync(join(copy, "d", "prog"), "NEW"); writeFileSync(join(copy, "x"), "NEW"); writeFileSync(join(copy, "y"), "NEW");
+  writeFileSync(join(real, "x"), "THEIRS"); // meanwhile
+  const asTheyLeftIt = describe(real);
+  const unmerged = mergeTree(copy, real, before, held, [...one(), ...other()]);
+  assert.deepEqual(unmerged.map((it) => it.path).sort(), ["d", "d/prog", "x", "y"]);
+  assert.match(unmerged.find((it) => it.path === "y").why, /it is one thing with d, which is not given what it was to allow/);
+  assert.deepEqual(describe(real), asTheyLeftIt);
+});
+
+test("a chain of things, each one thing with the next through a directory, is followed to its end however long it is", { skip: asRoot }, (t) => {
+  const real = scratch(t), copy = scratch(t), links = 6000;
+  writeFileSync(join(real, "x"), "OLD");
+  for (let n = 0; n < links; n++) mkdirSync(join(real, `d${n}`));
+  for (let n = 0; n < links; n++) chmodSync(join(real, `d${n}`), 0o755);
+  const held = tree.copyTree(real, copy);
+  const before = tree.readTree(copy);
+  const what = (path) => identityOf(join(copy, path));
+  const things = [[what("x"), what("d0")]];
+  for (let n = 1; n < links; n++) things.push([what(`d${n - 1}`), what(`d${n}`)]);
+  writeFileSync(join(copy, "x"), "NEW");
+  for (let n = 0; n < links; n++) chmodSync(join(copy, `d${n}`), 0o700);
+  writeFileSync(join(real, "x"), "THEIRS"); // meanwhile: the first thing does not arrive, and so none does
+  const unmerged = mergeTree(copy, real, before, held, things);
+  assert.equal(unmerged.length, links + 1);
+  assert.equal(allowedBy(join(real, `d${links - 1}`)), 0o755);
+  assert.match(unmerged.find((it) => it.path === `d${links - 1}`).why, new RegExp(`is one thing with d${links - 2}, which is not given what it was to allow`));
+});
+
+test("a path left alone for its thing is told of under a directory that is told of for its sake: it is the reason", (t) => {
+  const real = scratch(t), copy = scratch(t);
+  mkdirSync(join(real, "q")); writeFileSync(join(real, "q", "b"), "B"); writeFileSync(join(real, "y"), "OLD");
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  const asOneThing = oneThing(copy, ["y", "q/b"]);
+  rmSync(join(copy, "q"), { recursive: true }); writeFileSync(join(copy, "y"), "NEW");
+  writeFileSync(join(real, "y"), "THEIRS"); // meanwhile
+  const unmerged = mergeTree(copy, real, before, held, asOneThing());
+  assert.deepEqual(unmerged.map((it) => it.path).sort(), ["q", "q/b", "y"]);
+  assert.match(unmerged.find((it) => it.path === "q").why, /not all that is in it can go \(q\/b\)/);
+  assert.match(unmerged.find((it) => it.path === "q/b").why, /it is one thing with y, which did not arrive/);
+  assert.deepEqual(describe(real), { "q": "dir 755", "q/b": 'file 644 "B"', "y": 'file 644 "THEIRS"' });
+});
+
+test("a path under one that is told of is told of all the same where there is more to say of it: that it could not be put back", { skip: asRoot }, (t) => {
+  const real = scratch(t), copy = scratch(t);
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  mkdirSync(join(copy, "b")); writeFileSync(join(copy, "b", "a"), "NEW"); writeFileSync(join(copy, "z"), "NEW");
+  const what = (path) => identityOf(join(copy, path));
+  // The system will not have the last part made — nor, then, the file that was put before it taken away again.
+  const unmerged = withTheSystemRefusing(
+    (call, place) => (call === "copyFileSync" && place === join(real, "z")) || (call === "unlinkSync" && place === join(real, "b", "a")),
+    () => mergeTree(copy, real, before, held, [[what("b"), what("b/a"), what("z")]]));
+  assert.deepEqual(unmerged.map((it) => it.path).sort(), ["b", "b/a", "z"]);
+  assert.match(unmerged.find((it) => it.path === "b/a").why, /it could not be put back as it was/);
+  assert.deepEqual(describe(real), { "b": "dir 755", "b/a": 'file 644 "NEW"' });
+});
+
+test("where things that did not arrive for different reasons have a path and its directory between them, the project is as it was and each thing is accounted for", (t) => {
+  const real = scratch(t), copy = scratch(t);
+  writeFileSync(join(real, "x"), "OLD"); writeFileSync(join(real, "y"), "OLD");
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  mkdirSync(join(copy, "b")); writeFileSync(join(copy, "b", "a"), "NEW"); writeFileSync(join(copy, "x"), "NEW"); writeFileSync(join(copy, "y"), "NEW");
+  const what = (path) => identityOf(join(copy, path));
+  // The file is one thing with x, its directory with y: each thing does not arrive for a part of its own.
+  const things = [[what("x"), what("b/a")], [what("y"), what("b")]];
+  writeFileSync(join(real, "x"), "THEIRS"); writeFileSync(join(real, "y"), "THEIRS");
+  const unmerged = mergeTree(copy, real, before, held, things);
+  // (The directory is left alone for its thing; the file in it is then left alone with the directory, whatever
+  // order the two things are followed up in — and is told of besides only where it was left alone first.)
+  const told = unmerged.map((it) => it.path).sort();
+  assert.ok(["b", "x", "y"].every((path) => told.includes(path)) && told.every((path) => ["b", "b/a", "x", "y"].includes(path)), JSON.stringify(unmerged));
+  assert.match(unmerged.find((it) => it.path === "b").why, /it is one thing with y, which did not arrive/);
+  assert.deepEqual(describe(real), { "x": 'file 644 "THEIRS"', "y": 'file 644 "THEIRS"' });
+});
+
+test("where two things that did not arrive have a path and its directory between them, the path is not told of besides the directory", (t) => {
+  for (const order of [0, 1]) {
+    const real = scratch(t), copy = scratch(t);
+    writeFileSync(join(real, "x"), "OLD");
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    mkdirSync(join(copy, "b")); writeFileSync(join(copy, "b", "a"), "NEW"); writeFileSync(join(copy, "x"), "NEW");
+    const what = (path) => identityOf(join(copy, path));
+    const things = [[what("x"), what("b/a")], [what("x"), what("b"), what("b/a")]];
+    writeFileSync(join(real, "x"), "THEIRS");
+    const unmerged = mergeTree(copy, real, before, held, order ? things.reverse() : things);
+    assert.deepEqual(unmerged.map((it) => it.path).sort(), ["b", "x"]);
+  }
+});
+
+test("a directory whose thing does not arrive, and in which nothing else is to be done, is not touched", { skip: asRoot }, (t) => {
+  const real = scratch(t), copy = scratch(t);
+  mkdirSync(join(real, "d")); writeFileSync(join(real, "x"), "OLD"); chmodSync(join(real, "d"), 0o555);
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  const asOneThing = oneThing(copy, ["d", "x"]);
+  chmodSync(join(copy, "d"), 0o500); writeFileSync(join(copy, "x"), "NEW");
+  writeFileSync(join(real, "x"), "THEIRS"); // meanwhile
+  // (The system would refuse to have it opened or closed: it is not asked.)
+  const unmerged = withTheSystemRefusing((call, place) => call === "chmodSync" && place === join(real, "d"), () => mergeTree(copy, real, before, held, asOneThing()));
+  assert.deepEqual(unmerged.map((it) => it.path).sort(), ["d", "x"]);
+  assert.match(unmerged.find((it) => it.path === "d").why, /^what it was to allow \(500\) is one thing with x, which did not arrive: it is left allowing what it allowed$/);
+  assert.equal(allowedBy(join(real, "d")), 0o555);
+});
+
+test("what is told of a thing that did not arrive is true of each part: one that was not as it was, one under what did not arrive, and nothing where nothing was left undone", { skip: asRoot }, (t) => {
+  // A directory held back for a part that is amiss: it is not said of that part that it did not arrive.
+  {
+    const real = scratch(t), copy = scratch(t);
+    mkdirSync(join(real, "e")); chmodSync(join(real, "e"), 0o755); writeFileSync(join(real, "u"), "U");
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    const asOneThing = oneThing(copy, ["e", "u"]);
+    chmodSync(join(copy, "e"), 0o700);
+    writeFileSync(join(real, "u"), "THEIRS");
+    const unmerged = mergeTree(copy, real, before, held, asOneThing());
+    assert.deepEqual(unmerged.map((it) => it.path).sort(), ["e", "u"]);
+    assert.match(unmerged.find((it) => it.path === "e").why, /is one thing with u, which is not as it was in the project: it is left allowing what it allowed/);
+    assert.match(unmerged.find((it) => it.path === "u").why, /^the run left it as it was, but it was changed or removed in the project meanwhile/);
+  }
+  // A part the run left as it was, under a directory that did not arrive: what is said is that, not that the part did not.
+  {
+    const real = scratch(t), copy = scratch(t);
+    mkdirSync(join(real, "d")); chmodSync(join(real, "d"), 0o755); writeFileSync(join(real, "d", "u"), "U"); writeFileSync(join(real, "v"), "OLD");
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    const asOneThing = oneThing(copy, ["d/u", "v"]);
+    chmodSync(join(copy, "d"), 0o700); writeFileSync(join(copy, "v"), "NEW");
+    chmodSync(join(real, "d"), 0o750);
+    const unmerged = mergeTree(copy, real, before, held, asOneThing());
+    assert.deepEqual(unmerged.map((it) => it.path).sort(), ["d", "v"]);
+    assert.match(unmerged.find((it) => it.path === "v").why, /it is one thing with d\/u, which is under d, which did not arrive/);
+  }
+  // A part that is not as it was, where the rest is in place already — somebody made it so: nothing was left undone, and nothing is told.
+  {
+    const real = scratch(t), copy = scratch(t);
+    writeFileSync(join(real, "u"), "U"); writeFileSync(join(real, "v"), "OLD");
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    const asOneThing = oneThing(copy, ["u", "v"]);
+    writeFileSync(join(copy, "v"), "NEW");
+    writeFileSync(join(real, "u"), "THEIRS"); writeFileSync(join(real, "v"), "NEW");
+    assert.deepEqual(mergeTree(copy, real, before, held, asOneThing()), []);
+  }
+});
+
+test("what a file, a directory or a link is known by is the system's numbers for it — its device's and its own", (t) => {
+  const dir = scratch(t);
+  writeFileSync(join(dir, "f"), "F"); mkdirSync(join(dir, "d")); symlinkSync("f", join(dir, "l"));
+  for (const name of ["f", "d", "l", "."]) assert.equal(entryAt(join(dir, name)).id, identityOf(join(dir, name)), name);
+  assert.match(entryAt(join(dir, "f")).id, /^\d+:\d+$/);
+});
+
+test("the directory merged into is the one that was copied: where it is gone, or another is at its path, that is said once and nothing is done", (t) => {
+  for (const what of ["gone", "another directory", "a file"]) {
+    const base = scratch(t), real = join(base, "project"), copy = join(base, "elsewhere", "copy");
+    mkdirSync(real); mkdirSync(copy, { recursive: true });
+    writeFileSync(join(real, "f"), "OLD");
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    writeFileSync(join(copy, "f"), "NEW"); writeFileSync(join(copy, "made.txt"), "M");
+    // Meanwhile somebody moves the directory away — and, in two of the cases, puts something else at its path.
+    renameSync(real, join(base, "moved"));
+    if (what === "another directory") { mkdirSync(real); writeFileSync(join(real, "f"), "THEIRS"); }
+    if (what === "a file") writeFileSync(real, "THEIRS");
+    const unmerged = mergeTree(copy, real, before, held);
+    assert.deepEqual(unmerged.map((it) => it.path), ["."], what);
+    assert.match(unmerged[0].why, what === "another directory" ? /another directory is at the project's path than the one that was copied; nothing was merged into it/ : /the project is no longer there; nothing was merged into it/);
+    assert.deepEqual(describe(join(base, "moved")), { "f": 'file 644 "OLD"' }, what);
+    if (what === "another directory") assert.deepEqual(describe(real), { "f": 'file 644 "THEIRS"' });
+    if (what === "gone") assert.equal(existsSync(real), false);
+  }
+});
+
+test("of one thing that did not arrive, a path is told of once: not again under a directory of the thing that is told of", (t) => {
+  const real = scratch(t), copy = scratch(t);
+  writeFileSync(join(real, "program.ts"), "AS IT RAN");
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  const asOneThing = oneThing(copy, ["program.ts", "sub/main.ts", "sub"]);
+  mkdirSync(join(copy, "sub")); renameSync(join(copy, "program.ts"), join(copy, "sub", "main.ts")); symlinkSync("sub/main.ts", join(copy, "program.ts"));
+  // Somebody wrote the program meanwhile: it is theirs, and none of the thing arrives.
+  writeFileSync(join(real, "program.ts"), "THEIRS");
+  const unmerged = mergeTree(copy, real, before, held, asOneThing());
+  assert.deepEqual(unmerged.map((it) => it.path).sort(), ["program.ts", "sub"]);
+  assert.deepEqual(describe(real), { "program.ts": 'file 644 "THEIRS"' });
+});
+
+const namesFoldHere = existsSync(import.meta.filename.toUpperCase()) && existsSync(import.meta.filename.toLowerCase());
+test("what the run removed from a directory somebody spelled anew meanwhile is still there, to the project — and that is told", { skip: !namesFoldHere }, (t) => {
+  const cases = {
+    "removed": { run: (copy) => unlinkSync(join(copy, "d", "f")), now: { "D": "dir 755", "D/f": 'file 644 "F"', "D/keep": 'file 644 "K"' } },
+    "moved out": {
+      run: (copy) => renameSync(join(copy, "d", "f"), join(copy, "h")),
+      now: { "D": "dir 755", "D/f": 'file 644 "F"', "D/keep": 'file 644 "K"', "h": 'file 644 "F"' },
+    },
+  };
+  for (const [what, { run, now }] of Object.entries(cases)) {
+    const real = scratch(t), copy = scratch(t);
+    mkdirSync(join(real, "d")); chmodSync(join(real, "d"), 0o755); writeFileSync(join(real, "d", "f"), "F"); writeFileSync(join(real, "d", "keep"), "K");
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    run(copy);
+    renameSync(join(real, "d"), join(real, "D")); // meanwhile: the same directory, in other letters
+    const unmerged = mergeTree(copy, real, before, held);
+    assert.deepEqual(unmerged.map((it) => it.path), ["d/f"], what);
+    assert.match(unmerged[0].why, /the directory it is in is no longer there in the project, by that name/);
+    assert.deepEqual(describe(real), now, what);
+  }
+  // (Where the directory is gone altogether, what the run removed from it is gone with it, and there is nothing to tell.)
+  const real = scratch(t), copy = scratch(t);
+  mkdirSync(join(real, "d")); writeFileSync(join(real, "d", "f"), "F");
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  unlinkSync(join(copy, "d", "f"));
+  rmSync(join(real, "d"), { recursive: true });
+  assert.deepEqual(mergeTree(copy, real, before, held), []);
+});
+
+// --- A copy on a file system that tells names apart by their letters, of a directory on one that does not ---
+
+const foldsNames = namesFoldHere;
+/**
+ * A directory on such a file system — where the tests themselves run on one
+ * that takes "Sub" and "sub" for one name. macOS can make one, as a disk
+ * image. Null where none is to be had.
+ */
+let toldApart;
+function whereNamesAreToldApart() {
+  if (toldApart !== undefined) return toldApart;
+  toldApart = null;
+  if (process.platform !== "darwin" || !foldsNames) return null;
+  const home = realpathSync(mkdtempSync(join(tmpdir(), "trama-apart-")));
+  const image = join(home, "volume.dmg"), volume = join(home, "volume");
+  try {
+    execFileSync("hdiutil", ["create", "-size", "64m", "-fs", "Case-sensitive APFS", "-volname", "trama-test", "-quiet", image], { stdio: "ignore" });
+    mkdirSync(volume);
+    execFileSync("hdiutil", ["attach", image, "-mountpoint", volume, "-nobrowse", "-quiet"], { stdio: "ignore" });
+    process.on("exit", () => {
+      try { execFileSync("hdiutil", ["detach", volume, "-force", "-quiet"], { stdio: "ignore" }); } catch { /* it is left to the system */ }
+      rmSync(home, { recursive: true, force: true });
+    });
+    toldApart = volume;
+  } catch {
+    rmSync(home, { recursive: true, force: true });
+  }
+  return toldApart;
+}
+const NONE_TO_BE_HAD = "no file system that tells names apart, beside one that does not, is to be had here";
+
+test("what is in a directory the real one takes for another is in the same place: nothing is done there under either name", { skip: asRoot }, (t) => {
+  const apart = whereNamesAreToldApart();
+  if (!apart) return t.skip(NONE_TO_BE_HAD);
+  const cases = {
+    "removes Sub/a.txt, makes sub/a.txt": {
+      setUp: (dir) => { mkdirSync(join(dir, "Sub")); writeFileSync(join(dir, "Sub", "a.txt"), "OLD"); writeFileSync(join(dir, "Sub", "kept.txt"), "KEPT"); },
+      run: (dir) => { unlinkSync(join(dir, "Sub", "a.txt")); mkdirSync(join(dir, "sub")); writeFileSync(join(dir, "sub", "a.txt"), "NEW"); },
+      told: ["Sub/a.txt", "sub"],
+    },
+    "writes into Sub/a.txt, makes Sub/new.txt and sub/b.txt": {
+      setUp: (dir) => { mkdirSync(join(dir, "Sub")); writeFileSync(join(dir, "Sub", "a.txt"), "OLD"); },
+      run: (dir) => { writeFileSync(join(dir, "Sub", "a.txt"), "CHANGED"); writeFileSync(join(dir, "Sub", "new.txt"), "N"); mkdirSync(join(dir, "sub")); writeFileSync(join(dir, "sub", "b.txt"), "B"); },
+      told: ["Sub/a.txt", "Sub/new.txt", "sub"],
+    },
+    "the same a directory further down, and in a directory under the one that is taken for another": {
+      setUp: (dir) => { mkdirSync(join(dir, "Top", "Sub", "deep"), { recursive: true }); writeFileSync(join(dir, "Top", "Sub", "deep", "a.txt"), "OLD"); },
+      run: (dir) => { unlinkSync(join(dir, "Top", "Sub", "deep", "a.txt")); mkdirSync(join(dir, "Top", "sub", "deep"), { recursive: true }); writeFileSync(join(dir, "Top", "sub", "deep", "a.txt"), "NEW"); },
+      told: ["Top/Sub/deep/a.txt", "Top/sub"],
+    },
+    "two files the run made, where nothing was, under names taken for one: neither is put there": {
+      setUp: (dir) => { writeFileSync(join(dir, "kept.txt"), "KEPT"); },
+      run: (dir) => { writeFileSync(join(dir, "Notes.txt"), "ONE"); writeFileSync(join(dir, "notes.txt"), "THE OTHER"); writeFileSync(join(dir, "third.txt"), "T"); },
+      told: ["Notes.txt", "notes.txt"], arrives: { "third.txt": 'file 644 "T"' },
+    },
+    "two directories the run made under names taken for one: neither is made, nor anything in them": {
+      setUp: (dir) => { writeFileSync(join(dir, "kept.txt"), "KEPT"); },
+      run: (dir) => { mkdirSync(join(dir, "New")); writeFileSync(join(dir, "New", "x"), "X"); mkdirSync(join(dir, "new")); writeFileSync(join(dir, "new", "y"), "Y"); },
+      told: ["New", "new"],
+    },
+    "a directory beside it is not in it: what is done there arrives": {
+      setUp: (dir) => { mkdirSync(join(dir, "Sub")); mkdirSync(join(dir, "Other")); writeFileSync(join(dir, "Sub", "a.txt"), "OLD"); writeFileSync(join(dir, "Other", "o.txt"), "OLD"); },
+      run: (dir) => { mkdirSync(join(dir, "sub")); writeFileSync(join(dir, "Other", "o.txt"), "NEW"); unlinkSync(join(dir, "Sub", "a.txt")); },
+      told: ["Sub/a.txt", "sub"], arrives: { "Other/o.txt": 'file 644 "NEW"' },
+    },
+  };
+  for (const [what, { setUp, run, told, arrives = {} }] of Object.entries(cases)) {
+    const real = scratch(t), copy = mkdtempSync(join(apart, "copy-"));
+    t.after(() => wipe(copy));
+    setUp(real);
+    const held = copyTree(real, copy);
+    const before = readTree(copy);
+    run(copy);
+    const asItWas = describe(real);
+    const unmerged = mergeTree(copy, real, before, held);
+    assert.deepEqual(unmerged.map((it) => it.path).sort(), told, `${what}: ${JSON.stringify(unmerged)}`);
+    assert.deepEqual(describe(real), { ...asItWas, ...arrives }, what);
+  }
+});
+
+test("a directory somebody spelled anew meanwhile is not the tree's any more: what the run moved out of it is not removed from it", { skip: asRoot }, (t) => {
+  const apart = whereNamesAreToldApart();
+  if (!apart) return t.skip(NONE_TO_BE_HAD);
+  const real = scratch(t), copy = mkdtempSync(join(apart, "copy-"));
+  t.after(() => wipe(copy));
+  mkdirSync(join(real, "b")); writeFileSync(join(real, "b", "A"), "PRECIOUS"); writeFileSync(join(real, "b", "other"), "o");
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  // The run makes "B" beside "b", and moves a file from the one into the other.
+  mkdirSync(join(copy, "B")); renameSync(join(copy, "b", "A"), join(copy, "B", "A")); writeFileSync(join(copy, "b", "other"), "changed");
+  // Meanwhile somebody spells the directory "B": to the project, where the run moved the file is where it was.
+  renameSync(join(real, "b"), join(real, "B"));
+  const unmerged = mergeTree(copy, real, before, held);
+  assert.deepEqual(describe(real), { "B": "dir 755", "B/A": 'file 644 "PRECIOUS"', "B/other": 'file 644 "o"' });
+  // (Both what it changed there and what it took from there are told of: to the project, each is still where it was.)
+  assert.deepEqual(unmerged.map((it) => it.path).sort(), ["b/A", "b/other"]);
+  for (const { why } of unmerged) assert.match(why, /the directory it is in is no longer there in the project, by that name/);
+});
+
+for (const seed of SEEDS) {
+  test(`a copy that tells names apart, of a directory that does not: what is told not to have arrived is as it was by the directory's own reckoning of names, and the rest is as the run left it (seed ${seed})`, { skip: asRoot }, (t) => {
+    const apart = whereNamesAreToldApart();
+    if (!apart) return t.skip(NONE_TO_BE_HAD);
+    const rng = random(seed ^ 0xa9a7);
+    const folded = (path) => path.toLowerCase();
+    for (let round = 0; round < 60; round++) {
+      const { outside, real } = trial(t, rng);
+      const copy = mkdtempSync(join(apart, "copy-"));
+      try {
+        const held = copyTree(real, copy);
+        const before = readTree(copy);
+        const asItWas = describe(real);
+        const run = [];
+        for (let n = 0; n < 12; n++) {
+          const it = { ...step(rng, copy, ["near", "full", "through"], A_RUN), whateverTheFileSystem: true };
+          if (rng.next() < 0.3) it.kind = "respell";
+          carryOut(copy, outside, it);
+          run.push(it);
+        }
+        const left = describe(copy, real);
+        const unmerged = mergeTree(copy, real, before, held);
+        const now = describe(real);
+        const told = `round ${round}\n the run: ${JSON.stringify(run.map(({ kind, p, q }) => `${kind} ${p} ${q}`))}\n unmerged: ${JSON.stringify(unmerged)}`;
+        const toldOf = (path) => unmerged.some((it) => atOrUnder(folded(path), folded(it.path)) || atOrUnder(folded(it.path), folded(path)));
+        for (const { path } of unmerged) {
+          for (const other of new Set([...Object.keys(now), ...Object.keys(asItWas)])) {
+            if (!atOrUnder(folded(other), folded(path))) continue;
+            if (now[other] !== asItWas[other]) assert.fail(`${path} did not arrive, yet ${other} was ${asItWas[other]} and is now ${now[other]}\n${told}`);
+          }
+        }
+        for (const path of new Set([...Object.keys(left), ...Object.keys(asItWas), ...Object.keys(now)])) {
+          if (now[path] !== left[path] && !toldOf(path)) assert.fail(`${path} is ${now[path]}, not ${left[path]} as the run left it, and nothing says why\n${told}`);
+        }
+      } finally {
+        wipe(copy);
+      }
+    }
+  });
+}

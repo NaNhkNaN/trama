@@ -1,8 +1,8 @@
 import { spawn } from "child_process";
-import { readFileSync, writeFileSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 import { resolve, dirname } from "path";
 import type { Tools, ShellResult } from "./types.js";
-import { guardPath } from "./path-guard.js";
+import { guardPath, makeDirsIn } from "./path-guard.js";
 import { superviseChild } from "./child-process.js";
 import { signalGroup, stopGroups, stopWithThisProcess } from "./stopping.js";
 
@@ -86,7 +86,7 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
 
     async write(path, content) {
       const target = guardPath(normalizedProjectDir, path); // before mkdir — no side effects outside the project
-      mkdirSync(dirname(target), { recursive: true });
+      makeDirsIn(normalizedProjectDir, dirname(target));
       writeFileSync(target, content);
     },
 

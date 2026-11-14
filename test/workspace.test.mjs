@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, readdirSync, readFileSync, writeFileSync, mkdirSync, symlinkSync } from "fs";
+import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "fs";
 import { join } from "path";
 import { createWorkspace } from "../packages/runtime/dist/workspace.js";
 import { cleanupTempDir, makeTempDir, writeText } from "./helpers.mjs";
@@ -539,4 +539,27 @@ test("workspace.write keeps the permissions of the artifact it replaces", async 
   const { statSync } = await import("fs");
   assert.equal(statSync(join(wsDir, "run.sh")).mode & 0o777, 0o755);
   assert.equal(readFileSync(join(wsDir, "run.sh"), "utf-8"), "new");
+});
+
+test("a workspace somebody removed is made anew by the next write: it is nothing but its path", async (t) => {
+  const parent = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(parent));
+  const dir = join(parent, "workspace");
+  const ws = createWorkspace(dir);
+  await ws.write("first.txt", "1");
+  rmSync(dir, { recursive: true });
+  await ws.write("deep/second.txt", "2");
+  assert.equal(readFileSync(join(dir, "deep", "second.txt"), "utf-8"), "2");
+});
+
+test("a workspace named by a link, whose directory somebody removed, is made anew where the link says", async (t) => {
+  const parent = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(parent));
+  mkdirSync(join(parent, "shared", "data"), { recursive: true });
+  symlinkSync(join(parent, "shared", "data"), join(parent, "ws"));
+  const ws = createWorkspace(join(parent, "ws"));
+  await ws.write("first.txt", "1");
+  rmSync(join(parent, "shared", "data"), { recursive: true });
+  await ws.write("second.txt", "2");
+  assert.equal(readFileSync(join(parent, "shared", "data", "second.txt"), "utf-8"), "2");
 });

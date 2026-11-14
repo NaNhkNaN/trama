@@ -3,10 +3,10 @@ import {
   readFileSync, writeFileSync, appendFileSync,
   readdirSync, mkdirSync, existsSync, statSync,
   symlinkSync, rmSync, lstatSync, readlinkSync,
-  mkdtempSync, openSync, closeSync,
+  mkdtempSync, openSync, closeSync, chmodSync,
   accessSync, constants, truncateSync,
 } from "fs";
-import { join, dirname, relative } from "path";
+import { basename, join, dirname, relative } from "path";
 import { homedir, tmpdir } from "os";
 import { fileURLToPath } from "url";
 import { createHash, randomBytes } from "crypto";
@@ -19,7 +19,7 @@ import { LATEST_LOG_PATH, appendLogEntry, createContext } from "./context.js";
 import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
-import { guardPath, identityOf, realRootOf } from "./path-guard.js";
+import { guardPath, identityOf, realRootOf, wayTo } from "./path-guard.js";
 import { copyTree, entryAt, mergeTree, pathAsListed, readTree, type Tree } from "./tree.js";
 import { stageFile, type StagedFile } from "./replace-file.js";
 import { readProjectMeta } from "./meta.js";
@@ -134,7 +134,38 @@ function ensureGitignore(projectDir: string): void {
  * @trama-dev packages it can import.
  * Idempotent — called before every run, so a freshly cloned project just works.
  */
+/**
+ * Where a project is — which is a directory that is there. Nothing in the
+ * runtime makes one for a project that is gone: what it makes for a project,
+ * it makes in it. (Making the directories on the way to a file would make a
+ * project of that file, at the path of one that somebody has moved away.)
+ */
+export function projectAt(projectDir: string): string {
+  const project = realRootOf(projectDir);
+  if (!statSync(project, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`There is no project at ${project}.`);
+  return project;
+}
+
+/**
+ * A question to ask later: whether what is at a project's path is still the
+ * directory that is there now. A project is known by what it is, and what a
+ * run does over some time — ask for a fix, try it, install it, write it down
+ * — it does to the project it was started on: not to another directory that
+ * somebody has put at the path meanwhile. (Gone is not another: what is to be
+ * done where no project is, each step says for itself.)
+ */
+function sameProjectAs(projectDir: string): () => void {
+  const was = entryAt(realRootOf(projectDir));
+  return () => {
+    const now = entryAt(realRootOf(projectDir));
+    if (was?.kind === "dir" && now && !(now.kind === "dir" && now.id === was.id)) {
+      throw new Error(`What is at ${realRootOf(projectDir)} is not the project this was started on: nothing more is done there.`);
+    }
+  };
+}
+
 export function ensureProjectScaffold(projectDir: string): void {
+  projectAt(projectDir);
   mkdirSync(guardPath(projectDir, "history"), { recursive: true });
   mkdirSync(guardPath(projectDir, "logs"), { recursive: true });
   ensureModulePackageJson(projectDir);
@@ -356,9 +387,28 @@ export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promis
 }
 
 /**
- * Make `copyDir` a copy of a project to try a program in: what the project
- * holds (see copyTree), with `program` as its program.ts. Returns what the
- * project held when it was copied.
+ * Do something in a directory of a copy that may be closed to it: a copy is
+ * the runner's to open. The directory is left allowing what it allowed.
+ */
+function inDirOfCopy<T>(dir: string, what: () => T): T {
+  const allows = statSync(dir).mode;
+  if ((allows & 0o700) === 0o700) return what();
+  chmodSync(dir, (allows & 0o7777) | 0o700);
+  try {
+    return what();
+  } finally {
+    chmodSync(dir, allows & 0o7777);
+  }
+}
+
+/**
+ * Make, in `privateDir`, a copy of a project to try a program in: what the
+ * project is and holds (see copyTree), with `program` as its program.ts.
+ * Returns where the copy is, and what the project was when it was copied.
+ *
+ * The copy allows what the project allows, to everybody: so it is made in a
+ * directory that is this runner's alone, and is nobody else's to come to. It
+ * has the project's name there.
  *
  * The project's journals are not carried over: they are the record of its
  * runs, not part of what a run works on, and a copy is where a run is tried.
@@ -368,12 +418,15 @@ export async function withTempDir<T>(prefix: string, fn: (dir: string) => Promis
  * merged back into the project, and must not have been possible only there.
  * The one exception is the program: the one to be tried, in the place of
  * the project's. It allows what the project's allows — and its owner to
- * replace it: a copy is where programs are tried and replaced, and whether
- * the project's own may be is said of the project, where one is to take its
- * place (see whyNotReplaceable). A project with a directory where its
- * program should be has no place for one, and is not copied to try one in.
+ * replace it — and is put there whatever the directory it goes in allows:
+ * a copy is where programs are tried and replaced, and whether the project's
+ * own may be is said of the project, where one is to take its place (see
+ * whyNotReplaceable). A project with a directory where its program should be
+ * has no place for one, and is not copied to try one in.
  */
-function copyProjectWith(projectDir: string, copyDir: string, program: string): Tree {
+function copyProjectWith(projectDir: string, privateDir: string, program: string): { copy: string; held: Tree } {
+  const copyDir = join(realRootOf(privateDir), basename(projectAt(projectDir)) || "project");
+  mkdirSync(copyDir);
   // Two directories the copy must know when it comes to them — by what they are, since neither
   // need be spelled as the walk would spell it, or lie where its name suggests.
   let journals: string | undefined;
@@ -392,10 +445,14 @@ function copyProjectWith(projectDir: string, copyDir: string, program: string): 
     }
     return identity === journals;
   });
-  const had = statSync(guardPath(copyDir, "program.ts"), { throwIfNoEntry: false });
+  const place = guardPath(copyDir, "program.ts");
+  const had = statSync(place, { throwIfNoEntry: false });
   if (had?.isDirectory()) throw new Error(`No program can be tried in a copy of ${realRootOf(projectDir)}: its program.ts is a directory.`);
-  stageFile(copyDir, "program.ts", program, had && (had.mode | 0o200)).commit();
-  return held;
+  // The directory it goes in — or, if that is still to be made, the one it is made in.
+  let goesIn = dirname(place);
+  while (!existsSync(goesIn)) goesIn = dirname(goesIn);
+  inDirOfCopy(goesIn, () => stageFile(copyDir, "program.ts", program, had && (had.mode | 0o200)).commit());
+  return { copy: copyDir, held };
 }
 
 // --- Single program execution ---
@@ -782,15 +839,15 @@ async function requestRepair(
   input: { programSource: string; error: string },
 ): Promise<{ fixed: string } | { error: string }> {
   options.journal.note("fix-request", { error: input.error });
-  return withTempDir("trama-repair-", async (tempDir) => {
+  return withTempDir("trama-repair-", async (privateDir) => {
     const timedOut = new AbortController();
     const limit = createAllowance(options.timeout);
     const signal = options.signal ? AbortSignal.any([timedOut.signal, options.signal]) : timedOut.signal;
     try {
-      copyProjectWith(options.projectDir, tempDir, input.programSource);
+      const { copy } = copyProjectWith(options.projectDir, privateDir, input.programSource);
       limit.start(() => timedOut.abort());
       const fixed = stripCodeFences(await options.backend.ask(repairPrompt(input), {
-        cwd: tempDir, system: REPAIR_SYSTEM_PROMPT, signal,
+        cwd: copy, system: REPAIR_SYSTEM_PROMPT, signal,
       }));
       if (fixed.trim() === "") throw new Error("The repair returned an empty program.");
       if (fixed === input.programSource) throw new Error("The repair returned the program unchanged.");
@@ -824,9 +881,9 @@ async function requestRepair(
  */
 async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): Promise<RunOnceResult> {
   const { projectDir } = options;
-  return withTempDir("trama-staged-", async (stagedProject) => {
+  return withTempDir("trama-staged-", async (privateDir) => {
     // What the project held when it was copied: what its places are compared with when the run's work is merged in.
-    const held = copyProjectWith(projectDir, stagedProject, fixed);
+    const { copy: stagedProject, held } = copyProjectWith(projectDir, privateDir, fixed);
     // Taken with the fix in place: what differs from this afterwards is what the run did.
     const before = readTree(stagedProject);
     // The fix in the copy, as the copy has it: under which name, at which place — which is the place of
@@ -836,6 +893,13 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     const itsName = pathAsListed(stagedProject, join(copyRoot, "program.ts")) ?? "program.ts";
     const itsPlace = pathAsListed(stagedProject, fixAt);
     const allowed = statSync(fixAt).mode;
+    // And all that makes program.ts lead to it, as the copy stands: the name, each link and each directory on
+    // the way, the file — each by what it is, which is asked of the place, whatever its directory lists or allows.
+    const programIs = (): string[] => wayTo(stagedProject, "program.ts").flatMap((place) => {
+      const entry = entryAt(place);
+      return entry && entry.kind !== "other" ? [entry.id] : [];
+    });
+    const was = programIs();
     // If the copy cannot be run at all, or is left unusable, this fix did not work either.
     const trial = await runProgramOnce({ ...options, projectDir: stagedProject, attempt }).catch((err): RunOnceResult => ({
       outcome: null,
@@ -857,13 +921,17 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     // back where the run ended (the name itself, not what the link leads to).
     // A run that left something there that cannot be read as a program has
     // not left a project that has one, and was no fix.
+    let is: string[];
     try {
       if (statSync(join(copyRoot, itsName), { throwIfNoEntry: false })) {
         programIn(stagedProject);
       } else {
-        rmSync(join(copyRoot, itsName), { force: true });
-        stageFile(stagedProject, itsName, fixed, allowed).commit();
+        inDirOfCopy(copyRoot, () => {
+          rmSync(join(copyRoot, itsName), { force: true });
+          stageFile(stagedProject, itsName, fixed, allowed).commit();
+        });
       }
+      is = programIs();
     } catch (err) {
       return {
         outcome: null,
@@ -872,7 +940,14 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     }
     // If it cannot be put in place, that is an error, and it is thrown from
     // here with nothing of the run in the project: a state the old program
-    // did not write, beside the old program, is worse than either.
+    // did not write, beside the old program, is worse than either. Nor is it
+    // put into another directory that is at the project's path by now: the
+    // project is the directory that was copied, which the copy knows by what
+    // it is.
+    const copied = held.get("."), there = entryAt(realRootOf(projectDir));
+    if (there && copied?.kind === "dir" && !(there.kind === "dir" && there.id === copied.id)) {
+      throw new Error(`The program cannot be replaced: what is at ${realRootOf(projectDir)} is not the project the fix was tried on.`);
+    }
     const program = stageProgram(projectDir, fixed);
     program.commit();
     // The project now holds, where its program was, what the copy held there before the run — and the merge is
@@ -881,7 +956,11 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     const installed = entryAt(program.destination);
     const samePlace = relative(realRootOf(projectDir), program.destination) === relative(copyRoot, fixAt);
     if (itsPlace !== undefined && installed && samePlace) held.set(itsPlace, installed);
-    const unmerged = mergeTree(stagedProject, projectDir, before, held);
+    // What the run made of its program is one thing, with what it was: the name, and what the name leads through
+    // and to. If part of that does not arrive — or a part the run left alone is not, in the project, as it was —
+    // none of it is carried over: a link without what it leads to, or the file gone from where the project's
+    // program.ts still leads, would be a project with no program. The project then keeps the fix as it ran.
+    const unmerged = mergeTree(stagedProject, projectDir, before, held, [[...new Set([...was, ...is])]]);
     if (unmerged.length > 0) {
       // The run is done and its program installed; what it did that is not in the project is said, not passed over.
       options.journal.note("unmerged", { attempt, files: unmerged });
@@ -906,6 +985,7 @@ async function executeProgram(options: ExecuteOptions): Promise<Execution> {
   const stopped = () => options.signal?.aborted === true;
   const wasStopped = () => failed("The run was stopped before it finished.");
   if (stopped()) return wasStopped();
+  const stillTheProject = sameProjectAs(projectDir);
 
   const firstRun = await runProgramOnce(options);
   if (firstRun.outcome) return { result: firstRun.outcome };
@@ -913,6 +993,9 @@ async function executeProgram(options: ExecuteOptions): Promise<Execution> {
 
   let lastError = firstRun.failure;
   if (maxRepairAttempts === 0) return failed(`Program failed (repair disabled): ${lastError}`);
+  // What is said and done from here on is said and done of the project the run was started on. (Not what was
+  // said just now: where nothing more is to be done, how the program failed is all there is to say.)
+  stillTheProject();
   // A fix is worth asking for, and trying, only where it could become the program.
   const refusal = whyNotReplaceable(projectDir);
   if (refusal) return failed(`Program failed, and no repair was tried. ${refusal}\n${lastError}`);
@@ -923,8 +1006,10 @@ async function executeProgram(options: ExecuteOptions): Promise<Execution> {
 
   // The program as it was is attempt 0; each fix is the next.
   for (let attempt = 1; attempt <= maxRepairAttempts; attempt++) {
+    stillTheProject();
     const fix = await requestRepair(options, { programSource: currentSource, error: lastError });
     if (stopped()) return wasStopped();
+    stillTheProject();
     // Without a fix there is nothing more to try: asking again would be asking the same thing.
     if ("error" in fix) {
       return failed(`Failed after ${attempt} repair attempt(s): ${lastError}\nNo fix came back: ${fix.error}`);
@@ -982,8 +1067,8 @@ export async function validateProgram(
   const { journalRuns = 0, ...limits } = options;
   // Recorded with the project, though run in a copy of it.
   const journal = openJournal(projectDir, journalRuns, { purpose: "validate", ...limits });
-  const { result, repair, left } = await journalled(journal, () => withTempDir("trama-validate-", async (trialDir) => {
-    copyProjectWith(projectDir, trialDir, candidate);
+  const { result, repair, left } = await journalled(journal, () => withTempDir("trama-validate-", async (privateDir) => {
+    const { copy: trialDir } = copyProjectWith(projectDir, privateDir, candidate);
 
     const execution = await executeProgram({
       ...limits,
@@ -1027,6 +1112,12 @@ function programIn(projectDir: string): string | null {
  * only use is a new program — an update, a repair — is begun.
  */
 export function whyNotReplaceable(projectDir: string): string | null {
+  // A program is a project's: where no project is, none is put.
+  try {
+    projectAt(projectDir);
+  } catch (err) {
+    return `The program cannot be replaced: ${(err as Error).message}`;
+  }
   const place = guardPath(projectDir, "program.ts");
   const allows = (path: string, what: number) => {
     try { accessSync(path, what); return true; } catch { return false; }
@@ -1160,6 +1251,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
     args: options.args, // last: it is the one field of unknown size
   });
   askedFor?.started(journal.run, journal.path);
+  const stillTheProject = sameProjectAs(projectDir);
 
   const { result, repair } = await journalled(journal, () => executeProgram({
     projectDir,
@@ -1178,6 +1270,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   if (repair) {
     // The program is fixed and has run; failing to write this down must not turn that into an error.
     try {
+      stillTheProject();
       const message = `Repair attempt ${repair.attempt}/${maxRepairAttempts}`;
       appendLogEntry(guardPath(projectDir, LATEST_LOG_PATH), message, { error: repair.error });
       console.log(tagged(options.label, `[trama] ${message}`));

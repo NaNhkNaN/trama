@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
-import { join } from "path";
+import { basename, join } from "path";
 import { tmpdir } from "os";
 import { execFileSync } from "child_process";
 import { createServer } from "net";
@@ -11,6 +11,7 @@ import {
   validateProgram,
 } from "../packages/runtime/dist/runner.js";
 import { printJournals } from "../packages/runtime/dist/journal-view.js";
+import { createTools } from "../packages/runtime/dist/tools.js";
 import { openJournal } from "../packages/runtime/dist/journal.js";
 import {
   REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, readJson, startRunnerProcess, waitFor,
@@ -2608,20 +2609,462 @@ for (const [what, does, why] of [
   });
 }
 
-test("where somebody points program.ts elsewhere while a fix is tried, what the fix did to the file it was is still carried there", async (t) => {
+test("where somebody points program.ts elsewhere while a fix is tried, the fix goes where it leads now — and what the run made of the program it was is not carried there", async (t) => {
   const projectDir = projectWith(BOOM, { linked: true });
   writeText(join(projectDir, "other.ts"), "somebody's");
   const originalRepair = llm.repair;
   // The fix rewrites itself — and, standing in for somebody else, re-points the project's own program.ts.
   const elsewhere = `fs.unlinkSync(${JSON.stringify(join(projectDir, "program.ts"))}); fs.symlinkSync("other.ts", ${JSON.stringify(join(projectDir, "program.ts"))});`;
-  llm.repair = fixThat(`${elsewhere}\nfs.writeFileSync("program.ts", ${JSON.stringify(SELF)});`);
+  const fix = (await fixThat(`${elsewhere}\nfs.writeFileSync("program.ts", ${JSON.stringify(SELF)});`)()).trimEnd();
+  llm.repair = async () => fix;
   t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
 
   const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
   assert.equal(result.status, "done");
-  // The fix went where program.ts leads now. Where it led when the copy was made is as the copy knew it, and takes the run's work.
-  assert.deepEqual(messages.filter(line => line.includes("src/app.ts")), []);
-  assert.equal(shapeOf(projectDir, ["src/app.ts"])["src/app.ts"], `file 600 ${JSON.stringify(SELF)}`);
+  // The name is theirs now, and is part of what the program is: what the run made of the rest is not carried
+  // over without it. The file the name led to is as it was, and the project's program is the fix.
+  assert.deepEqual(shapeOf(projectDir, ["program.ts", "other.ts", "src/app.ts"]), {
+    "program.ts": "link to other.ts", "other.ts": `file 644 ${JSON.stringify(fix)}`, "src/app.ts": `file 600 ${JSON.stringify(BOOM)}`,
+  });
+  assert.ok(messages.some(line => /program\.ts — the run left it as it was, but it was changed or removed in the project meanwhile/.test(line)), messages.join("\n"));
+  assert.ok(messages.some(line => /src\/app\.ts — it is one thing with program\.ts, which is not as it was in the project/.test(line)), messages.join("\n"));
+});
+
+// --- The program is one thing: what a run made of it arrives whole, or the project keeps the fix as it ran ---
+
+/** Something done to a place of the project by somebody else, while a fix is tried: said in the fix's own text, which is what runs meanwhile. */
+const meanwhile = (place) => `{
+  const place = ${JSON.stringify(place)};
+  const there = fs.lstatSync(place, { throwIfNoEntry: false });
+  try {
+    if (!there) fs.writeFileSync(place, "THEIRS");
+    else if (there.isSymbolicLink()) { const says = fs.readlinkSync(place); fs.unlinkSync(place); fs.symlinkSync("./" + says, place); }
+    else if (there.isDirectory()) fs.chmodSync(place, 0o700);
+    else fs.appendFileSync(place, "\\n// theirs");
+  } catch {}
+}`;
+const REMOVES_ITSELF = {
+  "removes itself": { does: `fs.unlinkSync("program.ts");` },
+  "was a link, and removes itself": { linked: true, does: `fs.unlinkSync("program.ts");`, names: ["src/app.ts"] },
+  "was a link, and removes what it led to": { linked: true, does: `fs.unlinkSync("src/app.ts");`, names: ["src/app.ts"] },
+  "was a link, and removes the directory it led into": { linked: true, does: `fs.rmSync("src", { recursive: true });`, names: ["src/app.ts"] },
+};
+for (const [what, { does, linked, spelled, onlyWhereNamesFold, names = [] }] of Object.entries({ ...WHAT_A_PROGRAM_DOES_TO_ITSELF, ...REMOVES_ITSELF })) {
+  const places = new Set(["program.ts", ...names, ...names.map((name) => name.split("/")[0])]);
+  for (const place of places) {
+    test(`a repaired program that ${what}, while somebody else is at ${place}: the project has a program afterwards — the fix, or what it made of itself`, { skip: onlyWhereNamesFold && !foldsNames }, async (t) => {
+      const projectDir = projectWith(BOOM, { linked, spelled });
+      const fix = (await fixThat(`${meanwhile(join(projectDir, place))}\n${does}`)()).trimEnd();
+      const originalRepair = llm.repair;
+      llm.repair = async () => fix;
+      t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+      const { result } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+      assert.equal(result.status, "done");
+      let program;
+      try {
+        program = readFileSync(join(projectDir, "program.ts"), "utf-8");
+      } catch (err) {
+        assert.fail(`program.ts leads to no program (${err.code}): ${JSON.stringify(shapeOf(projectDir, ["program.ts", ...names]))}`);
+      }
+      assert.ok(program === fix || program === SELF, `program.ts leads to ${JSON.stringify(program)}`);
+    });
+  }
+}
+
+test("a fix that makes its program a link, where what the link leads to does not arrive: the project keeps the fix as it ran, and is told", async (t) => {
+  const projectDir = projectWith(BOOM);
+  // Somebody puts a file where the run makes a directory. (An ordinary project: nothing in it is closed.)
+  const fix = (await fixThat(`fs.writeFileSync(${JSON.stringify(join(projectDir, "sub"))}, "THEIRS");
+fs.mkdirSync("sub"); fs.writeFileSync("sub/main.ts", ${JSON.stringify(SELF)}); fs.unlinkSync("program.ts"); fs.symlinkSync("sub/main.ts", "program.ts");
+fs.writeFileSync("state.txt", "written by the run");`)()).trimEnd();
+  const originalRepair = llm.repair;
+  llm.repair = async () => fix;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  assert.deepEqual(shapeOf(projectDir, ["program.ts", "sub", "state.txt"]), {
+    "program.ts": `file 600 ${JSON.stringify(fix)}`, "sub": 'file 644 "THEIRS"', "state.txt": 'file 644 "written by the run"',
+  });
+  assert.ok(messages.some(line => /program\.ts — it is one thing with sub(\/main\.ts)?, which did not arrive/.test(line)), messages.join("\n"));
+  assert.deepEqual(messages.filter(line => line.includes("repair bookkeeping failed")), []);
+  // And it is a project that can be run again: the fix, which does the same again and fails at it — not a path that leads nowhere.
+  const again = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.equal(again.status, "failed");
+  assert.match(again.reason, /EEXIST|ENOTDIR/);
+});
+
+test("a fix that removes what its program.ts led to, where the file put in the link's place does not arrive: what the link leads to stays", async (t) => {
+  const projectDir = projectWith(BOOM, { linked: true });
+  const link = JSON.stringify(join(projectDir, "program.ts"));
+  // Somebody words the link otherwise meanwhile: it is theirs, and nothing takes its place.
+  const fix = (await fixThat(`fs.unlinkSync(${link}); fs.symlinkSync("./src/app.ts", ${link});\nfs.unlinkSync("src/app.ts");`)()).trimEnd();
+  const originalRepair = llm.repair;
+  llm.repair = async () => fix;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  assert.deepEqual(shapeOf(projectDir, ["program.ts", "src/app.ts"]), { "program.ts": "link to ./src/app.ts", "src/app.ts": `file 600 ${JSON.stringify(fix)}` });
+  assert.ok(messages.some(line => /src\/app\.ts — it is one thing with program\.ts, which did not arrive/.test(line)), messages.join("\n"));
+});
+
+const WHAT_THE_PROGRAM_LEANS_ON = {
+  "a file that is in the project already, which somebody removes": {
+    setUp: (dir) => writeText(join(dir, "alt.ts"), SELF),
+    does: `fs.unlinkSync("program.ts"); fs.symlinkSync("alt.ts", "program.ts");`,
+    meanwhile: (dir) => `fs.unlinkSync(${JSON.stringify(join(dir, "alt.ts"))});`,
+    told: /alt\.ts — the run left it as it was, but it was changed or removed in the project meanwhile/,
+  },
+  "a file in a directory that is in the project already, which somebody gives another name": {
+    setUp: (dir) => writeText(join(dir, "lib", "alt.ts"), SELF),
+    does: `fs.unlinkSync("program.ts"); fs.symlinkSync("lib/alt.ts", "program.ts");`,
+    meanwhile: (dir) => `fs.renameSync(${JSON.stringify(join(dir, "lib"))}, ${JSON.stringify(join(dir, "lib2"))});`,
+    told: /lib — the run left it as it was, but it was changed or removed in the project meanwhile/,
+  },
+  "a link that is in the project already, which somebody points out of the project": {
+    setUp: (dir) => { writeText(join(dir, "v1.ts"), SELF); symlinkSync("v1.ts", join(dir, "cur")); },
+    does: `fs.unlinkSync("program.ts"); fs.symlinkSync("cur", "program.ts");`,
+    meanwhile: (dir) => `fs.unlinkSync(${JSON.stringify(join(dir, "cur"))}); fs.symlinkSync("/etc/hosts", ${JSON.stringify(join(dir, "cur"))});`,
+    told: /cur — the run left it as it was, but it was changed or removed in the project meanwhile/,
+  },
+  "a directory its way goes into and out of again, where somebody has put a file": {
+    setUp: (dir) => mkdirSync(join(dir, "sub")),
+    does: `fs.mkdirSync("sub/deep"); fs.writeFileSync("sub/main.ts", ${JSON.stringify(SELF)}); fs.unlinkSync("program.ts"); fs.symlinkSync("sub/deep/../main.ts", "program.ts");`,
+    meanwhile: (dir) => `fs.writeFileSync(${JSON.stringify(join(dir, "sub", "deep"))}, "THEIRS");`,
+    told: /sub\/deep — something else is at that place in the project/,
+  },
+  "a file named in other letters, which has a second name beside it — where somebody is at its own": {
+    onlyWhereNamesFold: true,
+    setUp: (dir) => mkdirSync(join(dir, "sub")),
+    does: `fs.writeFileSync("sub/main.ts", ${JSON.stringify(SELF)}); fs.linkSync("sub/main.ts", "sub/amain.ts"); fs.unlinkSync("program.ts"); fs.symlinkSync("sub/MAIN.TS", "program.ts");`,
+    meanwhile: (dir) => `fs.writeFileSync(${JSON.stringify(join(dir, "sub", "main.ts"))}, "THEIRS");`,
+    told: /sub\/main\.ts — something else is at that place in the project/,
+  },
+};
+for (const [what, { setUp, does, meanwhile, told, onlyWhereNamesFold }] of Object.entries(WHAT_THE_PROGRAM_LEANS_ON)) {
+  test(`a fix that makes its program.ts lead through ${what}: the project keeps the fix as it ran, and is told`, { skip: onlyWhereNamesFold && !foldsNames }, async (t) => {
+    const projectDir = projectWith(BOOM);
+    setUp(projectDir);
+    const fix = (await fixThat(`${meanwhile(projectDir)}\n${does}`)()).trimEnd();
+    const originalRepair = llm.repair;
+    llm.repair = async () => fix;
+    t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+    const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+    assert.equal(result.status, "done");
+    assert.deepEqual(shapeOf(projectDir, ["program.ts"]), { "program.ts": `file 600 ${JSON.stringify(fix)}` });
+    assert.ok(messages.some(line => told.test(line)), messages.join("\n"));
+    assert.ok(messages.some(line => /program\.ts — it is one thing with .*: it is left as it was/.test(line)), messages.join("\n"));
+    assert.deepEqual(messages.filter(line => line.includes("repair bookkeeping failed")), []);
+  });
+}
+
+for (const [where, linked] of [["its own directory", false], ["the directory its program.ts leads into", true]]) {
+  test(`a fix whose run leaves ${where} passable and not to be listed has its work in the project all the same`, { skip: process.getuid?.() === 0 }, async (t) => {
+    const closes = linked ? "src" : ".";
+    const fix = (await fixThat(`fs.writeFileSync("out.txt", "made by the run"); fs.chmodSync(${JSON.stringify(closes)}, 0o300);`)()).trimEnd();
+    const projectDir = projectWith(BOOM, { linked });
+    const originalRepair = llm.repair;
+    llm.repair = async () => fix;
+    t.after(() => { llm.repair = originalRepair; chmodSync(join(projectDir, closes), 0o755); cleanupTempDir(projectDir); });
+
+    const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+    assert.equal(result.status, "done");
+    assert.deepEqual(messages.filter(line => line.includes("did not reach the project")), []);
+    assert.equal(statSync(join(projectDir, closes)).mode & 0o777, 0o300);
+    assert.equal(readFileSync(join(projectDir, "out.txt"), "utf-8"), "made by the run");
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fix);
+  });
+}
+
+test("a project whose directory somebody moved away while a fix was tried is not made anew at its path", async (t) => {
+  const parent = makeTempDir("trama-runner-");
+  const projectDir = join(parent, "proj"), movedTo = join(parent, "proj.moved");
+  createProjectFixture(projectDir, { scaffold: false, programSource: BOOM });
+  const fix = (await fixThat(`fs.renameSync(${JSON.stringify(projectDir)}, ${JSON.stringify(movedTo)});\nfs.writeFileSync("out.txt", "made by the run");`)()).trimEnd();
+  const originalRepair = llm.repair;
+  llm.repair = async () => fix;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(parent); });
+
+  await assert.rejects(runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }), /The program cannot be replaced: There is no project at /);
+  assert.deepEqual(readdirSync(parent), ["proj.moved"]);
+  assert.equal(readFileSync(join(movedTo, "program.ts"), "utf-8"), BOOM);
+  assert.equal(existsSync(join(movedTo, "out.txt")), false);
+  // Nor is a program installed where no project is.
+  assert.throws(() => installValidatedProgram(projectDir, { source: SELF }, "update", "p"), /There is no project at /);
+  assert.deepEqual(readdirSync(parent), ["proj.moved"]);
+  // Nor is a candidate tried, or its trial written down, where the project was: a journal makes no directory for one.
+  await assert.rejects(
+    validateProgram(projectDir, createBackend(loadConfig()), SELF, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5, journalRuns: 5 }),
+    /There is no project at /);
+  assert.deepEqual(readdirSync(parent), ["proj.moved"]);
+});
+
+test("another directory at the project's path, by the time a fix has run, is not the project: the fix is not put into it", async (t) => {
+  const parent = makeTempDir("trama-runner-");
+  const projectDir = join(parent, "proj"), movedTo = join(parent, "proj.moved"), other = join(parent, "other");
+  createProjectFixture(projectDir, { scaffold: false, programSource: BOOM });
+  createProjectFixture(other, { scaffold: false, programSource: "// somebody else's program\n" });
+  // Meanwhile: the project is moved away, and another directory put at its path — by name, and as a link to it.
+  for (const how of [`fs.renameSync(${JSON.stringify(other)}, ${JSON.stringify(projectDir)});`, `fs.symlinkSync(${JSON.stringify(other)}, ${JSON.stringify(projectDir)});`]) {
+    const fix = (await fixThat(`fs.renameSync(${JSON.stringify(projectDir)}, ${JSON.stringify(movedTo)}); ${how}\nfs.writeFileSync("out.txt", "made by the run");`)()).trimEnd();
+    const originalRepair = llm.repair;
+    llm.repair = async () => fix;
+    t.after(() => { llm.repair = originalRepair; cleanupTempDir(parent); });
+
+    await assert.rejects(runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }), /The program cannot be replaced: what is at .* is not the project the fix was tried on\./);
+    const theirs = existsSync(other) ? other : projectDir;
+    assert.equal(readFileSync(join(theirs, "program.ts"), "utf-8"), "// somebody else's program\n");
+    assert.equal(existsSync(join(theirs, "out.txt")), false);
+    assert.equal(readFileSync(join(movedTo, "program.ts"), "utf-8"), BOOM);
+    llm.repair = originalRepair;
+    // (Put back for the next way of doing it.)
+    rmSync(projectDir, { recursive: true, force: true });
+    if (!existsSync(other)) createProjectFixture(other, { scaffold: false, programSource: "// somebody else's program\n" });
+    renameSync(movedTo, projectDir);
+  }
+});
+
+test("another project put at the path while a fix is asked for is not the project the run was started on: no fix is tried or put there", async (t) => {
+  const parent = makeTempDir("trama-runner-");
+  const projectDir = join(parent, "proj"), movedTo = join(parent, "proj.moved"), other = join(parent, "other");
+  createProjectFixture(projectDir, { scaffold: false, programSource: BOOM });
+  createProjectFixture(other, { programSource: "// somebody else's program\n" });
+  writeText(join(other, "data.txt"), "THE OTHER'S DATA");
+  const fix = (await fixThat(`fs.writeFileSync("data.txt", "D2"); fs.writeFileSync("out.txt", "made by the run");`)()).trimEnd();
+  const originalRepair = llm.repair;
+  llm.repair = async () => { renameSync(projectDir, movedTo); renameSync(other, projectDir); return fix; };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(parent); });
+
+  await assert.rejects(runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }), /is not the project this was started on: nothing more is done there\./);
+  assert.deepEqual(shapeOf(projectDir, ["program.ts", "data.txt", "out.txt", "state.json", "history/0001.ts"]), {
+    "program.ts": 'file 644 "// somebody else\'s program\\n"', "data.txt": 'file 644 "THE OTHER\'S DATA"', "out.txt": "nothing", "state.json": "nothing", "history/0001.ts": "nothing",
+  });
+  assert.equal(readFileSync(join(movedTo, "program.ts"), "utf-8"), BOOM);
+});
+
+test("another directory at the path when a first attempt has failed is not described as the project: the run ends with what it is", async (t) => {
+  const parent = makeTempDir("trama-runner-");
+  const projectDir = join(parent, "proj"), movedTo = join(parent, "proj.moved"), other = join(parent, "other");
+  // The program itself, failing, stands in for somebody who swaps the directories while it runs.
+  createProjectFixture(projectDir, { scaffold: false, programSource: `import * as fs from "fs";\nfs.renameSync(${JSON.stringify(projectDir)}, ${JSON.stringify(movedTo)}); fs.renameSync(${JSON.stringify(other)}, ${JSON.stringify(projectDir)});\nthrow new Error("boom");\n` });
+  createProjectFixture(other, { programSource: "// somebody else's program\n" });
+  chmodSync(join(other, "program.ts"), 0o444); // (of which a run would say: it is read-only, and cannot be replaced)
+  const originalRepair = llm.repair;
+  let asked = 0;
+  llm.repair = async () => { asked++; return SELF; };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(parent); });
+
+  await assert.rejects(runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }), /is not the project this was started on: nothing more is done there\./);
+  assert.equal(asked, 0);
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), "// somebody else's program\n");
+});
+
+test("a program that rebuilds its own directory and then fails, with no repair to try, has failed for its own reason: that is what is said", async (t) => {
+  const parent = makeTempDir("trama-runner-");
+  const projectDir = join(parent, "proj"), old = join(parent, "proj.old");
+  createProjectFixture(projectDir, { scaffold: false, programSource: `import * as fs from "fs";
+fs.cpSync(${JSON.stringify(projectDir)}, ${JSON.stringify(projectDir + ".new")}, { recursive: true, verbatimSymlinks: true });
+fs.renameSync(${JSON.stringify(projectDir)}, ${JSON.stringify(old)}); fs.renameSync(${JSON.stringify(projectDir + ".new")}, ${JSON.stringify(projectDir)});
+throw new Error("THE REAL REASON");
+` });
+  t.after(() => cleanupTempDir(parent));
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /Program failed \(repair disabled\): [^]*THE REAL REASON/);
+});
+
+test("a run nobody's program asked for names its workspace: the way to it is made", async (t) => {
+  const parent = makeTempDir("trama-runner-");
+  const projectDir = join(parent, "proj"), workspaceDir = join(parent, "not", "there", "yet");
+  createProjectFixture(projectDir, { scaffold: false, programSource: `import { ctx, workspace } from "@trama-dev/runtime";\nawait workspace.write("a.txt", "1");\nawait ctx.done();\n` });
+  t.after(() => cleanupTempDir(parent));
+
+  const result = await runProgram({ projectDir, workspaceDir, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.equal(result.status, "done");
+  assert.equal(readFileSync(join(workspaceDir, "a.txt"), "utf-8"), "1");
+});
+
+test("the way to a run's workspace is made where the workspace is then looked for, when the run begins, and on its record", async (t) => {
+  const parent = realpathSync(makeTempDir("trama-runner-"));
+  const projectDir = join(parent, "here", "proj");
+  createProjectFixture(projectDir, { scaffold: false, programSource: `import { ctx, workspace } from "@trama-dev/runtime";\nawait workspace.write("a.txt", "1");\nawait ctx.done();\n` });
+  mkdirSync(join(parent, "elsewhere"));
+  symlinkSync(join(parent, "elsewhere"), join(parent, "here", "lnk"));
+  t.after(() => cleanupTempDir(parent));
+
+  // A path that says ".." after a link is read as the rest of the run reads it: as text.
+  const result = await runProgram({ projectDir, workspaceDir: `${parent}/here/lnk/../shared/ws`, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.equal(result.status, "done");
+  assert.equal(readFileSync(join(parent, "here", "shared", "ws", "a.txt"), "utf-8"), "1");
+  assert.deepEqual(readdirSync(join(parent, "elsewhere")), []);
+
+  // A run that is refused before it begins has made nothing.
+  await assert.rejects(runProgram({ projectDir, workspaceDir: join(parent, "deep", "ws"), maxRepairAttempts: 0, timeout: -1 }), /Invalid timeout/);
+  assert.equal(existsSync(join(parent, "deep")), false);
+
+  // One that cannot begin for its workspace says so, and its journal has it.
+  writeText(join(parent, "a-file"), "x");
+  await assert.rejects(runProgram({ projectDir, workspaceDir: join(parent, "a-file"), maxRepairAttempts: 0, timeout: 20_000 }), { code: "EEXIST" });
+  const journals = join(projectDir, "logs", "journal");
+  const last = readdirSync(journals).sort().at(-1);
+  assert.match(readFileSync(join(journals, last), "utf-8").trim().split("\n").at(-1), /"kind":"end".*EEXIST/);
+});
+
+test("a file a program writes is written into its project, which is there: one that is gone is not made anew for it", async (t) => {
+  const parent = makeTempDir("trama-runner-");
+  const projectDir = join(parent, "proj");
+  createProjectFixture(projectDir, { scaffold: false, programSource: BOOM });
+  const tools = createTools(projectDir);
+  t.after(async () => { await tools.stopActiveShells(); cleanupTempDir(parent); });
+  await tools.write("a/b/out.txt", "written");
+  assert.equal(readFileSync(join(projectDir, "a", "b", "out.txt"), "utf-8"), "written");
+  renameSync(projectDir, join(parent, "proj.moved"));
+  await assert.rejects(tools.write("c/out.txt", "written"), /There is no directory at /);
+  assert.deepEqual(readdirSync(parent), ["proj.moved"]);
+});
+
+test("for a project that is not there, no directory is made: what a project needs is made in it", (t) => {
+  const parent = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(parent));
+  assert.throws(() => ensureProjectScaffold(join(parent, "gone")), /There is no project at /);
+  assert.deepEqual(readdirSync(parent), []);
+});
+
+test("a project moved away while a fix was asked for: the run ends with that, and nothing is made at its path", async (t) => {
+  const parent = makeTempDir("trama-runner-");
+  const projectDir = join(parent, "proj"), movedTo = join(parent, "proj.moved");
+  createProjectFixture(projectDir, { scaffold: false, programSource: BOOM });
+  const originalRepair = llm.repair;
+  llm.repair = async () => { renameSync(projectDir, movedTo); return SELF; };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(parent); });
+
+  await assert.rejects(runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }), /There is no project at /);
+  assert.deepEqual(readdirSync(parent), ["proj.moved"]);
+});
+
+test("a fix that moves its program and closes the directory it was in, where the new place does not arrive: the directory is left as it was, and the program can be read", { skip: process.getuid?.() === 0 }, async (t) => {
+  for (const closedTo of [0o000, 0o600]) {
+    const projectDir = projectWith(BOOM, { linked: true });
+    const fix = (await fixThat(`fs.writeFileSync(${JSON.stringify(join(projectDir, "sub"))}, "THEIRS");
+fs.mkdirSync("sub"); fs.renameSync("src/app.ts", "sub/main.ts"); fs.unlinkSync("program.ts"); fs.symlinkSync("sub/main.ts", "program.ts"); fs.chmodSync("src", ${closedTo});`)()).trimEnd();
+    const originalRepair = llm.repair;
+    llm.repair = async () => fix;
+    t.after(() => { llm.repair = originalRepair; chmodSync(join(projectDir, "src"), 0o755); cleanupTempDir(projectDir); });
+    const allowed = statSync(join(projectDir, "src")).mode & 0o777;
+
+    const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+    assert.equal(result.status, "done");
+    assert.equal(statSync(join(projectDir, "src")).mode & 0o777, allowed);
+    assert.deepEqual(shapeOf(projectDir, ["program.ts", "src/app.ts"]), { "program.ts": "link to src/app.ts", "src/app.ts": `file 600 ${JSON.stringify(fix)}` });
+    assert.ok(messages.some(line => /src — what it was to allow \(\d+\) is one thing with .*, which did not arrive: it is left allowing what it allowed/.test(line)), messages.join("\n"));
+    assert.deepEqual(messages.filter(line => line.includes("repair bookkeeping failed")), []);
+    llm.repair = originalRepair;
+  }
+});
+
+// --- A project whose own directory may not be written to ---
+
+/** A project that has run once, whose program.ts leads into src — so that it can be replaced where the project's own directory may not be written to. */
+const closedProject = async (t, program, files = {}) => {
+  const projectDir = projectWith(program, { linked: true });
+  writeJson(join(projectDir, "state.json"), { n: 1 });
+  for (const [name, text] of Object.entries(files)) writeText(join(projectDir, name), text);
+  ensureProjectScaffold(projectDir); // (what a run makes in the directory, while it still can)
+  chmodSync(projectDir, 0o555);
+  t.after(() => { chmodSync(projectDir, 0o755); cleanupTempDir(projectDir); });
+  return projectDir;
+};
+const WRITES_INTO_WHAT_IS_THERE = `import { ctx } from "@trama-dev/runtime";\nimport * as fs from "fs";\nfs.writeFileSync("notes.txt", "written by the run");\nctx.state.n = 2;\nawait ctx.done();`;
+const MAKES_A_FILE = `import { ctx } from "@trama-dev/runtime";\nimport * as fs from "fs";\nfs.writeFileSync("new-file.txt", "made by the run");\nawait ctx.done();`;
+
+test("in a project whose own directory may not be written to, a repaired run's work reaches the files that are there — as the same run's does directly", { skip: process.getuid?.() === 0 }, async (t) => {
+  const direct = await closedProject(t, WRITES_INTO_WHAT_IS_THERE, { "notes.txt": "old" });
+  const repaired = await closedProject(t, BOOM, { "notes.txt": "old" });
+  const originalRepair = llm.repair;
+  llm.repair = async () => WRITES_INTO_WHAT_IS_THERE;
+  t.after(() => { llm.repair = originalRepair; });
+
+  assert.equal((await runProgram({ projectDir: direct, maxRepairAttempts: 0, timeout: 20_000 })).status, "done");
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir: repaired, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  assert.deepEqual(messages.filter(line => line.includes("did not reach the project")), []);
+  assert.deepEqual(shapeOf(repaired, ["notes.txt", "state.json"]), shapeOf(direct, ["notes.txt", "state.json"]));
+  assert.equal(loadState(repaired).n, 2);
+  assert.equal(statSync(repaired).mode & 0o777, 0o555, "and the directory is left allowing what it allowed");
+  assert.deepEqual(leftovers(repaired), []);
+});
+
+test("in a copy of a project whose own directory may not be written to, a program can do no more than in the project", { skip: process.getuid?.() === 0 }, async (t) => {
+  const projectDir = await closedProject(t, BOOM, { "notes.txt": "old" });
+  const limits = { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 };
+  // What the project's directory forbids fails in the copy, as it would in the project.
+  await assert.rejects(validateProgram(projectDir, createBackend(loadConfig()), MAKES_A_FILE, limits), /EACCES: permission denied, open 'new-file\.txt'/);
+  // And what it allows — writing into a file that is there — passes.
+  const validated = await validateProgram(projectDir, createBackend(loadConfig()), WRITES_INTO_WHAT_IS_THERE, limits);
+  assert.equal(validated.source, WRITES_INTO_WHAT_IS_THERE);
+  assert.deepEqual(shapeOf(projectDir, ["notes.txt", "new-file.txt"]), { "notes.txt": 'file 644 "old"', "new-file.txt": "nothing" });
+});
+
+test("a program is tried in a copy whatever the directory it goes in allows; whether it may take the project's place is said of the project", { skip: process.getuid?.() === 0 }, async (t) => {
+  // The program is a file of the project's own directory, which may not be written to.
+  const projectDir = projectWith(BOOM);
+  writeJson(join(projectDir, "state.json"), { n: 1 });
+  writeText(join(projectDir, "notes.txt"), "old");
+  ensureProjectScaffold(projectDir);
+  chmodSync(projectDir, 0o555);
+  t.after(() => { chmodSync(projectDir, 0o755); cleanupTempDir(projectDir); });
+  const limits = { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 };
+
+  const validated = await validateProgram(projectDir, createBackend(loadConfig()), WRITES_INTO_WHAT_IS_THERE, limits);
+  assert.equal(validated.source, WRITES_INTO_WHAT_IS_THERE);
+  // Putting it there did not open the copy to it: what the directory forbids, it forbids the program tried in it.
+  await assert.rejects(validateProgram(projectDir, createBackend(loadConfig()), MAKES_A_FILE, limits), /EACCES: permission denied, open 'new-file\.txt'/);
+  assert.throws(() => installValidatedProgram(projectDir, validated, "update", "p"), /The program cannot be replaced: nothing can be created in /);
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), BOOM);
+});
+
+test("a program is tried in a copy also where program.ts leads into a directory still to be made, in one that may not be written to", { skip: process.getuid?.() === 0 }, async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: BOOM, state: { n: 1 } });
+  rmSync(join(projectDir, "program.ts"));
+  symlinkSync("not-yet/app.ts", join(projectDir, "program.ts"));
+  ensureProjectScaffold(projectDir);
+  chmodSync(projectDir, 0o555);
+  t.after(() => { chmodSync(projectDir, 0o755); cleanupTempDir(projectDir); });
+
+  const validated = await validateProgram(projectDir, createBackend(loadConfig()), SELF, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 });
+  assert.equal(validated.source, SELF);
+  assert.equal(existsSync(join(projectDir, "not-yet")), false);
+});
+
+test("a fix that removes what its program.ts led to, in a project whose own directory may not be written to, is put back at its name there too", { skip: process.getuid?.() === 0 }, async (t) => {
+  const projectDir = await closedProject(t, BOOM);
+  const fix = (await fixThat(`fs.unlinkSync("src/app.ts");`)()).trimEnd();
+  const originalRepair = llm.repair;
+  llm.repair = async () => fix;
+  t.after(() => { llm.repair = originalRepair; });
+
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  assert.deepEqual(messages.filter(line => line.includes("did not reach the project")), []);
+  assert.deepEqual(shapeOf(projectDir, ["program.ts", "src/app.ts"]), { "program.ts": `file 600 ${JSON.stringify(fix)}`, "src/app.ts": "nothing" });
+  assert.equal(statSync(projectDir).mode & 0o777, 0o555);
+});
+
+test("a copy a fix is tried in is as the project is — its name, and what it allows — in a directory that is nobody else's", async (t) => {
+  const projectDir = projectWith(BOOM);
+  chmodSync(projectDir, 0o755);
+  const originalRepair = llm.repair;
+  llm.repair = async () => `import { ctx } from "@trama-dev/runtime";\nimport * as fs from "fs";\nimport * as path from "path";
+await ctx.done({ name: path.basename(process.cwd()), allows: fs.statSync(".").mode & 0o777, isIn: fs.statSync("..").mode & 0o777, inTheProject: fs.realpathSync(".") === ${JSON.stringify(realpathSync(projectDir))} });`;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.deepEqual(result.result, { name: basename(projectDir), allows: 0o755, isIn: 0o700, inTheProject: false });
 });
 
 test("a directory where a project's program should be is no program, and is said to be none", async (t) => {

@@ -13,10 +13,10 @@
 //
 // It records. Nothing reads it back to change what a run does.
 
-import { appendFileSync, closeSync, mkdirSync, openSync, readSync, readdirSync, rmSync } from "fs";
+import { appendFileSync, closeSync, openSync, readSync, readdirSync, rmSync } from "fs";
 import { createHash, randomBytes } from "crypto";
 import { join } from "path";
-import { guardPath, identityOf } from "./path-guard.js";
+import { guardPath, identityOf, makeDirsIn } from "./path-guard.js";
 import { isJsonObject } from "./serializable.js";
 
 /** The format of the records. Bump it when a reader of older journals would be misled. */
@@ -283,7 +283,8 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
   let identity: string | undefined;
   try {
     const dir = journalDirOf(projectDir);
-    mkdirSync(dir, { recursive: true });
+    // (In the project, which is there: a journal is not what makes a directory where a project was.)
+    makeDirsIn(projectDir, dir);
     makeRoom(dir, keep);
     path = journalIn(dir, run);
     // Readable by its owner only: it holds what the program read, wrote and was told.

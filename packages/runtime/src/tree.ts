@@ -17,9 +17,10 @@ import { stagedNameFor } from "./replace-file.js";
 /**
  * What is at one path. `id` says which file, directory or link it is: it
  * stays the same through being written to, renamed, or given other
- * permissions, and nothing else in the same directory tree has it. (It is the
- * system's number for it, which a file system may give again once what had
- * it is gone: what was removed can so be taken for what was made after it.)
+ * permissions, and nothing else has it. (It is the system's numbers for it —
+ * its device's, and its own on that — and a file system may give a number
+ * again once what had it is gone: what was removed can so be taken for what
+ * was made after it.)
  */
 export type Entry =
   /** `stamp` is different after any change to the file — to what it holds or to what it allows — and cannot be set by a program. */
@@ -29,8 +30,16 @@ export type Entry =
   /** A pipe, a socket, a device, a link that says nothing a path can be made of: one end of something else, not content. */
   | { kind: "other" };
 
-/** What a directory holds: every path under it ("/" between the names), a directory before what is in it. */
+/**
+ * What a directory is and holds: the directory itself, as ".", and every path
+ * under it ("/" between the names) — a directory before what is in it.
+ */
 export type Tree = Map<string, Entry>;
+
+/** The path of the directory a tree is of. It is in no directory of the tree, and every other path is under it. */
+const ITSELF = ".";
+/** The order in which a path comes before every path under it. (As text "." comes after "-x", which is under it.) */
+const inOrder = (a: string, b: string) => (a === b ? 0 : a === ITSELF || (b !== ITSELF && a < b) ? -1 : 1);
 
 const NOT_CONTENT: Entry = { kind: "other" };
 
@@ -39,11 +48,11 @@ export function entryAt(path: string): Entry | undefined {
   const stat = lstatSync(path, { bigint: true, throwIfNoEntry: false });
   if (!stat) return undefined;
   const mode = Number(stat.mode & 0o7777n);
-  const id = String(stat.ino);
+  const id = `${stat.dev}:${stat.ino}`;
   if (stat.isFile()) {
     // The time of the last change is the system's own: it moves when the file is written, replaced, or
     // has its permissions changed, and no program can put it back. (The time of the last write can be.)
-    return { kind: "file", mode, size: Number(stat.size), stamp: `${stat.ino}:${stat.ctimeNs}:${stat.size}`, id };
+    return { kind: "file", mode, size: Number(stat.size), stamp: `${id}:${stat.ctimeNs}:${stat.size}`, id };
   }
   if (stat.isDirectory()) return { kind: "dir", mode, id };
   if (stat.isSymbolicLink()) {
@@ -92,9 +101,9 @@ const gone = (err: unknown) => (err as NodeJS.ErrnoException).code === "ENOENT";
 const noSuchPlace = (err: unknown) => ["ENOENT", "ENOTDIR", "ENAMETOOLONG"].includes((err as NodeJS.ErrnoException).code ?? "");
 
 /**
- * Go through everything under a directory, a directory before what it holds.
- * `visit` is given each path, what is there, and where that is; if it returns
- * false the entry is left out, and not gone into.
+ * Go through a directory and everything under it, a directory before what it
+ * holds. `visit` is given each path, what is there, and where that is; if it
+ * returns false the entry is left out, and not gone into.
  *
  * Whatever goes wrong, the walk throws — with one exception, which is not
  * something going wrong: a directory may be in use while it is read, and what
@@ -119,7 +128,9 @@ function walk(root: string, visit: (path: string, entry: Entry, at: string) => b
       into(at, `${path}/`, inside);
     }
   };
-  into(root, "", namesIn(root));
+  const itself = entryAt(root);
+  if (itself && visit(ITSELF, itself, root) === false) return;
+  into(root, "", namesIn(root)); // (which says so, if no directory is there)
 }
 
 /** Whether two files hold the same bytes. Read a piece at a time: a file may be larger than can be held at once. */
@@ -148,21 +159,25 @@ function sameBytes(one: string, other: string): boolean {
   }
 }
 
-/** What a directory holds. The directory must be there, and all of it readable. */
+/** What a directory is and holds. The directory must be there, and all of it readable. */
 export function readTree(dir: string): Tree {
   const tree: Tree = new Map();
-  walk(dir, (path, entry) => { tree.set(path, entry); });
+  walk(realRootOf(dir), (path, entry) => { tree.set(path, entry); });
   return tree;
 }
 
 /**
- * Make `toDir` — an empty directory — hold what `fromDir` holds, and return
- * what that was: each entry as it was when it was copied. `leaveOut` names
+ * Make `toDir` — an empty directory — what `fromDir` is: allowing what it
+ * allows and holding what it holds. Returns what that was: the directory, and
+ * each entry as it was when it was copied. `leaveOut` names
  * what is no part of it; those entries are neither copied nor returned.
  *
  * What a directory holds is its files, its directories with what they allow,
  * and its links. What is not content is not carried over, though the tree
- * returned says it is there.
+ * returned says it is there. The directory itself is one of its directories
+ * in this: the copy is left allowing what it allows — to its owner, and to
+ * everybody else. (So a copy that is to be nobody else's is made in a
+ * directory that is nobody else's.)
  *
  * A link is made to name, in the copy, what it names here: the same place in
  * the copy if that is under `fromDir`, and the same place outside it if not.
@@ -220,7 +235,7 @@ export function copyTree(
     const copied = join(to, path);
     tree.set(path, entry);
     if (entry.kind === "dir") {
-      mkdirSync(copied);
+      if (path !== ITSELF) mkdirSync(copied); // (the copy itself is there: it is what was given)
       dirs.push({ copied, mode: entry.mode });
     } else if (entry.kind === "file") {
       try {
@@ -283,10 +298,14 @@ const reason = (err: unknown) => (err instanceof Error ? err.message : String(er
  * @param realDir - the directory it was copied from
  * @param before - the copy as it was before the run (readTree)
  * @param seed - the real directory as it was when the copy was made (copyTree)
+ * @param together - things that are one thing to the caller: each list the
+ *   `id`s (see Entry) of the files, links and directories that are one
  *
  * What the run did is where the copy differs from what it was: a file, a
  * directory or a link made, removed, changed, or put where something of
- * another kind was; permissions changed. Each difference is carried over on
+ * another kind was; permissions changed — those of the directory itself
+ * among them, which is a directory like any in it: only that it is neither
+ * made nor removed. Each difference is carried over on
  * one condition: the place in the real directory is still as it was when the
  * copy was made — and so is the directory it is in. If not, somebody else —
  * the user, another run of the same project — has been there since, and
@@ -306,7 +325,24 @@ const reason = (err: unknown) => (err instanceof Error ? err.message : String(er
  * goes from where it was only if it arrives where the run moved it: what it
  * holds is not to be in neither place. (What was moved is known by its `id`,
  * see Entry. What the run copied and then removed is a new file, and is not
- * known to be the old one's.) So what is returned as not arrived is as it
+ * known to be the old one's.) And what the caller says is one thing — a
+ * link, say, with the file that makes it lead somewhere: the things in one
+ * list of `together`, each known by what it is, at every path where the copy
+ * had it before the run or has it now — arrives together or not at all: if
+ * one of those paths is left alone, nothing is done at any of them. A part
+ * the run left as it was has nothing to arrive, but the rest leans on it: if
+ * it is not, in the project, as it was when the copy was made, that is told
+ * of it, and the rest does not arrive. (So that all this holds where the
+ * system refuses in the doing, what is done at such a path is only what can
+ * be taken back: a file there is not written into but has the new one put in
+ * its place, and what is to go from there is moved aside first, as what is
+ * taken the place of is. A directory among them that stays a directory is
+ * not left alone with the rest — what else the run did in it could not be
+ * taken for undone with it — but what it was to be left allowing does not
+ * arrive either, and that is told of it. And a part the run left as it was,
+ * and that is not so in the project, is told of besides, as that: nothing
+ * under it is left alone for it — and nothing is told of it where nothing is
+ * held back for it.) So what is returned as not arrived is as it
  * was, at that path and under it. That holds where the system refuses, in
  * the doing, what had been found possible — see how it is done, below — as
  * long as it does not also refuse to put back what was moved aside; then
@@ -326,10 +362,12 @@ const reason = (err: unknown) => (err instanceof Error ? err.message : String(er
  * where what it was to hold is.)
  *
  * Finding out is looking, and a directory that is closed cannot be looked
- * into. One of the real directory's is opened for it, as it is for what is
- * then done in it, and one of the copy's is opened to be read: both are this
- * merge's to open. Each of the real directory's is left, at the end, allowing
- * what the run left it allowing — or, if that did not arrive, what it allowed.
+ * into. One of the real directory's — or the directory itself — is opened
+ * for it, as it is for what is then done in it, and one of the copy's is
+ * opened to be read: both are this merge's to open. Each is left, at the end,
+ * allowing what the run left it allowing — or, if that did not arrive, what
+ * it allowed. (One that somebody else gave other permissions since the copy
+ * was made is theirs, and is not opened: nothing is made or removed in it.)
  *
  * A path is a name, and the real directory has the last word on its names:
  * its file system may take "Notes.txt" and "notes.txt" for one. A path of
@@ -341,7 +379,17 @@ const reason = (err: unknown) => (err instanceof Error ? err.message : String(er
  * remove the other. Neither is touched: nothing is done to what is there
  * under any name the run changed, and each is told of as not arrived. (What
  * is there is known by what it is. All the names of a file that has several
- * are therefore left, where one would have done.)
+ * are therefore left, where one would have done.) If what is there is a
+ * directory, nothing is done in it either: a path through it is a path
+ * through the other, and what the run left under the two names is in one
+ * place. And two names the run made where nothing was, which the directory
+ * turns out to take for one when the second is put there: neither is put.
+ * (That can only be seen in the putting. If the first was not put, for a
+ * reason of its own, the second is — and what is told of the first is then
+ * true of the name as the run spelled it, not as the directory takes it.)
+ * The same is asked of the way to a path: a directory on it that the real
+ * one no longer lists as the tree spells it — somebody spelled it anew — is
+ * not the tree's directory any more, and nothing is done in it.
  *
  * What is to be done is done so that nothing is lost by its being done in
  * part. A file or a link that is to be where something is, is made beside
@@ -386,14 +434,21 @@ const reason = (err: unknown) => (err instanceof Error ? err.message : String(er
  * off as one whose work did. Under a path that did not arrive, what was not
  * looked at for that reason is not listed: it is as it was, with the path.
  */
-export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed: Tree): Unmerged[] {
+export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed: Tree, together: string[][] = []): Unmerged[] {
   let copy: string;
   let real: string;
   const after: Tree = new Map();
   try {
     real = realRootOf(realDir);
+    // The directory is the one that was copied — which the seed knows by what it is. Where it is gone, or another
+    // is at its path by now, there is nothing here that the run's work is the work on.
+    const itself = entryAt(real), copied = seed.get(ITSELF);
+    if (itself?.kind !== "dir") return [{ path: ITSELF, why: "the project is no longer there; nothing was merged into it" }];
+    if (copied?.kind === "dir" && copied.id !== itself.id) {
+      return [{ path: ITSELF, why: "another directory is at the project's path than the one that was copied; nothing was merged into it" }];
+    }
   } catch (err) {
-    return [{ path: ".", why: `the project could not be come to (${reason(err)}); nothing was merged into it` }];
+    return [{ path: ITSELF, why: `the project could not be come to (${reason(err)}); nothing was merged into it` }];
   }
   try {
     copy = realRootOf(stagedDir);
@@ -403,7 +458,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
     });
   } catch (err) {
     // What the run left cannot be told. Nothing is merged — least of all as a removal of what cannot be seen.
-    return [{ path: ".", why: `what the run left could not be read (${reason(err)}); none of it was merged` }];
+    return [{ path: ITSELF, why: `what the run left could not be read (${reason(err)}); none of it was merged` }];
   }
   /**
    * Whether what is at a path, though it looks the same, is something the run
@@ -418,8 +473,35 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
   // Sorted, a path comes before every path under it.
   const changed = [...new Set([...before.keys(), ...after.keys()])]
     .filter((path) => !same(before.get(path), after.get(path)) || movedHere(path))
-    .sort();
+    .sort(inOrder);
   const isChanged = new Set(changed);
+  /**
+   * What is one thing to the caller (see `together`), as paths: by each path
+   * where the copy has a part of such a thing — had it before the run, or has
+   * it now — the things it is a part of, each as all its paths.
+   */
+  const partOf = new Map<string, string[][]>();
+  if (together.length > 0) {
+    const where = new Map<string, Set<string>>();
+    for (const tree of [before, after]) {
+      for (const [path, entry] of tree) {
+        const id = idOf(entry);
+        if (id === undefined) continue;
+        const those = where.get(id);
+        if (those) those.add(path);
+        else where.set(id, new Set([path]));
+      }
+    }
+    for (const ids of together) {
+      const paths = [...new Set(ids.flatMap((id) => [...(where.get(id) ?? [])]))];
+      for (const part of paths) {
+        const those = partOf.get(part);
+        if (those) those.push(paths);
+        else partOf.set(part, [paths]);
+      }
+    }
+  }
+  const parts = [...partOf.keys()].sort();
 
   /** What did not arrive, and why: found out beforehand, or — once things are being done — told by the system. */
   const refused = new Map<string, string>();
@@ -428,7 +510,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
     for (let end = path.lastIndexOf("/"); end !== -1; end = path.lastIndexOf("/", end - 1)) {
       if (of.has(path.slice(0, end))) return true;
     }
-    return false;
+    return path !== ITSELF && of.has(ITSELF);
   };
   /** Whether a path is one of those that did not arrive, or under one. */
   const leftAlone = (path: string): boolean => refused.has(path) || underOne(path, refused);
@@ -491,7 +573,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
    */
   const toClose = new Map<string, { id: string | undefined; mode: number; has: number }>();
   const open = (dir: string): void => {
-    if (dir === "." || opened.has(dir)) return;
+    if (opened.has(dir)) return;
     const place = join(real, dir);
     const there = entryAt(place);
     if (there?.kind === "dir") {
@@ -523,11 +605,11 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
    */
   const own = new Map<string, boolean>();
   const ownWay = (dir: string): boolean => {
-    if (dir === ".") return true;
+    if (dir === ITSELF) return true;
     if (toMake.has(dir)) return ownWay(dirname(dir));
     let known = own.get(dir);
     if (known === undefined) {
-      known = ownWay(dirname(dir)) && entryAt(join(real, dir))?.kind === "dir";
+      known = ownWay(dirname(dir)) && entryAt(join(real, dir))?.kind === "dir" && spells(dirname(dir), basename(dir));
       own.set(dir, known);
     }
     return known;
@@ -563,19 +645,35 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
     let there: Entry | undefined;
     /** That somebody changed the directory it is in — which is said only once it is known that something needs doing there. */
     let notInIt: Error | undefined;
-    // In a directory still to be made there is nothing — whatever is, for now, at the place of that directory.
-    if (!toMake.has(dir)) {
+    if (path === ITSELF) {
+      // The directory itself is in no directory of the tree: it is where it is, by the name it was given.
+      there = entryAt(place);
+    } else if (!toMake.has(dir)) {
+      // (In a directory still to be made there is nothing — whatever is, for now, at the place of that directory.)
       if (!ownWay(dir)) {
-        // No way that is the directory's own leads there any more. What the run removed is, then, not there.
-        if (!is) return undefined;
-        throw new Error("the directory it is in is no longer there in the project");
+        // No way that is the directory's own leads there any more. What the run removed is, then, not there —
+        // unless something is, by the way as it is now: under another spelling of a directory, or through a
+        // link put in its place. That is somebody's, and is left; but it is not gone, and that is said.
+        if (!is) {
+          let found: Entry | undefined;
+          try {
+            found = entryAt(place);
+          } catch (err) {
+            if (!noSuchPlace(err)) throw err;
+          }
+          if (!found) return undefined;
+        }
+        throw new Error("the directory it is in is no longer there in the project, by that name");
       }
       // The directory it is in. One the run changed has its own turn, before this; any other must be as it was.
-      if (dir !== "." && !isChanged.has(dir) && !unchanged(dir)) notInIt = new Error(`what ${dir} allows was changed in the project meanwhile`);
+      if (!isChanged.has(dir) && !unchanged(dir)) {
+        notInIt = new Error(dir === ITSELF ? "what the project's own directory allows was changed meanwhile" : `what ${dir} allows was changed in the project meanwhile`);
+      }
       let byItsName: boolean;
       try {
-        // It is looked into as it will be changed: opened, if it is closed — unless that it is closed is somebody else's doing.
-        if (!notInIt) open(dir);
+        // It is looked into as it will be changed: opened, if it is closed — unless that it is closed is somebody
+        // else's doing. (What the run left as it was is only looked at, which a directory that held it allows.)
+        if (!notInIt && isChanged.has(path)) open(dir);
         there = entryAt(place);
         byItsName = !there || spells(dir, basename(path));
       } catch (err) {
@@ -588,6 +686,9 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
       }
     }
     if (!is && !there) return undefined;
+    // What the run left as it was, and is as it was in the project, needs nothing done. (It is looked at because
+    // it is part of what is one thing: see the loop below.)
+    if (!isChanged.has(path) && same(there, seed.get(path))) return undefined;
     const want = is && wanted(path, is);
     // A place that holds what the run left needs nothing done — whoever made it so, and whatever became of its
     // directory, as long as it can still be looked into: one that somebody closed is not opened to find out.
@@ -609,23 +710,39 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
   };
 
   const deeds: Deed[] = [];
-  for (const path of changed) {
+  /** Parts of things that the run left as they were, and that are not so in the project: by the path, why. */
+  const amiss = new Map<string, string>();
+  // What the run changed — and the parts of what is one thing that it did not: nothing is to be done there, but
+  // the rest of the thing leans on their being there as they were.
+  for (const path of parts.every((part) => isChanged.has(part)) ? changed : [...new Set([...changed, ...parts])].sort(inOrder)) {
     if (leftAlone(path)) continue;
     try {
       const deed = decide(path);
       if (deed) deeds.push(deed);
     } catch (err) {
-      refused.set(path, reason(err));
+      // (A part the run left as it was did not fail to arrive: nothing under it is left alone for its sake.)
+      (isChanged.has(path) ? refused : amiss).set(path, reason(err));
     }
   }
-  // What the real directory takes for one name is one thing there: nothing is done to it under any name.
+  // What the real directory takes for one name is one thing there: nothing is done to it under any name — nor,
+  // if it is a directory, in it: a path through it is a path through the other.
   if (otherwise.size > 0) {
+    /** The path the run left that is taken for a name of a directory, or of one it is in — if any is. */
+    const takenFor = new Map<string, string | undefined>();
+    const through = (dir: string): string | undefined => {
+      if (dir === ITSELF) return undefined;
+      if (!takenFor.has(dir)) takenFor.set(dir, otherwise.get(identityOf(join(real, dir)) ?? "") ?? through(dirname(dir)));
+      return takenFor.get(dir);
+    };
     for (const { path, place, there } of deeds) {
-      if (!there || leftAlone(path)) continue;
+      if (path === ITSELF || leftAlone(path)) continue;
       try {
-        const other = otherwise.get(identityOf(place) ?? "");
+        const other = there && otherwise.get(identityOf(place) ?? "");
+        const above = other === undefined ? through(dirname(path)) : undefined;
         if (other !== undefined) {
           refused.set(path, `the run left ${other}, which the project's file system takes for a name of this, or of what is one file with it: it is left as it was`);
+        } else if (above !== undefined) {
+          refused.set(path, `the run left ${above}, which the project's file system takes for a name of a directory this is in: it is left as it was`);
         }
       } catch (err) {
         refused.set(path, reason(err));
@@ -680,6 +797,22 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
    */
   const followedUp = new Set<string>();
   const countedOut = new Set<string>();
+  /** Of the things that are one (see `partOf`), those of which a part has not arrived, or is not as it was. */
+  const broken = new Set<string[]>();
+  /**
+   * The directories that stay directories, of such things: by the path, what
+   * the thing did not arrive for. A directory like that is not left alone
+   * with the rest — what else was done in it could not be taken for undone
+   * with it — but what it was to be left allowing does not arrive.
+   */
+  const heldBack = new Map<string, string>();
+  /** Of paths in order, those that are a given path or under it. */
+  const atOrUnder = (sorted: string[], path: string): string[] => {
+    const under = `${path}/`;
+    const found = sorted[firstNotBefore(sorted, path)] === path ? [path] : [];
+    for (let at = firstNotBefore(sorted, under); at < sorted.length && sorted[at].startsWith(under); at++) found.push(sorted[at]);
+    return found;
+  };
   const settle = () => {
     const toFollowUp = [...refused.keys()].filter((path) => !followedUp.has(path));
     const refuse = (path: string, why: () => string) => {
@@ -687,6 +820,46 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
       refused.set(path, why());
       toFollowUp.push(path);
     };
+    /**
+     * The things a path is part of do not arrive: it did not, or is not as it
+     * was. Says whether anything is held back for that. (What follows from a
+     * directory's being held back is followed up in turn, not gone into: a
+     * chain of things may be as long as the caller makes it.)
+     */
+    const without = (first: string, how: string): boolean => {
+      let any = false;
+      const toDo: Array<[string, string]> = [[first, how]];
+      for (let next; (next = toDo.pop()) !== undefined;) {
+        const [part, which] = next;
+        // All the paths of the things it is part of, in order: a path under one that is left alone is left alone
+        // with it.
+        const others = new Set<string>();
+        for (const paths of partOf.get(part) ?? []) {
+          if (broken.has(paths)) continue;
+          broken.add(paths);
+          for (const other of paths) others.add(other);
+        }
+        for (const other of [...others].sort(inOrder)) {
+          const deed = deedAt.get(other);
+          if (!deed || leftAlone(other)) continue;
+          any = true;
+          if (!staysADirectory(deed)) {
+            refuse(other, () => `it is one thing with ${part}, ${which}: it is left as it was`);
+          } else if (!heldBack.has(other)) {
+            heldBack.set(other, `${part}, ${which}`);
+            // (And what else it is one thing with does not arrive without what it was to allow.)
+            toDo.push([other, "which is not given what it was to allow"]);
+          }
+        }
+      }
+      return any;
+    };
+    // A part the run left as it was, and that is not so in the project. (It is told of only if something is
+    // held back for it: where the rest is in place already, nothing was left undone.)
+    for (const [part, why] of amiss) {
+      if (without(part, "which is not as it was in the project")) tell(part, `the run left it as it was, but ${why}: what it is one thing with did not arrive`);
+    }
+    amiss.clear();
     for (let path; (path = toFollowUp.pop()) !== undefined;) {
       followedUp.add(path);
       const stays = path;
@@ -696,10 +869,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
         if (above && goesAsADirectory(above)) refuse(above.path, () => `the run removed it, but not all that is in it can go (${stays})`);
       }
       // What was moved to it, or to somewhere under it, has not arrived there.
-      const under = `${path}/`;
-      const notArrived = cameFrom.has(path) ? [path] : [];
-      for (let at = firstNotBefore(arrivals, under); at < arrivals.length && arrivals[at].startsWith(under); at++) notArrived.push(arrivals[at]);
-      for (const to of notArrived) {
+      for (const to of atOrUnder(arrivals, path)) {
         if (countedOut.has(to)) continue;
         countedOut.add(to);
         for (const from of cameFrom.get(to)!) {
@@ -708,6 +878,8 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
           if (left === 0) refuse(from.path, () => `the run moved what was here to ${wentTo(from).join(", ")}, which did not arrive: it is left as it was`);
         }
       }
+      // What it, or something under it, is one thing with does not arrive without it.
+      for (const part of atOrUnder(parts, path)) without(part, part === path ? "which did not arrive" : `which is under ${path}, which did not arrive`);
     }
   };
 
@@ -725,7 +897,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
   const besides = new Map<string, string>();
   const tell = (path: string, what: string) => besides.set(path, besides.has(path) ? `${besides.get(path)} — and ${what}` : what);
   /** A place of the real directory, as a path of it. */
-  const pathOf = (place: string) => relative(real, place).split(sep).join("/");
+  const pathOf = (place: string) => relative(real, place).split(sep).join("/") || ITSELF;
   const leftover = (path: string, failed: unknown) => `what was at ${path}, and was to go, is here: the system would not have it all removed (${reason(failed)})`;
   /** Remove what was made beside a place and is not going to be moved in. What will not go is told of. Throws nothing. */
   const discard = (made: string, madeFor: string) => {
@@ -769,6 +941,8 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
   const aside = new Map<string, string>();
   /** The places where this merge has put something in the place of what was there, or of nothing. */
   const put = new Set<string>();
+  /** What this merge has put where nothing was: by what it is, the path. */
+  const putAnew = new Map<string, string>();
   /** The directories that are not, now, where their path says: by the path, where they are — or were last, if they have gone since. */
   const elsewhere = new Map<string, string>();
   const setAside = ({ path, place, there }: Deed): string => {
@@ -786,7 +960,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
   const emptied = (dir: string, at: string): unknown => {
     let failed: unknown;
     for (const inIt of inDir.get(dir) ?? []) {
-      if (!inIt.there) continue;
+      if (!inIt.there || aside.has(inIt.path)) continue; // (what was moved aside to go has gone, or is told of where it is)
       const its = join(at, basename(inIt.path));
       try {
         if (inIt.there.kind === "dir") {
@@ -821,12 +995,14 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
    * itself: a directory that is to be a directory; or a file the run wrote
    * into — the same file, afterwards, not another put in its place — which
    * may be written into, or holds what the run left already. Anything else
-   * that is there is taken the place of.
+   * that is there is taken the place of. So is a file that is one thing with
+   * other paths: what is written into cannot be taken back, should the rest
+   * of the thing not arrive, and what is put in a place can.
    */
   const takes = new Set<string>();
   for (const { path, place, want, there } of deeds) {
     if (!want || !there || leftAlone(path)) continue;
-    const itself = want.kind === "file" && there.kind === "file" && idOf(before.get(path)) === idOf(after.get(path))
+    const itself = !partOf.has(path) && want.kind === "file" && there.kind === "file" && idOf(before.get(path)) === idOf(after.get(path))
       && (mayBeWrittenTo(place) || holdsBytes(there, place, want, path));
     if (itself || staysADirectory({ want, there })) takes.add(path);
   }
@@ -856,14 +1032,27 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
   // What the run made, or changed — a directory before what goes in it. What is in the place of it is moved aside.
   each(deeds, (deed) => {
     const { path, place, want, there } = deed;
-    if (!want) return;
+    if (!want) {
+      // What is to go, and is one thing with other paths, is moved aside like what is taken the place of: it
+      // comes back if the rest of the thing does not arrive. (Unless it has gone aside already, in its directory.)
+      if (there && partOf.has(path) && !underOne(path, elsewhere)) aside.set(path, setAside(deed));
+      return;
+    }
     const made = ready.get(path);
     if (takes.has(path)) {
       if (want.kind === "dir") {
-        // What it allows is what changed: it is opened like any other, and closed to that.
+        // What it allows is what changed: it is opened like any other, and closed to that. (Not one whose thing
+        // does not arrive: nothing is done to that for its own sake.)
+        if (heldBack.has(path)) return;
         open(path);
         const closing = toClose.get(path);
         if (!closing) throw new Error("it is no longer a directory in the project");
+        // Of what is one thing, whether the system will have it changed is to be known now, while the rest can
+        // still be taken back — not at the end, when it is closed. (It is changed now as far as leaves it open.)
+        if (partOf.has(path)) {
+          chmodSync(place, want.mode | 0o700);
+          closing.has = want.mode | 0o700;
+        }
         closing.mode = want.mode;
         return;
       }
@@ -894,24 +1083,47 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
       return;
     }
     if (there) aside.set(path, setAside(deed));
-    if (want.kind === "dir") {
-      mkdirSync(place);
-      put.add(path);
-      const closing = { id: identityOf(place), mode: want.mode, has: -1 };
-      toClose.set(path, closing);
-      chmodSync(place, want.mode | 0o700);
-      closing.has = want.mode | 0o700;
-    } else if (made !== undefined) {
-      renameSync(made, place);
-      ready.delete(path);
-      put.add(path);
-    } else if (want.kind === "link") {
-      symlinkSync(want.text, place);
-      put.add(path);
-    } else if (want.kind === "file") {
-      copyFileSync(stagedFile(path), place, constants.COPYFILE_EXCL);
-      put.add(path);
-      if (modeAt(place) !== want.mode) chmodSync(place, want.mode);
+    try {
+      if (want.kind === "dir") {
+        mkdirSync(place);
+        put.add(path);
+        const closing = { id: identityOf(place), mode: want.mode, has: -1 };
+        toClose.set(path, closing);
+        chmodSync(place, want.mode | 0o700);
+        closing.has = want.mode | 0o700;
+      } else if (made !== undefined) {
+        renameSync(made, place);
+        ready.delete(path);
+        put.add(path);
+      } else if (want.kind === "link") {
+        symlinkSync(want.text, place);
+        put.add(path);
+      } else if (want.kind === "file") {
+        copyFileSync(stagedFile(path), place, constants.COPYFILE_EXCL);
+        put.add(path);
+        if (modeAt(place) !== want.mode) chmodSync(place, want.mode);
+      }
+    } catch (err) {
+      // Where nothing was, and something is in the way now that this merge put there itself, under another path:
+      // the real directory takes the two names for one. That could not be seen while neither was there. Neither
+      // is put there — the other is taken back, with what follows from that.
+      if (!there && !put.has(path)) {
+        let other: string | undefined;
+        try {
+          other = putAnew.get(identityOf(place) ?? "");
+        } catch {
+          // (what cannot be looked at is not known to be that)
+        }
+        if (other !== undefined) {
+          refused.set(other, `the run left ${path} too, which the project's file system takes for the same name: neither is put there`);
+          throw new Error(`the run left ${other} too, which the project's file system takes for the same name: neither is put there`);
+        }
+      }
+      throw err;
+    }
+    if (!there) {
+      const what = identityOf(place);
+      if (what !== undefined) putAnew.set(what, path);
     }
   });
   settle();
@@ -949,7 +1161,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
         }
       } catch (err) {
         const where = kept === undefined ? "" : `: what was there is beside it, as ${basename(kept)}`;
-        refused.set(path, `${refused.get(path) ?? "it is not to stand"} — and it could not be put back as it was (${reason(err)})${where}`);
+        refused.set(path, `${refused.get(path) ?? "it is in what did not arrive"} — and it could not be put back as it was (${reason(err)})${where}`);
       }
     }
   }
@@ -959,7 +1171,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
   // would be had the run removed it there.
   each(deeds, (deed) => {
     const { path, place, want, there } = deed;
-    if (want || !there || underOne(path, seenTo)) return;
+    if (want || !there || aside.has(path) || underOne(path, seenTo)) return;
     if (there.kind !== "dir") return void unlinkSync(place);
     const failed = removed(deed, place);
     if (failed !== undefined) tell(path, `the run removed it, and the system would not have it removed, or not all that was in it (${reason(failed)}): what is left is there`);
@@ -967,6 +1179,15 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
 
   // What was made ready and never moved in is not left lying there.
   for (const [path, made] of ready) discard(made, path);
+  // What a directory was to be left allowing, of a thing that did not arrive, does not arrive: it is closed to
+  // what it allowed.
+  for (const [path, what] of heldBack) {
+    const { want, there } = deedAt.get(path)!;
+    if (leftAlone(path) || want?.kind !== "dir" || there?.kind !== "dir") continue;
+    const closing = toClose.get(path);
+    if (closing) closing.mode = there.mode;
+    tell(path, `what it was to allow (${want.mode.toString(8)}) is one thing with ${what}: it is left allowing what it allowed`);
+  }
   // The directories that this merge has allowing something else than they are to be left allowing are closed — the
   // deepest first, each where it is now, and only if it is that directory: at the place of one that is gone there
   // may be something else by now.
@@ -977,7 +1198,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
     }
     return join(real, path);
   };
-  for (const [path, { id, mode, has }] of [...toClose].sort(([a], [b]) => (a < b ? 1 : -1))) {
+  for (const [path, { id, mode, has }] of [...toClose].sort(([a], [b]) => inOrder(b, a))) {
     if (has === mode) continue;
     const place = placeNow(path);
     try {
@@ -999,6 +1220,9 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
       else tell(at, `${why}; what is in it is told of by itself, if it did not arrive`);
     }
   }
+  // What is told: what did not arrive, and what there is to say besides. (Every path that was left alone by
+  // itself, with its reason: where two of them are a directory and a path in it, each is the other's reason
+  // as often as not, and neither is left out for the other.)
   return [...refused, ...besides].map(([path, why]) => ({ path, why }));
 }
 
