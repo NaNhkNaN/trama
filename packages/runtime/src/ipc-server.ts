@@ -5,10 +5,11 @@
 import { createServer, type Server } from "http";
 import type { AddressInfo } from "net";
 import { timingSafeEqual } from "crypto";
-import type { Agent, Tools, Workspace } from "./types.js";
+import type { Tools, Workspace } from "./types.js";
+import type { RunnerAgent } from "./agent.js";
 import type { RunContext } from "./context.js";
 import type { ProgramResult, RunRequest } from "./runner-types.js";
-import type { Journal } from "./journal.js";
+import type { Journal, RecordedCall } from "./journal.js";
 import { isJsonObject } from "./serializable.js";
 
 const MAX_IPC_BODY = 50 * 1024 * 1024; // 50 MB
@@ -22,6 +23,8 @@ interface FieldKinds {
   string: string;
   number: number;
   object: Record<string, unknown>;
+  /** A list of strings. */
+  strings: string[];
   /** Anything JSON can say. */
   any: unknown;
 }
@@ -37,14 +40,18 @@ type Args<F extends Fields> = {
 interface Route {
   /**
    * Carry a call out, given the body of its request. `connectionClosed`
-   * resolves when the caller's connection ends, answered or not. `seq` is the
-   * call's position among the run's calls.
+   * resolves when the caller's connection ends, answered or not. `call` is
+   * the call as it is on record: its position among the run's calls, and
+   * where what it used is written down.
    */
-  handle(body: unknown, connectionClosed: Promise<void>, seq: number): unknown;
+  handle(body: unknown, connectionClosed: Promise<void>, call: RecordedCall): unknown;
 }
 
 const isOfKind = (value: unknown, kind: Kind): boolean =>
-  kind === "any" ? value !== undefined : kind === "object" ? isJsonObject(value) : typeof value === kind;
+  kind === "any" ? value !== undefined
+    : kind === "object" ? isJsonObject(value)
+    : kind === "strings" ? Array.isArray(value) && value.every(item => typeof item === "string")
+    : typeof value === kind;
 
 /** Read a call's declared fields out of a request body — refusing a body that does not hold them as declared. */
 function read<F extends Fields>(body: unknown, fields: F): Args<F> {
@@ -74,9 +81,9 @@ function read<F extends Fields>(body: unknown, fields: F): Args<F> {
  */
 function route<F extends Fields>(
   fields: F,
-  handle: (args: Args<F>, connectionClosed: Promise<void>, seq: number) => unknown,
+  handle: (args: Args<F>, connectionClosed: Promise<void>, call: RecordedCall) => unknown,
 ): Route {
-  return { handle: (body, connectionClosed, seq) => handle(read(body, fields), connectionClosed, seq) };
+  return { handle: (body, connectionClosed, call) => handle(read(body, fields), connectionClosed, call) };
 }
 
 export interface IpcBackends {
@@ -87,7 +94,7 @@ export interface IpcBackends {
    */
   token: string;
   ctx: RunContext;
-  agent: Agent;
+  agent: RunnerAgent;
   tools: Tools;
   /** The workspace of the session the program is running in — null when it is in none. */
   workspace: Workspace | null;
@@ -100,6 +107,11 @@ export interface IpcBackends {
   run(request: RunRequest, stop: AbortSignal, seq: number): Promise<ProgramResult>;
   /** Where every call, and how it ended, is written down. */
   journal: Journal;
+  /**
+   * Whether the program has ended. What comes back for a call after that is
+   * no answer — though its connection may not have been seen to close yet.
+   */
+  programOver(): boolean;
 }
 
 /** Whether a request carries `Authorization: Bearer <token>`, compared in constant time. */
@@ -127,12 +139,12 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run }: IpcBack
 
   return {
     "/agent/instruct": route(
-      { prompt: "string", system: "optional string" },
-      b => agent.instruct(b.prompt, { system: b.system }),
+      { prompt: "string", system: "optional string", model: "optional string", thinking: "optional string", tools: "optional strings" },
+      ({ prompt, ...options }, _closed, call) => agent.instruct(prompt, options as Parameters<RunnerAgent["instruct"]>[1], call.used),
     ),
     "/agent/generate": route(
-      { prompt: "string", schema: "object", system: "optional string" },
-      b => agent.generate({ prompt: b.prompt, schema: b.schema as Record<string, string>, system: b.system }),
+      { prompt: "string", schema: "object", system: "optional string", model: "optional string", thinking: "optional string" },
+      (input, _closed, call) => agent.generate(input as Parameters<RunnerAgent["generate"]>[0], call.used),
     ),
 
     "/tools/read": route({ path: "string" }, b => tools.read(b.path)),
@@ -162,7 +174,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run }: IpcBack
         timeout: "optional number", maxRepairAttempts: "optional number",
         id: "optional string", label: "optional string", workspaceDir: "optional string",
       },
-      async ({ id, ...request }, connectionClosed, seq) => {
+      async ({ id, ...request }, connectionClosed, { seq }) => {
         if (id !== undefined) {
           if (id === "") throw new BadRequest("Invalid field: id (expected a non-empty string)");
           if (runsAskedFor.has(id)) throw new BadRequest(`Duplicate run id: ${id}`);
@@ -215,7 +227,7 @@ export function createIPCServer(backends: IpcBackends): Server {
   return createServer((req, res) => {
     const connectionClosed = new Promise<void>(resolve => res.once("close", resolve));
     // An answer can be given once, and only while there is someone to give it to.
-    const answerable = () => !res.writableEnded && !res.destroyed;
+    const answerable = () => !backends.programOver() && !res.writableEnded && !res.destroyed;
     const reply = (status: number, body: string, json = false) => {
       if (!answerable()) return;
       res.writeHead(status, json ? { "Content-Type": "application/json" } : undefined);
@@ -249,7 +261,7 @@ export function createIPCServer(backends: IpcBackends): Server {
       // Written down as soon as it can be read, and again when it is answered.
       // What comes back for a caller that is gone is not an answer, and is not
       // recorded as one: a call nobody was left to answer has no result.
-      let call: ReturnType<Journal["call"]> | undefined;
+      let call: RecordedCall | undefined;
       try {
         let body: unknown;
         try {
@@ -260,7 +272,7 @@ export function createIPCServer(backends: IpcBackends): Server {
         const route = req.url && Object.hasOwn(routes, req.url) ? routes[req.url] : undefined;
         if (!route) return reply(404, "Not found");
         call = backends.journal.call(req.url!, body);
-        const result = (await route.handle(body, connectionClosed, call.seq)) ?? null;
+        const result = (await route.handle(body, connectionClosed, call)) ?? null;
         const payload = JSON.stringify({ result });
         if (answerable()) call.end({ ok: true, result });
         reply(200, payload, true);

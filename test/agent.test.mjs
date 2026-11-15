@@ -257,6 +257,8 @@ test("PiAdapter.ask calls session.dispose on abort during prompt", async () => {
     state: { messages: [] },
     // Simulate upstream contract: prompt is a pending call that rejects when disposed
     prompt: () => new Promise((_resolve, reject) => { rejectPrompt = reject; }),
+    // (A cancelled call has pi abort its run, which settles the prompt; the session is disposed of once it has.)
+    abort: async () => { rejectPrompt?.(new Error("Session disposed")); },
     dispose: () => {
       disposeCalled++;
       // Upstream contract: dispose() causes the in-flight prompt() to reject
@@ -452,4 +454,336 @@ test("createAgent generate takes a field's type from words, and nothing else for
     await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: type } }), /unsupported schema type/, JSON.stringify(type));
   }
   assert.deepEqual(await agent.generate({ prompt: "p", schema: { a: "string: any text" } }), { a: "x" });
+});
+
+// --- What a call asks of its backend, and what it is told the call used ---
+
+test("createAgent hands the backend what a call asks for and nothing it did not, and passes on what it used", async () => {
+  const calls = [];
+  const usage = { model: "p/m", input: 3, output: 2, cacheRead: 1, cacheWrite: 0, cost: 0.5 };
+  const backend = {
+    async ask(prompt, call) {
+      calls.push(call);
+      call.used?.(usage);
+      return calls.length === 2 ? "not json" : '{"a":"x"}';
+    },
+  };
+  const agent = createAgent(backend, "/work");
+  const heard = [];
+  const used = (what) => heard.push(what);
+
+  await agent.instruct("p", { system: "s", model: "p/m", thinking: "high", tools: ["read"] }, used);
+  assert.deepEqual(calls[0], { cwd: "/work", system: "s", signal: undefined, model: "p/m", thinking: "high", tools: ["read"], used });
+  assert.deepEqual(heard, [usage]);
+
+  // A generate that has to ask again has used both askings. (It is served without a say in the tools.)
+  assert.deepEqual(await agent.generate({ prompt: "p", schema: { a: "string" }, model: "p/m", thinking: "off", tools: ["read"] }, used), { a: "x" });
+  assert.deepEqual(calls[1], { cwd: "/work", system: undefined, signal: undefined, model: "p/m", thinking: "off", used });
+  assert.deepEqual(calls[2], calls[1]);
+  assert.deepEqual(heard, [usage, usage, usage]);
+
+  // No tools is something asked for; nothing asked for is not.
+  await agent.instruct("p", { tools: [] });
+  assert.deepEqual(calls[3], { cwd: "/work", system: undefined, signal: undefined, tools: [] });
+  await agent.instruct("p");
+  assert.deepEqual(calls[4], { cwd: "/work", system: undefined, signal: undefined });
+});
+
+// The pi adapter itself, served by a model that is a server in this process:
+// pi is real, its catalog is a models.json of the test's, and nothing leaves
+// the machine.
+import { createServer as createModelServer } from "node:http";
+import { writeFileSync as writeModelFile } from "node:fs";
+import { join as joinPath } from "node:path";
+
+/**
+ * A provider `fake` with two models — `plain`, which does not think, and
+ * `thinker`, which does — and a pi set up to know no others. `reply(request,
+ * respond, hit)` answers each request; without it every request is answered
+ * with a few words and a count of what they took.
+ */
+async function fakeProvider(t, reply, config = "plain") {
+  const requests = [];
+  const sse = (res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    const send = (choices, usage) => res.write(`data: ${JSON.stringify({ id: "x", object: "chat.completion.chunk", created: 1, model: "fake", choices, ...(usage && { usage }) })}\n\n`);
+    return {
+      says: (delta, finish = null) => send([{ index: 0, delta, finish_reason: finish }]),
+      used: (usage) => send([], usage),
+      done: () => res.end("data: [DONE]\n\n"),
+    };
+  };
+  const server = createModelServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      const request = JSON.parse(body);
+      requests.push(request);
+      if (reply) return reply(request, { res, sse: () => sse(res) }, requests.length);
+      const stream = sse(res);
+      stream.says({ role: "assistant", content: "hello from the fake" });
+      stream.says({}, "stop");
+      stream.used({ prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200, prompt_tokens_details: { cached_tokens: 300 } });
+      stream.done();
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const at = `http://127.0.0.1:${server.address().port}`;
+  const agentDir = makeTempDir("trama-pi-agent-");
+  const cwd = makeTempDir("trama-pi-cwd-");
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+    cleanupTempDir(agentDir);
+    cleanupTempDir(cwd);
+  });
+  writeModelFile(joinPath(agentDir, "models.json"), JSON.stringify({
+    providers: {
+      fake: {
+        baseUrl: `${at}/v1`, api: "openai-completions", apiKey: "none",
+        models: [
+          { id: "plain", cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } },
+          { id: "thinker", reasoning: true, cost: { input: 10, output: 20, cacheRead: 5, cacheWrite: 0 } },
+          { id: "org/deep", cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } },
+          { id: "terse", maxTokens: 200, cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } },
+        ],
+      },
+      "fake/two": { baseUrl: `${at}/v1`, api: "openai-completions", apiKey: "none", models: [{ id: "plain" }, { id: "org/deep" }] },
+      // One that speaks as Anthropic does: what a request took to read is said when its answer begins.
+      early: {
+        baseUrl: at, api: "anthropic-messages", apiKey: "none",
+        models: [{ id: "bird", cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 } }],
+      },
+    },
+  }));
+  const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
+  const adapter = new PiAdapter({ provider: "fake", model: config });
+  return {
+    cwd,
+    agentDir,
+    requests,
+    toolsOf: (request) => (request.tools ?? []).map((tool) => tool.function.name),
+    ask: (prompt, call = {}) =>
+      withEnv({ PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" }, () => adapter.ask(prompt, { cwd, ...call })),
+  };
+}
+
+test("pi serves a call with the model, the level and the tools it names, and says what that took", async (t) => {
+  const fake = await fakeProvider(t);
+  const heard = [];
+  const used = (usage) => heard.push(usage);
+
+  // Nothing named: the project's model, and pi's own choice of tools.
+  assert.equal(await fake.ask("say hello", { used }), "hello from the fake");
+  assert.equal(fake.requests[0].model, "plain");
+  assert.deepEqual(fake.toolsOf(fake.requests[0]), ["read", "bash", "edit", "write"]);
+  assert.equal(heard.length, 1);
+  const { cost, ...counted } = heard[0];
+  assert.deepEqual(counted, { model: "fake/plain", input: 700, output: 200, cacheRead: 300, cacheWrite: 0 });
+  assert.ok(Math.abs(cost - 0.00125) < 1e-9, `a million tokens in cost 1, out 2, from the cache 0.5: ${cost}`);
+
+  // Another model, told how much to think, with one tool and with none.
+  await fake.ask("say hello", { model: "fake/thinker", thinking: "high", tools: ["read"], used });
+  assert.equal(fake.requests[1].model, "thinker");
+  assert.equal(fake.requests[1].reasoning_effort, "high");
+  assert.deepEqual(fake.toolsOf(fake.requests[1]), ["read"]);
+  assert.equal(heard[1].model, "fake/thinker");
+  assert.ok(Math.abs(heard[1].cost - 0.0125) < 1e-9, `the other model's prices: ${heard[1].cost}`);
+
+  await fake.ask("say hello", { model: "fake/thinker", thinking: "off", tools: [] });
+  assert.equal(fake.requests[2].reasoning_effort, undefined);
+  assert.deepEqual(fake.toolsOf(fake.requests[2]), []);
+  // Not thinking is a level every model has; and pi has more tools than it chooses by itself.
+  await fake.ask("say hello", { thinking: "off", tools: ["ls", "read", "grep", "find", "read"] });
+  assert.deepEqual(fake.toolsOf(fake.requests[3]).sort(), ["find", "grep", "ls", "read"]);
+  assert.equal(heard.length, 2, "who does not ask is not told");
+
+  // A provider's name ends at the first stroke; a model's may have more of them — a call's, and a project's.
+  // A model is named "provider/model", and either name may have a stroke of its own — a call's, and a project's.
+  await fake.ask("say hello", { model: "fake/org/deep", used });
+  assert.equal(fake.requests[4].model, "org/deep");
+  assert.equal(heard[2].model, "fake/org/deep");
+  await fake.ask("say hello", { model: "fake/two/plain", used });
+  await fake.ask("say hello", { model: "fake/two/org/deep", used });
+  assert.deepEqual(heard.slice(3).map(usage => usage.model), ["fake/two/plain", "fake/two/org/deep"]);
+  const deep = await fakeProvider(t, undefined, "org/deep");
+  await deep.ask("say hello");
+  assert.equal(deep.requests[0].model, "org/deep");
+});
+
+test("what pi cannot give a call as it was asked is the call's failure — the model is not asked something else instead", async (t) => {
+  const fake = await fakeProvider(t);
+  const heard = [];
+
+  for (const model of ["fake/nope", "nope/plain", "plain", "", "/plain", "fake/", "fake/two", "fake/two/nope", "two/plain", "fake/plain/"]) {
+    await assert.rejects(() => fake.ask("p", { model, used: (usage) => heard.push(usage) }), /Unknown model ".*"\. A model is named "provider\/model"/, model);
+  }
+  // pi would have taken each of these and served the call at another level.
+  for (const [model, thinking] of [["fake/thinker", "max"], ["fake/thinker", "xhigh"], ["fake/thinker", "bogus"], ["fake/plain", "high"], [undefined, "minimal"]]) {
+    await assert.rejects(
+      () => fake.ask("p", { ...(model && { model }), thinking }),
+      new RegExp(`The model ${model ?? "fake/plain"} does not think at level "${thinking}"\\. Its levels: off`),
+      `${model} ${thinking}`,
+    );
+  }
+  // ...and each of these with other tools: a name it has not got left out, a pattern or a change to its own choice taken for one.
+  for (const [tools, given] of [
+    [["nope"], []], [["read", "nope"], ["read"]], [["re*"], ["read"]], [["READ"], []], [[""], []],
+    [["+grep"], ["read", "bash", "edit", "write", "grep"]], [["-bash"], ["read", "edit", "write"]],
+  ]) {
+    await assert.rejects(
+      () => fake.ask("p", { tools }),
+      { message: `The agent cannot be given the tools ${JSON.stringify(tools)}: pi would give it ${JSON.stringify(given)}.` },
+      JSON.stringify(tools),
+    );
+  }
+  assert.deepEqual(fake.requests, [], "no model was asked anything");
+  assert.deepEqual(heard, [], "and nothing was used");
+});
+
+test("a provider's refusal is the call's error, in the provider's words", async (t) => {
+  const fake = await fakeProvider(t, (_request, { res }) => {
+    res.writeHead(400, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "the fake will not have it", type: "invalid_request_error" } }));
+  });
+  const heard = [];
+  await assert.rejects(() => fake.ask("p", { used: (usage) => heard.push(usage) }), /The model did not answer: 400.*the fake will not have it/);
+  assert.deepEqual(heard, [], "a request that was refused took nothing, and nothing is said of it");
+});
+
+test("the answer is the model's last reply as it happened — not an earlier one, where pi took the last out of the conversation", async (t) => {
+  // pi takes a reply out of what the model is shown next when the provider refused the request as too long, or the
+  // reply was cut off: the last reply left there is the turn before, and that is not the answer.
+  let then;
+  const fake = await fakeProvider(t, (request, { res, sse }, hit) => {
+    const how = hit === 1 && then !== "at once" ? "a tool first" : then === "at once" ? first : then;
+    if (how === "too long") {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error: { message: "This model's maximum context length is 128000 tokens. However, your messages resulted in 190000 tokens.", type: "invalid_request_error", code: "context_length_exceeded" } }));
+    }
+    const stream = sse();
+    if (how === "a tool first") {
+      stream.says({ role: "assistant", content: "Let me look at the file first.", tool_calls: [{ index: 0, id: `call-${hit}`, type: "function", function: { name: "read", arguments: JSON.stringify({ path: "a.txt" }) } }] });
+      stream.says({}, "tool_calls");
+    } else {
+      stream.says({ role: "assistant", content: how === "cut off" ? "The answer, which is cut at the li" : "the answer" });
+      stream.says({}, how === "cut off" ? "length" : "stop");
+    }
+    stream.used({ prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200 });
+    stream.done();
+  });
+  writeModelFile(joinPath(fake.cwd, "a.txt"), "what the file says");
+  let first;
+
+  then = "the answer";
+  assert.equal(await fake.ask("read a.txt and answer"), "the answer");
+  for (const [how, why] of [
+    ["too long", /The model did not answer: 400.*maximum context length is 128000 tokens/],
+    ["cut off", /The model's answer was cut off at its output limit\./],
+  ]) {
+    then = how;
+    await assert.rejects(() => fake.ask("read a.txt and answer"), why, `${how}, after a turn that went well`);
+    then = "at once"; first = how;
+    await assert.rejects(() => fake.ask("read a.txt and answer"), why, `${how}, at once`);
+    // ...and where the limit it was cut off at is the model's own, which pi does not take for something to recover from.
+    await assert.rejects(() => fake.ask("read a.txt and answer", { model: "fake/terse" }), why, `${how}, at the model's own limit`);
+  }
+});
+
+test("a call that is stopped half-way has used what it had used by then", async (t) => {
+  const stop = new AbortController();
+  const fake = await fakeProvider(t, (_request, { sse }, hit) => {
+    const stream = sse();
+    if (hit === 1) {
+      // First the model has the agent read a file — a turn that is finished and counted.
+      stream.says({ role: "assistant", tool_calls: [{ index: 0, id: "call-1", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "a.txt" }) } }] });
+      stream.says({}, "tool_calls");
+      stream.used({ prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200 });
+      return stream.done();
+    }
+    // Then it starts to answer, and the call is stopped while it does.
+    stream.says({ role: "assistant", content: "the file says" });
+    stop.abort();
+  });
+  writeModelFile(joinPath(fake.cwd, "a.txt"), "what the file says");
+
+  const heard = [];
+  await assert.rejects(() => fake.ask("read a.txt", { signal: stop.signal, used: (usage) => heard.push(usage) }), /Aborted/);
+  assert.equal(fake.requests.length, 2);
+  assert.match(JSON.stringify(fake.requests[1].messages), /what the file says/, "the agent did read the file for the model");
+  assert.equal(heard.length, 1);
+  assert.deepEqual({ ...heard[0], cost: undefined }, { model: "fake/plain", input: 1000, output: 200, cacheRead: 0, cacheWrite: 0, cost: undefined });
+  assert.ok(heard[0].cost > 0);
+});
+
+test("a call stopped while the model answers has used what that request had taken to read", async (t) => {
+  // A provider that says so when its answer begins: fifty thousand tokens were read, whether or not the answer is waited for.
+  const stop = new AbortController();
+  const fake = await fakeProvider(t, (_request, { res }) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    const event = (type, data) => res.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
+    event("message_start", { message: { id: "msg_1", type: "message", role: "assistant", model: "bird", content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 50000, output_tokens: 1 } } });
+    event("content_block_start", { index: 0, content_block: { type: "text", text: "" } });
+    event("content_block_delta", { index: 0, delta: { type: "text_delta", text: "The answer begins, and " } });
+    setTimeout(() => stop.abort(), 50);
+  });
+
+  const heard = [];
+  await assert.rejects(() => fake.ask("p", { model: "early/bird", signal: stop.signal, used: (usage) => heard.push(usage) }), /Aborted/);
+  assert.equal(heard.length, 1);
+  assert.equal(heard[0].model, "early/bird");
+  assert.equal(heard[0].input, 50000);
+  assert.ok(Math.abs(heard[0].cost - 0.15) < 0.001, `fifty thousand tokens at 3 a million: ${heard[0].cost}`);
+});
+
+test("whoever cancels a call is answered at once, whatever its backend still has to do about it", async (t) => {
+  const { createBackend } = await import("../packages/runtime/dist/runner.js");
+  const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
+  const realAsk = PiAdapter.prototype.ask;
+  t.after(() => { PiAdapter.prototype.ask = realAsk; });
+  const backend = createBackend({ provider: "fake", model: "plain" });
+
+  // A backend lets go of a cancelled call a little later than the call is answered: it has things to stop first.
+  const order = [];
+  PiAdapter.prototype.ask = (_prompt, { signal, used }) => new Promise((_resolve, reject) => {
+    signal.addEventListener("abort", () => setTimeout(() => { used({ input: 1 }); order.push("let go"); reject(new Error("stopped")); }, 30));
+  });
+  const stop = new AbortController();
+  const call = backend.ask("p", { cwd: "/work", signal: stop.signal, used: () => order.push("used") });
+  stop.abort();
+  await assert.rejects(call, /Aborted/);
+  order.push("answered");
+  assert.deepEqual(order, ["answered"], "the one who cancelled is answered at once");
+
+  // A call that came to its end by itself leaves nothing listening for a cancellation.
+  const later = new AbortController();
+  PiAdapter.prototype.ask = async () => "an answer";
+  assert.equal(await backend.ask("p", { cwd: "/work", signal: later.signal }), "an answer");
+  assert.equal(getEventListeners(later.signal, "abort").length, 0);
+});
+
+test("a program's prompt reaches the model as it was written, whatever it begins with", async (t) => {
+  // The user's own pi has prompts of its own, called up by a line that begins with their name.
+  const fake = await fakeProvider(t);
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(joinPath(fake.agentDir, "prompts"));
+  writeModelFile(joinPath(fake.agentDir, "prompts", "review.md"), "---\ndescription: review\n---\nSomething else altogether. $ARGUMENTS\n");
+
+  await fake.ask("/review the diff below");
+  const said = fake.requests[0].messages.filter((message) => message.role === "user").at(-1).content;
+  assert.equal(typeof said === "string" ? said : said.map((part) => part.text).join(""), "/review the diff below");
+});
+
+test("a session is disposed of whatever becomes of telling what the call used", async () => {
+  const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
+  let disposed = 0;
+  const adapter = new PiAdapter({ provider: "fake", model: "plain" });
+  adapter.createSession = async () => ({
+    prompt: async () => {},
+    dispose: () => { disposed += 1; },
+    getSessionStats: () => ({ tokens: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, total: 2 }, cost: 0 }),
+    sessionManager: { getEntries: () => [{ type: "message", message: { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "an answer" }] } }] },
+  });
+  await assert.rejects(() => adapter.ask("p", { cwd: process.cwd(), used: () => { throw new Error("nowhere to write it"); } }), /nowhere to write it/);
+  assert.equal(disposed, 1);
 });

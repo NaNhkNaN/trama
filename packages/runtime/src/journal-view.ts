@@ -43,6 +43,26 @@ function gist(request: Record<string, unknown> | undefined): string {
   return "";
 }
 
+/** What `usage` records add up to, in a few words — and nothing where there are none. */
+function spent(usage: JournalRecord[]): string {
+  if (usage.length === 0) return "";
+  const sum = (field: string) => usage.reduce((total, record) => total + (Number(record[field]) || 0), 0);
+  return `${sum("input") + sum("output") + sum("cacheRead") + sum("cacheWrite")} tokens  $${sum("cost").toFixed(4)}`;
+}
+
+const usageIn = (records: JournalRecord[]) => records.filter(record => record.kind === "usage");
+
+/**
+ * What a run used, as far as its journal says. That is all of it (`inAll`
+ * says so) unless the journal filled up: then it is what is on record, be
+ * that nothing, and is said to be.
+ */
+function spentInAll(records: JournalRecord[], inAll = ""): string {
+  const counted = spent(usageIn(records));
+  if (!records.some(record => record.kind === "full")) return counted && counted + inAll;
+  return `${counted || "no usage"} on record — the journal was full`;
+}
+
 /** How a run ended, in a word or two — or that it has not, or never will. */
 function ending(path: string, records: JournalRecord[]): string {
   const end = records.find(record => record.kind === "end");
@@ -60,6 +80,8 @@ function printJournal(path: string, records: JournalRecord[]): void {
 
   const results = new Map<number, JournalRecord>();
   for (const record of records) if (record.kind === "result") results.set(record.seq, record);
+  const usage = usageIn(records);
+  const total = spentInAll(records, " in all");
 
   for (const record of records) {
     const at = `${(record.at / 1000).toFixed(3).padStart(9)}s`;
@@ -72,9 +94,14 @@ function printJournal(path: string, records: JournalRecord[]): void {
         const how = !result ? "never answered"
           : result.ok ? `ok  ${result.ms}ms`
           : `failed  ${result.ms}ms  ${oneLine(result.error, 60)}`;
-        console.log(`${at}  #${String(record.seq).padEnd(3)} ${record.endpoint.slice(1).padEnd(18)} ${gist(record.request).padEnd(60)}  ${how}`);
+        const used = spent(usage.filter(item => item.seq === record.seq));
+        console.log(`${at}  #${String(record.seq).padEnd(3)} ${record.endpoint.slice(1).padEnd(18)} ${gist(record.request).padEnd(60)}  ${how}${used && `  ${used}`}`);
         break;
       }
+      case "usage":
+        // (What a call used is shown with the call.)
+        if (record.for === "fix") console.log(`${at}  asking for the fix used ${spent([record])}`);
+        break;
       case "child":
         console.log(`${at}  #${String(record.seq).padEnd(3)} started run ${record.run}`);
         break;
@@ -102,7 +129,7 @@ function printJournal(path: string, records: JournalRecord[]): void {
         console.log(`${at}  the journal is full: calls from here on were not recorded`);
         break;
       case "end":
-        console.log(`${at}  end: ${howEnded}`);
+        console.log(`${at}  end: ${howEnded}${total && `  (${total})`}`);
         break;
     }
   }
@@ -126,7 +153,8 @@ export function printJournals(projectDir: string, name: string, options: { run?:
       const path = journalIn(dir, run);
       const records = readJournal(path);
       const calls = records.filter(record => record.kind === "call").length;
-      console.log(`${run}  ${String(records[0]?.purpose ?? "").padEnd(8)}  ${String(calls).padStart(4)} calls  ${ending(path, records)}`);
+      const used = spentInAll(records);
+      console.log(`${run}  ${String(records[0]?.purpose ?? "").padEnd(8)}  ${String(calls).padStart(4)} calls  ${ending(path, records)}${used && `  ${used}`}`);
     }
     return;
   }

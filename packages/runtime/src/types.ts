@@ -65,23 +65,41 @@ export interface Ctx {
   yield(reason: string): Promise<never>;
 }
 
+/** How much a model is to think before it answers. */
+export type Thinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+
+/**
+ * What a call may say about how it is served. Each is honoured or the call
+ * fails: nothing asked for here is quietly left out.
+ */
+export interface ModelOptions {
+  /** Instructions for this call, on top of the agent's own. */
+  system?: string;
+  /** The model that serves this call, as "provider/model" — in place of the project's. */
+  model?: string;
+  /** How much the model is to think. A level pi does not have for the model is an error. */
+  thinking?: Thinking;
+}
+
 export interface Agent {
   /**
    * Instruct the pi-coding-agent to perform a task. Returns plain text.
-   * The underlying agent may autonomously use its built-in tools
-   * (bash, file read/write/edit) to fulfill the instruction.
+   * The underlying agent may autonomously use its tools to fulfill the
+   * instruction — its own choice of them (read, bash, edit, write), or
+   * exactly the ones named in `tools`: `[]` for none, and pi has more
+   * than it chooses (grep, find, ls). A name the agent has no tool for is
+   * an error.
    */
-  instruct(prompt: string, options?: { system?: string }): Promise<string>;
+  instruct(prompt: string, options?: ModelOptions & { tools?: string[] }): Promise<string>;
 
   /**
    * Structured LLM call. Returns typed object matching the provided schema.
    * Supported schema value prefixes: "string", "number", "boolean".
    * Retries once on parse/validation failure.
    */
-  generate<T>(input: {
+  generate<T>(input: ModelOptions & {
     prompt: string;
     schema: Record<string, string>;
-    system?: string;
   }): Promise<T>;
 }
 

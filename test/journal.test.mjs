@@ -848,3 +848,254 @@ test("a journal directory that may not be read is no part of a copy: the project
   assert.equal(result.result.status, "done");
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), `console.log("mended");`);
 });
+
+// --- What agent calls ask for, and what they used ---
+
+import { printJournals } from "../packages/runtime/dist/journal-view.js";
+
+test("what an agent call asks for reaches its backend as asked, and what the call used is on record beside it — answered or not", async (t) => {
+  const projectDir = makeTempDir("trama-journal-");
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, agent } from "@trama-dev/runtime";
+const told = (err: unknown) => String(err);
+const first = await agent.instruct("first", { system: "s", model: "p/m", thinking: "high", tools: ["read"] });
+const second = await agent.generate<{ a: string }>({ prompt: "second", schema: { a: "string" }, model: "p/m", thinking: "off" });
+const third = await agent.instruct("third").catch(told);
+const fourth = await agent.instruct("fourth", { tools: ["read", 1] } as any).catch(told);
+const fifth = await agent.instruct("fifth", { tools: "read" } as any).catch(told);
+const sixth = await agent.instruct("sixth", { thinking: 3 } as any).catch(told);
+const seventh = await agent.instruct("seventh", { tools: [], model: undefined, thinking: null } as any);
+await ctx.done({ first, second, third, fourth, fifth, sixth, seventh });`,
+  });
+
+  const asked = [];
+  const originalAsk = llm.ask;
+  llm.ask = async (prompt, { cwd, signal, used, ...call }) => {
+    asked.push({ prompt: prompt.startsWith("Your previous response failed validation") ? "second, again" : prompt.split("\n")[0], ...call });
+    // (What a report holds beside what a report is declared to hold is not what a record is made of.)
+    used({ model: "p/m", input: 10, output: 5, cacheRead: 2, cacheWrite: 1, cost: 0.25, kind: "end", seq: 99, at: -1, more: "x" });
+    if (prompt === "third") throw new Error("the model is away");
+    if (prompt.startsWith("second")) return "not what was asked for";
+    if (prompt.includes("second")) return '{"a":"x"}';
+    return `answer to ${prompt}`;
+  };
+  t.after(() => { llm.ask = originalAsk; cleanupTempDir(projectDir); });
+
+  const { result } = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.deepEqual(result, {
+    first: "answer to first",
+    second: { a: "x" },
+    third: "Error: trama runtime error: Error: the model is away",
+    fourth: "Error: trama runtime error: Invalid field: tools (expected strings or undefined)",
+    fifth: "Error: trama runtime error: Invalid field: tools (expected strings or undefined)",
+    sixth: "Error: trama runtime error: Invalid field: thinking (expected string or undefined)",
+    seventh: "answer to seventh",
+  });
+  assert.deepEqual(asked, [
+    { prompt: "first", system: "s", model: "p/m", thinking: "high", tools: ["read"] },
+    { prompt: "second", system: undefined, model: "p/m", thinking: "off" },
+    { prompt: "second, again", system: undefined, model: "p/m", thinking: "off" },
+    { prompt: "third", system: undefined },
+    { prompt: "seventh", system: undefined, tools: [] },
+  ]);
+
+  const records = onlyJournal(projectDir);
+  assert.deepEqual(callAt(records, 1).call.request, { prompt: "first", system: "s", model: "p/m", thinking: "high", tools: ["read"] });
+  const usage = records.filter(record => record.kind === "usage");
+  // Each asking of the backend is one record: the second call asked twice, the refused ones never.
+  assert.deepEqual(usage.map(record => record.seq), [1, 2, 2, 3, 7]);
+  const { at, ...one } = usage[0];
+  assert.deepEqual(one, { kind: "usage", seq: 1, model: "p/m", input: 10, output: 5, cacheRead: 2, cacheWrite: 1, cost: 0.25 });
+  // What a call used is written when the backend says it — before the call's answer, and whether or not it got one.
+  assert.equal(callAt(records, 3).result.ok, false);
+  assert.ok(records.indexOf(usage[3]) < records.indexOf(callAt(records, 3).result));
+
+  const { messages } = await captureConsole("log", async () => printJournals(projectDir, "it", {}));
+  const shown = messages.join("\n");
+  assert.match(shown, /#1 +agent\/instruct +first +ok +\d+ms  18 tokens  \$0\.2500$/m);
+  assert.match(shown, /#2 +agent\/generate +second +ok +\d+ms  36 tokens  \$0\.5000$/m);
+  assert.match(shown, /#3 +agent\/instruct +third +failed +\d+ms +Error: the model is away  18 tokens  \$0\.2500$/m);
+  assert.match(shown, /#4 +agent\/instruct +fourth +failed +\d+ms +Invalid field: tools \(expected strings or undefined\)$/m);
+  assert.match(shown, /end: done  \(90 tokens  \$1\.2500 in all\)$/m);
+  assert.doesNotMatch(shown, /asking for the fix/, "what a call used is said with the call, and only there");
+  const listed = await captureConsole("log", async () => printJournals(projectDir, "it", { list: true }));
+  assert.match(listed.messages.join("\n"), /^\S+  run +8 calls  done  90 tokens  \$1\.2500$/m);
+});
+
+test("what asking for a fix used is on record with the run, whether or not a fix came back", async (t) => {
+  const mended = makeTempDir("trama-journal-");
+  const unmended = makeTempDir("trama-journal-");
+  for (const projectDir of [mended, unmended]) {
+    createProjectFixture(projectDir, { scaffold: false, programSource: `throw new Error("the original fails");` });
+  }
+  const originalRepair = llm.repair;
+  llm.repair = async (_prompt, call) => {
+    call.used({ model: "p/m", input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.5, kind: "end", for: "nothing", more: "x" });
+    if (existsSync(join(call.cwd, "unmended"))) throw new Error("no fix today");
+    if (existsSync(join(call.cwd, "garbled"))) call.used(undefined);
+    return `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ fixed: true });`;
+  };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(mended); cleanupTempDir(unmended); });
+  const used = { kind: "usage", for: "fix", model: "p/m", input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.5 };
+  const shapeOf = (records) => records.map(record => record.kind).filter(kind => kind !== "call" && kind !== "result");
+  const usageIn = (records) => records.filter(record => record.kind === "usage").map(({ at, ...record }) => record);
+
+  assert.deepEqual(await runProgram({ projectDir: mended, maxRepairAttempts: 3, timeout: 20_000 }), { status: "done", result: { fixed: true } });
+  let records = onlyJournal(mended);
+  assert.deepEqual(shapeOf(records), ["run", "attempt", "exit", "fix-request", "usage", "fix", "attempt", "exit", "end"]);
+  assert.deepEqual(usageIn(records), [used]);
+
+  // What is said that is no report at all is written down as that, and the run goes on as it would have.
+  const garbled = makeTempDir("trama-journal-");
+  t.after(() => cleanupTempDir(garbled));
+  createProjectFixture(garbled, { scaffold: false, programSource: `throw new Error("the original fails");` });
+  writeText(join(garbled, "garbled"), "x");
+  assert.equal((await runProgram({ projectDir: garbled, maxRepairAttempts: 3, timeout: 20_000 })).status, "done");
+  const odd = onlyJournal(garbled).filter(record => record.kind === "usage");
+  assert.deepEqual(odd.map(record => typeof record.unrecordable), ["undefined", "string"]);
+
+  // A run that asked no model anything says nothing of what it used.
+  assert.equal((await runProgram({ projectDir: mended, maxRepairAttempts: 3, timeout: 20_000 })).status, "done");
+  const quiet = await captureConsole("log", async () => printJournals(mended, "it", {}));
+  assert.match(quiet.messages.join("\n"), /^\S+  run  done\n(.*\n)*.* end: done$/);
+  const listed = await captureConsole("log", async () => printJournals(mended, "it", { list: true }));
+  assert.match(listed.messages.join("\n"), /^\S+  run +\d+ calls  done  120 tokens  \$0\.5000\n\S+  run +\d+ calls  done$/);
+
+  writeText(join(unmended, "unmended"), "the copy the fix is asked for in holds this, and is told from the other by it");
+  const { result: failed } = await captureConsole("error", () => runProgram({ projectDir: unmended, maxRepairAttempts: 3, timeout: 20_000 }));
+  assert.equal(failed.status, "failed");
+  records = onlyJournal(unmended);
+  assert.deepEqual(shapeOf(records), ["run", "attempt", "exit", "fix-request", "usage", "fix", "end"]);
+  assert.deepEqual(usageIn(records), [used]);
+  assert.equal(records.find(record => record.kind === "fix").ok, false);
+
+  const { messages } = await captureConsole("log", async () => printJournals(unmended, "it", {}));
+  const shown = messages.join("\n");
+  assert.match(shown, /asking for the fix used 120 tokens  \$0\.5000$/m);
+  assert.match(shown, /end: failed  \(120 tokens  \$0\.5000 in all\)$/m);
+});
+
+test("a run's journal ends after the calls it cut off have said what they used — given the time anything asked to stop is given, and no run's but its own", async (t) => {
+  const projectDir = makeTempDir("trama-journal-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: `throw new Error("the original fails");` });
+  const originalRepair = llm.repair;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+  const quietly = (run) => captureConsole("error", run).then(({ result }) => result);
+  const used = { model: "p/m", input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.5 };
+  const lastJournal = () => readRecords(join(journalDir(projectDir), journalFiles(projectDir).at(-1)));
+
+  // A backend that has things to stop first lets go of a cancelled call a little after the call was answered.
+  llm.repair = (_prompt, { signal, used: say }) => new Promise((_resolve, reject) => {
+    signal.addEventListener("abort", () => setTimeout(() => { say(used); reject(new Error("stopped")); }, 100));
+  });
+  let started = Date.now();
+  assert.equal((await quietly(() => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 300 }))).status, "failed");
+  assert.ok(Date.now() - started < 3000, "it is waited for no longer than it takes");
+  let records = lastJournal();
+  assert.deepEqual(records.map(record => record.kind).slice(-4), ["fix-request", "fix", "usage", "end"]);
+  assert.deepEqual(records.at(-2), { at: records.at(-2).at, kind: "usage", for: "fix", ...used });
+
+  // One that never lets go is waited for as long as a program that ignores being asked to stop — and then no more:
+  // what it says afterwards finds the journal closed, and the next run has nothing of it to wait for.
+  let sayLate;
+  llm.repair = (_prompt, { used: say }) => new Promise(() => { sayLate = () => say(used); });
+  started = Date.now();
+  assert.equal((await quietly(() => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 300 }))).status, "failed");
+  const waited = Date.now() - started;
+  assert.ok(waited > 4500 && waited < 9000, `the run ended ${waited}ms after it began`);
+  sayLate();
+  records = lastJournal();
+  assert.deepEqual(records.map(record => record.kind).slice(-3), ["fix-request", "fix", "end"]);
+
+  llm.repair = async () => { throw new Error("no fix today"); };
+  started = Date.now();
+  assert.equal((await quietly(() => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }))).status, "failed");
+  assert.ok(Date.now() - started < 3000, "a run that cut nothing off waits for nothing");
+
+  // What one run cut off is that run's to wait for: another, going on beside it, ends when it is done...
+  const beside = makeTempDir("trama-journal-");
+  t.after(() => cleanupTempDir(beside));
+  createProjectFixture(beside, { scaffold: false, programSource: `throw new Error("this one fails too");` });
+  llm.repair = (_prompt, { cwd }) => existsSync(join(cwd, "beside"))
+    ? Promise.reject(new Error("no fix today"))
+    : new Promise(() => {});
+  writeText(join(beside, "beside"), "x");
+  const stuck = quietly(() => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 300 }));
+  await new Promise(resolve => setTimeout(resolve, 1000)); // (the one that is stuck has cut its call off by now)
+  started = Date.now();
+  assert.equal((await quietly(() => runProgram({ projectDir: beside, maxRepairAttempts: 1, timeout: 20_000 }))).status, "failed");
+  assert.ok(Date.now() - started < 3000, `the run beside it took ${Date.now() - started}ms`);
+  assert.equal((await stuck).status, "failed");
+
+  // ...and a run that is not recorded has nowhere to write what it would hear, and does not wait for it.
+  writeJson(join(defaultsHome, ".trama", "config.json"), { journalRuns: 0 });
+  t.after(() => cleanupTempDir(join(defaultsHome, ".trama")));
+  llm.repair = () => new Promise(() => {});
+  started = Date.now();
+  assert.equal((await quietly(() => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 300 }))).status, "failed");
+  assert.ok(Date.now() - started < 3000, `the unrecorded run took ${Date.now() - started}ms`);
+});
+
+test("a total that the journal could not hold all of says so", async (t) => {
+  const projectDir = makeTempDir("trama-journal-");
+  t.after(() => cleanupTempDir(projectDir));
+  const run = "2026-11-15T01-02-03-004Z-0a1b2c";
+  writeText(join(journalDir(projectDir), `${run}.jsonl`), [
+    { at: 0, kind: "run", v: 1, run, pid: 1, purpose: "run" },
+    { at: 1, kind: "call", seq: 1, endpoint: "/agent/instruct", request: { prompt: "p" } },
+    { at: 2, kind: "usage", seq: 1, model: "p/m", input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.5 },
+    { at: 3, kind: "result", seq: 1, ms: 2, ok: true, result: "an answer" },
+    { at: 4, kind: "full", bytes: 67108865, note: "calls after this point are not recorded" },
+    { at: 5, kind: "end", result: { status: "done" } },
+  ].map(record => JSON.stringify(record)).join("\n") + "\n");
+
+  const shown = (await captureConsole("log", async () => printJournals(projectDir, "it", {}))).messages.join("\n");
+  assert.match(shown, /end: done  \(120 tokens  \$0\.5000 on record — the journal was full\)$/m);
+  let listed = (await captureConsole("log", async () => printJournals(projectDir, "it", { list: true }))).messages.join("\n");
+  assert.match(listed, /1 calls  done  120 tokens  \$0\.5000 on record — the journal was full$/);
+
+  // ...also where what is on record is nothing: it filled up before any model was asked, and whatever was asked later is not there.
+  const later = "2026-11-15T01-02-03-005Z-0a1b2c";
+  writeText(join(journalDir(projectDir), `${later}.jsonl`), [
+    { at: 0, kind: "run", v: 1, run: later, pid: 1, purpose: "run" },
+    { at: 4, kind: "full", bytes: 67108865, note: "calls after this point are not recorded" },
+    { at: 5, kind: "end", result: { status: "done" } },
+  ].map(record => JSON.stringify(record)).join("\n") + "\n");
+  const latest = (await captureConsole("log", async () => printJournals(projectDir, "it", {}))).messages.join("\n");
+  assert.match(latest, /end: done  \(no usage on record — the journal was full\)$/m);
+  listed = (await captureConsole("log", async () => printJournals(projectDir, "it", { list: true }))).messages.join("\n");
+  assert.match(listed, /0 calls  done  no usage on record — the journal was full$/);
+});
+
+test("what an agent call comes to after its program has ended is no answer, and is not recorded as one", async (t) => {
+  const projectDir = makeTempDir("trama-journal-");
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { agent } from "@trama-dev/runtime";
+await agent.instruct("this takes longer than the program has");`,
+  });
+  // A backend lets go of a cancelled call at once — sooner than the bridge sees the program's connection close.
+  const originalAsk = llm.ask;
+  llm.ask = (_prompt, { signal }) => new Promise((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("Aborted"))));
+  t.after(() => { llm.ask = originalAsk; cleanupTempDir(projectDir); });
+
+  for (let round = 0; round < 3; round++) {
+    const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 1_000 });
+    assert.match(result.reason, /timeout/);
+    const records = readRecords(join(journalDir(projectDir), journalFiles(projectDir).at(-1)));
+    assert.deepEqual(records.map(record => record.kind), ["run", "attempt", "call", "exit", "end"]);
+  }
+});
+
+test("a run that has waited for what it cut off leaves nothing behind that keeps its process going", async (t) => {
+  const projectDir = makeTempDir("trama-journal-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false });
+  const waiting = () => process.getActiveResourcesInfo().filter(resource => resource === "Timeout").length;
+
+  assert.equal((await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 })).status, "done");
+  const before = waiting();
+  assert.equal((await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 })).status, "done");
+  assert.equal(waiting(), before, "the time it would have given a call that does not let go is not still running");
+});

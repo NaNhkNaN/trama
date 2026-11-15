@@ -631,8 +631,8 @@ await ctx.yield(reason)// cooperative suspension — persists state, exits proce
 ### agent — LLM calls
 
 ```typescript
-await agent.instruct(prompt, { system? })     // instruct the agent — may use tools autonomously
-await agent.generate<T>({ prompt, schema })   // text in -> typed JSON out
+await agent.instruct(prompt, { system?, model?, thinking?, tools? })   // instruct the agent — may use tools autonomously
+await agent.generate<T>({ prompt, schema, system?, model?, thinking? }) // text in -> typed JSON out
 ```
 
 `agent.instruct()` is **not** a simple text completion. The underlying pi-coding-agent runs a full agent loop and may autonomously use its built-in tools (bash, file read/write/edit) to fulfill the instruction. What you get back is the final text response.
@@ -651,6 +651,28 @@ const result = await agent.generate<{ score: number; reasoning: string }>({
 ```
 
 Only `string`, `number`, and `boolean` are supported as schema types. The part after `:` is a description hint for the LLM (ignored during validation). Retries once on parse/validation failure.
+
+A call can say how it is to be served:
+
+```typescript
+// A cheap model that only reads, for the survey; the project's model, thinking hard, for the decision.
+const survey = await agent.instruct("List every place the config is read.", {
+  model: "anthropic/claude-haiku-5-5",
+  tools: ["read", "grep", "find", "ls"],
+});
+const plan = await agent.instruct(`Decide how to split the config:\n${survey}`, { thinking: "high", tools: [] });
+```
+
+- `model` — the model for this call, as `"provider/model"`, in place of the project's.
+- `thinking` — how much the model is to think: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"` or `"max"`.
+- `tools` (`instruct` only) — the agent's tools for this call: exactly the ones named, `[]` for none. Left to itself pi takes `read`, `bash`, `edit` and `write`; it also has `grep`, `find` and `ls`, among others.
+
+Each is honoured or the call fails. A model pi does not know, a level pi does not have for the model, a tool the agent has not got: pi itself would serve such a call with something else and say nothing, so trama checks what the call was given before the model is asked. Two things it cannot see to:
+
+- What a provider makes of a level is the provider's. For some models two levels pi offers come to the same request (`"minimal"` and `"low"` for several of Anthropic's, say), and a few take any level and send none.
+- The spelling of the option itself. The bridge passes over a field it does not know, so `tool: [...]` restricts nothing — and neither does `tools` given to `generate`.
+
+The answer of a call is the model's last reply, and only if the model ended it itself: a reply that is the provider's error fails the call with the provider's words, and so does one that was cut off at the output limit. And the prompt is text: it reaches the model as written, also where it begins like one of your own pi commands (`/review …`).
 
 ### tools — I/O operations
 
@@ -759,14 +781,17 @@ $ trama journal lead
     0.434s  end: done
 ```
 
+An agent call's line ends with what it used, and the last line with what the run used in all — `1200 tokens  $0.0125`.
+
 - **One file per run**, `logs/journal/<run>.jsonl` in the project, one JSON record per line. A repair is part of the run it repairs: the failed attempt, the fix, and the attempt that tried the fix are in the same journal — including an attempt whose fix did not work and left no other trace.
 - **A session is a tree of journals.** A participant's run has a journal of its own, in its own project. The journal of the program that spawned it says which run that call started, and the participant's journal says which call started it.
 - **Written as things happen.** A journal says what had happened by the time of its last line. The journal of a run that died has no `end`; a call that nobody was left to answer — the program was gone — has no `result`.
+- **What the agent used is counted.** Each time the agent behind a call was asked, a `usage` record says which model served it, the tokens it read and wrote (and read from and wrote to a cache), and what pi's price list makes of that in US dollars — over everything the agent asked of the model for that call: every turn, every retry, a summary pi made of a conversation grown long. It is written when the call is over, however it ended: a call that failed, or was stopped half-way, has used what it used, and a run that is recorded waits for the calls it cut off to say so before its journal ends (up to five seconds, for a backend that does not let go). The same is recorded for each fix that was asked for. Nothing is recorded where nothing was counted — the provider was never reached, or does not say. Not counted at all: the calls `create` and `update` make to write a program, which happen outside any run.
 - **It is a record, not a control.** Nothing reads a journal back to change what a run does.
 
 What goes in it is what the program did: prompts and answers, the contents of files read and written, shell commands and their output. Keep that in mind before sharing one. One thing is held back on purpose: the values of credential-looking headers of a web request (`Authorization`, `Cookie`, `X-Api-Key`, anything with "key", "token" or "auth" in its name) are replaced by `[redacted]`. A secret a program puts anywhere else — in a URL, a prompt, a command — is recorded as written. Journals are readable by their owner only, and `logs/` is kept out of version control.
 
-It is bounded in size. A text longer than 256 KB is cut to its beginning, and a record holds about 1 MB. A record that lost something says so in its `cuts`: which value, and what was there — a text's full length and hash, how many items a list had. A record without `cuts` is whole. A journal that has grown past 64 MB goes on recording how the run goes — attempts, exits, the end — but no more of its calls.
+It is bounded in size. A text longer than 256 KB is cut to its beginning, and a record holds about 1 MB. A record that lost something says so in its `cuts`: which value, and what was there — a text's full length and hash, how many items a list had. A record without `cuts` is whole. A journal that has grown past 64 MB goes on recording how the run goes — attempts, exits, the end — but no more of its calls, nor what they used: the total `trama journal` shows for such a run is what is on record, and says so.
 
 A project keeps the journals of its latest 20 runs — more for a while, if older ones are still being written. Change that with `"journalRuns"` in `~/.trama/config.json`; `0` records nothing. A journal that names another run's journal does not keep that one from being removed in its turn.
 
@@ -810,7 +835,7 @@ Two kinds of program are validated only part of the way, because running them to
 
 **`agent.instruct()` gives the LLM autonomous tool access.** When your program calls `agent.instruct()`, the underlying pi-coding-agent may autonomously read files, write files, and run shell commands to fulfill the request. This is not a simple text-in/text-out call — the LLM can take multi-step actions within the project directory.
 
-This is a deliberate design choice. trama is a power tool, not a managed service. If you need execution constraints, apply them below trama: containers, VM isolation, or pi's tool-level configuration. The only built-in guard is a path check on `tools` and `workspace` file access (traversal and symlink escapes) — a footgun guard, not a security boundary.
+This is a deliberate design choice. trama is a power tool, not a managed service. A program can narrow what one call may do (`tools: ["read", "grep"]`, or `tools: []` for none), which is a way to say what a step is for, not a wall around it. If you need execution constraints, apply them below trama: containers, VM isolation, or pi's tool-level configuration. The only built-in guard is a path check on `tools` and `workspace` file access (traversal and symlink escapes) — a footgun guard, not a security boundary.
 
 ---
 

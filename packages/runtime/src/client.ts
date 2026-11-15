@@ -2,11 +2,11 @@
 // A thin wrapper that forwards every call to the runner's IPC server
 // (ipc-server.ts), which does the real work.
 
-import type { Ctx, Agent, ShellResult, Tools, ObserveResult, Workspace } from "./types.js";
+import type { Ctx, Agent, ModelOptions, Thinking, ShellResult, Tools, ObserveResult, Workspace } from "./types.js";
 import { openBridge, remoteWorkspace } from "./bridge-client.js";
 import { assertSerializable, toLogData } from "./serializable.js";
 
-export type { Ctx, Agent, ShellResult, Tools, ObserveResult, Workspace };
+export type { Ctx, Agent, ModelOptions, Thinking, ShellResult, Tools, ObserveResult, Workspace };
 
 const PORT = process.env.TRAMA_PORT;
 if (!PORT) {

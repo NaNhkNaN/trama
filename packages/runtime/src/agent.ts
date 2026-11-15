@@ -1,5 +1,5 @@
 import type { Agent } from "./types.js";
-import type { AgentBackend } from "./agent-backend.js";
+import type { AgentBackend, AgentCall } from "./agent-backend.js";
 import { isJsonObject } from "./serializable.js";
 
 /** A line of a reply that could be the edge of a fenced block: three or more backticks. */
@@ -139,24 +139,39 @@ function extractBySchema(
   return picked;
 }
 
+/** Hears what a call used — each time its backend was asked: a `generate` that had to ask again is heard twice. */
+type Used = AgentCall["used"];
+
+/** The runner's side of a program's `agent`: its calls, and for each a place to say what it used. */
+export interface RunnerAgent {
+  instruct(prompt: string, options?: Parameters<Agent["instruct"]>[1], used?: Used): Promise<string>;
+  generate<T>(input: Parameters<Agent["generate"]>[0], used?: Used): Promise<T>;
+}
+
+/** Of what a call may ask for, what it did ask for: a backend is not handed a thing nobody named. */
+const asked = (options: Pick<AgentCall, "model" | "thinking" | "tools" | "used">) =>
+  Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined));
+
 /**
  * The `agent` a program talks to: its calls, served by `backend` working in
  * `cwd`, and cancelled together through `signal`.
  */
-export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSignal): Agent {
+export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSignal): RunnerAgent {
   return {
-    async instruct(prompt, options) {
-      return backend.ask(prompt, { cwd, system: options?.system, signal });
+    async instruct(prompt, options, used) {
+      const { system, model, thinking, tools } = options ?? {};
+      return backend.ask(prompt, { cwd, system, signal, ...asked({ model, thinking, tools, used }) });
     },
 
-    async generate(input) {
+    async generate(input, used) {
       const schemaEntries = parseSchema(input.schema);
       const schemaInstruction = `Respond with ONLY a JSON object matching this shape:\n${
         JSON.stringify(input.schema, null, 2)
       }\nNo markdown. No explanation. Just the JSON.`;
 
       const fullPrompt = `${input.prompt}\n\n${schemaInstruction}`;
-      const call = { cwd, system: input.system, signal };
+      const { system, model, thinking } = input;
+      const call = { cwd, system, signal, ...asked({ model, thinking, used }) };
 
       const parseAndValidate = (response: string): Record<string, unknown> => {
         const trimmed = response.trim();

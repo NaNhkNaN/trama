@@ -26,8 +26,8 @@
 import { spawn, type ChildProcess } from "child_process";
 import * as fs from "fs";
 
-/** How long a process group gets to exit after SIGTERM before it is sent SIGKILL. */
-const KILL_GRACE_MS = 5000;
+/** How long what was asked to stop gets to do so: a process group after SIGTERM, before it is sent SIGKILL; a backend's call after it was cancelled, before the run goes on without it. */
+export const KILL_GRACE_MS = 5000;
 const STOP_POLL_MS = 25;
 /** How long a group is waited for after SIGKILL before it is given up on. */
 const KILL_SETTLE_MS = 1000;

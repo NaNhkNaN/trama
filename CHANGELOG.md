@@ -2,6 +2,26 @@
 
 All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`) are released together under one version.
 
+## Unreleased
+
+### Added
+
+- **A call says how it is served.** `agent.instruct(prompt, { model, thinking, tools })` and `agent.generate({ …, model, thinking })`: the model for this one call, as `"provider/model"`; how much it is to think; and, for `instruct`, the agent's tools — exactly the ones named, `[]` for none. Each is honoured or the call fails. pi takes a thinking level it does not have for the model and serves the call at another, drops a tool name it does not know, and reads `"re*"`, `"+grep"` and `"-bash"` as patterns and changes to its own choice — all without a word; trama looks at what the call was given before the model is asked, and refuses what is not what was asked for. A model named by a call that pi's catalog does not have is an error too (the project's own, if unknown, is still a warning and pi's fallback). What a provider makes of a level pi does offer is beyond that check: for some models two levels come to the same request. These options were passed over until now, like any field the bridge does not know: a program that already gave them is now held to them.
+- **What agent calls used is in the journal.** Each time the agent behind a call was asked, a `usage` record says which model served it, the tokens in and out and through the cache, and the cost by pi's price list — written when the call is over, however it ended: a call that failed or was stopped half-way has used what it used, the request that was cut off included, and a run's journal does not end before the calls it cut off have said so. Each fix asked for has one too. `trama journal` shows it on the call's line, and a run's total on its last line and in `--list`. Nothing acts on it yet; it is the count a budget needs.
+
+### Fixed
+
+- **A call's answer is the model's last reply, as it happened.** It was read from the conversation as pi would next show it to the model — and pi takes a failed reply out of that. So a call whose last request the provider refused as too long, or whose last reply was cut off, came back with whatever the model had said the turn before (`"Let me look at the file first."`) as its answer, or as `Empty response from LLM` where there was no turn before. The answer is read from the session's record now.
+- **A provider's refusal is the call's error.** A request the provider refused or could not serve — a bad key, a model it will not run, a request it calls invalid or too long — ended as `Empty response from LLM`, the reason lost: pi ends such a run quietly, with the reason in the last message, and only its text was read. The call now fails with `The model did not answer:` and the provider's own words. So does a reply pi itself holds to have failed though it has text — a stream that ended without saying how — which used to be returned.
+- **A prompt that begins like a pi command is still a prompt.** `agent.instruct("/review the diff below")`, on a machine whose user has a pi prompt template called `review`, sent the model the template's text in place of the program's. A program's prompt is passed to pi as text and nothing else.
+- **What comes back for an agent call after its program has ended is not recorded as an answer.** The rule was there and held for a shell command; an agent call is cancelled faster than the bridge sees the program's connection close, and its `Aborted` went on record as what the program had been told.
+
+### Changed
+
+- **An answer that was cut off at the model's output limit fails the call** (`The model's answer was cut off at its output limit.`). It used to be returned as if it were whole.
+- **A cancelled agent call has pi abort its run** rather than throw the session away: what the request in flight had taken by then is counted. A recorded run that cut a call off waits for its backend to let go of it before the run is over — a few milliseconds with pi, at most the five seconds a program that ignores being stopped is given.
+- **Backends hear `model`, `thinking`, `tools` and `used` in a call** (`AgentCall`, internal). A backend that cannot honour one of the first three is to reject; one that cannot know what a call used, or a call that used nothing, says nothing.
+
 ## 0.5.0 — 2026-11-15
 
 ### Fixed

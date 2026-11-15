@@ -25,7 +25,7 @@ import { stageFile, type StagedFile } from "./replace-file.js";
 import { readProjectMeta } from "./meta.js";
 import { describeJson, isJsonObject } from "./serializable.js";
 import { createAllowance, superviseChild, type ChildExit } from "./child-process.js";
-import { removeTempDir, removeWithThisProcess, requireWatchdog, stopGroups, stopWithThisProcess } from "./stopping.js";
+import { KILL_GRACE_MS, removeTempDir, removeWithThisProcess, requireWatchdog, stopGroups, stopWithThisProcess } from "./stopping.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
 import { journalEntriesOf, openJournal, type Journal } from "./journal.js";
 import { messageOf } from "./errors.js";
@@ -233,11 +233,39 @@ export function loadProjectConfig(projectDir: string, meta = readProjectMeta(pro
  * What does the LLM work for a project. The only place that picks a backend:
  * everything else is handed one and does not know which it is.
  */
-export function createBackend(config: TramaConfig): AgentBackend {
+export function createBackend(config: TramaConfig): Backend {
   const backend = new PiAdapter(config);
-  // The interface promises that a cancelled call rejects, and a run's end
-  // waits on that. Every backend is held to it here, rather than trusted with it.
-  return { ask: (prompt, call) => rejectOnAbort(backend.ask(prompt, call), call.signal) };
+  // The calls that were cancelled.
+  const cutOff = new Set<Promise<unknown>>();
+  return {
+    // The interface promises that a cancelled call rejects, and a run's end
+    // waits on that. Every backend is held to it here, rather than trusted with it.
+    ask(prompt, call) {
+      const work = backend.ask(prompt, call);
+      const off = onAbort(call.signal, () => { cutOff.add(work); });
+      work.then(off, off);
+      return rejectOnAbort(work, call.signal);
+    },
+    async letGo() {
+      let giveUp: NodeJS.Timeout | undefined;
+      await Promise.race([
+        Promise.allSettled(cutOff),
+        new Promise(resolve => { giveUp = setTimeout(resolve, KILL_GRACE_MS); }),
+      ]);
+      clearTimeout(giveUp);
+    },
+  };
+}
+
+/** A backend as the runner holds it: one whose cancelled calls are answered at once, and can be waited for apart. */
+export interface Backend extends AgentBackend {
+  /**
+   * Resolves when the backend has let go of the calls that were cancelled so
+   * far: whoever cancelled one went on at once, and the backend still had to
+   * stop what it was doing, and to say what the call had used. They are
+   * waited for no longer than anything asked to stop is.
+   */
+  letGo(): Promise<void>;
 }
 
 export function loadState(projectDir: string): Record<string, unknown> {
@@ -428,7 +456,7 @@ function copyProjectWith(projectDir: string, privateDir: string, program: string
 interface RunOnceOptions {
   /** The project to run. It is also where the program's agent calls work. */
   projectDir: string;
-  backend: AgentBackend;
+  backend: Backend;
   timeout: number;
   maxIterations: number;
   argsOverride?: Record<string, unknown>;
@@ -622,6 +650,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   const tools = createTools(projectDir, runEnded.signal);
   // Known only to this run's program, through its init file.
   const token = randomBytes(32).toString("hex");
+  // Whether the program's process has ended. (Nothing is an answer to it after that, and it is no longer there to stop.)
+  let programOver = false;
   const server = createIPCServer({
     token,
     ctx,
@@ -630,6 +660,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     workspace: sessionWorkspace,
     workspaceAt,
     journal,
+    programOver: () => programOver,
     run: (request, stop, seq) => {
       if (validating) {
         // As far as a validation goes. The call is left unanswered — an answer
@@ -670,7 +701,6 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   // Asked to stop while its program had not ended. Everything it has in flight
   // goes at once — the runs it asked for among them, so that a tree of runs is
   // stopped together rather than one level after another.
-  let programOver = false;
   let stopped = false;
   const stopProgram = () => {
     if (programOver) return;
@@ -815,6 +845,7 @@ async function requestRepair(
       limit.start(() => timedOut.abort());
       const fixed = stripCodeFences(await options.backend.ask(repairPrompt(input), {
         cwd: copy, system: REPAIR_SYSTEM_PROMPT, signal,
+        used: (usage) => options.journal.used("fix", usage),
       }));
       if (fixed.trim() === "") throw new Error("The repair returned an empty program.");
       if (fixed === input.programSource) throw new Error("The repair returned the program unchanged.");
@@ -995,17 +1026,22 @@ async function executeProgram(options: ExecuteOptions): Promise<Execution> {
 
 /**
  * Carry out a run under its journal. However it goes, the journal's last
- * record says so: the run's result, or why it could not be carried out.
+ * record says so: the run's result, or why it could not be carried out —
+ * after the agent calls that were cut off on the way have said what they
+ * used. (A run that is not recorded has nothing to wait for.)
  */
-async function journalled<T extends Execution>(journal: Journal, run: () => Promise<T>): Promise<T> {
+async function journalled<T extends Execution>(journal: Journal, backend: Backend, run: (backend: Backend) => Promise<T>): Promise<T> {
+  let end: Record<string, unknown> = {};
   try {
-    const execution = await run();
-    journal.note("end", { result: execution.result });
+    const execution = await run(backend);
+    end = { result: execution.result };
     return execution;
   } catch (err) {
-    journal.note("end", { error: messageOf(err) });
+    end = { error: messageOf(err) };
     throw err;
   } finally {
+    if (journal.run) await backend.letGo();
+    journal.note("end", end);
     journal.close();
   }
 }
@@ -1028,14 +1064,14 @@ const VALIDATION_READY_GRACE_MS = 2_000;
  */
 export async function validateProgram(
   projectDir: string,
-  backend: AgentBackend,
+  backend: Backend,
   candidate: string,
   options: { timeout: number; maxRepairAttempts: number; maxIterations: number; journalRuns?: number; signal?: AbortSignal },
 ): Promise<{ source: string; repairedError?: string }> {
   const { journalRuns = 0, signal, ...limits } = options;
   // Recorded with the project, though run in a copy of it.
   const journal = openJournal(projectDir, journalRuns, { purpose: "validate", ...limits });
-  const { result, repair, left } = await journalled(journal, () => withTempDir("trama-validate-", async (privateDir) => {
+  const { result, repair, left } = await journalled(journal, backend, () => withTempDir("trama-validate-", async (privateDir) => {
     const { copy: trialDir } = copyProjectWith(projectDir, privateDir, candidate);
 
     const execution = await executeProgram({
@@ -1230,9 +1266,9 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   askedFor?.started(journal.run, journal.path);
   const stillTheProject = sameProjectAs(projectDir);
 
-  const { result, repair } = await journalled(journal, () => executeProgram({
+  const { result, repair } = await journalled(journal, createBackend(config), (backend) => executeProgram({
     projectDir,
-    backend: createBackend(config),
+    backend,
     maxRepairAttempts,
     timeout,
     maxIterations: config.defaultMaxIterations,

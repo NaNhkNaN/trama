@@ -20,6 +20,7 @@ import { guardPath, identityIn, identityOf, makeDirsIn, realRootOf } from "./pat
 import { stagedNameFor } from "./replace-file.js";
 import { isJsonObject } from "./serializable.js";
 import { messageOf } from "./errors.js";
+import { declaredUsage, type AgentUsage } from "./agent-backend.js";
 
 /** The format of the records. Bump it when a reader of older journals would be misled. */
 export const JOURNAL_VERSION = 1;
@@ -293,6 +294,15 @@ function recordable(endpoint: string, value: unknown): unknown {
 
 export type CallOutcome = { ok: true; result: unknown } | { ok: false; error: string };
 
+/** A bridge call on record: its position among the run's calls, and what is written down of it later. */
+export interface RecordedCall {
+  seq: number;
+  /** How it was answered. */
+  end(outcome: CallOutcome): void;
+  /** What the agent behind it used — each time it was asked, and whether or not the call is answered. */
+  used(usage: AgentUsage): void;
+}
+
 export interface Journal {
   /** The run's id — the name of its journal file, without the extension. Empty if nothing is being recorded. */
   readonly run: string;
@@ -303,11 +313,13 @@ export interface Journal {
    * allowance is spent in order, and what comes last is what gets cut.
    */
   note(kind: string, fields?: Record<string, unknown>): void;
+  /** Record what the agent used on the runner's own account — asking for a fix, say (`what`: "fix"). */
+  used(what: string, usage: AgentUsage): void;
   /**
    * Record a bridge call as it arrives. Returns its position among the run's
    * calls, and what records how it was answered.
    */
-  call(endpoint: string, request: unknown): { seq: number; end(outcome: CallOutcome): void };
+  call(endpoint: string, request: unknown): RecordedCall;
   /** Stop recording. Anything noted after this is dropped. */
   close(): void;
 }
@@ -315,7 +327,7 @@ export interface Journal {
 /** A journal that records nothing. Calls are still numbered, so the rest of the runner need not care. */
 function noJournal(): Journal {
   let seq = 0;
-  return { run: "", path: "", note() {}, call: () => ({ seq: ++seq, end() {} }), close() {} };
+  return { run: "", path: "", note() {}, used() {}, call: () => ({ seq: ++seq, end() {}, used() {} }), close() {} };
 }
 
 /**
@@ -454,9 +466,10 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
     run,
     path,
     note: (kind, fields = {}) => write(kind, () => fields),
+    used: (what, usage) => write("usage", () => ({ for: what, ...declaredUsage(usage) })),
     call(endpoint, request) {
       const position = ++seq;
-      if (!roomForCalls()) return { seq: position, end() {} };
+      if (!roomForCalls()) return { seq: position, end() {}, used() {} };
       const arrived = performance.now();
       write("call", () => ({ seq: position, endpoint, request: recordable(endpoint, request) }));
       return {
@@ -467,6 +480,9 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
             ms: Math.round(performance.now() - arrived),
             ...(outcome.ok ? { ok: true, result: recordable(endpoint, outcome.result) } : outcome),
           }));
+        },
+        used(usage) {
+          write("usage", () => ({ seq: position, ...declaredUsage(usage) }));
         },
       };
     },
