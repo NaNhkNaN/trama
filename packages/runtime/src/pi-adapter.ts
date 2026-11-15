@@ -1,5 +1,5 @@
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
-import { onAbort, rejectOnAbort } from "./abort.js";
+import { onAbort, rejectOnAbort, throwIfAborted } from "./abort.js";
 import type { AgentBackend, AgentCall } from "./agent-backend.js";
 import type { ModelConfig } from "./runner-types.js";
 
@@ -25,8 +25,6 @@ export class PiAdapter implements AgentBackend {
   }
 
   private async createSession(cwd: string, systemPrompt?: string, signal?: AbortSignal): Promise<AgentSession> {
-    if (signal?.aborted) throw new Error("Aborted");
-
     // Each step below is given up on the moment the call is cancelled.
     const raceAbort = <T>(step: Promise<T>) => rejectOnAbort(step, signal);
 
@@ -117,19 +115,19 @@ export class PiAdapter implements AgentBackend {
    */
   async ask(prompt: string, call: AgentCall): Promise<string> {
     const { cwd, system, signal } = call;
-    if (signal?.aborted) throw new Error("Aborted");
+    throwIfAborted(signal);
 
     const session = await this.createSession(cwd, system, signal);
     let offAbort = () => {};
 
     try {
-      if (signal?.aborted) throw new Error("Aborted");
+      throwIfAborted(signal);
       offAbort = onAbort(signal, () => session.dispose());
 
       await session.prompt(prompt);
       // An aborted prompt resolves with no usable answer — report it as an abort,
       // not as an empty LLM response.
-      if (signal?.aborted) throw new Error("Aborted");
+      throwIfAborted(signal);
       const text = this.extractText(session);
       if (!text) throw new Error("Empty response from LLM");
       return text;

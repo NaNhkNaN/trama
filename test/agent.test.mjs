@@ -353,3 +353,103 @@ test("stripCodeFences extracts code from responses with leading text", async () 
   // ...apart from the whitespace around it
   assert.equal(stripCodeFences("\n  const value = 1;\n\n"), "const value = 1;");
 });
+
+test("stripCodeFences preserves unfenced code with inner fences and extracts outer fences around inner fence text", async () => {
+  const { stripCodeFences } = await import("../packages/runtime/dist/agent.js");
+
+  const unfencedWithDoc = [
+    "/**",
+    " * Example:",
+    " * ```ts",
+    " * const sample = 42;",
+    " * ```",
+    " */",
+    "export const template = `\\n```json\\n{\"ok\":true}\\n```\\n`;",
+  ].join("\n");
+  assert.equal(stripCodeFences(unfencedWithDoc), unfencedWithDoc);
+
+  const fencedWithInner = `Updated program:\n\n\`\`\`typescript\n${unfencedWithDoc}\n\`\`\``;
+  assert.equal(stripCodeFences(fencedWithInner), unfencedWithDoc);
+});
+
+test("createAgent generate rejects non-finite numbers in number schema fields and retries", async () => {
+  let attempt = 0;
+  const adapter = {
+    async ask() {
+      attempt += 1;
+      return attempt === 1 ? '{"score": 1e500}' : '{"score": 99.5}';
+    },
+  };
+
+  const agent = createAgent(adapter, "/work");
+  const result = await agent.generate({
+    prompt: "score it",
+    schema: { score: "number: finite score" },
+  });
+
+  assert.equal(attempt, 2);
+  assert.deepEqual(result, { score: 99.5 });
+});
+
+// --- A reply's fences, and a program's own ---
+
+test("stripCodeFences takes the block out of a reply, whatever stands around it", async () => {
+  const { stripCodeFences } = await import("../packages/runtime/dist/agent.js");
+  const F = "```";
+  const program = "/** The program. */\nexport default async function run() {}";
+  for (const [what, reply, expected = program] of [
+    ["words before it that mention a glob", `It now lists \`docs/*.md\`:\n\n${F}ts\n${program}\n${F}`],
+    ["words before it that open a comment the program closes at once", `I removed the /* TODO marker.\n\n${F}ts\n${program}\n${F}`],
+    ["words before it that open a comment nothing closes", `I removed the /* TODO marker.\n\n${F}ts\nexport default 1;\n${F}`, "export default 1;"],
+    ["words before it that open a comment the program closes", `Use /* for comments.\n${F}ts\nexport default 1; // a */ b\n${F}`, "export default 1; // a */ b"],
+    ["words before it with an apostrophe and a backtick", `Here's the \` character, and the program:\n${F}ts\n${program}\n${F}`],
+    ["words after it", `${F}ts\n${program}\n${F}\n\nThat is all of it.`],
+    ["a line of the words before it that begins as a comment would, and never ends", `Notes:\n/* see below\n${F}ts\nexport default 1;\n${F}`, "export default 1;"],
+    ["a pattern in the words before it, and one in the words after", `It reads ./*.json:\n\n${F}ts\nexport default 1;\n${F}\n\nOr point it at **/*.json.`, "export default 1;"],
+    ["a command before it that names files by a pattern", `${F}bash\ntrama run it --arg files=./*.json\n${F}\n\nThe program:\n\n${F}ts\n${program}\n${F}`],
+    ["a line of words before it that begins with a fence and a word", `${F} markers\nare not needed, but here:\n\n${F}ts\n${program}\n${F}`],
+    ["one backtick in the words before it, and one after", `Note the \` character:\n\n${F}ts\n${program}\n${F}\n\nThe \` is meant.`],
+    ["a line of words before it that ends in a fence and a word", `I wrapped it in ${F} fences\n\n${F}ts\n${program}\n${F}`],
+    ["a closing fence with a full stop after it", `${F}ts\n${program}\n${F}.`],
+    ["an item of a list, indented by four", `1. The program:\n\n    ${F}ts\n    export default 1;\n    ${F}`, "export default 1;"],
+    ["a fence that opens at the end of a line of words", `Sure: ${F}ts\n${program}\n${F}`],
+    ["a closing fence with words after it", `${F}ts\n${program}\n${F} done`],
+    ["lines that end as Windows ends them", `${F}ts\r\nexport default 1;\r\n${F}\r\n`, "export default 1;"],
+    ["a block before it", `Before:\n${F}ts\nold\n${F}\nAfter:\n${F}ts\n${program}\n${F}`],
+    ["a longer fence around a shorter one", `${F}\`md\nSee:\n${F}ts\ncode\n${F}\n${F}\``, `See:\n${F}ts\ncode\n${F}`],
+    ["a longer fence that only a shorter one closes", `${F}\`ts\nexport default 1;\n${F}`, "export default 1;"],
+    ["a block whose comment never ends", `${F}ts\n/* unfinished\nexport default 1;\n${F}`, "/* unfinished\nexport default 1;"],
+  ]) assert.equal(stripCodeFences(reply), expected, what);
+
+  // What is no block is left as it is: a fence nothing closes, three backticks among words, no fence at all.
+  for (const reply of [`${F}ts\nexport default 1;`, `Wrap it in ${F} and then run it.`, `${F} typescript\n${program}\n${F}`, program]) {
+    assert.equal(stripCodeFences(reply), reply);
+  }
+});
+
+test("stripCodeFences leaves a program the fences it wrote down itself", async () => {
+  const { stripCodeFences } = await import("../packages/runtime/dist/agent.js");
+  const F = "```";
+  for (const [what, program] of [
+    ["in a comment that shows how it is used", `/*\nUsage:\n${F}\ntrama run x\n${F}\n*/\nexport default 1;`],
+    ["in a comment of one line", `// ${F}ts\nexport default 1;\n// ${F}`],
+    ["in a comment of one line, and in one of many", `// As in: ${F}ts\n/*\n${F}\ntrama run x\n${F}\n*/\nexport default 1;`],
+    ["in a comment, after an apostrophe that is no string's", `const p = <p>don't</p>;\n/*\n${F}\ntrama run x\n${F}\n*/\nexport default p;`],
+    ["in a comment of many lines, each with its star", `/**\n * As in:\n * ${F}ts\n * run();\n * ${F}\n */\nexport default 1;`],
+  ]) {
+    assert.equal(stripCodeFences(program), program, `${what}, in a reply that is the program`);
+    assert.equal(stripCodeFences(`Updated:\n\n${F}ts\n${program}\n${F}\n`), program, `${what}, in a reply that fences the program`);
+  }
+
+  // Nothing else of the program is read, so nothing else of it can mislead: a backtick in a pattern, say.
+  assert.equal(stripCodeFences(`${F}ts\nconst parts = "a\`b".split(/\`/);\n/*\n${F}ts\nuse(parts);\n${F}\n*/\nexport default parts;\n${F}\n\nRun:\n${F}bash\ntrama run x\n${F}`), "trama run x");
+  assert.equal(stripCodeFences(`Before:\n${F}ts\nconst tick = /\`/;\n${F}\n\nAfter:\n${F}ts\nexport default 2;\n${F}`), "export default 2;");
+});
+
+test("createAgent generate takes a field's type from words, and nothing else for words", async () => {
+  const agent = createAgent({ async ask() { return '{"a": "x"}'; } }, "/work");
+  for (const type of [["string"], { type: "string" }, 7, null]) {
+    await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: type } }), /unsupported schema type/, JSON.stringify(type));
+  }
+  assert.deepEqual(await agent.generate({ prompt: "p", schema: { a: "string: any text" } }), { a: "x" });
+});

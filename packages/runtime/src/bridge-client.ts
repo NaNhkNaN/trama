@@ -4,6 +4,7 @@
 import { readFileSync } from "fs";
 import { request } from "http";
 import type { Workspace } from "./types.js";
+import { messageOf } from "./errors.js";
 
 export interface Bridge {
   /** What the runner handed the program when it started it — the bridge secret among it. */
@@ -60,10 +61,16 @@ export function openBridge(port: string, initPath: string): Bridge {
         const chunks: Buffer[] = [];
         res.on("data", (chunk: Buffer) => chunks.push(chunk));
         res.on("error", reject);
+        // (An answer that is cut off is an error of the response, above: it never comes to an end.)
         res.on("end", () => {
           const text = Buffer.concat(chunks).toString("utf-8");
-          if (res.statusCode !== 200) reject(new Error(`trama runtime error: ${text}`));
-          else resolve(JSON.parse(text).result);
+          if (res.statusCode !== 200) return reject(new Error(`trama runtime error: ${text}`));
+          // Whatever is wrong with an answer is the call's to fail with — not thrown at whoever is on the stack.
+          try {
+            resolve(JSON.parse(text).result);
+          } catch (err) {
+            reject(new Error(`trama runtime error: the runner's answer to ${endpoint} cannot be read: ${messageOf(err)}`));
+          }
         });
       });
       req.on("error", reject);

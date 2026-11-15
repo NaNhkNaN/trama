@@ -13,11 +13,13 @@
 //
 // It records. Nothing reads it back to change what a run does.
 
-import { appendFileSync, closeSync, openSync, readSync, readdirSync, rmSync } from "fs";
+import { closeSync, constants, fstatSync, openSync, readSync, readdirSync, renameSync, rmSync, writeSync } from "fs";
 import { createHash, randomBytes } from "crypto";
 import { join } from "path";
-import { guardPath, identityOf, makeDirsIn } from "./path-guard.js";
+import { guardPath, identityIn, identityOf, makeDirsIn, realRootOf } from "./path-guard.js";
+import { stagedNameFor } from "./replace-file.js";
 import { isJsonObject } from "./serializable.js";
+import { messageOf } from "./errors.js";
 
 /** The format of the records. Bump it when a reader of older journals would be misled. */
 export const JOURNAL_VERSION = 1;
@@ -25,14 +27,90 @@ export const JOURNAL_VERSION = 1;
 /** Where a project keeps its journals, relative to the project — under logs/, which trama keeps out of version control. */
 export const JOURNAL_DIR = join("logs", "journal");
 
+/** The shape of a run's id: ISO timestamp (with dashes) followed by 6 hex digits. */
+const RUN_ID = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{6}$/;
+/** A record's line is never longer than this: a megabyte of characters, each written as an escape of six at most, and its cuts. */
+const LONGEST_LINE = 8 * 1024 * 1024;
+const SAFE_READ_FLAGS = constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW;
+
 /**
  * A project's journal directory, by its one real name however the project was
- * referred to: a journal is recognised as still being written by its path.
+ * referred to.
  */
 export function journalDirOf(projectDir: string): string {
   // Where the path leads, by the guard's own reckoning — the same before the
   // directory exists as after, and never a place the guard did not check.
   return guardPath(projectDir, JOURNAL_DIR);
+}
+
+/** The journal of a run, in a journal directory. */
+export const journalIn = (dir: string, run: string) => join(dir, `${run}.jsonl`);
+
+/** How a journal begins: the record of its run, which names the run and the process that writes it. */
+const FIRST_RECORD = /^\{"at":\d+,"kind":"run","v":\d+,"run":"([^"]+)","pid":(\d+)[,}]/;
+
+/**
+ * Look into what may be a journal — the file of `run`, if one is named —
+ * without waiting on a pipe or following a link there: `look` is given what
+ * to read it with. Undefined if it is no journal: not a file, or one that
+ * does not begin as a journal does. (Any `.jsonl` file can be put where the
+ * journals are; only what trama wrote is listed, read, or removed in its turn.)
+ * Throws where it cannot be opened at all, which is the caller's to judge.
+ */
+function inJournal<T>(path: string, run: string | undefined, look: (journal: { writer: number | null; ended(): boolean }) => T): T | undefined {
+  const fd = openSync(path, SAFE_READ_FLAGS);
+  try {
+    const file = fd, stat = fstatSync(fd), size = stat.size;
+    if (!stat.isFile()) return undefined;
+    const read = (from: number, length: number) => {
+      const buffer = Buffer.allocUnsafe(length);
+      return buffer.toString("utf-8", 0, readSync(file, buffer, 0, length, from));
+    };
+    // The start of the first record is always written the same way, however long the record is.
+    const first = FIRST_RECORD.exec(read(0, Math.min(size, 512)));
+    if (!first || !RUN_ID.test(first[1]) || (run !== undefined && first[1] !== run)) return undefined;
+    const pid = Number(first[2]);
+    /** The last line, if it begins within the last `length` bytes. */
+    const lastLine = (length: number) => {
+      const from = Math.max(0, size - length);
+      const text = read(from, size - from).trimEnd();
+      const line = text.lastIndexOf("\n");
+      return line === -1 && from > 0 ? undefined : text.slice(line + 1);
+    };
+    return look({
+      writer: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
+      // A record's line is rarely longer than a page, and never than LONGEST_LINE.
+      ended() {
+        try {
+          const last: unknown = JSON.parse(lastLine(4096) ?? lastLine(LONGEST_LINE) ?? "");
+          return isJsonObject(last) && last.kind === "end";
+        } catch {
+          return false; // cut off in the middle of a record
+        }
+      },
+    });
+  } catch {
+    return undefined;
+  } finally {
+    try { closeSync(fd); } catch { /* nothing more to do with it */ }
+  }
+}
+
+/**
+ * Whether the file `name` of a journal directory is a journal: named for a
+ * run, and beginning as that run's journal does. One that is named for a run
+ * and may not be read — another user's run of the project wrote it — is taken
+ * at its name: it can be listed and removed in its turn, and cannot be copied.
+ */
+function isJournal(dir: string, name: string): boolean {
+  const run = name.endsWith(".jsonl") ? name.slice(0, -".jsonl".length) : "";
+  if (!RUN_ID.test(run)) return false;
+  try {
+    return inJournal(join(dir, name), run, () => true) === true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "EACCES" || code === "EPERM";
+  }
 }
 
 /** The ids of the runs that have a journal in `dir`, oldest first. (A run's id starts with when it started.) */
@@ -45,13 +123,39 @@ export function runsIn(dir: string): string[] {
     throw err;
   }
   // A journal is a file. Anything else that bears a journal's name — a directory, a link, a pipe,
-  // which would hold up whoever opened it — is not one, and is neither read nor removed in its turn.
-  return entries.filter(entry => entry.isFile() && entry.name.endsWith(".jsonl"))
-    .map(entry => entry.name.slice(0, -".jsonl".length)).sort();
+  // which would hold up whoever opened it — is not one; nor is a file somebody else put there.
+  return entries.filter((entry) => entry.isFile() && isJournal(dir, entry.name))
+    .map((entry) => entry.name.slice(0, -".jsonl".length)).sort();
 }
 
-/** The journal of a run, in a journal directory. */
-export const journalIn = (dir: string, run: string) => join(dir, `${run}.jsonl`);
+/**
+ * What a copy of `projectDir` is to leave out so as not to carry the project's
+ * journals, each by what it is (its `identityOf`): the directory they are in,
+ * if nothing else is in it or it may not be read or searched — and otherwise every
+ * journal in it. Somebody's own file among the journals is the project's
+ * like any other, and is copied.
+ */
+export function journalEntriesOf(projectDir: string): Set<string> {
+  const only = (...ids: Array<string | undefined>) => new Set(ids.filter((id): id is string => id !== undefined));
+  let dir: string | undefined;
+  /** The directory itself — which is not left out where it is the project (by links that lead back to it). */
+  const whole = () => {
+    const id = dir === undefined ? undefined : identityOf(dir);
+    return id === identityOf(realRootOf(projectDir)) ? undefined : id;
+  };
+  try {
+    const journalDir = dir = journalDirOf(projectDir);
+    const entries = readdirSync(journalDir, { withFileTypes: true });
+    const journals = entries.filter((entry) => entry.isFile() && isJournal(journalDir, entry.name));
+    const all = journals.length === entries.length ? whole() : undefined;
+    return all !== undefined ? only(all) : only(...journals.map((entry) => identityOf(join(journalDir, entry.name))));
+  } catch (err) {
+    // Where the journals would be, the project has none: the way leads out of it, or to nothing, or to a file.
+    // And a directory that may not be read, or looked into, is left out whole: no part of it can be told from another.
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "EACCES" || code === "EPERM" ? only(whole()) : only();
+  }
+}
 
 /** The longest text kept whole. */
 const MAX_TEXT = 256 * 1024;
@@ -88,11 +192,12 @@ interface Room { left: number; cuts: Cut[] }
  * characters whatever shape its contents have. (Its line can be longer: JSON
  * writes some characters as escapes of up to six.)
  */
-function clip(value: unknown, room: Room, path: Array<string | number> = []): unknown {
+function clip(value: unknown, room: Room, path: Array<string | number> = [], expanded = false): unknown {
   const cut = (about: Omit<Cut, "path">) => {
     room.cuts.push({ path, ...about });
     room.left -= 128 + path.reduce((size: number, step) => size + String(step).length + 3, 0);
   };
+  if (typeof value === "bigint") value = value.toString();
   if (typeof value === "string") {
     const keep = Math.max(0, Math.min(MAX_TEXT, room.left));
     room.left -= Math.min(value.length, keep) + 3;
@@ -100,7 +205,6 @@ function clip(value: unknown, room: Room, path: Array<string | number> = []): un
     cut({ cut: "text", length: value.length, sha256: createHash("sha256").update(value).digest("hex") });
     return value.slice(0, keep);
   }
-  if (typeof value === "bigint") value = value.toString();
   if (value === null || typeof value !== "object") {
     room.left -= typeof value === "number" ? String(value).length + 1 : 8;
     return value;
@@ -110,9 +214,9 @@ function clip(value: unknown, room: Room, path: Array<string | number> = []): un
     cut({ cut: "bytes", length: value.byteLength });
     return null;
   }
-  // Anything that knows how it wants to be written (a Date) is asked.
-  if (typeof (value as { toJSON?: unknown }).toJSON === "function") {
-    return clip((value as { toJSON(): unknown }).toJSON(), room, path);
+  // Anything that knows how it wants to be written (a Date) is asked — once per slot, like JSON.stringify.
+  if (!expanded && typeof (value as { toJSON?: unknown }).toJSON === "function") {
+    return clip((value as { toJSON(): unknown }).toJSON(), room, path, true);
   }
   if (path.length >= MAX_DEPTH) {
     cut({ cut: "depth" });
@@ -134,6 +238,10 @@ function clip(value: unknown, room: Room, path: Array<string | number> = []): un
   let fieldsLeftOut = false;
   for (const key in value) {
     if (!Object.hasOwn(value, key)) continue;
+    // What cannot be written down is no field, as it is none to JSON — and so nothing the record
+    // is made of says how it wants to be written: each thing was asked that once, above.
+    const field = (value as Record<string, unknown>)[key];
+    if (typeof field === "function") continue;
     // A field goes in with its name, or not at all. A name that is too long
     // is passed over — it would be repeated in the path of everything cut
     // beneath it — and one there is no room for ends the object.
@@ -145,7 +253,7 @@ function clip(value: unknown, room: Room, path: Array<string | number> = []): un
       continue;
     }
     room.left -= key.length + 3;
-    fields[key] = clip((value as Record<string, unknown>)[key], room, [...path, key]);
+    fields[key] = clip(field, room, [...path, key]);
   }
   return fields;
 }
@@ -217,33 +325,23 @@ function noJournal(): Journal {
  */
 const beingWritten = new Set<string>();
 
-/** The process that started a journal — named at the start of its first record — or null if it cannot be told. */
-function writerOf(path: string): number | null {
-  let fd: number | null = null;
-  try {
-    fd = openSync(path, "r");
-    const start = Buffer.alloc(512);
-    const pid = /"pid":(\d+)/.exec(start.toString("utf-8", 0, readSync(fd, start, 0, start.length, 0)))?.[1];
-    return pid ? Number(pid) : null;
-  } catch {
-    return null;
-  } finally {
-    if (fd !== null) closeSync(fd);
-  }
-}
-
-const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-
 /**
  * Whether a journal is still being written: by this process, or by another
- * runner that is still there. (A journal this process started and has closed
- * is finished, though the process lives on.)
+ * runner that is still there and has not yet written its ending. (A journal
+ * this process started and has closed is finished, though the process lives
+ * on. And a process that may not be signalled is not the writer of a journal
+ * that can be read: its number has been given to somebody else's since.)
  */
 export function stillBeingWritten(path: string): boolean {
   const journal = identityOf(path);
   if (journal !== undefined && beingWritten.has(journal)) return true;
-  const writer = writerOf(path);
-  return writer !== null && writer !== process.pid && isAlive(writer);
+  const isAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  try {
+    return inJournal(path, undefined, ({ writer, ended }) =>
+      writer !== null && writer !== process.pid && isAlive(writer) && !ended()) === true;
+  } catch {
+    return false; // (nothing to be read there, so nothing that says who writes it)
+  }
 }
 
 /**
@@ -278,27 +376,49 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
 
   const started = new Date();
   const run = `${started.toISOString().replace(/[:.]/g, "-")}-${randomBytes(3).toString("hex")}`;
-  let fd: number | null;
-  let path: string;
+  const t0 = performance.now();
+  let fd: number | null = null;
+  let path = "";
+  let staged = "";
   let identity: string | undefined;
+  let written = 0;
+  let full = false;
+
+  const formatLine = (at: number, kind: string, compose: () => Record<string, unknown>): string => {
+    try {
+      const room: Room = { left: MAX_RECORD, cuts: [] };
+      const record = clip({ at, kind, ...compose() }, room) as Record<string, unknown>;
+      if (room.cuts.length > 0) record.cuts = room.cuts;
+      return JSON.stringify(record);
+    } catch (err) {
+      return JSON.stringify({ at, kind, unrecordable: messageOf(err) });
+    }
+  };
+
   try {
     const dir = journalDirOf(projectDir);
     // (In the project, which is there: a journal is not what makes a directory where a project was.)
     makeDirsIn(projectDir, dir);
     makeRoom(dir, keep);
     path = journalIn(dir, run);
-    // Readable by its owner only: it holds what the program read, wrote and was told.
-    fd = openSync(path, "a", 0o600);
-    identity = identityOf(path);
-    if (identity !== undefined) beingWritten.add(identity);
+    staged = stagedNameFor(path);
+    const firstLine = formatLine(0, "run", () => ({
+      v: JOURNAL_VERSION, run, pid: process.pid, started: started.toISOString(), project: projectDir, ...about,
+    }));
+    // Readable by its owner only, and whole from the moment its name appears in the directory.
+    fd = openSync(staged, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_APPEND, 0o600);
+    written = writeSync(fd, firstLine + "\n");
+    identity = identityIn(fstatSync(fd, { bigint: true }));
+    beingWritten.add(identity);
+    renameSync(staged, path);
+    staged = "";
   } catch (err) {
-    console.warn(`[trama] this run is not being recorded: ${err instanceof Error ? err.message : err}`);
+    if (fd !== null) try { closeSync(fd); } catch { /* ignore */ }
+    if (identity !== undefined) beingWritten.delete(identity);
+    if (staged) try { rmSync(staged, { force: true }); } catch { /* ignore */ }
+    console.warn(`[trama] this run is not being recorded: ${messageOf(err)}`);
     return noJournal();
   }
-
-  const t0 = performance.now();
-  let written = 0;
-  let full = false;
 
   const close = () => {
     if (fd === null) return;
@@ -310,21 +430,11 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
   /** Write one record. `compose` builds it, and may fail: what cannot be written down is noted as such. */
   const write = (kind: string, compose: () => Record<string, unknown>) => {
     if (fd === null) return;
-    const at = Math.round(performance.now() - t0);
-    let line: string;
+    const line = formatLine(Math.round(performance.now() - t0), kind, compose);
     try {
-      const room: Room = { left: MAX_RECORD, cuts: [] };
-      const record = clip({ at, kind, ...compose() }, room) as Record<string, unknown>;
-      if (room.cuts.length > 0) record.cuts = room.cuts;
-      line = JSON.stringify(record);
+      written += writeSync(fd, line + "\n");
     } catch (err) {
-      line = JSON.stringify({ at, kind, unrecordable: err instanceof Error ? err.message : String(err) });
-    }
-    try {
-      appendFileSync(fd, line + "\n");
-      written += line.length + 1;
-    } catch (err) {
-      console.warn(`[trama] the journal could not be written, and stops here: ${err instanceof Error ? err.message : err}`);
+      console.warn(`[trama] the journal could not be written, and stops here: ${messageOf(err)}`);
       close();
     }
   };
@@ -339,7 +449,6 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
   };
 
   let seq = 0;
-  write("run", () => ({ v: JOURNAL_VERSION, run, pid: process.pid, started: started.toISOString(), project: projectDir, ...about }));
 
   return {
     run,

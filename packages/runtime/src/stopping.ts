@@ -35,7 +35,10 @@ const KILL_SETTLE_MS = 1000;
 /**
  * Send a signal to a whole process group. Children spawned with `detached: true`
  * lead their own group, so this also reaches whatever they started in the background.
- * Signal 0 only probes. Returns false if the group no longer exists.
+ * Signal 0 only probes. Returns false if the group no longer exists — or
+ * holds nothing that can be signalled, which is the same to one who means to
+ * stop it. (macOS says so of a group whose last members have exited and are
+ * yet to be reaped; to wait for such a group is to wait for nothing.)
  */
 export function signalGroup(pgid: number, signal: NodeJS.Signals | 0): boolean {
   try {
@@ -79,10 +82,11 @@ function removeTree(fs: Pick<typeof import("fs"), "rmSync" | "readdirSync" | "ch
 const WATCHDOG = `
 const fs = require("fs");
 ${removeTree}
+${signalGroup}
 const { grace, settle, poll } = JSON.parse(process.argv[1]);
 const lists = { g: new Set(), d: new Set(), asked: new Set() };
-const alive = (pgid) => { try { process.kill(-pgid, 0); return true; } catch { return false; } };
-const signal = (pgid, name) => { try { process.kill(-pgid, name); } catch {} };
+const alive = (pgid) => signalGroup(pgid, 0);
+const signal = signalGroup;
 
 let unread = "";
 process.stdin.setEncoding("utf8");
@@ -146,9 +150,13 @@ function startWatchdog(): ChildProcess | null {
   let child: ChildProcess;
   try {
     const timings = { grace: KILL_GRACE_MS, settle: KILL_SETTLE_MS, poll: STOP_POLL_MS };
+    // It is this file's own few lines, and is to start whatever this process was started with:
+    // not with what NODE_OPTIONS would have it load first, or wait for (a debugger, say).
+    const { NODE_OPTIONS: _options, ...env } = process.env;
     child = spawn(process.execPath, ["-e", WATCHDOG, JSON.stringify(timings)], {
       detached: true, // a signal sent to this process's group must not reach it
       stdio: ["pipe", "ignore", "ignore"],
+      env,
     });
   } catch {
     return null;

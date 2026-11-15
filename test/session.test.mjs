@@ -631,3 +631,17 @@ await ctx.done({ workspaceExists, stopped, workerAlive, alreadyStopped });`,
     alreadyStopped: stoppedRun,
   });
 });
+
+test("Session.createTemp stays inside tmpdir for an empty prefix and rejects traversal or separator prefixes", async (t) => {
+  const { tmpdir } = await import("os");
+  const { dirname, resolve } = await import("path");
+
+  const emptyPrefixSession = await Session.createTemp("");
+  t.after(() => cleanupTempDir(emptyPrefixSession.workspaceDir));
+  assert.equal(dirname(emptyPrefixSession.workspaceDir), resolve(tmpdir()));
+
+  for (const bad of [".", "..", "nested/prefix", "nested\\prefix", "bad\0name"]) {
+    await assert.rejects(() => Session.createTemp(bad), /createTemp prefix/);
+  }
+});
+

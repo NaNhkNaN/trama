@@ -405,3 +405,95 @@ test("superviseChild stops a child at once when it is asked to with a signal tha
   assert.equal(exit.signal, "SIGTERM");
   assert.ok(performance.now() - started < 5_000);
 });
+
+test("createTools write refuses to overwrite the project root itself or recreate a moved-away project as a file", async (t) => {
+  const parent = makeTempDir("trama-tools-root-");
+  t.after(() => cleanupTempDir(parent));
+  const projectDir = join(parent, "project");
+  mkdirSync(projectDir, { recursive: true });
+  symlinkSync(".", join(projectDir, "self-link"));
+
+  const tools = createTools(projectDir);
+  for (const rootPath of ["", ".", "self-link"]) {
+    await assert.rejects(async () => tools.write(rootPath, "nope"), /EISDIR/);
+  }
+
+  const { renameSync } = await import("fs");
+  const movedDir = join(parent, "moved");
+  renameSync(projectDir, movedDir);
+  await assert.rejects(async () => tools.write("", "nope"), /There is no project at/);
+  await assert.rejects(async () => tools.write(".", "nope"), /leads on from what does not exist/);
+  assert.equal(existsSync(projectDir), false);
+});
+
+test("createTools fetch truncates streaming responses past 10 MB without reading an unbounded stream", async (t) => {
+  const projectDir = makeTempDir("trama-tools-fetch-");
+  t.after(() => cleanupTempDir(projectDir));
+
+  let chunksSent = 0;
+  const chunk = "a".repeat(256 * 1024);
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    const pump = () => {
+      while (!res.destroyed && chunksSent < 400) {
+        chunksSent += 1;
+        if (!res.write(chunk)) {
+          res.once("drain", pump);
+          return;
+        }
+      }
+      if (!res.destroyed) res.end();
+    };
+    pump();
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+  const { port } = server.address();
+
+  const tools = createTools(projectDir);
+  const response = await tools.fetch(`http://127.0.0.1:${port}/stream`);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.endsWith("\n[trama] response body truncated at 10MB"), true);
+  assert.ok(chunksSent < 200, `stream should cancel early once truncated, but sent ${chunksSent} chunks`);
+});
+
+test("superviseChild does not mark an already-exited child as timedOut while draining background pipe holders", async (t) => {
+  const { spawn } = await import("child_process");
+  const { superviseChild } = await import("../packages/runtime/dist/child-process.js");
+  const child = spawn("sh", ["-c", "printf done; sleep 10 &"], { detached: true, stdio: ["ignore", "pipe", "pipe"] });
+  t.after(() => {
+    try { if (child.pid) process.kill(-child.pid, "SIGKILL"); } catch { /* already gone */ }
+  });
+
+  const exit = await superviseChild(child, { timeout: 250 });
+  assert.equal(exit.code, 0);
+  assert.equal(exit.timedOut, false);
+  assert.equal(exit.stopped, false);
+  assert.equal(exit.stdout.toString("utf-8"), "done");
+});
+
+test("createTools shell takes any time for a timeout: no limit at all is one, and no time at all ends the command at once", async (t) => {
+  const projectDir = makeTempDir("trama-tools-timeout-");
+  t.after(() => cleanupTempDir(projectDir));
+  const tools = createTools(projectDir);
+
+  for (const timeout of [Infinity, 2 ** 31, 60_000]) {
+    const result = await tools.shell("echo ran", { timeout });
+    assert.deepEqual([result.exitCode, result.stdout.trim()], [0, "ran"], String(timeout));
+  }
+  const result = await tools.shell("sleep 5; echo ran", { timeout: 0 });
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.stdout, "");
+  assert.match(result.stderr, /timeout$/);
+});
+
+test("createTools fetch gives an answer that has no body an empty one", async (t) => {
+  const projectDir = makeTempDir("trama-tools-fetch-");
+  t.after(() => cleanupTempDir(projectDir));
+  const server = createServer((_req, res) => { res.writeHead(204).end(); });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => server.close());
+
+  const response = await createTools(projectDir).fetch(`http://127.0.0.1:${server.address().port}/`);
+  assert.deepEqual([response.status, response.body], [204, ""]);
+});

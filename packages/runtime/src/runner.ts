@@ -19,7 +19,7 @@ import { LATEST_LOG_PATH, appendLogEntry, createContext } from "./context.js";
 import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
-import { guardPath, identityOf, realRootOf, wayTo } from "./path-guard.js";
+import { guardPath, identityOf, projectAt, realRootOf, sameProjectAs, wayTo } from "./path-guard.js";
 import { copyTree, entryAt, mergeTree, pathAsListed, readTree, type Tree } from "./tree.js";
 import { stageFile, type StagedFile } from "./replace-file.js";
 import { readProjectMeta } from "./meta.js";
@@ -27,7 +27,8 @@ import { describeJson, isJsonObject } from "./serializable.js";
 import { createAllowance, superviseChild, type ChildExit } from "./child-process.js";
 import { removeTempDir, removeWithThisProcess, requireWatchdog, stopGroups, stopWithThisProcess } from "./stopping.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
-import { journalDirOf, openJournal, type Journal } from "./journal.js";
+import { journalEntriesOf, openJournal, type Journal } from "./journal.js";
+import { messageOf } from "./errors.js";
 
 // --- Locating the runtime itself ---
 
@@ -104,7 +105,7 @@ function ensureModulePackageJson(projectDir: string): void {
   } catch (err) {
     throw new Error(
       `Malformed package.json at ${pkgPath}. ${advice}\n` +
-      `Parse error: ${err instanceof Error ? err.message : err}`
+      `Parse error: ${messageOf(err)}`
     );
   }
   if (!isJsonObject(pkg)) {
@@ -134,36 +135,6 @@ function ensureGitignore(projectDir: string): void {
  * @trama-dev packages it can import.
  * Idempotent — called before every run, so a freshly cloned project just works.
  */
-/**
- * Where a project is — which is a directory that is there. Nothing in the
- * runtime makes one for a project that is gone: what it makes for a project,
- * it makes in it. (Making the directories on the way to a file would make a
- * project of that file, at the path of one that somebody has moved away.)
- */
-export function projectAt(projectDir: string): string {
-  const project = realRootOf(projectDir);
-  if (!statSync(project, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`There is no project at ${project}.`);
-  return project;
-}
-
-/**
- * A question to ask later: whether what is at a project's path is still the
- * directory that is there now. A project is known by what it is, and what a
- * run does over some time — ask for a fix, try it, install it, write it down
- * — it does to the project it was started on: not to another directory that
- * somebody has put at the path meanwhile. (Gone is not another: what is to be
- * done where no project is, each step says for itself.)
- */
-function sameProjectAs(projectDir: string): () => void {
-  const was = entryAt(realRootOf(projectDir));
-  return () => {
-    const now = entryAt(realRootOf(projectDir));
-    if (was?.kind === "dir" && now && !(now.kind === "dir" && now.id === was.id)) {
-      throw new Error(`What is at ${realRootOf(projectDir)} is not the project this was started on: nothing more is done there.`);
-    }
-  };
-}
-
 export function ensureProjectScaffold(projectDir: string): void {
   projectAt(projectDir);
   mkdirSync(guardPath(projectDir, "history"), { recursive: true });
@@ -216,7 +187,7 @@ export function loadConfig(): TramaConfig {
   } catch (err) {
     throw new Error(
       `Malformed config at ${configPath} — fix or delete it.\n` +
-      `Parse error: ${err instanceof Error ? err.message : err}`
+      `Parse error: ${messageOf(err)}`
     );
   }
   if (!isJsonObject(parsed)) {
@@ -286,7 +257,7 @@ export function loadState(projectDir: string): Record<string, unknown> {
   }
   let parsed: unknown;
   try { parsed = JSON.parse(raw); } catch (err) {
-    fail(`Parse error: ${err instanceof Error ? err.message : err}`);
+    fail(`Parse error: ${messageOf(err)}`);
   }
   if (!isJsonObject(parsed)) {
     fail(`Expected a JSON object but got ${describeJson(parsed)}.`);
@@ -316,7 +287,8 @@ function recordVersion(
   const indexPath = guardPath(projectDir, join("history", "index.jsonl"));
   const versions = readdirSync(historyDir)
     .filter(f => /^\d+\.ts$/.test(f))
-    .map(f => parseInt(f, 10));
+    .map(f => parseInt(f, 10))
+    .filter(n => Number.isSafeInteger(n) && n < Number.MAX_SAFE_INTEGER);
   const version = versions.reduce((a, b) => Math.max(a, b), 0) + 1;
   const snapshot = guardPath(projectDir, join("history", `${String(version).padStart(4, "0")}.ts`));
 
@@ -401,6 +373,13 @@ function inDirOfCopy<T>(dir: string, what: () => T): T {
   }
 }
 
+/** The directory a file at `place` is made in — or, if that is still to be made, the one it is made in. */
+function whereMade(place: string): string {
+  let dir = dirname(place);
+  while (!existsSync(dir)) dir = dirname(dir);
+  return dir;
+}
+
 /**
  * Make, in `privateDir`, a copy of a project to try a program in: what the
  * project is and holds (see copyTree), with `program` as its program.ts.
@@ -425,33 +404,22 @@ function inDirOfCopy<T>(dir: string, what: () => T): T {
  * has no place for one, and is not copied to try one in.
  */
 function copyProjectWith(projectDir: string, privateDir: string, program: string): { copy: string; held: Tree } {
-  const copyDir = join(realRootOf(privateDir), basename(projectAt(projectDir)) || "project");
+  const root = projectAt(projectDir);
+  const copyDir = join(realRootOf(privateDir), basename(root) || "project");
   mkdirSync(copyDir);
-  // Two directories the copy must know when it comes to them — by what they are, since neither
-  // need be spelled as the walk would spell it, or lie where its name suggests.
-  let journals: string | undefined;
-  try {
-    journals = identityOf(journalDirOf(projectDir));
-  } catch {
-    // Where the journals would be is no place the project may use (a link out of it, say): it has none to leave out.
-  }
+  const journals = journalEntriesOf(root);
   const theCopy = identityOf(copyDir);
-  const held = copyTree(projectDir, copyDir, (at, entry) => {
-    if (entry.kind !== "dir") return false;
-    const identity = identityOf(at);
-    if (identity === undefined) return false; // gone since it was looked at
-    if (identity === theCopy) {
-      throw new Error(`A copy of ${realRootOf(projectDir)} cannot be made inside it, at ${at}. (Is the temp directory in the project?)`);
+  const held = copyTree(root, copyDir, (at, entry) => {
+    if (entry.kind === "other") return false;
+    if (entry.id === theCopy) {
+      throw new Error(`A copy of ${root} cannot be made inside it, at ${at}. (Is the temp directory in the project?)`);
     }
-    return identity === journals;
+    return journals.has(entry.id);
   });
   const place = guardPath(copyDir, "program.ts");
   const had = statSync(place, { throwIfNoEntry: false });
-  if (had?.isDirectory()) throw new Error(`No program can be tried in a copy of ${realRootOf(projectDir)}: its program.ts is a directory.`);
-  // The directory it goes in — or, if that is still to be made, the one it is made in.
-  let goesIn = dirname(place);
-  while (!existsSync(goesIn)) goesIn = dirname(goesIn);
-  inDirOfCopy(goesIn, () => stageFile(copyDir, "program.ts", program, had && (had.mode | 0o200)).commit());
+  if (had?.isDirectory()) throw new Error(`No program can be tried in a copy of ${root}: its program.ts is a directory.`);
+  inDirOfCopy(whereMade(place), () => stageFile(copyDir, "program.ts", program, had && (had.mode | 0o200)).commit());
   return { copy: copyDir, held };
 }
 
@@ -605,7 +573,6 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   const { projectDir, backend, timeout, maxIterations, argsOverride, validating, workspaceDir, label, signal, journal } = options;
   const attempt = options.attempt ?? 0;
 
-  if (signal?.aborted) return { outcome: null, failure: "The run was stopped before its program started." };
   requireWatchdog();
   ensureProjectScaffold(projectDir);
 
@@ -778,7 +745,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       // says — unless it had already said it was done.
       outcome = stopped && !ctx.ended ? null : settle(projectDir, child, ctx.ended);
     } catch (err) {
-      noteExit({ error: err instanceof Error ? err.message : String(err) });
+      noteExit({ error: messageOf(err) });
       throw err;
     }
     noteExit({ outcome });
@@ -801,7 +768,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     ]);
     programSettled();
     server.closeAllConnections();
-    await closeServer(server).catch(() => { /* best-effort */ });
+    await closeServer(server);
   }
 }
 
@@ -854,7 +821,7 @@ async function requestRepair(
       options.journal.note("fix", { ok: true, source: fixed });
       return { fixed };
     } catch (err) {
-      const error = err instanceof Error ? err.message : String(err);
+      const error = messageOf(err);
       options.journal.note("fix", { ok: false, error });
       return { error };
     } finally {
@@ -903,7 +870,7 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     // If the copy cannot be run at all, or is left unusable, this fix did not work either.
     const trial = await runProgramOnce({ ...options, projectDir: stagedProject, attempt }).catch((err): RunOnceResult => ({
       outcome: null,
-      failure: `The repaired program could not be run: ${err instanceof Error ? err.message : err}`,
+      failure: `The repaired program could not be run: ${messageOf(err)}`,
     }));
     if (trial.outcome === null) return trial;
 
@@ -935,7 +902,7 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     } catch (err) {
       return {
         outcome: null,
-        failure: `The repaired program ran, but left no program.ts that can be read: ${err instanceof Error ? err.message : err}`,
+        failure: `The repaired program ran, but left no program.ts that can be read: ${messageOf(err)}`,
       };
     }
     // If it cannot be put in place, that is an error, and it is thrown from
@@ -944,9 +911,10 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     // put into another directory that is at the project's path by now: the
     // project is the directory that was copied, which the copy knows by what
     // it is.
-    const copied = held.get("."), there = entryAt(realRootOf(projectDir));
+    const projectRoot = realRootOf(projectDir);
+    const copied = held.get("."), there = entryAt(projectRoot);
     if (there && copied?.kind === "dir" && !(there.kind === "dir" && there.id === copied.id)) {
-      throw new Error(`The program cannot be replaced: what is at ${realRootOf(projectDir)} is not the project the fix was tried on.`);
+      throw new Error(`The program cannot be replaced: what is at ${projectRoot} is not the project the fix was tried on.`);
     }
     const program = stageProgram(projectDir, fixed);
     program.commit();
@@ -954,7 +922,7 @@ async function tryFix(options: ExecuteOptions, fixed: string, attempt: number): 
     // told so: that is what the place is taken to have held when the copy was made. (If that is still the
     // place program.ts leads to: where somebody has pointed it elsewhere meanwhile, the seed knows nothing new.)
     const installed = entryAt(program.destination);
-    const samePlace = relative(realRootOf(projectDir), program.destination) === relative(copyRoot, fixAt);
+    const samePlace = relative(projectRoot, program.destination) === relative(copyRoot, fixAt);
     if (itsPlace !== undefined && installed && samePlace) held.set(itsPlace, installed);
     // What the run made of its program is one thing, with what it was: the name, and what the name leads through
     // and to. If part of that does not arrive — or a part the run left alone is not, in the project, as it was —
@@ -1035,7 +1003,7 @@ async function journalled<T extends Execution>(journal: Journal, run: () => Prom
     journal.note("end", { result: execution.result });
     return execution;
   } catch (err) {
-    journal.note("end", { error: err instanceof Error ? err.message : String(err) });
+    journal.note("end", { error: messageOf(err) });
     throw err;
   } finally {
     journal.close();
@@ -1062,9 +1030,9 @@ export async function validateProgram(
   projectDir: string,
   backend: AgentBackend,
   candidate: string,
-  options: { timeout: number; maxRepairAttempts: number; maxIterations: number; journalRuns?: number },
+  options: { timeout: number; maxRepairAttempts: number; maxIterations: number; journalRuns?: number; signal?: AbortSignal },
 ): Promise<{ source: string; repairedError?: string }> {
-  const { journalRuns = 0, ...limits } = options;
+  const { journalRuns = 0, signal, ...limits } = options;
   // Recorded with the project, though run in a copy of it.
   const journal = openJournal(projectDir, journalRuns, { purpose: "validate", ...limits });
   const { result, repair, left } = await journalled(journal, () => withTempDir("trama-validate-", async (privateDir) => {
@@ -1076,11 +1044,19 @@ export async function validateProgram(
       backend,
       depth: 0,
       validating: { readyGraceMs: VALIDATION_READY_GRACE_MS },
+      signal,
       journal,
     });
+    // Of a run that failed nothing is installed, and why it failed is what there is to say: what it left is not looked at.
+    if (execution.result.status === "failed") return { ...execution, left: candidate };
     // The program as its run left it: the candidate, or what a repair or the program itself
     // made of it. (One that removed itself is still the candidate that ran.)
-    return { ...execution, left: programIn(trialDir) ?? candidate };
+    try {
+      return { ...execution, left: programIn(trialDir) ?? candidate };
+    } catch (err) {
+      const reason = `The program ran, but left no program.ts that can be read: ${messageOf(err)}`;
+      return { ...execution, result: { status: "failed" as const, reason }, left: candidate };
+    }
   }));
   if (result.status === "failed") throw new Error(`Program failed: ${result.reason}`);
   return { source: left, repairedError: repair?.error };
@@ -1088,6 +1064,7 @@ export async function validateProgram(
 
 /** A project's program text — null if it has none. Throws if what is in its place is no file. */
 function programIn(projectDir: string): string | null {
+  // (What the guard lets through is a file, a directory, or nothing yet: reading it waits on nothing.)
   const place = guardPath(projectDir, "program.ts");
   try {
     return readFileSync(place, "utf-8");
@@ -1113,21 +1090,21 @@ function programIn(projectDir: string): string | null {
  */
 export function whyNotReplaceable(projectDir: string): string | null {
   // A program is a project's: where no project is, none is put.
+  let place: string;
+  let there: ReturnType<typeof statSync>;
   try {
     projectAt(projectDir);
+    place = guardPath(projectDir, "program.ts");
+    there = statSync(place, { throwIfNoEntry: false });
   } catch (err) {
-    return `The program cannot be replaced: ${(err as Error).message}`;
+    return `The program cannot be replaced: ${messageOf(err)}`;
   }
-  const place = guardPath(projectDir, "program.ts");
   const allows = (path: string, what: number) => {
     try { accessSync(path, what); return true; } catch { return false; }
   };
-  const there = statSync(place, { throwIfNoEntry: false });
   if (there?.isDirectory()) return `The program cannot be replaced: ${place} is a directory.`;
   if (there && !allows(place, constants.W_OK)) return `The program cannot be replaced: ${place} is read-only.`;
-  // The directory the new file is made in — or, if that is still to be made, the one it is made in.
-  let dir = dirname(place);
-  while (!existsSync(dir)) dir = dirname(dir);
+  const dir = whereMade(place);
   if (!allows(dir, constants.W_OK | constants.X_OK)) return `The program cannot be replaced: nothing can be created in ${dir}.`;
   return null;
 }
@@ -1276,7 +1253,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
       console.log(tagged(options.label, `[trama] ${message}`));
       copyToHistory(projectDir, "repair", repair.error);
     } catch (err) {
-      console.warn(tagged(options.label, `[trama] repair bookkeeping failed: ${err instanceof Error ? err.message : err}`));
+      console.warn(tagged(options.label, `[trama] repair bookkeeping failed: ${messageOf(err)}`));
     }
   }
   return result;

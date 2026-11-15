@@ -631,3 +631,38 @@ test("what a path leads to is a file, a directory, or nothing yet — a pipe is 
   // The runtime's own files are held to the same.
   assert.throws(() => loadState(root), /Not a file or a directory: state\.json/);
 });
+
+// --- How many links a way may lead through ---
+
+test("links that lead to links are followed as far as the system follows them; links that lead through links, to a depth, and past it refused for what they are", async (t) => {
+  const { linksOf } = await import("../packages/runtime/dist/path-guard.js");
+  const root = realpathSync(makeTempDir("trama-guard-links-"));
+  t.after(() => cleanupTempDir(root));
+  const followed = (from, text) => linksOf(root).names(root, join(from, text)).to;
+
+  // One after another: l0 -> l1 -> … -> the directory.
+  const chain = (name, links) => {
+    mkdirSync(join(root, name, "dir"), { recursive: true });
+    writeFileSync(join(root, name, "dir", "f"), "there");
+    for (let i = 0; i < links; i++) symlinkSync(i === links - 1 ? "dir" : `l${i + 1}`, join(root, name, `l${i}`));
+    return name;
+  };
+  assert.equal(followed(chain("as-many", 32), "l0/f"), join(root, "as-many", "dir", "f"));
+  assert.equal(readFileSync(join(root, "as-many", "l0", "f"), "utf-8"), "there", "the system follows that many as well");
+  assert.throws(() => followed(chain("one-more", 33), "l0/f"), /Too many levels of symbolic links/);
+
+  // One through another: the words of l0 lead on through l1, those of l1 through l2, … down to a directory,
+  // where the "x" each of them goes on with is the directory again.
+  const nest = (name, links) => {
+    mkdirSync(join(root, name, `l${links}`), { recursive: true });
+    writeFileSync(join(root, name, `l${links}`, "f"), "there");
+    symlinkSync(".", join(root, name, `l${links}`, "x"));
+    for (let i = 0; i < links; i++) symlinkSync(`l${i + 1}/x`, join(root, name, `l${i}`));
+    return name;
+  };
+  assert.equal(followed(nest("shallow", 5), "l0/f"), join(root, "shallow", "l5", "f"));
+  assert.equal(readFileSync(join(root, "shallow", "l0", "f"), "utf-8"), "there", "the system follows these as well");
+  // Far deeper than any system goes: refused as that, and not by running out of room to keep count in.
+  assert.throws(() => readFileSync(join(root, nest("deep", 4000), "l0", "f")), /ELOOP/);
+  assert.throws(() => followed("deep", "l0/f"), (err) => !(err instanceof RangeError) && /Too many levels of symbolic links/.test(err.message));
+});

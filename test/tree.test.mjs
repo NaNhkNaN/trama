@@ -2743,3 +2743,126 @@ for (const seed of SEEDS) {
     }
   });
 }
+
+test("copyTree onto a case-sensitive volume leaves external absolute symlinks unchanged and respells multi-hop internal link chains", { skip: asRoot }, (t) => {
+  const apart = whereNamesAreToldApart();
+  if (!apart) return t.skip(NONE_TO_BE_HAD);
+  const real = scratch(t), copy = mkdtempSync(join(apart, "copy-"));
+  t.after(() => wipe(copy));
+
+  // Source has "ETC" so walking "/etc/hosts" relative to dirname(source) or source would collide if mis-rooted.
+  mkdirSync(join(real, "ETC"));
+  symlinkSync("/etc/hosts", join(real, "ext-hosts"));
+
+  // Multi-hop symlink chain: hop1 -> hop2 -> RealDir, and a link whose path traverses hop1/file.txt in wrong case.
+  mkdirSync(join(real, "RealDir"));
+  writeFileSync(join(real, "RealDir", "TargetFile.txt"), "payload");
+  symlinkSync("RealDir", join(real, "hop2"));
+  symlinkSync("hop2", join(real, "hop1"));
+  symlinkSync("hop1/targetfile.txt", join(real, "via-chain"));
+
+  copyTree(real, copy);
+  assert.equal(readlinkSync(join(copy, "ext-hosts")), "/etc/hosts");
+  assert.equal(readlinkSync(join(copy, "via-chain")), "hop1/TargetFile.txt");
+  assert.equal(readFileSync(join(copy, "via-chain"), "utf-8"), "payload");
+});
+
+// --- The names a directory lists, and the letters a link is written in ---
+
+test("a place is known by the names its directories list for it; the directory itself is \".\", and what is not in it has no name there", (t) => {
+  const dir = scratch(t);
+  mkdirSync(join(dir, "Sub"));
+  writeFileSync(join(dir, "Sub", "Report.txt"), "the report");
+  symlinkSync("Sub", join(dir, "by-link"));
+
+  assert.equal(tree.pathAsListed(dir, dir), ".");
+  assert.equal(tree.pathAsListed(dir, join(dir, "Sub", "Report.txt")), "Sub/Report.txt");
+  assert.equal(tree.pathAsListed(dir, join(dir, "by-link")), "by-link", "a link is named, not followed");
+  symlinkSync("nowhere", join(dir, "to-nothing"));
+  for (const elsewhere of [dirname(dir), join(dirname(dir), "beside"), join(dir, "Sub", "missing.txt"), join(dir, "missing", "Report.txt"), join(dir, "to-nothing", "Report.txt")]) {
+    assert.equal(tree.pathAsListed(dir, elsewhere), undefined, elsewhere);
+  }
+  // What is outside has no name in it either where the directory itself is gone.
+  assert.equal(tree.pathAsListed(join(dir, "gone"), dir), undefined);
+  if (!foldsNames) return;
+  // In other letters, where the file system takes them for the same: the listed ones are the answer.
+  assert.equal(tree.pathAsListed(dir, join(dir, "sub", "REPORT.TXT")), "Sub/Report.txt");
+  // And of a file's several names in one directory, the one that was meant — whichever the directory lists first.
+  for (const other of ["a-second-name", "Z-third-name", "report.bak", "1"]) linkSync(join(dir, "Sub", "Report.txt"), join(dir, "Sub", other));
+  assert.equal(tree.pathAsListed(dir, join(dir, "SUB", "report.txt")), "Sub/Report.txt");
+  assert.equal(tree.pathAsListed(dir, join(dir, "sub", "REPORT.BAK")), "Sub/report.bak");
+});
+
+test("a copy beside the original keeps every link to the letter, in whatever letters it is written", { skip: !foldsNames }, (t) => {
+  const real = scratch(t), copy = scratch(t), outside = scratch(t);
+  mkdirSync(join(real, "Dir"));
+  writeFileSync(join(real, "Dir", "Inner.txt"), "inner");
+  writeFileSync(join(real, "Dir", "Left-Out.txt"), "no part of the copy");
+  writeFileSync(join(outside, "Shared.txt"), "shared");
+  const links = {
+    "as-listed": "Dir/Inner.txt", "in-other-letters": "dir/INNER.txt", "to-nothing": "DIR/missing.txt",
+    // Through a link that comes after it, to what is left out of the copy, and out of the directory by a link of it.
+    "by-way-of-later": "ZLINK/inner.TXT", "to-what-is-left-out": "DIR/left-out.TXT", "out-by-a-link": "ZOUT/SHARED.txt",
+    "zlink": "dir", "zout": outside,
+  };
+  for (const [name, text] of Object.entries(links)) symlinkSync(text, join(real, name));
+
+  // (And a file of two names, of which the copy is given one: the other is not turned into it.)
+  linkSync(join(real, "Dir", "Inner.txt"), join(real, "Dir", "Left-Out-too.txt"));
+  symlinkSync("Dir/Left-Out-too.txt", join(real, "to-a-name-left-out"));
+  links["to-a-name-left-out"] = "Dir/Left-Out-too.txt";
+  tree.copyTree(real, copy, (at) => /Left-Out(-too)?\.txt$/.test(at));
+  for (const [name, text] of Object.entries(links)) assert.equal(readlinkSync(join(copy, name)), text, name);
+  assert.equal(readFileSync(join(copy, "by-way-of-later"), "utf-8"), "inner");
+  assert.equal(readFileSync(join(copy, "out-by-a-link"), "utf-8"), "shared");
+});
+
+test("a copy on a file system that tells letters apart has each link lead where it led, by the names the copy has", { skip: asRoot }, (t) => {
+  const apart = whereNamesAreToldApart();
+  if (!apart) return t.skip(NONE_TO_BE_HAD);
+  const real = scratch(t), copy = mkdtempSync(join(apart, "copy-")), outside = scratch(t);
+  t.after(() => wipe(copy));
+  mkdirSync(join(real, "Dir", "Deep"), { recursive: true });
+  writeFileSync(join(real, "Dir", "Inner.txt"), "inner");
+  writeFileSync(join(real, "Dir", "Left-Out.txt"), "no part of the copy");
+  writeFileSync(join(outside, "Shared.txt"), "shared");
+  symlinkSync("Dir/Deep", join(real, "zdeep"));
+  symlinkSync(outside, join(real, "zout"));
+  writeFileSync(join(real, "Dir", "Deep", "Far.txt"), "far");
+  linkSync(join(real, "Dir", "Inner.txt"), join(real, "Dir", "a-second-name"));
+  linkSync(join(real, "Dir", "Inner.txt"), join(real, "Dir", "Z-third-name"));
+  // (And a name of the same file in another directory, which is no name of it in this one.)
+  mkdirSync(join(real, "Other"));
+  linkSync(join(real, "Dir", "Inner.txt"), join(real, "Other", "INNER.TXT"));
+  symlinkSync("dir", join(real, "zlink"));
+  const said = {
+    "as-listed": ["Dir/Inner.txt", "Dir/Inner.txt"],
+    "in-other-letters": ["dir/INNER.txt", "Dir/Inner.txt"],
+    "up-and-down": ["DIR/deep/../inner.TXT", "Dir/Deep/../Inner.txt"],
+    "by-way-of-later": ["ZLINK/DEEP/far.txt", "zlink/Deep/Far.txt"],
+    // Said from the top of the file system, of the directory in other letters: what follows is said of the copy.
+    "from-the-top": [join(real, "DIR", "DEEP", "FAR.TXT"), join(copy, "Dir", "Deep", "Far.txt")],
+    // What is not there is written as it was, on from the names that are — and so is what the copy was not given.
+    "to-nothing": ["dir/Missing.txt", "Dir/Missing.txt"],
+    "to-what-is-left-out": ["DIR/left-out.TXT", "Dir/left-out.TXT"],
+    // Up from where a link led is up from there: the name after it is one of Dir's, not of the directory the link is in.
+    "up-from-a-link": ["ZDEEP/../INNER.txt", "zdeep/../Inner.txt"],
+    // A file that has a name in another directory too is named, there, by the name it has there.
+    "by-its-other-name": ["other/inner.txt", "Other/INNER.TXT"],
+    // A name outside is no name of the copy's, though a link of the directory leads to it.
+    "out-by-a-link": ["ZOUT/SHARED.txt", "zout/SHARED.txt"],
+    // And what never comes to the directory is none of its names.
+    "outside": ["/ETC/hosts", "/ETC/hosts"],
+  };
+  for (const [name, [text]] of Object.entries(said)) symlinkSync(text, join(real, name));
+  mkdirSync(join(real, "nested"));
+  symlinkSync("../DIR/deep/FAR.txt", join(real, "nested", "from-below"));
+
+  tree.copyTree(real, copy, (at) => at.endsWith("Left-Out.txt"));
+  for (const [name, [, expected]] of Object.entries(said)) assert.equal(readlinkSync(join(copy, name)), expected, name);
+  assert.equal(readFileSync(join(copy, "up-from-a-link"), "utf-8"), "inner");
+  assert.equal(readlinkSync(join(copy, "nested", "from-below")), "../Dir/Deep/Far.txt");
+  for (const [name, content] of [["in-other-letters", "inner"], ["up-and-down", "inner"], ["by-way-of-later", "far"], ["from-the-top", "far"], ["nested/from-below", "far"]]) {
+    assert.equal(readFileSync(join(copy, name), "utf-8"), content, name);
+  }
+});

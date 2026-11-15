@@ -2,8 +2,9 @@ import { spawn } from "child_process";
 import { readFileSync, writeFileSync } from "fs";
 import { resolve, dirname } from "path";
 import type { Tools, ShellResult } from "./types.js";
-import { guardPath, makeDirsIn } from "./path-guard.js";
+import { guardPath, makeDirsIn, projectAt, realRootOf } from "./path-guard.js";
 import { superviseChild } from "./child-process.js";
+import { messageOf } from "./errors.js";
 import { signalGroup, stopGroups, stopWithThisProcess } from "./stopping.js";
 
 const MAX_FETCH_BODY = 10 * 1024 * 1024; // 10 MB
@@ -86,6 +87,9 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
 
     async write(path, content) {
       const target = guardPath(normalizedProjectDir, path); // before mkdir — no side effects outside the project
+      // (Asked to write the project itself, the system refuses a directory. Where the project is gone it is refused
+      // either way, as any write is: this only says of the project what is otherwise said of "the directory".)
+      if (target === realRootOf(normalizedProjectDir)) projectAt(normalizedProjectDir);
       makeDirsIn(normalizedProjectDir, dirname(target));
       writeFileSync(target, content);
     },
@@ -114,8 +118,7 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
         };
       } catch (spawnError) {
         // Failed to start (e.g. cwd does not exist) — a result, not an exception.
-        if (pgid) untrack(pgid);
-        return { exitCode: 1, stdout: "", stderr: (spawnError as Error).message };
+        return { exitCode: 1, stdout: "", stderr: messageOf(spawnError) };
       }
     },
 
@@ -127,10 +130,33 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
         signal,
       });
 
-      const raw = await response.text();
-      const body = raw.length > MAX_FETCH_BODY
-        ? raw.slice(0, MAX_FETCH_BODY) + "\n[trama] response body truncated at 10MB"
-        : raw;
+      let body: string;
+      if (response.body) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let text = "";
+        let truncated = false;
+        try {
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            text += decoder.decode(value, { stream: true });
+            if (text.length > MAX_FETCH_BODY) {
+              truncated = true;
+              await reader.cancel();
+              break;
+            }
+          }
+          if (!truncated) text += decoder.decode();
+        } finally {
+          reader.releaseLock();
+        }
+        body = truncated
+          ? text.slice(0, MAX_FETCH_BODY) + "\n[trama] response body truncated at 10MB"
+          : text;
+      } else {
+        body = ""; // (an answer that has no body: to a HEAD, say)
+      }
 
       const headers: Record<string, string> = {};
       response.headers.forEach((v, k) => { headers[k] = v; });

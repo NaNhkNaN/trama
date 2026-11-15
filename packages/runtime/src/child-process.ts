@@ -127,7 +127,6 @@ export function superviseChild(child: ChildProcess, options: SuperviseOptions): 
     const errDecoder = new StringDecoder("utf-8");
     let timedOut = false;
     let stopped = false;
-    let exited = false;
 
     const emitOut = (text: string) => { if (text) { out.append(text); sinks?.stdout?.(text); } };
     const emitErr = (text: string) => { if (text) { err.append(text); sinks?.stderr?.(text); } };
@@ -138,13 +137,12 @@ export function superviseChild(child: ChildProcess, options: SuperviseOptions): 
     const terminate = () => { if (child.pid) void stopGroups([child.pid]); };
 
     const offStop = onAbort(stopSignal, () => {
-      if (exited || stopped || timedOut) return;
+      if (timedOut) return;
       stopped = true;
       terminate();
     });
 
     allowance.start(() => {
-      if (exited) return;
       timedOut = true;
       terminate();
     });
@@ -168,11 +166,14 @@ export function superviseChild(child: ChildProcess, options: SuperviseOptions): 
     // and what that writes is not the child's output. Stop waiting for it:
     // otherwise such a process keeps the run from ever ending, timeout or not.
     child.on("exit", () => {
+      // From here on there is no child to stop, and none that could run out of time: what
+      // is still waited for is its output, for a moment (see below).
+      allowance.cancel();
+      offStop();
       drainTimer = setTimeout(() => { child.stdout?.destroy(); child.stderr?.destroy(); }, DRAIN_MS);
     });
 
     child.on("close", (code, signal) => {
-      exited = true;
       cleanup();
       emitOut(outDecoder.end());
       emitErr(errDecoder.end());

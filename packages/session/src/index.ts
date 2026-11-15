@@ -1,5 +1,5 @@
 import { mkdtempSync } from "fs";
-import { join, resolve } from "path";
+import { join, resolve, sep } from "path";
 import { homedir, tmpdir } from "os";
 import { createWorkspace, runProgram } from "@trama-dev/runtime/runner";
 import type { ProgramResult, Workspace } from "@trama-dev/runtime/runner";
@@ -76,10 +76,11 @@ export class Session {
    * Useful for testing or ephemeral sessions.
    */
   static async createTemp(prefix = "trama-session-"): Promise<Session> {
-    if (prefix.includes("/") || prefix.includes("\\")) {
-      throw new Error("createTemp prefix must not contain path separators");
+    if (prefix.includes("/") || prefix.includes("\\") || prefix.includes("\0") || prefix === "." || prefix === "..") {
+      throw new Error("createTemp prefix must not contain path separators or traversal segments");
     }
-    return new Session(mkdtempSync(resolve(tmpdir(), prefix)));
+    const base = resolve(tmpdir());
+    return new Session(mkdtempSync(base.endsWith(sep) ? base + prefix : base + sep + prefix));
   }
 
   /**

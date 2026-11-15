@@ -9,14 +9,14 @@ export interface Ctx {
 
   /**
    * Persistent state. Must be strictly JSON-serializable.
-   * Local working copy — only checkpoint() and done() persist to disk.
+   * Local working copy — only checkpoint(), yield() and done() persist to disk.
    * Reserved keys: any key starting with `__trama_` is reserved.
    */
   state: Record<string, unknown>;
 
   /**
    * Current iteration counter (starts at 0).
-   * Advances only when checkpoint() or done() is called.
+   * Advances only when checkpoint(), yield() or done() is called.
    */
   iteration: number;
 

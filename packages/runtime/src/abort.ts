@@ -12,6 +12,11 @@ export function onAbort(signal: AbortSignal | undefined, fn: () => void): () => 
   return () => signal.removeEventListener("abort", fn);
 }
 
+/** Go no further where `signal` is aborted. (The system's own `throwIfAborted` says it in other words.) */
+export function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new Error("Aborted");
+}
+
 /**
  * Reject as soon as `signal` is aborted, whether or not `work` itself notices.
  * What `work` goes on to do after that is no longer waited for.

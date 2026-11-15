@@ -10,9 +10,10 @@ import {
   accessSync, chmodSync, closeSync, constants, copyFileSync, lstatSync, mkdirSync, openSync,
   readdirSync, readSync, renameSync, rmdirSync, rmSync, statSync, symlinkSync, unlinkSync,
 } from "fs";
-import { basename, dirname, join, relative, sep } from "path";
-import { identityOf, linksOf, linkText, realRootOf } from "./path-guard.js";
+import { basename, dirname, isAbsolute, join, relative, sep } from "path";
+import { identityIn, identityOf, linksOf, linkText, realRootOf, utf8Text } from "./path-guard.js";
 import { stagedNameFor } from "./replace-file.js";
+import { messageOf } from "./errors.js";
 
 /**
  * What is at one path. `id` says which file, directory or link it is: it
@@ -48,7 +49,7 @@ export function entryAt(path: string): Entry | undefined {
   const stat = lstatSync(path, { bigint: true, throwIfNoEntry: false });
   if (!stat) return undefined;
   const mode = Number(stat.mode & 0o7777n);
-  const id = `${stat.dev}:${stat.ino}`;
+  const id = identityIn(stat);
   if (stat.isFile()) {
     // The time of the last change is the system's own: it moves when the file is written, replaced, or
     // has its permissions changed, and no program can put it back. (The time of the last write can be.)
@@ -90,8 +91,8 @@ function same(a: Entry | undefined, b: Entry | undefined): boolean {
 /** The names in a directory. One that is not text cannot be told from another, or looked up again: it throws. */
 function namesIn(dir: string): string[] {
   return readdirSync(dir, "buffer").map((raw) => {
-    const name = raw.toString("utf-8");
-    if (!Buffer.from(name, "utf-8").equals(raw)) throw new Error(`${dir} holds a name that is not readable as text`);
+    const name = utf8Text(raw);
+    if (name === undefined) throw new Error(`${dir} holds a name that is not readable as text`);
     return name;
   });
 }
@@ -181,7 +182,9 @@ export function readTree(dir: string): Tree {
  *
  * A link is made to name, in the copy, what it names here: the same place in
  * the copy if that is under `fromDir`, and the same place outside it if not.
- * Most links do that as they are written, and are kept so. Not one whose
+ * Most links do that as they are written, and are kept so — but for the
+ * letters of a name the copy does not have as it is written, where its file
+ * system tells apart what this one takes for one name. Not one whose
  * way steps out of the directory over its top with "..", or into it from
  * outside: from the copy's place those words lead somewhere else — or back
  * into the original, where what was done through the link in the copy would
@@ -212,10 +215,19 @@ export function copyTree(
   const to = realRootOf(toDir);
   const tree: Tree = new Map();
   const dirs: Array<{ copied: string; mode: number }> = [];
+  /** What was copied, by what it is: the paths the copy has it under. (A file may have several names.) */
+  const copiedAs = new Map<string, string[]>();
+  const copiedIs = (id: string, path: string) => { copiedAs.set(id, [...(copiedAs.get(id) ?? []), path]); };
+  /** The links whose words name things of the directory, to be read again when all of the copy is there. */
+  const written: Array<{ copied: string; says: string; before: string; dir: string; words: string }> = [];
 
   const read = linksOf(from);
-  /** What a link must say in the copy — undefined if what it names cannot be told. */
-  const inCopy = (link: string, text: string): string | undefined => {
+  /**
+   * What a link must say in the copy — undefined if what it names cannot be
+   * told — and, of that, the `words` that name things of the directory: said
+   * from `dir`, after what stands `before` them.
+   */
+  const inCopy = (link: string, text: string): { says: string; own?: { before: string; dir: string; words: string } } | undefined => {
     try {
       try {
         statSync(link);
@@ -223,11 +235,40 @@ export function copyTree(
         if (!gone(err)) throw err; // (that nothing is there yet is no refusal to go there)
       }
       const lead = read.names(dirname(link), text);
+      // (Words from the top that never come to the directory name nothing of it: they need no second reading,
+      // which for such words is a long one.)
+      if (!lead.strays) return { says: text, own: isAbsolute(text) ? undefined : { before: "", dir: dirname(link), words: text } };
       // A way that strays and does not come home ends outside the directory: the place is itself, from anywhere.
-      return !lead.strays ? text : lead.home !== undefined ? to + lead.home : lead.to;
+      if (lead.home === undefined) return { says: lead.to };
+      return { says: to + lead.home, own: lead.home === "" ? undefined : { before: to + sep, dir: from, words: lead.home.slice(sep.length) } };
     } catch {
       return undefined;
     }
+  };
+  /**
+   * Words of a link, each name in the letters the copy knows it by. A file
+   * system may take "data" for the name of what its directory lists as
+   * "Data", and the copy's need not: there the words would lead nowhere. So a
+   * name the copy does not have as it is written, and has under the name its
+   * directory lists here — the one that reads the same — is written as that. Where each name is looked up is
+   * asked of the words before it; which directory of the copy that is, and
+   * what the copy calls the thing, is known from the copying: a name of
+   * something that is not in the copy is left as it is.
+   */
+  const spelled = (dir: string, words: string): string => {
+    const steps = words.split(sep);
+    return steps.map((step, i) => {
+      if (step === "" || step === "." || step === "..") return step;
+      try {
+        const at = i === 0 ? dir : read.names(dir, steps.slice(0, i).join(sep) + sep).to;
+        const [inDir] = copiedAs.get(identityOf(at) ?? "") ?? [];
+        if (inDir === undefined || identityOf(join(to, inDir, step)) !== undefined) return step;
+        const names = (copiedAs.get(identityOf(join(at, step)) ?? "") ?? []).filter((path) => dirname(path) === inDir).map((path) => basename(path));
+        return names.find((other) => reads(other) === reads(step)) ?? step;
+      } catch {
+        return step;
+      }
+    }).join(sep);
   };
 
   walk(from, (path, entry, source) => {
@@ -237,51 +278,85 @@ export function copyTree(
     if (entry.kind === "dir") {
       if (path !== ITSELF) mkdirSync(copied); // (the copy itself is there: it is what was given)
       dirs.push({ copied, mode: entry.mode });
+      copiedIs(entry.id, path);
     } else if (entry.kind === "file") {
       try {
         // The copy is empty where this goes: a name that is there already is two names of the directory taken for one.
         copyFileSync(source, copied, constants.COPYFILE_EXCL);
+        copiedIs(entry.id, path);
       } catch (err) {
         if (!gone(err) || lstatSync(source, { throwIfNoEntry: false })) throw err;
         tree.delete(path); // gone since it was looked at
       }
     } else if (entry.kind === "link") {
-      const text = inCopy(source, entry.text);
+      const said = inCopy(source, entry.text);
       try {
-        if (text === undefined) tree.set(path, NOT_CONTENT);
-        else symlinkSync(text, copied);
+        if (said === undefined) tree.set(path, NOT_CONTENT);
+        else {
+          symlinkSync(said.says, copied);
+          copiedIs(entry.id, path);
+          if (said.own) written.push({ copied, says: said.says, ...said.own });
+        }
       } catch (err) {
         // Words made for the copy that are too long for a link: they cannot be said here at all.
-        if (text === entry.text || (err as NodeJS.ErrnoException).code !== "ENAMETOOLONG") throw err;
+        if (said?.says === entry.text || (err as NodeJS.ErrnoException).code !== "ENAMETOOLONG") throw err;
         tree.set(path, NOT_CONTENT);
       }
     }
   });
+  // The letters of each link's words, now that the copy can be asked what it has.
+  for (const { copied, says, before, dir, words } of written) {
+    const spelt = before + spelled(dir, words);
+    if (spelt === says) continue;
+    unlinkSync(copied);
+    try {
+      symlinkSync(spelt, copied);
+    } catch (err) {
+      symlinkSync(says, copied);
+      if ((err as NodeJS.ErrnoException).code !== "ENAMETOOLONG") throw err;
+    }
+  }
   // Last, and the deepest first: a directory that may not be written to has to be filled before it is closed.
   for (const { copied, mode } of dirs.reverse()) chmodSync(copied, mode);
   return tree;
 }
 
+/** A name as it reads, whatever its letters: what tells one name of a file from another, where a file system takes several for one. */
+const reads = (name: string) => name.normalize("NFD").toLowerCase();
+
 /**
- * The path a reading of `dir` has for a place under it: each step by the
- * name its directory lists for it, which need not be the letters the place
- * is known by (a file system may take "Program.ts" and "program.ts" for one
- * name). Undefined if nothing is there. The place is named without links.
+ * The name a directory lists for what it knows as `name` — which need not be
+ * the letters given: a file system may take "Program.ts" and "program.ts"
+ * for one name. Undefined if nothing is there.
  *
- * The name is found by what is there, so this is to be asked where no file
- * has two names in one directory: of a copy, which has every file once.
+ * Found by what is there. A file may have more names than one in a directory,
+ * and then the one meant is the one that reads the same as the name given.
+ */
+function nameListed(dir: string, name: string): string | undefined {
+  const what = identityOf(join(dir, name));
+  if (what === undefined) return undefined;
+  const names = namesIn(dir);
+  if (names.includes(name)) return name;
+  const its = names.filter((other) => identityOf(join(dir, other)) === what);
+  return its.find((other) => reads(other) === reads(name)) ?? its[0];
+}
+
+/**
+ * The path a reading of `dir` has for a place: each step by the name its
+ * directory lists for it, and "." for the directory itself. Undefined if
+ * nothing is there, or the place is not in `dir`. The place is named without
+ * links.
  */
 export function pathAsListed(dir: string, place: string): string | undefined {
-  const steps: string[] = [];
-  let at = realRootOf(dir);
-  for (const step of relative(at, place).split(sep)) {
-    const what = identityOf(join(at, step));
-    if (what === undefined) return undefined;
-    const names = namesIn(at);
-    const name = names.includes(step) ? step : names.find((other) => identityOf(join(at, other)) === what);
+  const root = realRootOf(dir);
+  const steps = relative(root, place).split(sep);
+  if (steps[0] === "") return identityOf(root) === undefined ? undefined : ITSELF;
+  if (steps[0] === "..") return undefined; // (outside: its first step up is there to be found, whatever the directory is)
+  let at = root;
+  for (const [i, step] of steps.entries()) {
+    const name = nameListed(at, step);
     if (name === undefined) return undefined;
-    steps.push(name);
-    at = join(at, name);
+    at = join(at, steps[i] = name);
   }
   return steps.join("/");
 }
@@ -289,7 +364,6 @@ export function pathAsListed(dir: string, place: string): string | undefined {
 /** Something a run did in a copy that did not reach the real directory, and why. */
 export interface Unmerged { path: string; why: string }
 
-const reason = (err: unknown) => (err instanceof Error ? err.message : String(err));
 
 /**
  * Carry what a run did to a copy back into the directory it is a copy of.
@@ -448,7 +522,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
       return [{ path: ITSELF, why: "another directory is at the project's path than the one that was copied; nothing was merged into it" }];
     }
   } catch (err) {
-    return [{ path: ITSELF, why: `the project could not be come to (${reason(err)}); nothing was merged into it` }];
+    return [{ path: ITSELF, why: `the project could not be come to (${messageOf(err)}); nothing was merged into it` }];
   }
   try {
     copy = realRootOf(stagedDir);
@@ -458,7 +532,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
     });
   } catch (err) {
     // What the run left cannot be told. Nothing is merged — least of all as a removal of what cannot be seen.
-    return [{ path: ITSELF, why: `what the run left could not be read (${reason(err)}); none of it was merged` }];
+    return [{ path: ITSELF, why: `what the run left could not be read (${messageOf(err)}); none of it was merged` }];
   }
   /**
    * Whether what is at a path, though it looks the same, is something the run
@@ -565,7 +639,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
    * those this merge makes: what each is to be left allowing — what it
    * allowed, until what the run left it allowing arrives.
    */
-    const opened = new Set<string>();
+  const opened = new Set<string>();
   /**
    * Each with which directory it is, what it is to be left allowing, and what
    * this merge has it allowing for now (-1: not known — it was made, and
@@ -714,14 +788,14 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
   const amiss = new Map<string, string>();
   // What the run changed — and the parts of what is one thing that it did not: nothing is to be done there, but
   // the rest of the thing leans on their being there as they were.
-  for (const path of parts.every((part) => isChanged.has(part)) ? changed : [...new Set([...changed, ...parts])].sort(inOrder)) {
+  for (const path of [...new Set([...changed, ...parts])].sort(inOrder)) {
     if (leftAlone(path)) continue;
     try {
       const deed = decide(path);
       if (deed) deeds.push(deed);
     } catch (err) {
       // (A part the run left as it was did not fail to arrive: nothing under it is left alone for its sake.)
-      (isChanged.has(path) ? refused : amiss).set(path, reason(err));
+      (isChanged.has(path) ? refused : amiss).set(path, messageOf(err));
     }
   }
   // What the real directory takes for one name is one thing there: nothing is done to it under any name — nor,
@@ -745,7 +819,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
           refused.set(path, `the run left ${above}, which the project's file system takes for a name of a directory this is in: it is left as it was`);
         }
       } catch (err) {
-        refused.set(path, reason(err));
+        refused.set(path, messageOf(err));
       }
     }
   }
@@ -898,7 +972,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
   const tell = (path: string, what: string) => besides.set(path, besides.has(path) ? `${besides.get(path)} — and ${what}` : what);
   /** A place of the real directory, as a path of it. */
   const pathOf = (place: string) => relative(real, place).split(sep).join("/") || ITSELF;
-  const leftover = (path: string, failed: unknown) => `what was at ${path}, and was to go, is here: the system would not have it all removed (${reason(failed)})`;
+  const leftover = (path: string, failed: unknown) => `what was at ${path}, and was to go, is here: the system would not have it all removed (${messageOf(failed)})`;
   /** Remove what was made beside a place and is not going to be moved in. What will not go is told of. Throws nothing. */
   const discard = (made: string, madeFor: string) => {
     try {
@@ -911,7 +985,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
       } catch (cannot) {
         there = !noSuchPlace(cannot);
       }
-      if (there) tell(pathOf(made), `it was made ready for ${madeFor}, and the system would not have it removed (${reason(err)})`);
+      if (there) tell(pathOf(made), `it was made ready for ${madeFor}, and the system would not have it removed (${messageOf(err)})`);
     }
   };
   /** Make a file or a link the run left beside its place, under a name of its own, ready to be moved in. */
@@ -1014,7 +1088,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
       try {
         step(deed);
       } catch (err) {
-        refused.set(deed.path, reason(err));
+        refused.set(deed.path, messageOf(err));
       }
     }
   };
@@ -1068,17 +1142,17 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
             renameSync(made, place);
           } catch (again) {
             ready.delete(path); // (it is not removed: it is the only whole one there is)
-            throw new Error(`${reason(err)} — and a new file could not be put in its place either (${reason(again)}): what it held may be damaged, and what it was to hold is beside it, as ${basename(made)}`);
+            throw new Error(`${messageOf(err)} — and a new file could not be put in its place either (${messageOf(again)}): what it held may be damaged, and what it was to hold is beside it, as ${basename(made)}`);
           }
           ready.delete(path);
-          tell(path, `it could not be written into (${reason(err)}): a new file, holding what the run left, was put in its place`);
+          tell(path, `it could not be written into (${messageOf(err)}): a new file, holding what the run left, was put in its place`);
         }
         if (ready.delete(path)) discard(made, path);
       }
       try {
         if (modeAt(place) !== want.mode) chmodSync(place, want.mode);
       } catch (err) {
-        tell(path, `what it is to allow (${want.mode.toString(8)}) could not be set (${reason(err)}); what it holds arrived`);
+        tell(path, `what it is to allow (${want.mode.toString(8)}) could not be set (${messageOf(err)}); what it holds arrived`);
       }
       return;
     }
@@ -1161,7 +1235,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
         }
       } catch (err) {
         const where = kept === undefined ? "" : `: what was there is beside it, as ${basename(kept)}`;
-        refused.set(path, `${refused.get(path) ?? "it is in what did not arrive"} — and it could not be put back as it was (${reason(err)})${where}`);
+        refused.set(path, `${refused.get(path) ?? "it is in what did not arrive"} — and it could not be put back as it was (${messageOf(err)})${where}`);
       }
     }
   }
@@ -1174,7 +1248,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
     if (want || !there || aside.has(path) || underOne(path, seenTo)) return;
     if (there.kind !== "dir") return void unlinkSync(place);
     const failed = removed(deed, place);
-    if (failed !== undefined) tell(path, `the run removed it, and the system would not have it removed, or not all that was in it (${reason(failed)}): what is left is there`);
+    if (failed !== undefined) tell(path, `the run removed it, and the system would not have it removed, or not all that was in it (${messageOf(failed)}): what is left is there`);
   });
 
   // What was made ready and never moved in is not left lying there.
@@ -1206,7 +1280,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
     } catch (err) {
       // Where there is no such place there is nothing to close. Where it cannot be come to, it may be there, open.
       if (!gone(err) && (err as NodeJS.ErrnoException).code !== "ENOTDIR") {
-        tell(pathOf(place), `it was opened, and cannot be come to to be given back what it is to allow (${mode.toString(8)}): ${reason(err)}`);
+        tell(pathOf(place), `it was opened, and cannot be come to to be given back what it is to allow (${mode.toString(8)}): ${messageOf(err)}`);
       }
       continue;
     }
@@ -1214,7 +1288,7 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
       if (modeAt(place) !== mode) chmodSync(place, mode);
     } catch (err) {
       // What it was to be left allowing did not arrive, or could not be put back. What is in it is another matter.
-      const why = `what it is to allow (${mode.toString(8)}) could not be set (${reason(err)})`;
+      const why = `what it is to allow (${mode.toString(8)}) could not be set (${messageOf(err)})`;
       const at = pathOf(place);
       if (refused.has(at)) refused.set(at, `${refused.get(at)} — and ${why}`);
       else tell(at, `${why}; what is in it is told of by itself, if it did not arrive`);

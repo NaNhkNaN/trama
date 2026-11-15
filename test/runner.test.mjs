@@ -3089,3 +3089,127 @@ test("a directory where a project's program should be is no program, and is said
   assert.throws(() => installValidatedProgram(projectDir, { source: SELF }, "update", "p"), /The program cannot be replaced: .*program\.ts is a directory\./);
   assert.deepEqual(readdirSync(join(projectDir, "program.ts")), []);
 });
+
+test("when a failing program replaces program.ts with an escaping symlink or FIFO, runProgram refuses repair cleanly without throwing", async (t) => {
+  for (const [label, corrupt] of [
+    ["escaping symlink", `fs.unlinkSync("program.ts"); fs.symlinkSync("/etc/hosts", "program.ts");`],
+    ["FIFO", `fs.unlinkSync("program.ts"); child_process.execFileSync("mkfifo", ["program.ts"]);`],
+  ]) {
+    const projectDir = makeTempDir("trama-runner-corrupt-");
+    createProjectFixture(projectDir, {
+      scaffold: false,
+      programSource: `import * as fs from "fs";\nimport * as child_process from "child_process";\n${corrupt}\nconsole.error("boom");\nprocess.exit(1);\n`,
+    });
+    const originalRepair = llm.repair;
+    let asked = 0;
+    llm.repair = async () => { asked += 1; return SELF; };
+    t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+    const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+    assert.equal(result.status, "failed", label);
+    assert.match(result.reason, /no repair was tried\. The program cannot be replaced:/, label);
+    assert.equal(asked, 0, label);
+  }
+});
+
+// --- What was left unpinned: version numbers, a candidate's failure, what a new program may do, the watchdog's start ---
+
+test("copyToHistory numbers the next version after the versions there are, whatever else bears a number's name", (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+  // Numbers too great to count on from: taken for the last version, the next would be no number of its own.
+  for (const name of ["99999999999999999999.ts", "9007199254740993.ts", "9007199254740991.ts"]) writeFileSync(join(projectDir, "history", name), "// not a version");
+  writeFileSync(join(projectDir, "history", "0007.ts"), "// the last version");
+
+  copyToHistory(projectDir, "update", "prompt");
+  assert.equal(readFileSync(join(projectDir, "history", "0008.ts"), "utf-8"), readFileSync(join(projectDir, "program.ts"), "utf-8"));
+  assert.equal(JSON.parse(readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8").trim()).version, 8);
+});
+
+test("a candidate that fails is refused for how it failed, whatever it left where its program was; one that ran and left no program, for that", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { programSource: `// the program there is\n` });
+  const validate = (candidate) => validateProgram(projectDir, createBackend(loadConfig()), candidate, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 });
+  const makesItselfADirectory = `import * as fs from "fs";\nfs.rmSync("program.ts");\nfs.mkdirSync("program.ts");\n`;
+
+  await assert.rejects(validate(`${makesItselfADirectory}console.error("no good");\nprocess.exit(3);\n`), (err) => {
+    assert.match(err.message, /^Program failed.*exited with code 3/s);
+    assert.match(err.message, /no good/);
+    assert.doesNotMatch(err.message, /left no program\.ts/);
+    return true;
+  });
+  await assert.rejects(validate(`import { ctx } from "@trama-dev/runtime";\n${makesItselfADirectory}await ctx.done();\n`),
+    /Program failed: The program ran, but left no program\.ts that can be read: .*is a directory, not a program\./);
+  // Neither touched the project.
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), `// the program there is\n`);
+});
+
+test("a repair gives the new program what the old one allowed, and not what let it run as somebody else", { skip: process.getuid?.() === 0 }, async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: `console.error("boom");\nprocess.exit(1);\n` });
+  chmodSync(join(projectDir, "program.ts"), 0o6755);
+  const originalRepair = llm.repair;
+  llm.repair = async () => SELF;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+  if ((statSync(join(projectDir, "program.ts")).mode & 0o6000) === 0) return t.skip("this file system keeps no such bits");
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.equal(result.status, "done");
+  assert.equal((statSync(join(projectDir, "program.ts")).mode & 0o7777).toString(8), "755");
+});
+
+test("the watchdog is started as itself: not with what NODE_OPTIONS would have every node load first", async (t) => {
+  const fakeHome = makeTempDir("trama-runner-home-");
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => { cleanupTempDir(fakeHome); cleanupTempDir(projectDir); });
+  createProjectFixture(projectDir, { scaffold: false, programSource: `import { ctx } from "@trama-dev/runtime";\nawait ctx.done();\n` });
+  // Loaded first by every node that is given it: each says how it was started.
+  const started = join(fakeHome, "started.jsonl"), preload = join(fakeHome, "preload.cjs");
+  writeText(preload, `require("fs").appendFileSync(${JSON.stringify(started)}, JSON.stringify(process.execArgv) + "\\n");\n`);
+
+  const { exited } = startRunnerProcess(fakeHome, projectDir, { env: { NODE_OPTIONS: `--require ${preload}` } });
+  assert.deepEqual(await exited, { code: 0, signal: null });
+  const starts = readFileSync(started, "utf-8").trim().split("\n").map(line => JSON.parse(line).join(" "));
+  // The runner and its program were given it — and so would the watchdog have been, whose few lines hold these words.
+  assert.ok(starts.length >= 2, `${starts.length} started with it`);
+  assert.deepEqual(starts.filter(args => /The pipe has closed: the runner is gone/.test(args)), []);
+});
+
+test("a run a program asks for is known by the name it was given: no name is no name, and one name is one run", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  const asked = makeTempDir("trama-runner-asked-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(asked); });
+  createProjectFixture(asked, { scaffold: false, programSource: `import { ctx } from "@trama-dev/runtime";\nawait new Promise(resolve => setTimeout(resolve, 400));\nawait ctx.done({ ran: true });\n` });
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx } from "@trama-dev/runtime";
+import { readFileSync } from "fs";
+const { token } = JSON.parse(readFileSync(process.env.TRAMA_INIT, "utf-8"));
+const post = async (path, body) => {
+  const res = await fetch("http://127.0.0.1:" + process.env.TRAMA_PORT + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Authorization": "Bearer " + token },
+    body: JSON.stringify(body),
+  });
+  return [res.status, (await res.text()).slice(0, 80)];
+};
+const run = (id) => post("/run/program", { projectDir: ${JSON.stringify(asked)}, maxRepairAttempts: 0, id });
+const first = run("one");
+await new Promise(resolve => setTimeout(resolve, 100));
+const second = await run("one");
+const nameless = [await run(""), await post("/run/stop", { id: "" })];
+const [status] = await first;
+// Once it is over the name is free again.
+const [again] = await run("one");
+await ctx.done({ status, second, nameless, again });`,
+  });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 30_000 });
+  assert.equal(result.status, "done", result.reason);
+  assert.equal(result.result.status, 200);
+  assert.deepEqual([result.result.second[0], /Duplicate run id: one/.test(result.result.second[1])], [400, true]);
+  assert.deepEqual(result.result.nameless.map(([status, text]) => [status, /expected a non-empty string/.test(text)]), [[400, true], [400, true]]);
+  assert.equal(result.result.again, 200);
+});

@@ -1,8 +1,9 @@
 // The runner side of the IPC bridge. A running program.ts reaches ctx, agent,
-// tools and workspace by POSTing JSON to this local HTTP server (see client.ts
-// for the other end).
+// tools and workspace by POSTing JSON to this local HTTP server (see
+// bridge-client.ts for the other end, and client.ts for what is made of it).
 
 import { createServer, type Server } from "http";
+import type { AddressInfo } from "net";
 import { timingSafeEqual } from "crypto";
 import type { Agent, Tools, Workspace } from "./types.js";
 import type { RunContext } from "./context.js";
@@ -11,6 +12,7 @@ import type { Journal } from "./journal.js";
 import { isJsonObject } from "./serializable.js";
 
 const MAX_IPC_BODY = 50 * 1024 * 1024; // 50 MB
+const MAX_STOPPED_AHEAD = 1024;
 
 /** A request the program got wrong — answered with 400 rather than 500. */
 class BadRequest extends Error {}
@@ -161,25 +163,37 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run }: IpcBack
         id: "optional string", label: "optional string", workspaceDir: "optional string",
       },
       async ({ id, ...request }, connectionClosed, seq) => {
+        if (id !== undefined) {
+          if (id === "") throw new BadRequest("Invalid field: id (expected a non-empty string)");
+          if (runsAskedFor.has(id)) throw new BadRequest(`Duplicate run id: ${id}`);
+        }
         const stop = new AbortController();
         // A caller that is gone — its process died, or it gave up — no longer wants the run.
         void connectionClosed.then(() => stop.abort());
         // `id` is the name the program gave the run, to stop it by.
-        if (id && stoppedAhead.delete(id)) stop.abort();
-        if (id) runsAskedFor.set(id, stop);
+        if (id !== undefined) {
+          if (stoppedAhead.delete(id)) stop.abort();
+          runsAskedFor.set(id, stop);
+        }
         try {
           return await run(request, stop.signal, seq);
         } finally {
-          if (id) runsAskedFor.delete(id);
+          if (id !== undefined) runsAskedFor.delete(id);
         }
       },
     ),
     // Stop a run asked for above. The call that asked for it still gets its
     // answer — a failed run — once the run is over.
     "/run/stop": route({ id: "string" }, b => {
+      if (b.id === "") throw new BadRequest("Invalid field: id (expected a non-empty string)");
       const asked = runsAskedFor.get(b.id);
       if (asked) asked.abort();
-      else stoppedAhead.add(b.id);
+      else {
+        if (stoppedAhead.size >= MAX_STOPPED_AHEAD && !stoppedAhead.has(b.id)) {
+          stoppedAhead.delete(stoppedAhead.values().next().value!);
+        }
+        stoppedAhead.add(b.id);
+      }
     }),
 
     "/workspace/read": route({ path: "string", dir: "optional string" }, b => workspaceOf(b.dir).read(b.path)),
@@ -243,12 +257,13 @@ export function createIPCServer(backends: IpcBackends): Server {
         } catch {
           return reply(400, "The request body is not valid JSON");
         }
-        const route = req.url ? routes[req.url] : undefined;
+        const route = req.url && Object.hasOwn(routes, req.url) ? routes[req.url] : undefined;
         if (!route) return reply(404, "Not found");
         call = backends.journal.call(req.url!, body);
         const result = (await route.handle(body, connectionClosed, call.seq)) ?? null;
+        const payload = JSON.stringify({ result });
         if (answerable()) call.end({ ok: true, result });
-        reply(200, JSON.stringify({ result }), true);
+        reply(200, payload, true);
       } catch (err) {
         const refused = err instanceof BadRequest;
         const error = refused ? err.message : String(err);
@@ -265,18 +280,12 @@ export function listen(server: Server): Promise<number> {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => {
       server.removeListener("error", reject);
-      const addr = server.address();
-      if (addr && typeof addr === "object") resolve(addr.port);
-      else reject(new Error("Failed to get server port"));
+      resolve((server.address() as AddressInfo).port);
     });
   });
 }
 
+/** Stop listening, and wait until it has. (The one thing a server can say against it is that it was not listening.) */
 export function closeServer(server: Server): Promise<void> {
-  return new Promise((resolve, reject) => {
-    server.close(err => {
-      if (!err || (err as NodeJS.ErrnoException).code === "ERR_SERVER_NOT_RUNNING") resolve();
-      else reject(err);
-    });
-  });
+  return new Promise((resolve) => { server.close(() => resolve()); });
 }

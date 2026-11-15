@@ -4,6 +4,7 @@
 import { readFileSync } from "fs";
 import { guardPath } from "./path-guard.js";
 import { describeJson, isJsonObject } from "./serializable.js";
+import { messageOf } from "./errors.js";
 
 export interface ProjectMeta {
   /** What the program is given as ctx.input. */
@@ -30,7 +31,7 @@ export function readProjectMeta(projectDir: string): ProjectMeta {
   try {
     parsed = JSON.parse(raw);
   } catch (err) {
-    throw fail(`Parse error: ${err instanceof Error ? err.message : err}`);
+    throw fail(`Parse error: ${messageOf(err)}`);
   }
   if (!isJsonObject(parsed)) {
     throw fail(`expected a JSON object but got ${describeJson(parsed)}.`);

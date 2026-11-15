@@ -648,3 +648,203 @@ test("a journal is a file: a pipe, a directory or a link that bears a journal's 
   assert.equal(lstatSync(join(dir, "0000-a-pipe.jsonl")).isFIFO(), true);
   assert.equal(existsSync(join(dir, "0000-a-directory.jsonl")), true);
 });
+
+test("journal inspection rejects non-anchored >4KB lookalikes, non-positive pids, staged temps, and clips huge BigInts", async (t) => {
+  const { journalEntriesOf, openJournal, stillBeingWritten } = await import("../packages/runtime/dist/journal.js");
+  const projectDir = makeTempDir("trama-journal-edge-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { scaffold: false });
+
+  const dir = journalDir(projectDir);
+  mkdirSync(dir, { recursive: true });
+
+  // A >4KB single-line user .jsonl file that mentions a run header mid-line is not a trama journal.
+  const lookalikeRun = "2026-01-01T00-00-00-000Z-aaaaaa";
+  const padding = "x".repeat(4500);
+  writeText(
+    join(dir, `${lookalikeRun}.jsonl`),
+    `{"note":"${padding}","embedded":{"at":0,"kind":"run","v":1,"run":"${lookalikeRun}","pid":12345}}`,
+  );
+  assert.deepEqual(runsIn(dir), []);
+
+  // A truncated journal whose pid is 0 or negative must never be treated as still being written.
+  const zeroPidRun = "2026-01-01T00-00-01-000Z-bbbbbb";
+  const zeroPidPath = join(dir, `${zeroPidRun}.jsonl`);
+  writeText(zeroPidPath, `{"at":0,"kind":"run","v":1,"run":"${zeroPidRun}","pid":0}\n`);
+  assert.deepEqual(runsIn(dir), [zeroPidRun]);
+  assert.equal(stillBeingWritten(zeroPidPath), false);
+
+  // Clean out the user lookalike, add a staged .trama-tmp-* file, and verify journalEntriesOf omits the whole journal dir.
+  const { rmSync } = await import("fs");
+  rmSync(join(dir, `${lookalikeRun}.jsonl`));
+  writeText(join(dir, `${zeroPidRun}.jsonl.trama-tmp-0123456789ab`), "staged");
+  assert.equal(journalEntriesOf(projectDir).size, 1);
+
+  // Huge BigInt values are converted to string and clipped to MAX_TEXT instead of blowing past the record cap.
+  const j = openJournal(projectDir, 5, { purpose: "run" });
+  j.note("custom", { huge: 10n ** 400_000n });
+  j.close();
+  const records = readRecords(j.path);
+  const custom = records.find(r => r.kind === "custom");
+  assert.equal(typeof custom.huge, "string");
+  assert.ok(custom.huge.length <= 256 * 1024);
+  assert.ok(Array.isArray(custom.cuts) && custom.cuts.length > 0);
+});
+
+// --- What is a journal, what is beside the journals, and what a copy of the project carries of them ---
+
+test("a project with a file where its journals would be is run and repaired all the same, unrecorded", async (t) => {
+  const projectDir = makeTempDir("trama-journal-");
+  createProjectFixture(projectDir, { programSource: `console.error("boom"); process.exit(1);\n` });
+  writeText(join(projectDir, "logs", "journal"), "somebody's own");
+  const originalRepair = llm.repair;
+  llm.repair = async () => `console.log("mended");\n`;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { messages, result } = await captureConsole("warn", () =>
+    captureConsole("log", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 })));
+  assert.equal(result.result.status, "done");
+  assert.match(messages.join("\n"), /this run is not being recorded/);
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), `console.log("mended");`);
+  assert.equal(readFileSync(join(projectDir, "logs", "journal"), "utf-8"), "somebody's own");
+});
+
+test("somebody's own file among the journals is the project's: a fix finds it in its copy, and what it writes beside it arrives", async (t) => {
+  const { journalEntriesOf } = await import("../packages/runtime/dist/journal.js");
+  const projectDir = makeTempDir("trama-journal-");
+  createProjectFixture(projectDir, { programSource: `console.error("boom"); process.exit(1);\n` });
+  mkdirSync(journalDir(projectDir), { recursive: true });
+  writeText(join(journalDir(projectDir), "notes.txt"), "kept by hand");
+  const originalRepair = llm.repair;
+  llm.repair = async () => `import { readFileSync, writeFileSync, readdirSync } from "fs";
+writeFileSync("logs/journal/out.txt", readFileSync("logs/journal/notes.txt", "utf-8") + ", and read");
+writeFileSync("seen.json", JSON.stringify(readdirSync("logs/journal").sort()));
+`;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { result } = await captureConsole("log", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  assert.equal(readFileSync(join(journalDir(projectDir), "out.txt"), "utf-8"), "kept by hand, and read");
+  // The copy held the file, and none of the journals: not the one being written either.
+  assert.deepEqual(JSON.parse(readFileSync(join(projectDir, "seen.json"), "utf-8")), ["notes.txt", "out.txt"]);
+  // What is left out of a copy is the journals, one by one — as many as there are — where something else is with them.
+  const journals = journalFiles(projectDir).filter(name => name.endsWith(".jsonl"));
+  assert.equal(journals.length, 1);
+  assert.equal(journalEntriesOf(projectDir).size, journals.length);
+});
+
+test("a journal that has its end is not being written, though the process that wrote it lives on", async (t) => {
+  const { stillBeingWritten } = await import("../packages/runtime/dist/journal.js");
+  const { rmSync } = await import("fs");
+  const projectDir = makeTempDir("trama-journal-");
+  t.after(() => cleanupTempDir(projectDir));
+  const dir = journalDir(projectDir);
+  mkdirSync(dir, { recursive: true });
+  // A process that is there, and is not this one.
+  const other = process.ppid;
+  assert.equal(isAlive(other), true);
+  const journal = (run, ...records) => {
+    const path = join(dir, `${run}.jsonl`);
+    writeText(path, [{ at: 0, kind: "run", v: 1, run, pid: other }, ...records].map(record => JSON.stringify(record) + "\n").join(""));
+    return path;
+  };
+
+  assert.equal(stillBeingWritten(journal("2026-01-01T00-00-00-000Z-aaaaaa", { at: 1, kind: "attempt" })), true);
+  assert.equal(stillBeingWritten(journal("2026-01-01T00-00-01-000Z-aaaaaa", { at: 1, kind: "attempt" }, { at: 2, kind: "end" })), false);
+  // An end that is longer than what is first looked at is found as well.
+  assert.equal(stillBeingWritten(journal("2026-01-01T00-00-02-000Z-aaaaaa", { at: 2, kind: "end", result: "y".repeat(20_000) })), false);
+  // And a record that only mentions an end is none.
+  assert.equal(stillBeingWritten(journal("2026-01-01T00-00-03-000Z-aaaaaa", { at: 2, kind: "call", body: { kind: "end" } })), true);
+  assert.deepEqual(runsIn(dir).length, 4);
+  // One that started a moment after its run did — an older trama wrote the time down as it was — is one all the same.
+  writeText(join(dir, "2026-01-01T00-00-08-000Z-aaaaaa.jsonl"), JSON.stringify({ at: 3, kind: "run", v: 1, run: "2026-01-01T00-00-08-000Z-aaaaaa", pid: other }) + "\n");
+  assert.deepEqual(runsIn(dir).length, 5);
+  rmSync(join(dir, "2026-01-01T00-00-08-000Z-aaaaaa.jsonl"));
+  // A journal is the journal of the run it is named for: one that begins as another's is none.
+  writeText(join(dir, "2026-01-01T00-00-09-000Z-aaaaaa.jsonl"), JSON.stringify({ at: 0, kind: "run", v: 1, run: "2026-01-01T00-00-00-000Z-aaaaaa", pid: other }) + "\n");
+  assert.deepEqual(runsIn(dir).length, 4);
+});
+
+test("what says how it is to be written down is asked once, also when its answer is itself", async (t) => {
+  const { openJournal } = await import("../packages/runtime/dist/journal.js");
+  const projectDir = makeTempDir("trama-journal-");
+  t.after(() => cleanupTempDir(projectDir));
+  const journal = openJournal(projectDir, 5, { purpose: "test" });
+  const itself = { n: 1, toJSON() { return this; } };
+  journal.note("odd", { itself, when: { toJSON: () => ({ toJSON: () => "asked twice", n: 2 }) } });
+  journal.note("after");
+  journal.close();
+
+  const [, odd, after] = readRecords(journal.path);
+  assert.equal(odd.unrecordable, undefined);
+  assert.equal(odd.itself.n, 1);
+  assert.equal(odd.when.n, 2);
+  assert.equal(after.kind, "after");
+});
+
+test("a project whose logs/journal leads back to the project itself is copied whole, less its journals", async (t) => {
+  const projectDir = makeTempDir("trama-journal-");
+  createProjectFixture(projectDir, { scaffold: false, programSource: `console.error("boom"); process.exit(1);\n` });
+  // By links: logs is the project, and so is logs/journal. The journals are written beside the program.
+  symlinkSync(".", join(projectDir, "logs"));
+  symlinkSync(".", join(projectDir, "journal"));
+  writeText(join(projectDir, "kept.txt"), "the project's");
+  const originalRepair = llm.repair;
+  llm.repair = async () => `import { readFileSync, readdirSync, writeFileSync } from "fs";
+writeFileSync("seen.json", JSON.stringify({ kept: readFileSync("kept.txt", "utf-8"), journals: readdirSync(".").filter(name => /^\\d{4}-.*\\.jsonl$/.test(name)) }));
+`;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { result } = await captureConsole("log", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  assert.deepEqual(JSON.parse(readFileSync(join(projectDir, "seen.json"), "utf-8")), { kept: "the project's", journals: [] });
+  assert.equal(readdirSync(projectDir).filter(name => /^\d{4}-.*\.jsonl$/.test(name)).length, 1);
+});
+
+test("a journal nobody here may read, or whose writer's number is somebody else's by now, does not stand in the way", { skip: process.getuid?.() === 0 }, async (t) => {
+  const { chmodSync } = await import("fs");
+  const { openJournal, stillBeingWritten } = await import("../packages/runtime/dist/journal.js");
+  const projectDir = makeTempDir("trama-journal-");
+  createProjectFixture(projectDir, { programSource: `console.error("boom"); process.exit(1);\n` });
+  const dir = journalDir(projectDir);
+  mkdirSync(dir, { recursive: true });
+  const record = (run, pid) => JSON.stringify({ at: 0, kind: "run", v: 1, run, pid }) + "\n";
+  // Written by a run of another user's: named for its run, and not to be read.
+  const sealed = "2026-01-01T00-00-00-000Z-aaaaaa";
+  writeText(join(dir, `${sealed}.jsonl`), record(sealed, process.ppid));
+  chmodSync(join(dir, `${sealed}.jsonl`), 0o000);
+  // Left by a run that was killed; the number its runner had is by now that of a process that is not ours to signal.
+  // (The first process of the system is such a one — unless it is ours, as in a container: then this one has no number.)
+  const notOurs = (() => { try { process.kill(1, 0); return false; } catch (err) { return err.code === "EPERM"; } })();
+  const orphaned = "2026-01-01T00-00-01-000Z-aaaaaa";
+  writeText(join(dir, `${orphaned}.jsonl`), record(orphaned, notOurs ? 1 : 0));
+  const originalRepair = llm.repair;
+  llm.repair = async () => `console.log("mended");\n`;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  assert.deepEqual(runsIn(dir), [sealed, orphaned]);
+  assert.equal(stillBeingWritten(join(dir, `${sealed}.jsonl`)), false);
+  assert.equal(stillBeingWritten(join(dir, `${orphaned}.jsonl`)), false);
+  // The project can be copied — the journal that cannot be read is no part of a copy — and so repaired.
+  const { result } = await captureConsole("log", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  // And both make room in their turn.
+  openJournal(projectDir, 1, { purpose: "test" }).close();
+  assert.equal(runsIn(dir).includes(sealed) || runsIn(dir).includes(orphaned), false);
+});
+
+test("a journal directory that may not be read is no part of a copy: the project is repaired all the same, unrecorded", { skip: process.getuid?.() === 0 }, async (t) => {
+  const { chmodSync } = await import("fs");
+  const projectDir = makeTempDir("trama-journal-");
+  createProjectFixture(projectDir, { programSource: `console.error("boom"); process.exit(1);\n` });
+  mkdirSync(journalDir(projectDir), { recursive: true });
+  writeText(join(journalDir(projectDir), "notes.txt"), "kept by hand");
+  chmodSync(journalDir(projectDir), 0o000);
+  const originalRepair = llm.repair;
+  llm.repair = async () => `console.log("mended");\n`;
+  t.after(() => { llm.repair = originalRepair; chmodSync(journalDir(projectDir), 0o700); cleanupTempDir(projectDir); });
+
+  const { result } = await captureConsole("warn", () => captureConsole("log", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 })));
+  assert.equal(result.result.status, "done");
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), `console.log("mended");`);
+});

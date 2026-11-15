@@ -48,6 +48,12 @@ function leaveBySignal(name: SignalName): void {
   setTimeout(() => process.exit(128 + SIGNALS[name]), 100);
 }
 
+/** While `work` goes on, a signal stops it rather than this process. */
+function stoppable<T>(work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  running = true;
+  return work(stopRun.signal).finally(() => { running = false; });
+}
+
 function collectArg(value: string, previous: string[]) {
   return [...previous, value];
 }
@@ -71,7 +77,9 @@ function command<A extends unknown[]>(run: (...args: A) => Promise<void>) {
   return async (...args: A) => {
     try {
       await run(...args);
+      if (received) return leaveBySignal(received);
     } catch (err) {
+      if (received) return leaveBySignal(received);
       console.error(`Error: ${err instanceof Error ? err.message : err}`);
       process.exit(1);
     }
@@ -94,7 +102,8 @@ cli
   .option("--model <model>", "LLM model to use")
   .option("--arg <key=value>", "Pass argument to the program (repeatable)", collectArg, [])
   .action(command(async (name: string, prompt: string, opts: { model?: string; arg: string[] }) => {
-    await createProject(name, prompt, { model: opts.model, args: parseArgs(opts.arg) });
+    const args = parseArgs(opts.arg);
+    await stoppable((signal) => createProject(name, prompt, { model: opts.model, args, signal }));
   }));
 
 cli
@@ -112,10 +121,8 @@ cli
     }
     const args = parseArgs(opts.arg);
     const projectDir = resolveProject(name);
-    running = true;
-    const result = await runProgram({ projectDir, timeout, args, signal: stopRun.signal })
-      .finally(() => { running = false; });
-    if (received) return leaveBySignal(received);
+    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, signal }));
+    // (A run that a signal stopped has failed, and is not reported as that: see `command`.)
     if (result.status === "failed") {
       throw new Error(`Program failed: ${result.reason}`);
     }
@@ -124,7 +131,9 @@ cli
 cli
   .command("update <name> <prompt>")
   .description("Update an existing program with new requirements")
-  .action(command(updateProject));
+  .action(command(async (name: string, prompt: string) => {
+    await stoppable((signal) => updateProject(name, prompt, { signal }));
+  }));
 
 cli
   .command("list")

@@ -6,7 +6,7 @@ import { join, resolve } from "path";
 import { homedir } from "os";
 import { piVersion } from "./pi-adapter.js";
 import { stripCodeFences } from "./agent.js";
-import { onAbort } from "./abort.js";
+import { onAbort, throwIfAborted } from "./abort.js";
 import type { AgentBackend } from "./agent-backend.js";
 import { LATEST_LOG_PATH } from "./context.js";
 import { readProjectMeta } from "./meta.js";
@@ -14,10 +14,11 @@ import {
   loadConfig, loadProjectConfig, loadState, createBackend, validateProgram, installValidatedProgram,
   withTempDir, ensureProjectScaffold, RUNTIME_TYPES, runProgram as runHere, whyNotReplaceable,
 } from "./runner.js";
-import { createWorkspace as workspaceHere } from "./workspace.js";
+import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspace.js";
 import { parentBridge, remoteWorkspace } from "./bridge-client.js";
-import { guardPath } from "./path-guard.js";
+import { guardPath, identityOf, sameProjectAs } from "./path-guard.js";
 import { printJournals } from "./journal-view.js";
+import { messageOf } from "./errors.js";
 
 export type { ProgramResult, RunOptions } from "./runner-types.js";
 import type { ProgramResult, RunOptions, TramaConfig } from "./runner-types.js";
@@ -62,8 +63,7 @@ export async function runProgram(options: RunOptions): Promise<ProgramResult> {
 export function createWorkspace(dir: string): Workspace {
   const bridge = parentBridge();
   if (!bridge) return workspaceHere(dir);
-  const absolute = resolve(dir);
-  mkdirSync(absolute, { recursive: true }); // it exists from here on, as it does outside a program
+  const absolute = ensureWorkspaceDir(dir); // it exists from here on, as it does outside a program
   return remoteWorkspace(bridge.call, absolute);
 }
 
@@ -182,16 +182,24 @@ export function resolveProject(name: string): string {
 
 // --- Helpers ---
 
-/** Ask in an empty throwaway directory, so the agent's tools cannot write into the real project. */
-async function isolatedAsk(backend: AgentBackend, prompt: string, system: string): Promise<string> {
-  return withTempDir("trama-gen-", (cwd) => backend.ask(prompt, { cwd, system }));
+/**
+ * Ask for a program — in an empty throwaway directory, so the agent's tools
+ * cannot write into the real project — and take what comes back for one only
+ * if something does: no program is not a program that does nothing.
+ */
+async function generateProgram(backend: AgentBackend, prompt: string, system: string, signal?: AbortSignal): Promise<string> {
+  const program = stripCodeFences(await withTempDir("trama-gen-", (cwd) => backend.ask(prompt, { cwd, system, signal })));
+  throwIfAborted(signal);
+  if (program === "") throw new Error("The model answered with no program.");
+  return program;
 }
 
-const validationOptions = (config: TramaConfig) => ({
+const validationOptions = (config: TramaConfig, signal?: AbortSignal) => ({
   timeout: config.defaultTimeout,
   maxRepairAttempts: config.maxRepairAttempts,
   maxIterations: config.defaultMaxIterations,
   journalRuns: config.journalRuns,
+  signal,
 });
 
 // --- Public API ---
@@ -199,17 +207,24 @@ const validationOptions = (config: TramaConfig) => ({
 export async function createProject(
   name: string,
   prompt: string,
-  options?: { model?: string; args?: Record<string, unknown> },
+  options?: { model?: string; args?: Record<string, unknown>; signal?: AbortSignal },
 ): Promise<void> {
   validateProjectName(name);
+  throwIfAborted(options?.signal);
   const projectDir = join(projectsDir(), name);
   let keepProjectOnFailure = false;
 
-  if (existsSync(projectDir)) {
-    throw new Error(`Project "${name}" already exists.`);
+  mkdirSync(projectsDir(), { recursive: true });
+  try {
+    // Made here, and only here: whatever bears the name already — a project, a file, a link to nothing — is in the way.
+    mkdirSync(projectDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new Error(`Project "${name}" already exists.`);
+    throw err;
   }
-
-  mkdirSync(projectDir, { recursive: true });
+  // The directory made just now is the project: what is done from here on is done to it, and it alone is taken away again.
+  const made = identityOf(projectDir);
+  const stillTheProject = sameProjectAs(projectDir);
 
   try {
     ensureProjectScaffold(projectDir);
@@ -229,64 +244,77 @@ export async function createProject(
     const backend = createBackend(config);
 
     console.log(`Generating program for "${name}"...`);
-    const candidate = stripCodeFences(await isolatedAsk(backend,
+    const candidate = await generateProgram(backend,
       `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation.`,
       getSystemPrompt(),
-    ));
+      options?.signal,
+    );
+    stillTheProject();
 
     // From here on the project is kept even if validation fails, so the
     // generated program can be inspected and fixed by hand.
-    writeFileSync(join(projectDir, "program.ts"), candidate);
+    writeFileSync(guardPath(projectDir, "program.ts"), candidate);
     keepProjectOnFailure = true;
 
     console.log("Validating program...");
-    const validated = await validateProgram(projectDir, backend, candidate, validationOptions(config));
+    const validated = await validateProgram(projectDir, backend, candidate, validationOptions(config, options?.signal));
+    stillTheProject();
     installValidatedProgram(projectDir, validated, "create", prompt);
 
     console.log(`Created ${name}. Run with: trama run ${name}`);
   } catch (err) {
-    if (!keepProjectOnFailure) {
+    if (!keepProjectOnFailure && identityOf(projectDir) === made) {
       rmSync(projectDir, { recursive: true, force: true });
     }
     throw err;
   }
 }
 
-export async function updateProject(name: string, prompt: string): Promise<void> {
+export async function updateProject(
+  name: string,
+  prompt: string,
+  options?: { signal?: AbortSignal },
+): Promise<void> {
   const projectDir = resolveProject(name);
   const unchanged = (why: unknown) =>
-    new Error(`Update failed — the program is unchanged.\n${why instanceof Error ? why.message : why}`);
+    new Error(`Update failed — the program is unchanged.\n${messageOf(why)}`);
+  const stillTheProject = sameProjectAs(projectDir);
   // Asked before anything else is done, the project's own preparation included: an update's only
   // use is to replace the program, and where that cannot be done there is nothing to prepare for.
   const refusal = whyNotReplaceable(projectDir);
   if (refusal) throw unchanged(refusal);
-  // A hand-written project may never have been run: give it history/ and the rest first.
-  ensureProjectScaffold(projectDir);
-
-  const originalSource = readFileSync(guardPath(projectDir, "program.ts"), "utf-8");
-  const state = loadState(projectDir);
-  const meta = readProjectMeta(projectDir);
-  const config = loadProjectConfig(projectDir, meta);
-  const backend = createBackend(config);
-
-  const systemPrompt =
-    getSystemPrompt() +
-    `\n\nOriginal prompt: ${meta.input.prompt}` +
-    `\n\nCurrent program.ts:\n${originalSource}` +
-    (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : "");
 
   // The new program is generated and validated off to the side. The project is
   // only written to once there is a program that works, so a failed update has
   // nothing to undo.
   try {
+    throwIfAborted(options?.signal);
+    // A hand-written project may never have been run: give it history/ and the rest first.
+    ensureProjectScaffold(projectDir);
+
+    const originalSource = readFileSync(guardPath(projectDir, "program.ts"), "utf-8");
+    const state = loadState(projectDir);
+    const meta = readProjectMeta(projectDir);
+    const config = loadProjectConfig(projectDir, meta);
+    const backend = createBackend(config);
+
+    const systemPrompt =
+      getSystemPrompt() +
+      `\n\nOriginal prompt: ${meta.input.prompt}` +
+      `\n\nCurrent program.ts:\n${originalSource}` +
+      (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : "");
+
     console.log(`Updating "${name}"...`);
-    const candidate = stripCodeFences(await isolatedAsk(backend,
+    const candidate = await generateProgram(backend,
       `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
       systemPrompt,
-    ));
+      options?.signal,
+    );
+    stillTheProject();
 
     console.log("Validating updated program...");
-    const validated = await validateProgram(projectDir, backend, candidate, validationOptions(config));
+    const validated = await validateProgram(projectDir, backend, candidate, validationOptions(config, options?.signal));
+    stillTheProject();
     installValidatedProgram(projectDir, validated, "update", prompt);
   } catch (err) {
     throw unchanged(err);

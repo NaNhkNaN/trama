@@ -215,3 +215,39 @@ await new Promise(() => {});`,
   assert.equal(existsSync(join(signalDir, "closed-properly")), true, "the program should have been asked to stop");
   assert.equal(isAlive(programPid), false, "and gone before the command returned");
 });
+
+test("a signal stops `trama create` while generation is in flight and cleans up the half-made project", async (t) => {
+  const fakeHome = makeTempDir("trama-cli-home-");
+  const signalDir = makeTempDir("trama-cli-create-signal-");
+  t.after(() => { cleanupTempDir(fakeHome); cleanupTempDir(signalDir); });
+
+  const askedMarker = join(signalDir, "asked");
+  const preloadPath = join(fakeHome, "mock-slow-create.mjs");
+  writeText(preloadPath, `import { writeFileSync } from "node:fs";
+import { PiAdapter } from ${JSON.stringify(pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "pi-adapter.js")).href)};
+
+PiAdapter.prototype.ask = async function ask(_prompt, options) {
+  const keepAlive = setInterval(() => {}, 1000);
+  writeFileSync(${JSON.stringify(askedMarker)}, "1", "utf-8");
+  return await new Promise((_resolve, reject) => {
+    const onAbort = () => { clearInterval(keepAlive); reject(new Error("Aborted")); };
+    if (options?.signal?.aborted) { onAbort(); return; }
+    options?.signal?.addEventListener("abort", onAbort, { once: true });
+  });
+};
+`);
+
+  const cli = spawn(
+    process.execPath,
+    ["--import", preloadPath, CLI_ENTRY, "create", "half-made", "build something"],
+    { cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome }, stdio: "ignore" },
+  );
+  const exited = new Promise(resolve => cli.on("close", (code, signal) => resolve({ code, signal })));
+  await waitFor(() => existsSync(askedMarker), "create ask() to start");
+
+  cli.kill("SIGINT");
+  const { signal } = await exited;
+  assert.equal(signal, "SIGINT");
+  assert.equal(existsSync(join(fakeHome, ".trama", "projects", "half-made")), false);
+});
+

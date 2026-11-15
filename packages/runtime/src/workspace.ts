@@ -2,30 +2,25 @@ import { readFileSync, mkdirSync, readdirSync, statSync } from "fs";
 import { resolve, relative, sep } from "path";
 import type { Workspace } from "./types.js";
 import { onAbort } from "./abort.js";
-import { guardPath } from "./path-guard.js";
+import { guardPath, realRootOf } from "./path-guard.js";
 import { isStagedName, stageFile } from "./replace-file.js";
 
 const OBSERVE_POLL_MS = 250;
 
 /**
- * Compile a simple glob pattern for matching relative paths.
- * Supports `*` (any segment chars), `?` (single char), and `**` (any path segments).
- * `** /` matches zero or more directory segments (including root).
+ * Compile a simple glob pattern for matching relative paths: `*` is any run
+ * of characters within a segment, `?` one of them, `**` any run of characters
+ * at all, and `**` with its slash any number of whole segments, none included
+ * (so `**` + `/*.md` matches at the root too). Every other character is itself.
+ *
+ * The pattern is taken apart at its operators and each piece between them
+ * escaped whole — nothing is put into the pattern on the way, so there is no
+ * text a pattern could hold that is mistaken for an operator.
  */
 function compileGlob(pattern: string): RegExp {
-  // Replace ** with placeholders before escaping
-  let regex = pattern
-    .replace(/\*\*\//g, "\x00GLOBSTARSLASH\x00")
-    .replace(/\*\*/g, "\x00GLOBSTAR\x00");
-  // Escape regex special chars except * and ?
-  regex = regex
-    .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-    .replace(/\*/g, "[^/]*")
-    .replace(/\?/g, "[^/]");
-  // Restore placeholders
-  regex = regex
-    .replace(/\x00GLOBSTARSLASH\x00/g, "(?:.+/)?")
-    .replace(/\x00GLOBSTAR\x00/g, ".*");
+  const literal = (text: string) => text.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  const within = (segment: string) => segment.split("?").map((part) => part.split("*").map(literal).join("[^/]*")).join("[^/]");
+  const regex = pattern.split("**/").map((part) => part.split("**").map(within).join(".*")).join("(?:.+/)?");
   return new RegExp(`^${regex}$`);
 }
 
@@ -50,7 +45,8 @@ function isExactPath(pattern: string): boolean {
  * a loop is gone round once, and the work is bounded by the links there are
  * times what they lead to; following links found through links, it is
  * bounded by nothing but the length of a path. What this leaves unlisted,
- * though it can be read: a path through two links or more.
+ * though it can be read: what lies beyond a second link to a directory. (A
+ * link to a file costs nothing to list, wherever it is come upon.)
  */
 function listFiles(dir: string, root: string, found: string[], byLink = false): void {
   let entries;
@@ -95,9 +91,20 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Workspace {
+/**
+ * Make sure a workspace directory exists where `workspaceDir` leads, and
+ * return its resolved path. Unlike a project, a workspace is nothing but its
+ * path and is made as needed — also when `workspaceDir` is a link whose target
+ * is not there yet.
+ */
+export function ensureWorkspaceDir(workspaceDir: string): string {
   const root = resolve(workspaceDir);
-  mkdirSync(root, { recursive: true });
+  mkdirSync(realRootOf(root), { recursive: true });
+  return root;
+}
+
+export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Workspace {
+  const root = ensureWorkspaceDir(workspaceDir);
 
   /** All artifact paths matching a glob, sorted. */
   const listMatching = (pattern: string): string[] => {
@@ -146,9 +153,18 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
         throw new Error(`workspace.observe(): timeout must be a non-negative number (got ${timeout})`);
       }
       const needed = expect ?? 1;
+      const exact = isExactPath(pattern);
       // One exact path, one artifact wanted → the caller gets its content as a string.
-      const single = isExactPath(pattern) && needed === 1;
-      if (single) guardPath(root, pattern); // a path that will never be read is refused now, rather than waited for
+      const single = exact && needed === 1;
+      // A path that will never be read is refused now, rather than waited for: one that leads out of the
+      // workspace, or cannot be followed as things stand, whatever is asked of it. (What comes to be in its way
+      // later, while it waits — a link, a file where a directory is to be — is waited out like anything that is
+      // not there yet.)
+      if (exact) guardPath(root, pattern);
+      // And one path, wanted as one text, is none while a directory is there: that is said as soon as it is seen.
+      const isDirectory = () => {
+        try { return statSync(guardPath(root, pattern)).isDirectory(); } catch { return false; }
+      };
 
       const collectMatches = (): Array<{ path: string; content: string }> => {
         const matches: Array<{ path: string; content: string }> = [];
@@ -163,6 +179,9 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
       const startTime = performance.now();
       while (true) {
         if (signal?.aborted) throw new Error("workspace.observe() aborted");
+        if (single && isDirectory()) {
+          throw Object.assign(new Error(`EISDIR: illegal operation on a directory, read '${pattern}'`), { code: "EISDIR" });
+        }
 
         const matches = collectMatches();
         if (matches.length >= needed) return single ? matches[0].content : matches;

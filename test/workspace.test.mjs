@@ -563,3 +563,105 @@ test("a workspace named by a link, whose directory somebody removed, is made ane
   await ws.write("second.txt", "2");
   assert.equal(readFileSync(join(parent, "shared", "data", "second.txt"), "utf-8"), "2");
 });
+
+test("workspace.observe fails promptly when an exact target becomes a directory and guards traversal even with expect > 1", async (t) => {
+  const wsDir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(wsDir));
+  const ws = createWorkspace(wsDir);
+
+  await assert.rejects(
+    () => ws.observe("../outside.txt", { expect: 2, timeout: 5_000 }),
+    /Path escapes/,
+  );
+
+  const started = performance.now();
+  const pending = ws.observe("out/result.txt", { timeout: 10_000 });
+  setTimeout(() => mkdirSync(join(wsDir, "out", "result.txt"), { recursive: true }), 80);
+
+  await assert.rejects(pending, /EISDIR/);
+  assert.ok(performance.now() - started < 3_000, "observe should fail as soon as the directory appears instead of timing out");
+});
+
+// --- What a pattern means, and what is listed ---
+
+test("a pattern's ** is any run of characters, and with its slash any number of whole directories", async (t) => {
+  const wsDir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(wsDir));
+  const ws = createWorkspace(wsDir);
+  for (const path of ["top.md", "docs/a.md", "docs/sub/b.md", "ab.txt", "a/x/b.txt", "a/xb.txt", "notes (1).txt", "notes+1.txt", "x.y"]) await ws.write(path, path);
+
+  for (const [pattern, expected] of [
+    ["**/*.md", ["docs/a.md", "docs/sub/b.md", "top.md"]],
+    ["**.md", ["docs/a.md", "docs/sub/b.md", "top.md"]],
+    ["docs/**.md", ["docs/a.md", "docs/sub/b.md"]],
+    ["docs/**", ["docs/a.md", "docs/sub/b.md"]],
+    ["docs/*", ["docs/a.md"]],
+    ["a**", ["a/x/b.txt", "a/xb.txt", "ab.txt"]],
+    ["a**/b.txt", ["a/x/b.txt", "ab.txt"]],
+    // (Whole directories: what stands between two slashes, not the end of a name.)
+    ["a/**/b.txt", ["a/x/b.txt"]],
+    ["a/**b.txt", ["a/x/b.txt", "a/xb.txt"]],
+    ["?b.txt", ["ab.txt"]],
+    // Every other character is itself — those a pattern of another kind would take for an operator among them.
+    ["notes (1).txt", ["notes (1).txt"]],
+    ["notes+1.txt", ["notes+1.txt"]],
+    ["x.y", ["x.y"]],
+    ["x?y", ["x.y"]],
+    ["[ab].txt", []],
+    ["{top,x}.md", []],
+  ]) assert.deepEqual(await ws.list(pattern), expected, pattern);
+
+  // And no text in a pattern is taken for an operator: what a pattern is made of is only what was written.
+  for (const odd of ["\x00GLOBSTAR\x00", "\x00GLOBSTARSLASH\x00top.md"]) assert.deepEqual(await ws.list(odd), [], JSON.stringify(odd));
+});
+
+test("a link to a file is listed wherever it can be read — in a directory that is itself come to by a link, too", async (t) => {
+  const wsDir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(wsDir));
+  const ws = createWorkspace(wsDir);
+  await ws.write("real/f.txt", "the file");
+  symlinkSync("f.txt", join(wsDir, "real", "alias"));
+  symlinkSync("real", join(wsDir, "by-link"));
+  // (A link to a directory is not followed a second time: that is what would never end.)
+  symlinkSync("..", join(wsDir, "real", "up"));
+
+  const listed = await ws.list("**");
+  assert.deepEqual(listed, ["by-link/alias", "by-link/f.txt", "real/alias", "real/f.txt", "real/up/real/alias", "real/up/real/f.txt"]);
+  for (const path of listed) assert.equal(await ws.read(path), "the file", path);
+});
+
+test("a file that is written anew does not keep what let the old one run as somebody else", { skip: process.getuid?.() === 0 }, async (t) => {
+  const { chmodSync, statSync } = await import("fs");
+  const wsDir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(wsDir));
+  const ws = createWorkspace(wsDir);
+  await ws.write("tool.sh", "#!/bin/sh\n");
+  chmodSync(join(wsDir, "tool.sh"), 0o6755);
+  if ((statSync(join(wsDir, "tool.sh")).mode & 0o6000) === 0) return t.skip("this file system keeps no such bits");
+
+  await ws.write("tool.sh", "#!/bin/sh\necho rewritten\n");
+  // As when the system itself writes into such a file: what it allows stays, the rest goes.
+  assert.equal((statSync(join(wsDir, "tool.sh")).mode & 0o7777).toString(8), "755");
+});
+
+test("a workspace named by a link to nothing is made where the link leads", async (t) => {
+  const parent = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(parent));
+  symlinkSync(join("made", "later"), join(parent, "by-link"));
+
+  const ws = createWorkspace(join(parent, "by-link"));
+  await ws.write("a.txt", "written");
+  assert.equal(readFileSync(join(parent, "made", "later", "a.txt"), "utf-8"), "written");
+  assert.deepEqual(await ws.list("*"), ["a.txt"]);
+});
+
+test("workspace.observe waits out what comes to be in the way of a path that could be read when it began", async (t) => {
+  const wsDir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(wsDir));
+  const ws = createWorkspace(wsDir);
+  const pending = ws.observe("out/result.txt", { timeout: 10_000 });
+  // While it waits: a file where the directory is to be — then the directory, and the file in it.
+  setTimeout(() => writeFileSync(join(wsDir, "out"), "in the way"), 50);
+  setTimeout(() => { rmSync(join(wsDir, "out")); mkdirSync(join(wsDir, "out")); writeFileSync(join(wsDir, "out", "result.txt"), "there now"); }, 700);
+  assert.equal(await pending, "there now");
+});

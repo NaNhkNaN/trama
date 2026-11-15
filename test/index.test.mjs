@@ -988,3 +988,66 @@ test("updateProject says a project nothing can be created in cannot be updated, 
   assert.equal(asked, 0);
   assert.equal(existsSync(join(projectDir, "history")), false);
 });
+
+// --- A model that answers with nothing, and a project that is another by now ---
+
+test("createProject makes no project of an answer that holds no program", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const originalAsk = llm.ask, originalRepair = llm.repair;
+  let fixesAsked = 0;
+  llm.repair = async () => { fixesAsked += 1; return DEFAULT_PROGRAM; };
+  t.after(() => { llm.ask = originalAsk; llm.repair = originalRepair; cleanupTempDir(fakeHome); });
+
+  for (const [i, nothing] of ["", "  \n", "```ts\n```"].entries()) {
+    llm.ask = async () => nothing;
+    await withEnv({ HOME: fakeHome }, () => captureConsole("log", () =>
+      assert.rejects(() => createProject(`empty-${i}`, "make something"), /answered with no program/)));
+    assert.equal(existsSync(join(fakeHome, ".trama", "projects", `empty-${i}`)), false, JSON.stringify(nothing));
+  }
+  // Nothing was tried, so nothing was there to mend.
+  assert.equal(fixesAsked, 0);
+});
+
+test("updateProject leaves the program as it is where the answer holds none", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const projectDir = join(fakeHome, ".trama", "projects", "kept");
+  createProjectFixture(projectDir);
+  const originalAsk = llm.ask;
+  llm.ask = async () => "\n";
+  t.after(() => { llm.ask = originalAsk; cleanupTempDir(fakeHome); });
+
+  await withEnv({ HOME: fakeHome }, () => captureConsole("log", () =>
+    assert.rejects(() => updateProject("kept", "change it"), /Update failed — the program is unchanged\.\n.*answered with no program/s)));
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), DEFAULT_PROGRAM);
+});
+
+test("createProject takes away only the directory it made: another that is at the name by then stays", async (t) => {
+  const { renameSync } = await import("fs");
+  const fakeHome = makeTempDir("trama-home-");
+  const projectDir = join(fakeHome, ".trama", "projects", "swapped");
+  const originalAsk = llm.ask;
+  // While the program is asked for, somebody moves the new project away and puts a directory of their own at its name.
+  llm.ask = async () => {
+    renameSync(projectDir, join(fakeHome, "moved-away"));
+    mkdirSync(projectDir);
+    writeText(join(projectDir, "theirs.txt"), "somebody's own");
+    throw new Error("LLM unavailable");
+  };
+  t.after(() => { llm.ask = originalAsk; cleanupTempDir(fakeHome); });
+
+  await withEnv({ HOME: fakeHome }, () => captureConsole("log", () =>
+    assert.rejects(() => createProject("swapped", "make something"), /LLM unavailable/)));
+  assert.equal(readFileSync(join(projectDir, "theirs.txt"), "utf-8"), "somebody's own");
+
+  // And where the answer does come, it is not written into that directory either.
+  llm.ask = async () => {
+    renameSync(join(fakeHome, ".trama", "projects", "swapped-2"), join(fakeHome, "moved-away-2"));
+    mkdirSync(join(fakeHome, ".trama", "projects", "swapped-2"));
+    return DEFAULT_PROGRAM;
+  };
+  const second = join(fakeHome, ".trama", "projects", "swapped-2");
+  await withEnv({ HOME: fakeHome }, () => captureConsole("log", () =>
+    assert.rejects(() => createProject("swapped-2", "make something"), /is not the project this was started on/)));
+  assert.equal(existsSync(second), true);
+  assert.equal(existsSync(join(second, "program.ts")), false);
+});

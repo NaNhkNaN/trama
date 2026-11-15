@@ -2,7 +2,7 @@ import { writeFileSync, appendFileSync } from "fs";
 import { join } from "path";
 import type { Ctx } from "./types.js";
 import type { ProgramResult } from "./runner-types.js";
-import { assertSerializable } from "./serializable.js";
+import { assertSerializable, isJsonObject } from "./serializable.js";
 import { guardPath } from "./path-guard.js";
 import { readProjectMeta } from "./meta.js";
 
@@ -17,7 +17,8 @@ export function appendLogEntry(logsPath: string, message: string, data?: unknown
 
 /**
  * The runner's side of a program's `ctx`: what the program is told when it
- * starts, and the one place its state file and run log are written. The
+ * starts, and where its state file and run log are written while it runs
+ * (once it is over, the runner settles both: see runProgramOnce). The
  * program's own `ctx` (client.ts) forwards to this over IPC.
  *
  * The state is the program's. It is handed over with each call that persists
@@ -77,7 +78,8 @@ export function createContext(
     : meta.input) as Ctx["input"];
 
   // A yield marker left by the previous run means this run is its resumption.
-  const yieldMarker = initialState.__trama_yield as { reason: string } | undefined;
+  const rawYield = initialState.__trama_yield;
+  const yieldMarker = isJsonObject(rawYield) && typeof rawYield.reason === "string" ? { reason: rawYield.reason } : null;
   const savedIteration = initialState.__trama_iteration;
 
   let iteration = typeof savedIteration === "number" && Number.isInteger(savedIteration) && savedIteration >= 0

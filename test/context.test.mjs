@@ -311,3 +311,17 @@ test("createContext: once a run has ended its state is settled — nothing more 
     assert.equal(readText(join(projectDir, "logs", "latest.jsonl")).trim().split("\n").length, 1);
   }
 });
+
+test("createContext takes a run for a resumption only where the state holds a yield's reason", (t) => {
+  const projectDir = makeTempDir("trama-context-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+
+  const resumed = createContext(projectDir, { __trama_yield: { reason: "waiting" } }, { print() {} });
+  assert.deepEqual([resumed.resumed, resumed.yieldReason], [true, "waiting"]);
+  // What only bears the name — written by hand, or by something else — is no yield.
+  for (const marker of ["waiting", 1, true, [], {}, { reason: 7 }, null]) {
+    const ctx = createContext(projectDir, { __trama_yield: marker }, { print() {} });
+    assert.deepEqual([ctx.resumed, ctx.yieldReason], [false, null], JSON.stringify(marker));
+  }
+});

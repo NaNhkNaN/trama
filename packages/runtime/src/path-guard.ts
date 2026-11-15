@@ -20,6 +20,7 @@ import { dirname, isAbsolute, join, parse, resolve, sep } from "path";
  * to the strictest of the systems this runs on (macOS stops at 32, Linux at 40).
  */
 const MAX_LINKS = 32;
+const tooManyLinks = (path: string) => new Error(`Too many levels of symbolic links: ${path}`);
 
 /**
  * A step that is not a name: what the walk has come to must be a directory.
@@ -35,15 +36,28 @@ function stepsOf(path: string): string[] {
   return steps;
 }
 
+const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+/**
+ * A byte buffer as UTF-8 text — undefined if its bytes are not valid UTF-8.
+ * Leading BOM bytes are preserved as text rather than stripped.
+ */
+export function utf8Text(raw: Buffer): string | undefined {
+  try {
+    return UTF8.decode(raw);
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * What a link says, as text — undefined if it says nothing a path can be made
  * of: a name that is not valid UTF-8, or nothing at all (macOS lets a link to
  * nothing be made, and then refuses every use of it).
  */
 export function linkText(link: string): string | undefined {
-  const raw = readlinkSync(link, "buffer");
-  const text = raw.toString("utf-8");
-  return text !== "" && Buffer.from(text, "utf-8").equals(raw) ? text : undefined;
+  const text = utf8Text(readlinkSync(link, "buffer"));
+  return text !== "" ? text : undefined;
 }
 
 /** How far a walk has got: where it is, how many links it has followed, and whether anything is there. */
@@ -57,6 +71,12 @@ interface Place {
 
 /** The top of the file system an absolute path starts from: where every walk begins. */
 const topOf = (path: string): Place => ({ at: parse(path).root, links: 0, missing: false });
+
+/** What a walk lets its caller see and say on the way: see `follow`. */
+interface Watch {
+  passing?(at: string, ahead: readonly string[]): string | undefined;
+  link?(link: string, last: boolean): Place | undefined;
+}
 
 /**
  * Where a path leads once every symlink on the way is followed. The path is
@@ -79,11 +99,6 @@ const topOf = (path: string): Place => ({ at: parse(path).root, links: 0, missin
  * walk that goes round. Whoever has links taken so, and needs to know whether
  * the system would follow the words, asks the system.)
  */
-interface Watch {
-  passing?(at: string, ahead: readonly string[]): string | undefined;
-  link?(link: string, last: boolean): Place | undefined;
-}
-
 function follow(path: string, from: Place, watch: Watch = {}): Place {
   const fromTop = isAbsolute(path);
   let { at, links, missing } = fromTop ? topOf(path) : from;
@@ -131,7 +146,7 @@ function follow(path: string, from: Place, watch: Watch = {}): Place {
     }
     const instead = watch.link?.(next, steps.length === 0);
     if (instead) {
-      if (++links > MAX_LINKS) throw new Error(`Too many levels of symbolic links: ${path}`);
+      if (++links > MAX_LINKS) throw tooManyLinks(path);
       ({ at, missing } = instead);
       // As where a file is come to by a step: nothing lies beyond one.
       if (steps.length > 0 && !missing && !lstatSync(at).isDirectory()) {
@@ -139,7 +154,7 @@ function follow(path: string, from: Place, watch: Watch = {}): Place {
       }
       continue;
     }
-    if (++links > MAX_LINKS) throw new Error(`Too many levels of symbolic links: ${path}`);
+    if (++links > MAX_LINKS) throw tooManyLinks(path);
     const target = linkText(next);
     if (target === undefined) {
       throw new Error(`Path cannot be followed: ${next} (it links to nothing, or to what is not readable as text)`);
@@ -164,7 +179,7 @@ export function realRootOf(rootDir: string): string {
 const within = (path: string, root: string) =>
   path === root || path.startsWith(root.endsWith(sep) ? root : root + sep);
 
-const identityIn = (stat: BigIntStats) => `${stat.dev}:${stat.ino}`;
+export const identityIn = (stat: BigIntStats) => `${stat.dev}:${stat.ino}`;
 
 /**
  * What tells one file or directory from every other — undefined if nothing is
@@ -262,11 +277,15 @@ export function linksOf(root: string): {
 } {
   /** What each link of the root that a way has passed through names — null while that is being worked out. */
   const named = new Map<string, Place | null>();
+  let depth = 0;
   const nameOf = (link: string): Place => {
     const known = named.get(link);
     if (known) return known;
-    if (known === null) throw new Error(`Too many levels of symbolic links: ${link}`);
+    // (A link that is being worked out leads back to itself. And one link's words may lead through another's, and
+    // those through a third: the system follows so many in one way and no more, and neither is this to go deeper.)
+    if (known === null || depth >= MAX_LINKS) throw tooManyLinks(link);
     named.set(link, null);
+    depth += 1;
     try {
       const text = linkText(link);
       if (text === undefined) throw new Error(`Path cannot be followed: ${link} (it links to nothing, or to what is not readable as text)`);
@@ -276,6 +295,8 @@ export function linksOf(root: string): {
     } catch (err) {
       named.delete(link);
       throw err;
+    } finally {
+      depth -= 1;
     }
   };
   const isLink = (place: Place) => !place.missing && lstatSync(place.at, { throwIfNoEntry: false })?.isSymbolicLink() === true;
@@ -301,8 +322,8 @@ export function linksOf(root: string): {
         if (!within(link, root)) return undefined;
         if (last) return { at: link, links: 0, missing: false };
         let place = nameOf(link);
-        for (let hops = 0; within(place.at, root) && isLink(place); hops++) {
-          if (hops === MAX_LINKS) throw new Error(`Too many levels of symbolic links: ${link}`);
+        for (let hops = 1; within(place.at, root) && isLink(place); hops++) {
+          if (hops === MAX_LINKS) throw tooManyLinks(link);
           place = nameOf(place.at);
         }
         inside = within(place.at, root); // arrived by a link of the root, not by a step of this way
@@ -354,6 +375,38 @@ export function wayTo(rootDir: string, path: string): string[] {
     // The way cannot be followed to its end. How far it came is all that is known of it.
   }
   return [...places];
+}
+
+/**
+ * Where a project is — which is a directory that is there. Nothing in the
+ * runtime makes one for a project that is gone: what it makes for a project,
+ * it makes in it. (Making the directories on the way to a file would make a
+ * project of that file, at the path of one that somebody has moved away.)
+ */
+export function projectAt(projectDir: string): string {
+  const project = realRootOf(projectDir);
+  if (!statSync(project, { throwIfNoEntry: false })?.isDirectory()) throw new Error(`There is no project at ${project}.`);
+  return project;
+}
+
+/**
+ * A question to ask later: whether what is at a project's path is still the
+ * directory that is there now. A project is known by what it is, and what is
+ * done over some time — generate a program, ask for a fix, try it, install it,
+ * write it down — is done to the project it was started on: not to another
+ * directory that somebody has put at the path meanwhile. (Gone is not another:
+ * what is to be done where no project is, each step says for itself.)
+ */
+export function sameProjectAs(projectDir: string): () => void {
+  const start = lstatSync(realRootOf(projectDir), { bigint: true, throwIfNoEntry: false });
+  const wasId = start?.isDirectory() ? identityIn(start) : undefined;
+  return () => {
+    const root = realRootOf(projectDir);
+    const now = lstatSync(root, { bigint: true, throwIfNoEntry: false });
+    if (wasId !== undefined && now && !(now.isDirectory() && identityIn(now) === wasId)) {
+      throw new Error(`What is at ${root} is not the project this was started on: nothing more is done there.`);
+    }
+  };
 }
 
 /**
