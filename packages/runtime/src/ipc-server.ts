@@ -12,6 +12,7 @@ import type { ProgramResult, RunRequest } from "./runner-types.js";
 import type { Journal, RecordedCall } from "./journal.js";
 import { describeJson, isJsonObject } from "./serializable.js";
 import { checkedEnv, variableName } from "./child-process.js";
+import { checkedBudget, type Budget } from "./budget.js";
 import { messageOf } from "./errors.js";
 
 const MAX_IPC_BODY = 50 * 1024 * 1024; // 50 MB
@@ -24,9 +25,12 @@ class BadRequest extends Error {}
 interface FieldKinds {
   string: string;
   number: number;
+  boolean: boolean;
   object: Record<string, unknown>;
   /** A list of strings. */
   strings: string[];
+  /** All or none of something, or some of it by name. */
+  "boolean or strings": boolean | string[];
   /** Anything JSON can say. */
   any: unknown;
 }
@@ -49,10 +53,13 @@ interface Route {
   handle(body: unknown, connectionClosed: Promise<void>, call: RecordedCall): unknown;
 }
 
+const isStrings = (value: unknown): boolean => Array.isArray(value) && value.every(item => typeof item === "string");
+
 const isOfKind = (value: unknown, kind: Kind): boolean =>
   kind === "any" ? value !== undefined
     : kind === "object" ? isJsonObject(value)
-    : kind === "strings" ? Array.isArray(value) && value.every(item => typeof item === "string")
+    : kind === "strings" ? isStrings(value)
+    : kind === "boolean or strings" ? typeof value === "boolean" || isStrings(value)
     : typeof value === kind;
 
 /** Read a call's declared fields out of a request body — refusing a body that does not hold them as declared, or holds any other. */
@@ -101,6 +108,16 @@ function envOf(env: Record<string, unknown> | undefined): Record<string, string>
   }
 }
 
+/** The budget a call gives a run, held to what a budget is (see checkedBudget). */
+function budgetOf(budget: Record<string, unknown> | undefined): Budget | undefined {
+  if (budget === undefined) return undefined;
+  try {
+    return checkedBudget(budget);
+  } catch (err) {
+    throw new BadRequest(`Invalid field: ${messageOf(err)}`);
+  }
+}
+
 /**
  * A request as it is written down: all of it, but for what it gives as
  * variables — a journal is no place for a key. Of variables the names are
@@ -109,6 +126,16 @@ function envOf(env: Record<string, unknown> | undefined): Record<string, string>
 const asRecorded = (body: unknown): unknown =>
   !isJsonObject(body) || body.env == null ? body
     : { ...body, env: isJsonObject(body.env) ? Object.keys(body.env).map(variableName) : `(${describeJson(body.env)})` };
+
+/**
+ * What an agent call may say about how it is served (see AgentOptions). (A
+ * prompt of `instruct` may be read as a template besides: a typed answer's is
+ * not, for what says how to answer follows it.)
+ */
+const HOW_SERVED = {
+  system: "optional string", model: "optional string", thinking: "optional string", tools: "optional strings",
+  skills: "optional boolean or strings", extensions: "optional boolean", cutOff: "optional string",
+} as const satisfies Fields;
 
 export interface IpcBackends {
   /**
@@ -163,14 +190,11 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run }: IpcBack
 
   return {
     "/agent/instruct": route(
-      { prompt: "string", system: "optional string", model: "optional string", thinking: "optional string", tools: "optional strings", cutOff: "optional string" },
+      { prompt: "string", ...HOW_SERVED, templates: "optional boolean or strings" },
       ({ prompt, ...options }, _closed, call) => agent.instruct(prompt, options as Parameters<RunnerAgent["instruct"]>[1], call.used),
     ),
     "/agent/generate": route(
-      {
-        prompt: "string", schema: "object", system: "optional string", model: "optional string", thinking: "optional string",
-        tools: "optional strings", cutOff: "optional string",
-      },
+      { prompt: "string", schema: "object", ...HOW_SERVED },
       (input, _closed, call) => agent.generate(input as Parameters<RunnerAgent["generate"]>[0], call.used),
     ),
 
@@ -200,9 +224,10 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run }: IpcBack
         projectDir: "string", args: "optional object",
         timeout: "optional number", maxRepairAttempts: "optional number",
         id: "optional string", label: "optional string", workspaceDir: "optional string", env: "optional object",
+        budget: "optional object",
       },
-      async ({ id, env, ...asked }, connectionClosed, { seq }) => {
-        const request: RunRequest = { ...asked, env: envOf(env) };
+      async ({ id, env, budget, ...asked }, connectionClosed, { seq }) => {
+        const request: RunRequest = { ...asked, env: envOf(env), budget: budgetOf(budget) };
         if (id !== undefined) {
           if (id === "") throw new BadRequest("Invalid field: id (expected a non-empty string)");
           if (runsAskedFor.has(id)) throw new BadRequest(`Duplicate run id: ${id}`);

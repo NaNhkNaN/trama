@@ -1,5 +1,6 @@
-import type { AgentSession } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ExtensionFactory, ResourceLoader, SettingsManager as Settings } from "@earendil-works/pi-coding-agent";
 import { onAbort, rejectOnAbort, throwIfAborted } from "./abort.js";
+import { messageOf } from "./errors.js";
 import { CutOff, type AgentBackend, type AgentCall, type AgentUsage } from "./agent-backend.js";
 import type { ModelConfig } from "./runner-types.js";
 
@@ -17,9 +18,53 @@ export const piVersion = async (): Promise<string> => (await loadPi()).VERSION;
 const warnedUnknownModels = new Set<string>();
 
 /** What a call may ask of its session, beyond where it works and what it is told. */
-type Asked = Pick<AgentCall, "model" | "thinking" | "tools">;
+type Asked = Pick<AgentCall, "model" | "thinking" | "tools" | "skills" | "templates" | "extensions" | "asText">;
 
 const nameOf = (model: { provider: string; id: string }): string => `${model.provider}/${model.id}`;
+
+/**
+ * Of what a call may have all of, some by name, or none: whether it chose
+ * from them, and which by name. (A list with no name in it chooses none, as
+ * any list chooses only what it names.)
+ */
+type Choice = boolean | string[] | undefined;
+const chosen = (choice: Choice): boolean => choice === true || Array.isArray(choice);
+const named = (choice: Choice): string[] | undefined => (Array.isArray(choice) ? choice : undefined);
+
+/** What pi found of each kind a call may choose from, by name: all of it, whatever the call chose. */
+interface Found { skills: string[]; templates: string[] }
+
+/** What pi writes of a set of skills, to tell a model of them: differently for each way the model has of reading one. */
+type SkillsAsTold = Awaited<ReturnType<typeof loadPi>>["formatSkillsForPrompt"];
+const WAYS_TO_READ = ["read", "bash", "indirect"] as const;
+
+/** How long an extension is given to hear that its session is over — and, where a call is cancelled while it is still being told that one begins, to have heard that first. */
+const EXTENSION_LEAVE_MS = 5_000;
+
+/**
+ * `work` — but once `signal` has said to stop, waited for no longer than a
+ * while: a call that was cancelled is not held for good by what does not
+ * return (an extension's handler, where the call has extensions).
+ */
+function notHeld<T>(work: Promise<T>, signal: AbortSignal | undefined, ms: number): Promise<T> {
+  if (!signal) return work;
+  return new Promise<T>((resolve, reject) => {
+    let late: NodeJS.Timeout | undefined;
+    const off = onAbort(signal, () => { late = setTimeout(() => reject(new Error("Aborted")), ms); });
+    const over = () => {
+      off();
+      clearTimeout(late);
+    };
+    work.then(value => { over(); resolve(value); }, err => { over(); reject(err); });
+  });
+}
+
+/** Wait for `work`, but no longer than a while. (What becomes of it is not asked.) */
+async function within(work: Promise<unknown>, ms: number): Promise<void> {
+  let giveUp: NodeJS.Timeout | undefined;
+  await Promise.race([work.catch(() => {}), new Promise(resolve => { giveUp = setTimeout(resolve, ms); })]);
+  clearTimeout(giveUp);
+}
 
 /**
  * Why a session is not the one a call asked for. pi takes a level it does not
@@ -27,7 +72,12 @@ const nameOf = (model: { provider: string; id: string }): string => `${model.pro
  * a word; a call is to have what it asked for or fail. (`serving` is the model
  * by name, if pi has a real one.)
  */
-function whyNotAsAsked(session: AgentSession, { thinking, tools }: Asked, serving: string | null): string | undefined {
+function whyNotAsAsked(session: AgentSession, asked: Asked, serving: string | null, found: Found, asTold: SkillsAsTold): string | undefined {
+  const { thinking, tools } = asked;
+  // (An extension pi has something against — it did not load, or a tool of it bears the name of another's — is
+  // not one the call has as it was written: and it may be where a tool the call names was to come from.)
+  const failed = asked.extensions ? session.resourceLoader.getExtensions().errors[0] : undefined;
+  if (failed) return `The extension ${failed.path} is not as pi would have it: ${failed.error}`;
   if (thinking !== undefined && session.thinkingLevel !== thinking) {
     return `The model${serving ? ` ${serving}` : ""} does not think at level "${thinking}". ` +
       `Its levels: ${session.getAvailableThinkingLevels().join(", ")}.`;
@@ -39,7 +89,48 @@ function whyNotAsAsked(session: AgentSession, { thinking, tools }: Asked, servin
       return `The agent cannot be given the tools ${JSON.stringify(tools)}: pi would give it ${JSON.stringify(given)}.`;
     }
   }
+  const lacking = (kind: string, choice: Choice, had: string[]): string | undefined => {
+    const missing = named(choice)?.find(name => !had.includes(name));
+    return missing === undefined ? undefined : `pi has no ${kind} "${missing}". Its ${kind}s: ${had.join(", ") || "none"}.`;
+  };
+  const missing = lacking("skill", asked.skills, found.skills) ?? lacking("prompt template", asked.templates, found.templates);
+  if (missing) return missing;
+  // pi tells a model of its skills only where the model has something to read them with: a skill
+  // that is for the model to take up (and not only to be called by name, in the prompt) has to be told of.
+  // Looked for is what pi would write of them, word for word — nothing, where none is for the model to take up.
+  if (chosen(asked.skills)) {
+    const skills = session.resourceLoader.getSkills().skills;
+    if (!WAYS_TO_READ.some(way => session.systemPrompt.includes(asTold(skills, way).trim()))) {
+      const untold = skills.filter(skill => !skill.disableModelInvocation).map(skill => skill.name);
+      return `The agent cannot take up its skills (${untold.join(", ")}) with the tools ${JSON.stringify(session.getActiveToolNames())}: ` +
+        `pi tells a model of its skills only where it has "read" or "bash" to read them with.`;
+    }
+  }
   return undefined;
+}
+
+/** What is kept of a session that has extensions, beside the session. */
+interface Extended {
+  /** What its extensions have put to the model and is not yet over. */
+  puts: Set<Promise<void>>;
+  /** Whether its call has come to its end. */
+  over: boolean;
+}
+
+/**
+ * Tell a session's extensions that it is over, and wait for them — a while:
+ * an extension may hold what is to be let go of (a server it started), and
+ * one that does not answer is not waited for. What one of them put to the
+ * model and is still on its way there is seen off too, before the session is
+ * gone: it is stopped as it begins to ask (see `ask`), where a session that
+ * is disposed of under it would let it through.
+ */
+async function leaveExtensions(session: AgentSession, puts: Set<Promise<void>>): Promise<void> {
+  const left = async () => {
+    await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    while (puts.size > 0) await Promise.allSettled([...puts]);
+  };
+  await within(left(), EXTENSION_LEAVE_MS);
 }
 
 /**
@@ -67,14 +158,18 @@ function usageOf(session: AgentSession): AgentUsage | undefined {
  * (the second with what there was of it: see CutOff). A reply cut off in the
  * middle of a tool call is never the last: pi has the model make the call again.
  */
-function answerOf(session: AgentSession): string {
+function answerOf(session: AgentSession, taken = false): string {
   const replies = session.sessionManager.getEntries()
     .flatMap(entry => (entry.type === "message" && entry.message.role === "assistant" ? [entry.message] : []));
   const reply = replies.at(-1);
   const text = reply?.content.map(block => (block.type === "text" ? block.text : "")).join("") ?? "";
   if (reply?.stopReason === "error") throw new Error(`The model did not answer: ${reply.errorMessage ?? "no reason given"}`);
   if (reply?.stopReason === "length") throw new CutOff(text);
-  if (!text) throw new Error("Empty response from LLM");
+  if (!text) {
+    throw new Error(taken
+      ? "The prompt was taken by an extension — a command of its own, or its reading of what is asked — and the model gave no answer."
+      : "Empty response from LLM");
+  }
   return text;
 }
 
@@ -90,17 +185,85 @@ export class PiAdapter implements AgentBackend {
     // Each step below is given up on the moment the call is cancelled.
     const raceAbort = <T>(step: Promise<T>) => rejectOnAbort(step, signal);
 
-    const { createAgentSession, SessionManager, DefaultResourceLoader, ModelRuntime, getAgentDir } = await raceAbort(loadPi());
+    const { createAgentSession, SessionManager, SettingsManager, DefaultResourceLoader, ModelRuntime, getAgentDir, formatSkillsForPrompt } = await raceAbort(loadPi());
     const agentDir = getAgentDir();
-    const resourceLoader = new DefaultResourceLoader({
+    // Skills and prompt templates are pi's for the user and for where the agent works — the
+    // project's own, in its .pi directory, among them: and a call has those it chose, and no others.
+    const found: Found = { skills: [], templates: [] };
+    const only = <T extends { name: string }>(choice: Choice, items: T[]): T[] => {
+      const names = named(choice);
+      return names ? items.filter(item => names.includes(item.name)) : items;
+    };
+    const resources = new DefaultResourceLoader({
       cwd,
       agentDir,
       noExtensions: true,
-      noSkills: true,
+      noSkills: !chosen(asked.skills),
+      noPromptTemplates: !chosen(asked.templates),
+      skillsOverride: (base) => {
+        found.skills = base.skills.map(skill => skill.name);
+        return { ...base, skills: only(asked.skills, base.skills) };
+      },
+      promptsOverride: (base) => {
+        found.templates = base.prompts.map(template => template.name);
+        return { ...base, prompts: only(asked.templates, base.prompts) };
+      },
       ...(systemPrompt && { appendSystemPrompt: [systemPrompt] }),
     });
+    await raceAbort(resources.reload());
 
-    await raceAbort(resourceLoader.reload());
+    // Extensions are the user's own, and never the project's: an extension is code, run here, in
+    // the runner — and what a project holds its program can write. So they are loaded apart, by a
+    // loader that takes nothing of the project's, and the session has the rest from the other.
+    // And so an extension that asks is told the project is not one to be trusted — pi has
+    // extensions ask that before they take anything of a project's for their own. The session's
+    // settings are otherwise what any call's are, the project's among them: a call does not come
+    // to other tools, or another shell, for having asked for extensions.
+    let resourceLoader: ResourceLoader = resources;
+    const wary = asked.extensions
+      ? Object.assign(Object.create(SettingsManager.create(cwd, agentDir)) as Settings, { isProjectTrusted: () => false })
+      : undefined;
+    const extended: Extended | undefined = asked.extensions ? { puts: new Set(), over: false } : undefined;
+    if (extended) {
+      // A session that is to ask no more — its call cancelled, or over — is stopped each time it begins to
+      // (see `ask`); and an extension may set it going again each time it stops, by more ways than one. All
+      // of that is done without the runner coming to anything else: not to the clock that is to give the
+      // call up, nor to any other run. So each beginning of such a session waits a turn of the runner's —
+      // by a handler of trama's own among the extensions, which is what pi waits for when a run begins.
+      const breathes: ExtensionFactory = (pi) => {
+        pi.on("agent_start", async () => {
+          if (extended.over || signal?.aborted) await new Promise(resolve => setImmediate(resolve));
+        });
+      };
+      const own = new DefaultResourceLoader({
+        cwd,
+        agentDir,
+        extensionFactories: [breathes],
+        settingsManager: SettingsManager.create(cwd, agentDir, { projectTrusted: false }),
+        // (Nothing but its extensions is asked of it, and so it need find nothing else.)
+        noSkills: true,
+        noPromptTemplates: true,
+        noThemes: true,
+        noContextFiles: true,
+      });
+      await raceAbort(own.reload());
+      resourceLoader = {
+        getExtensions: () => own.getExtensions(),
+        getSkills: () => resources.getSkills(),
+        getPrompts: () => resources.getPrompts(),
+        getThemes: () => resources.getThemes(),
+        getAgentsFiles: () => resources.getAgentsFiles(),
+        getSystemPrompt: () => resources.getSystemPrompt(),
+        getSystemPromptSource: () => resources.getSystemPromptSource(),
+        getAppendSystemPrompt: () => resources.getAppendSystemPrompt(),
+        getAppendSystemPromptSources: () => resources.getAppendSystemPromptSources(),
+        extendResources: (paths) => resources.extendResources(paths),
+        reload: async (options) => {
+          await resources.reload(options);
+          await own.reload();
+        },
+      };
+    }
 
     // Resolve the model through pi's model runtime (built-in catalog plus the
     // user's models.json). The project's own, if it is unknown there, resolves
@@ -124,27 +287,96 @@ export class PiAdapter implements AgentBackend {
       model,
       sessionManager: SessionManager.inMemory(cwd),
       resourceLoader,
+      ...(wary && { settingsManager: wary }),
       ...(asked.thinking !== undefined && { thinkingLevel: asked.thinking as AgentSession["thinkingLevel"] }),
       ...(asked.tools && { tools: asked.tools }),
     });
 
+    let session: AgentSession | undefined;
+    // The telling of extensions that a session begins, while it lasts.
+    let beginning: Promise<void> | undefined;
     try {
-      const { session } = await raceAbort(sessionPromise);
+      ({ session } = await raceAbort(sessionPromise));
+      // An extension is told that its session has begun, as pi tells it where pi runs by itself:
+      // that is when it sets itself up. What goes wrong in one later is said, and is not the call's failure.
+      // A command of one can wait for the model it asked, as it can there; the session is one call's, and
+      // is not to be left for another.
+      if (extended) {
+        const here = session;
+        const stays = async () => ({ cancelled: true });
+        // What an extension puts to the model — a command of it, asking — is the call's to wait for (see
+        // `ask`), and the command's own, where it waits: pi calls a session idle while a question is still
+        // on its way to being asked, so what was put is kept account of here, as it is put.
+        const { puts } = extended;
+        this.extended.set(session, extended);
+        const prompting = session.prompt.bind(session);
+        session.prompt = (text, options) => {
+          const put = prompting(text, options);
+          if (options?.source !== "extension") return put;
+          const over = () => { puts.delete(put); };
+          puts.add(put);
+          put.then(over, over);
+          return put;
+        };
+        // A command that waits is told, when it has waited, that its call was cancelled — where it was: one
+        // that asks until it is satisfied then stops asking, and need not be stopped each time it begins to.
+        const idle = async () => {
+          while (puts.size > 0) await Promise.allSettled([...puts]);
+          await here.waitForIdle();
+          throwIfAborted(signal);
+        };
+        beginning = session.bindExtensions({
+          mode: "print",
+          commandContextActions: {
+            waitForIdle: idle,
+            newSession: stays,
+            fork: stays,
+            switchSession: stays,
+            navigateTree: async (target, options) => ({ cancelled: (await here.navigateTree(target, options)).cancelled }),
+            reload: () => here.reload(),
+          },
+          // (A command that was not let wait, its call being cancelled, did not fail: nothing is said of it.)
+          onError: (failure) => {
+            if (signal?.aborted && failure.error === "Aborted") return;
+            console.warn(`[trama] an extension failed (${failure.extensionPath}): ${failure.error}`);
+          },
+        });
+        await raceAbort(beginning);
+      }
       // With no model it can use, pi reports a placeholder that is not in its
       // catalog — a model is named only when it is a real one.
       const picked = session.model;
       const serving = picked && modelRuntime.getModel(picked.provider, picked.id) ? nameOf(picked) : null;
-      const refusal = whyNotAsAsked(session, asked, serving);
-      if (refusal) {
-        session.dispose();
-        throw new Error(refusal);
-      }
+      const refusal = whyNotAsAsked(session, asked, serving, found, formatSkillsForPrompt);
+      if (refusal) throw new Error(refusal);
       if (!model) this.warnUnknownModel(serving);
       return session;
     } catch (err) {
-      // If abort won the race, the real promise may still resolve later — dispose it
-      sessionPromise.then(({ session }) => session.dispose()).catch(() => {});
+      // A session that is here is let go of, once, before the call fails — its extensions, if they were
+      // still being told that it begins, having heard that out first (or been given the while they are
+      // given to hear of its end). Where the call was cancelled before the session came, it may still
+      // come: it is disposed of when it does, and no extension was told of it.
+      if (session) {
+        if (beginning) await within(beginning, EXTENSION_LEAVE_MS);
+        await this.letGoOf(session, asked);
+      } else {
+        sessionPromise.then(({ session: late }) => late.dispose()).catch(() => {});
+      }
       throw err;
+    }
+  }
+
+  /** What is kept of each session that has extensions. */
+  private extended = new WeakMap<AgentSession, Extended>();
+
+  /** Be done with a session: its extensions, where it has any, told first that it is over. */
+  private async letGoOf(session: AgentSession, asked: Asked): Promise<void> {
+    try {
+      if (asked.extensions) await leaveExtensions(session, this.extended.get(session)?.puts ?? new Set());
+    } catch (err) {
+      console.warn(`[trama] an extension could not be told its session is over: ${messageOf(err)}`);
+    } finally {
+      session.dispose();
     }
   }
 
@@ -175,28 +407,66 @@ export class PiAdapter implements AgentBackend {
    * the session's record what the request that was cut off had taken by then.
    */
   async ask(prompt: string, call: AgentCall): Promise<string> {
-    const { cwd, system, signal, used } = call;
+    const { cwd, system, signal, used, sofar } = call;
     throwIfAborted(signal);
 
     const session = await this.createSession(cwd, system, signal, call);
     let offAbort = () => {};
+    // Whether the call has come to its end: what it used is what it had used by then.
+    let over = false;
 
     try {
       throwIfAborted(signal);
       offAbort = onAbort(signal, () => { session.abort().catch(() => {}); });
+      // Each time the model is about to be asked again, what the call has used so far is said:
+      // whoever hears it may cancel the call there, and the model is then not asked.
+      // (pi asks its model for the next turn, and — between two turns — to sum up a conversation grown long.)
+      // And a call that was cancelled, or is over, asks no more, whatever sets its session going again
+      // after that: a command of an extension that asks the model once more is stopped as it begins to,
+      // and so is what an extension starts while it is being told that the call is over.
+      if (sofar || call.extensions) {
+        session.subscribe((event) => {
+          if (event.type !== "turn_start" && event.type !== "compaction_start") return;
+          if (over || signal?.aborted) return void session.abort().catch(() => {});
+          const usage = sofar && usageOf(session);
+          if (usage) sofar(usage);
+        });
+      }
 
-      // (The prompt is a program's text, whatever it begins with: it is not one of the user's own pi commands or templates.)
-      await session.prompt(prompt, { expandPromptTemplates: false });
+      // The prompt is a program's text, whatever it begins with — but where the call has the user's skills,
+      // templates or extensions, and does not say its prompt is text all the same: each of those has a line of
+      // its own to be called up by ("/skill:name", "/name", a command), and pi reads a prompt for all of them
+      // or for none.
+      let taken = false;
+      const answered = async () => {
+        await session.prompt(prompt, {
+          expandPromptTemplates: !call.asText && (chosen(call.skills) || chosen(call.templates) || call.extensions === true),
+          preflightResult: (how) => { taken = how === "handled"; },
+        });
+        // A command that asked the model has the model's answer be the call's: what it put to the model is
+        // waited for — also where the command itself did not wait, or pi had not yet set the run going.
+        const puts = this.extended.get(session)?.puts;
+        while (puts && puts.size > 0) await Promise.allSettled([...puts]);
+        if (taken) await session.waitForIdle();
+      };
+      await notHeld(answered(), signal, EXTENSION_LEAVE_MS);
       // An aborted prompt resolves with no usable answer — report it as an abort,
       // not as an empty LLM response.
       throwIfAborted(signal);
-      return answerOf(session);
+      return answerOf(session, taken);
     } finally {
       offAbort();
-      session.dispose();
-      // What the call used is said when it is over, however it ended.
-      const usage = used && usageOf(session);
-      if (usage) used(usage);
+      over = true;
+      const extended = this.extended.get(session);
+      if (extended) extended.over = true;
+      try {
+        // What the call used is said when it is over, however it ended — and before its extensions are
+        // waited for: a count is not to wait on them.
+        const usage = used && usageOf(session);
+        if (usage) used(usage);
+      } finally {
+        await this.letGoOf(session, call);
+      }
     }
   }
 }

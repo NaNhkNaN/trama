@@ -70,7 +70,8 @@ export type Thinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" |
 
 /**
  * What a call may say about how it is served. Each is honoured or the call
- * fails: nothing asked for here is quietly left out.
+ * fails: nothing asked for here is quietly left out. (But by an extension
+ * the call asked for itself: what one does to a session is its to do.)
  */
 export interface AgentOptions {
   /** Instructions for this call, on top of the agent's own. */
@@ -87,6 +88,39 @@ export interface AgentOptions {
    * agent has no tool for is an error.
    */
   tools?: string[];
+  /**
+   * The skills the agent has for this call: `true` for all that pi finds
+   * for the user and for the project (its `.pi/skills` among them; of two
+   * by one name, the project's) — or the ones named. Without it, none. A
+   * name pi has no skill by is an error, and so is a call whose agent could
+   * not read them: pi tells a model of its skills only where it has `read`
+   * or `bash`. A prompt of `instruct` that begins with "/skill:name " is
+   * then that skill's text, and after it what followed the space. (A prompt
+   * of `generate` is text, whatever it begins with.)
+   */
+  skills?: boolean | string[];
+  /**
+   * The prompt templates the call has: `true` for all that pi finds for the
+   * user and for the project (its `.pi/prompts`; of two by one name, the
+   * project's) — or the ones named. A prompt that begins with "/name" is
+   * then the template of that name, with what follows as its arguments:
+   * split as a shell splits words — quotes taken off, a line break or a run
+   * of spaces become one space. A name pi has no template by is an error.
+   * (For `instruct` only: what tells the model how a typed answer is to be
+   * written follows the prompt, and a template is free to leave that out.)
+   */
+  templates?: boolean | string[];
+  /**
+   * Whether the agent has the user's pi extensions — those of the user's pi
+   * directory and settings, not the ones pi has built in, and not the
+   * project's: an extension is code that runs in the runner. With them come
+   * the tools they add, the commands a prompt of `instruct` can then begin
+   * with ("/name"), and what they do to a session, the skills and templates
+   * they bring among it. One pi has something against is an error. Without
+   * any of `skills`, `templates` and `extensions`, a prompt is the text it
+   * is, whatever it begins with.
+   */
+  extensions?: boolean;
   /**
    * What to make of an answer that was cut off at the model's output limit.
    * "fail", as it is without this: the call fails — the answer is not whole.
@@ -126,7 +160,7 @@ export interface Agent {
    * that shape: the fields of the schema and no others, each as declared.
    * Asks once more on a parse/validation failure.
    */
-  generate<T>(input: AgentOptions & {
+  generate<T>(input: Omit<AgentOptions, "templates"> & {
     prompt: string;
     schema: Schema;
   }): Promise<T>;

@@ -873,7 +873,8 @@ await ctx.done({ first, second, third, fourth, fifth, sixth, seventh, eighth, ni
 
   const asked = [];
   const originalAsk = llm.ask;
-  llm.ask = async (prompt, { cwd, signal, used, ...call }) => {
+  llm.ask = async (prompt, { cwd, signal, used, sofar, ...call }) => {
+    assert.equal(typeof sofar, "function", "a backend is always given where to say what a call has used so far");
     asked.push({ prompt: prompt.startsWith("Your previous response failed validation") ? "second, again" : prompt.split("\n")[0], ...call });
     // (What a report holds beside what a report is declared to hold is not what a record is made of.)
     used({ model: "p/m", input: 10, output: 5, cacheRead: 2, cacheWrite: 1, cost: 0.25, kind: "end", seq: 99, at: -1, more: "x" });
@@ -894,8 +895,8 @@ await ctx.done({ first, second, third, fourth, fifth, sixth, seventh, eighth, ni
     sixth: "Error: trama runtime error: Invalid field: thinking (expected string or undefined)",
     seventh: "answer to seventh",
     // An option that is none — misspelt, or not this call's — is not passed over: the program would think it had been taken.
-    eighth: "Error: trama runtime error: Unknown field: tool (this call takes: prompt, system, model, thinking, tools, cutOff)",
-    ninth: "Error: trama runtime error: Unknown field: tool (this call takes: prompt, schema, system, model, thinking, tools, cutOff)",
+    eighth: "Error: trama runtime error: Unknown field: tool (this call takes: prompt, system, model, thinking, tools, skills, extensions, cutOff, templates)",
+    ninth: "Error: trama runtime error: Unknown field: tool (this call takes: prompt, schema, system, model, thinking, tools, skills, extensions, cutOff)",
   });
   assert.deepEqual(asked, [
     { prompt: "first", system: "s", model: "p/m", thinking: "high", tools: ["read"] },

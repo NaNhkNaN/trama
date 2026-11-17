@@ -174,7 +174,7 @@ export interface RunnerAgent {
 }
 
 /** Of what a call may ask for, what it did ask for: a backend is not handed a thing nobody named. */
-const asked = (options: Pick<AgentCall, "model" | "thinking" | "tools" | "used">) =>
+const asked = (options: Pick<AgentCall, "model" | "thinking" | "tools" | "skills" | "templates" | "extensions" | "asText" | "used">) =>
   Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined));
 
 /**
@@ -201,8 +201,8 @@ export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSi
 
   return {
     async instruct(prompt, options, used) {
-      const { system, model, thinking, tools, cutOff } = options ?? {};
-      return ask(prompt, { cwd, system, signal, ...asked({ model, thinking, tools, used }) }, cutOff);
+      const { system, model, thinking, tools, skills, templates, extensions, cutOff } = options ?? {};
+      return ask(prompt, { cwd, system, signal, ...asked({ model, thinking, tools, skills, templates, extensions, used }) }, cutOff);
     },
 
     async generate(input, used) {
@@ -215,8 +215,11 @@ export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSi
       }No markdown. No explanation. Just the JSON.`;
 
       const fullPrompt = `${input.prompt}\n\n${schemaInstruction}`;
-      const { system, model, thinking, tools, cutOff } = input;
-      const call = { cwd, system, signal, ...asked({ model, thinking, tools, used }) };
+      const { system, model, thinking, tools, skills, extensions, cutOff } = input;
+      // The prompt of a typed answer is text, whatever it begins with: what says how to answer follows it, and a
+      // skill called up by name, or a command, would take that for its own — and would not be there at a second asking.
+      const asText = skills !== undefined || extensions !== undefined ? true : undefined;
+      const call = { cwd, system, signal, ...asked({ model, thinking, tools, skills, extensions, asText, used }) };
 
       const parseAndValidate = (response: string): Record<string, unknown> => {
         const trimmed = response.trim();

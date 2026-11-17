@@ -577,7 +577,7 @@ Six commands. `create` turns intent into code, `run` executes it, `update` rewri
 
 ```bash
 trama create <name> <prompt> [--model <model>] [--arg key=value ...]
-trama run <name> [--timeout <ms>] [--arg key=value ...]
+trama run <name> [--timeout <ms>] [--budget cap=number ...] [--arg key=value ...]
 trama update <name> <prompt>
 trama list
 trama logs <name>
@@ -587,6 +587,7 @@ trama journal <name> [run] [--list]
 - `--model` — override the LLM model for program generation (create only).
 - Ctrl-C (or SIGTERM) stops a run politely: the program is sent SIGTERM and given five seconds to finish what it must, and `trama run` returns once it is gone. Press Ctrl-C again to leave at once.
 - `--timeout` — per-phase timeout in milliseconds. Applies to each run and repair attempt separately. Default: `300000` (5 minutes). It limits the program's own time: while a participant it spawned is running — under a timeout of its own — the clock is stopped.
+- `--budget` — cap what the run may use of a model: `cost=2.50` (US dollars), `tokens=500000` or `calls=40`. Repeatable. See [Budgets](#budgets).
 - `--arg` — pass key-value arguments to the program, accessible via `ctx.input.args`. Repeatable.
 - `trama journal` — what a run did, call by call: the latest run of the project, or the one named. `--list` shows which runs are on record. See [The journal](#the-journal).
 
@@ -631,8 +632,8 @@ await ctx.yield(reason)// cooperative suspension — persists state, exits proce
 ### agent — LLM calls
 
 ```typescript
-await agent.instruct(prompt, { system?, model?, thinking?, tools?, cutOff? })   // instruct the agent — may use tools autonomously
-await agent.generate<T>({ prompt, schema, system?, model?, thinking?, tools?, cutOff? }) // the same, answered as typed JSON
+await agent.instruct(prompt, { system?, model?, thinking?, tools?, skills?, templates?, extensions?, cutOff? })   // instruct the agent — may use tools autonomously
+await agent.generate<T>({ prompt, schema, system?, model?, thinking?, tools?, skills?, extensions?, cutOff? }) // the same, answered as typed JSON
 ```
 
 `agent.instruct()` is **not** a simple text completion. The underlying pi-coding-agent runs a full agent loop and may autonomously use its built-in tools (bash, file read/write/edit) to fulfill the instruction. What you get back is the final text response.
@@ -679,13 +680,31 @@ const plan = await agent.instruct(`Decide how to split the config:\n${survey}`, 
 - `model` — the model for this call, as `"provider/model"`, in place of the project's.
 - `thinking` — how much the model is to think: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"` or `"max"`.
 - `tools` — the agent's tools for this call: exactly the ones named, `[]` for none. Left to itself pi takes `read`, `bash`, `edit` and `write`; it also has `grep`, `find` and `ls`, among others. A `generate` that is to be made from its prompt alone — nothing read, run or written — is one with `tools: []`.
+- `skills`, `templates`, `extensions` — your pi's skills, prompt templates and extensions: see below. Without them the call has none of the three.
 - `cutOff` — what to make of an answer that was cut off at the model's output limit: `"fail"` (as it is without the option) or `"keep"`.
 
 Each is honoured or the call fails. A model pi does not know, a level pi does not have for the model, a tool the agent has not got: pi itself would serve such a call with something else and say nothing, so trama checks what the call was given before the model is asked. One thing it cannot see to: what a provider makes of a level is the provider's. For some models two levels pi offers come to the same request (`"minimal"` and `"low"` for several of Anthropic's, say), and a few take any level and send none.
 
+**Your pi's skills, templates and extensions.** An agent call is served by pi with none of your skills, prompt templates or extensions, unless the call asks for them (your pi's settings, models and `AGENTS.md` it has always had):
+
+```typescript
+// The skills pi finds for you and for the project (.pi/skills, .agents/skills). Or the ones named.
+await agent.instruct("Turn report.md into a PDF.", { skills: ["pdf"] });
+// A prompt template of yours, or of the project's (.pi/prompts): "/name" and what it is filled in with.
+await agent.instruct("/review src/config.ts", { templates: ["review"] });
+// Your extensions: the tools they add can then be named among a call's tools.
+await agent.instruct("Find the ticket this change belongs to.", { extensions: true, tools: ["read", "ticket_search"] });
+```
+
+- `skills` — `true` for all the skills pi finds, or a list of names. pi looks where it looks when you run it in the project: your pi directory and `~/.agents/skills`, what your settings and the project's `.pi/settings.json` name (packages among it), the project's `.pi/skills`, and `.agents/skills` in the project and the directories above it; where two have one name, the project's is taken. The model is told of them and reads the one it needs; a prompt of `instruct` that begins with `/skill:name ` (the name, then a space) is that skill's text and, after it, the rest of the prompt. pi tells a model of its skills only where it has `read` or `bash` to read them with, so a call with skills and neither is an error.
+- `templates` — `true` for all your prompt templates and the project's, or a list of names; of two by one name, the project's. A prompt that begins with `/name` is then the template of that name, with the rest as its arguments — split as a shell splits words: quotes are taken off, and a line break or a run of spaces becomes one space, so a diff or a file put after the name does not arrive in its shape (put it in the template's own text, or ask without a template). It is an option of `agent.instruct` only: what tells the model how a typed answer is to be written follows the prompt, and a template is free to leave out what follows its name.
+- `extensions` — `true` for your pi extensions, those of your pi directory and settings (not the ones the `pi` command has built in — its MCP support among them): the tools they register, the commands a prompt of `instruct` can then begin with, and what they do to a session — the skills and templates an extension brings come with it where the call names none of its own (a list of names is a list of all the call has, an extension's included). They are yours and not the project's — pi would load a project's `.pi/extensions` too, and trama does not: an extension is code that runs inside the runner, and what a project holds its program can write. For the same reason an extension that asks is told the project is not a trusted one — which is what pi has an extension ask before it takes anything of a project's for its own. (The call's own settings are what they are without extensions, the project's `.pi/settings.json` among them.) An extension pi has something against — it does not load, or a tool of it bears the name of another's — is the call's error. A command that puts a question to the model before it returns has the model's answer be the call's, whether or not it waits for it; a prompt a command takes and that gets no answer fails the call, which says so. A call that is cancelled — by a timeout, or by its budget — asks no more, whatever a command would go on to ask, and a command that waits for the model is not let wait again; where a handler of an extension does not return, the call is given up five seconds after it was cancelled (its session up to five seconds after that). Nor is anything asked once a call has come to its end, while its extensions are being told so. What an extension does once a session has begun is its own to do: one that changes the tools or the instructions of a session changes what the call asked for, and nothing checks it after.
+
+A name pi has no skill or template by is an error that lists the ones it has. `false`, or an empty list, is the same as leaving the option out. Without any of the three a prompt is the text it is, whatever it begins with — as is the prompt of `agent.generate` always (an extension that looks at what is put to a session still sees it, and may change it). `create`, `update` and a repair take none of the three.
+
 An option that is not one of these is an error too, as is any option a call to the runtime does not take, or a value that cannot be sent to it (a callback, say): `tool: [...]`, misspelt, would otherwise restrict nothing and say nothing. This is so of the calls a program makes to its runtime — `agent`, `tools`, `workspace`, `ctx`, and `runProgram`. A `Session`, and `runProgram` called outside a program, are ordinary TypeScript, and take no notice of what they do not know.
 
-The answer of a call is the model's last reply, and only if the model ended it itself: a reply that is the provider's error fails the call with the provider's words, and so does one that was cut off at the output limit — unless the call says `cutOff: "keep"`, and then it returns what there was of the reply, as if that were the answer (the call still fails where there was nothing of it: a reply cut off before its first word, or while the model was still thinking). That is for a call whose work is what the agent did with its tools, and whose closing words matter little: `await agent.instruct("add the endpoint and its tests", { cutOff: "keep" })` does not fail, and start over, because the summary at the end ran long. (A reply cut off in the middle of a tool call never ends a call: pi has the model make the call again. But the agent goes no further than a reply that was cut off in its words — where those were leading up to more work, the work was not done. And a typed answer that was cut off is seldom whole: `generate` holds what it kept to the schema like any reply, and asks again where it does not fit.) And the prompt is text: it reaches the model as written, also where it begins like one of your own pi commands (`/review …`).
+The answer of a call is the model's last reply, and only if the model ended it itself: a reply that is the provider's error fails the call with the provider's words, and so does one that was cut off at the output limit — unless the call says `cutOff: "keep"`, and then it returns what there was of the reply, as if that were the answer (the call still fails where there was nothing of it: a reply cut off before its first word, or while the model was still thinking). That is for a call whose work is what the agent did with its tools, and whose closing words matter little: `await agent.instruct("add the endpoint and its tests", { cutOff: "keep" })` does not fail, and start over, because the summary at the end ran long. (A reply cut off in the middle of a tool call never ends a call: pi has the model make the call again. But the agent goes no further than a reply that was cut off in its words — where those were leading up to more work, the work was not done. And a typed answer that was cut off is seldom whole: `generate` holds what it kept to the schema like any reply, and asks again where it does not fit.) And the prompt is text: it reaches the model as written, also where it begins like one of your own pi commands (`/review …`) — unless the call asks for your templates, skills or extensions (above).
 
 ### tools — I/O operations
 
@@ -800,14 +819,40 @@ An agent call's line ends with what it used, and the last line with what the run
 - **One file per run**, `logs/journal/<run>.jsonl` in the project, one JSON record per line. A repair is part of the run it repairs: the failed attempt, the fix, and the attempt that tried the fix are in the same journal — including an attempt whose fix did not work and left no other trace.
 - **A session is a tree of journals.** A participant's run has a journal of its own, in its own project. The journal of the program that spawned it says which run that call started, and the participant's journal says which call started it.
 - **Written as things happen.** A journal says what had happened by the time of its last line. The journal of a run that died has no `end`; a call that nobody was left to answer — the program was gone — has no `result`.
-- **What the agent used is counted.** Each time the agent behind a call was asked, a `usage` record says which model served it, the tokens it read and wrote (and read from and wrote to a cache), and what pi's price list makes of that in US dollars — over everything the agent asked of the model for that call: every turn, every retry, a summary pi made of a conversation grown long. It is written when the call is over, however it ended: a call that failed, or was stopped half-way, has used what it used, and a run that is recorded waits for the calls it cut off to say so before its journal ends (up to five seconds, for a backend that does not let go). The same is recorded for each fix that was asked for. Nothing is recorded where nothing was counted — the provider was never reached, or does not say. Not counted at all: the calls `create` and `update` make to write a program, which happen outside any run.
-- **It is a record, not a control.** Nothing reads a journal back to change what a run does.
+- **What the agent used is counted.** Each time the agent behind a call was asked, a `usage` record says which model served it, the tokens it read and wrote (and read from and wrote to a cache), and what pi's price list makes of that in US dollars — over everything the agent asked of the model for that call: every turn, every retry, a summary pi made of a conversation grown long. It is written when the call is over, however it ended: a call that failed, or was stopped half-way, has used what it used, and a run that is recorded waits for the calls it cut off to say so before its journal ends (up to five seconds, for a backend that does not let go). The same is recorded for each fix that was asked for. Nothing is recorded where nothing was counted — the provider was never reached, or does not say.
+- **What writing a program used is with its validation.** `create` and `update` ask a model for the program before there is any run: what that took is printed (`writing the program used 3410 tokens  $0.0212`) and is the first `usage` record of the validation's journal, counted in its total. Where no program came back — the model failed, or the writing was stopped — there is no validation, and the printed line is all there is.
+- **It is a record, not a control.** Nothing reads a journal back to change what a run does. (A budget is counted in the runner's memory as calls are made, not from the journal.)
 
 What goes in it is what the program did: prompts and answers, the contents of files read and written, shell commands and their output. Keep that in mind before sharing one. Two things are held back on purpose: the values of credential-looking headers of a web request (`Authorization`, `Cookie`, `X-Api-Key`, anything with "key", "token" or "auth" in its name) are replaced by `[redacted]`, and of the variables given to a command or a run (`env`) only the names are written. A secret a program puts anywhere else — in a URL, a prompt, a command — is recorded as written. Journals are readable by their owner only, and `logs/` is kept out of version control.
 
 It is bounded in size. A text longer than 256 KB is cut to its beginning, and a record holds about 1 MB. A record that lost something says so in its `cuts`: which value, and what was there — a text's full length and hash, how many items a list had. A record without `cuts` is whole. A journal that has grown past 64 MB goes on recording how the run goes — attempts, exits, the end — but no more of its calls, nor what they used: the total `trama journal` shows for such a run is what is on record, and says so.
 
 A project keeps the journals of its latest 20 runs — more for a while, if older ones are still being written. Change that with `"journalRuns"` in `~/.trama/config.json`; `0` records nothing. A journal that names another run's journal does not keep that one from being removed in its turn.
+
+### Budgets
+
+A run can be capped in what it uses of a model:
+
+```bash
+trama run optimizer --budget cost=2.50 --budget calls=40
+```
+
+```jsonc
+// ~/.trama/config.json — for every run that is given none of its own, and for each create and update
+{ "budget": { "cost": 5, "tokens": 2000000, "calls": 200 } }
+```
+
+```typescript
+// A participant, or any run a program asks for, can be given less than the run that asks has
+session.spawn("scout", { projectDir: "~/.trama/projects/scout", budget: { cost: 0.5 } });
+await runProgram({ projectDir, budget: { calls: 10 } });
+```
+
+- `cost` is US dollars as pi's price list counts them, `tokens` is everything the model read and wrote (cached or not), `calls` is how many calls to an agent are taken on — a `generate` that had to ask again is two, a request for a fix is one, and a call counts once it is taken on, whatever becomes of it. What is not named is not capped. A run given a budget of its own has that one, and not the config's beside it.
+- **A budget covers everything a run causes**: its program's agent calls, each request for a fix, and all that the runs it asks for use. Those runs are held to the budgets above them as well as to their own, so a program can give a run it starts less than it has, and never more. The config's budget is for a run nobody's program asked for; it is not applied a second time to each run inside it.
+- **Once it is spent**, an agent call is refused — the program gets an error that says what was used of what (`The budget is spent: $2.0134 used of $2.`) — and no repair is tried, since a fix is asked of a model too. A call that is under way when a cap on cost or tokens is reached is stopped where its agent would ask the model again: what it had asked for by then is used, and the request in flight is let finish. So a run ends over its cap by the requests that were in flight when it was reached — one, for a program that makes its calls one after another; as many as it has going at once, for one that makes them together. The first time a call is refused or stopped it is printed; and a journal says so in a `budget` record before its last, where its run ended with a budget spent — its own, whose caps are in its first record, or one above it — or had a call refused or stopped for one.
+- For `create` and `update` the config's budget covers writing the program and validating it together.
+- **It is a guard, not a wall.** It counts what goes through the runner's agent calls. A program is not confined (see [Trust and safety](#trust-and-safety)): one that calls a model's API itself, or runs another agent from a shell command, spends what trama never sees. One such way is trama's own: `createProject` and `updateProject` called by a program are carried out in the program's own process — unlike `runProgram`, which its runner carries out — and so each is under the config's budget by itself, not under the run's. And what pi cannot count — a provider that does not say what a request took — is counted as nothing; `calls` is the cap that holds there.
 
 ### Version history
 
@@ -852,6 +897,8 @@ Two kinds of program are validated only part of the way, because running them to
 **`create`, `update` and a repair may change more of a project than `program.ts`.** The agent that writes or fixes a program works in the copy the program is then tried in, and what it changed there — files made, changed or removed, trama's own (`state.json`, `meta.json`, `history/`) among them — reaches the project with a program that ran, and only with one. The paths are printed (the first ten), and for a fix recorded in the journal (the first two hundred); `history/` versions the program only. Set `"agentChanges": "discard"` in `~/.trama/config.json` to take nothing from the agent but the program.
 
 **`agent.instruct()` gives the LLM autonomous tool access.** When your program calls `agent.instruct()`, the underlying pi-coding-agent may autonomously read files, write files, and run shell commands to fulfill the request. This is not a simple text-in/text-out call — the LLM can take multi-step actions within the project directory.
+
+**`extensions: true` runs your pi extensions inside the runner.** A call that asks for them loads the extensions of your own pi (never a project's) into the process that runs the program's whole tree of runs, where they can do what any code of yours can — and where what they get wrong is the runner's to bear. An extension is written for a session that lasts as long as you sit at pi; here a session is one call. One that goes on working after its call is over — a timer that asks the model later, work it started and did not wait for — works against a session that is gone, and what pi throws at it then is thrown in the runner with nobody to catch it: the runner ends, and every run in its tree with it — or, where the extension catches that and goes round again without waiting on anything, the runner is held for good and has to be killed. A call that does not ask for extensions loads none.
 
 This is a deliberate design choice. trama is a power tool, not a managed service. A program can narrow what one call may do (`tools: ["read", "grep"]`, or `tools: []` for none), which is a way to say what a step is for, not a wall around it. If you need execution constraints, apply them below trama: containers, VM isolation, or pi's tool-level configuration. The only built-in guard is a path check on `tools` and `workspace` file access (traversal and symlink escapes) — a footgun guard, not a security boundary.
 

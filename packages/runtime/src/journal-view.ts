@@ -43,12 +43,13 @@ function gist(request: Record<string, unknown> | undefined): string {
   return "";
 }
 
-/** What `usage` records add up to, in a few words — and nothing where there are none. */
-function spent(usage: JournalRecord[]): string {
+/** What reports of usage — `usage` records, or what a backend said — add up to, in a few words: and nothing where there are none. */
+export function spentIn(usage: object[]): string {
   if (usage.length === 0) return "";
-  const sum = (field: string) => usage.reduce((total, record) => total + (Number(record[field]) || 0), 0);
+  const sum = (field: string) => usage.reduce((total, record) => total + (Number((record as Record<string, unknown>)[field]) || 0), 0);
   return `${sum("input") + sum("output") + sum("cacheRead") + sum("cacheWrite")} tokens  $${sum("cost").toFixed(4)}`;
 }
+const spent = spentIn;
 
 const usageIn = (records: JournalRecord[]) => records.filter(record => record.kind === "usage");
 
@@ -101,6 +102,10 @@ function printJournal(path: string, records: JournalRecord[]): void {
       case "usage":
         // (What a call used is shown with the call.)
         if (record.for === "fix") console.log(`${at}  asking for the fix used ${spent([record])}`);
+        if (record.for === "generate") console.log(`${at}  writing the program used ${spent([record])}`);
+        break;
+      case "budget":
+        console.log(`${at}  ${oneLine(record.spent, 100)}`);
         break;
       case "child":
         console.log(`${at}  #${String(record.seq).padEnd(3)} started run ${record.run}`);

@@ -489,6 +489,14 @@ test("createAgent hands the backend what a call asks for and nothing it did not,
   assert.deepEqual(calls[2], calls[1]);
   assert.deepEqual(heard, [usage, usage, usage]);
 
+  // A typed answer's prompt is text, whatever it begins with — said to the backend where the call has what a prompt could call up.
+  await agent.generate({ prompt: "/skill:x p", schema: { a: "string" }, skills: ["x"] });
+  assert.deepEqual(calls.pop(), { cwd: "/work", system: undefined, signal: undefined, skills: ["x"], asText: true });
+  await agent.generate({ prompt: "/cmd p", schema: { a: "string" }, extensions: true });
+  assert.deepEqual(calls.pop(), { cwd: "/work", system: undefined, signal: undefined, extensions: true, asText: true });
+  await agent.instruct("/skill:x p", { skills: ["x"], templates: true, extensions: true });
+  assert.deepEqual(calls.pop(), { cwd: "/work", system: undefined, signal: undefined, skills: ["x"], templates: true, extensions: true });
+
   // No tools is something asked for; nothing asked for is not.
   await agent.instruct("p", { tools: [] });
   assert.deepEqual(calls[3], { cwd: "/work", system: undefined, signal: undefined, tools: [] });
@@ -553,6 +561,7 @@ async function fakeProvider(t, reply, config = "plain") {
           { id: "thinker", reasoning: true, cost: { input: 10, output: 20, cacheRead: 5, cacheWrite: 0 } },
           { id: "org/deep", cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } },
           { id: "terse", maxTokens: 200, cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } },
+          { id: "small", contextWindow: 3000, maxTokens: 500, cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } },
         ],
       },
       "fake/two": { baseUrl: `${at}/v1`, api: "openai-completions", apiKey: "none", models: [{ id: "plain" }, { id: "org/deep" }] },
@@ -570,8 +579,18 @@ async function fakeProvider(t, reply, config = "plain") {
     agentDir,
     requests,
     toolsOf: (request) => (request.tools ?? []).map((tool) => tool.function.name),
+    // (pi looks for a user's skills in their home as well: here, a home that has none.)
     ask: (prompt, call = {}) =>
-      withEnv({ PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" }, () => adapter.ask(prompt, { cwd, ...call })),
+      withEnv({ PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", HOME: agentDir }, () => adapter.ask(prompt, { cwd, ...call })),
+    /** What the model was told at the last request made: by the system, and by the user. */
+    told: () => {
+      const text = (message) => (typeof message?.content === "string" ? message.content : (message?.content ?? []).map((part) => part.text).join(""));
+      const messages = requests.at(-1).messages;
+      return {
+        system: messages.filter((message) => message.role === "system" || message.role === "developer").map(text).join("\n"),
+        user: text(messages.filter((message) => message.role === "user").at(-1)),
+      };
+    },
   };
 }
 
@@ -1059,4 +1078,478 @@ test("pi leaves nothing where it works but what the agent's tools put there: a d
 
   assert.equal(await fake.ask("make a file"), "done");
   assert.deepEqual(readdirSync(fake.cwd, { recursive: true }).sort(), ["made.txt", "there-before.txt"]);
+});
+
+// --- What a call may have of the user's pi: skills, prompt templates, extensions ---
+
+/** A pi of a user's with skills, templates and an extension of their own — and a project with the same of its own. */
+async function furnished(t, reply) {
+  const fake = await fakeProvider(t, reply);
+  const { mkdirSync } = await import("node:fs");
+  const put = (dir, path, text) => {
+    mkdirSync(joinPath(dir, path, ".."), { recursive: true });
+    writeModelFile(joinPath(dir, path), text);
+  };
+  put(fake.agentDir, "skills/greet/SKILL.md", "---\nname: greet\ndescription: How to greet somebody properly.\n---\nSay hello, twice.\n");
+  put(fake.agentDir, "skills/quiet/SKILL.md", "---\nname: quiet\ndescription: Only ever called by name.\ndisable-model-invocation: true\n---\nBe quiet.\n");
+  put(fake.cwd, ".pi/skills/local/SKILL.md", "---\nname: local\ndescription: A skill of the project's own.\n---\nLocal things.\n");
+  put(fake.agentDir, "prompts/review.md", "---\ndescription: review\n---\nReview this, please: $ARGUMENTS\n");
+  put(fake.cwd, ".pi/prompts/proj.md", "---\ndescription: proj\n---\nThe project's template: $ARGUMENTS\n");
+  const extension = (name, tool) => `
+export default function (pi) {
+  const seen = (globalThis.__tramaExtensions ??= []);
+  seen.push("${name} loaded");
+  pi.on("session_start", async (_event, ctx) => { seen.push("${name} told of the start"); globalThis.__tramaTrusted = ctx.isProjectTrusted(); });
+  pi.registerCommand("ask-and-go", { description: "ask the model, and do not wait for it", handler: async (args) => { pi.sendUserMessage("the command asks: " + args); await new Promise((resolve) => setTimeout(resolve, 40)); } });
+  pi.registerCommand("ask-at-once", { description: "ask the model, and leave", handler: async (args) => { pi.sendUserMessage("the command asks: " + args); } });
+  pi.registerCommand("ask-until-told", { description: "ask the model again and again", handler: async (args, ctx) => {
+    for (;;) { pi.sendUserMessage("again: " + args); await ctx.waitForIdle(); }
+  } });
+  pi.registerCommand("ask-as-it-ends", { description: "ask the model when the call is over", handler: async () => { globalThis.__tramaAskAsItEnds = true; } });
+  pi.on("session_shutdown", async () => { if (globalThis.__tramaAskAsItEnds) { delete globalThis.__tramaAskAsItEnds; pi.sendUserMessage("asked while the call was being ended"); await new Promise((resolve) => setTimeout(resolve, 250)); } });
+  pi.registerCommand("ask-twice", { description: "ask the model two things, one after the other", handler: async (args, ctx) => {
+    pi.sendUserMessage("first: " + args); await ctx.waitForIdle(); seen.push("the first was answered");
+    pi.sendUserMessage("second: " + args); await ctx.waitForIdle(); seen.push("the second was answered");
+  } });
+  pi.on("input", async (event) => { if (String(event.text).includes("slowly")) await new Promise((resolve) => setTimeout(resolve, 40)); });
+  pi.registerCommand("ask", { description: "ask the model", handler: async (args, ctx) => { pi.sendUserMessage("the command asks: " + args); await ctx.waitForIdle(); seen.push("the command's question was answered"); } });
+  // (It takes a moment over it: a call is over only once its extensions have heard that it is.)
+  pi.on("session_shutdown", async () => { await new Promise((resolve) => setTimeout(resolve, 30)); seen.push("${name} told of the end"); });
+  pi.registerTool({ name: "${tool}", label: "${tool}", description: "A tool of an extension", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "hi" }] }; } });
+  pi.registerCommand("shout", { description: "shout", handler: async (args) => { seen.push("shout " + args); } });
+}
+`;
+  put(fake.agentDir, "extensions/hello.ts", extension("the user's", "hello_tool"));
+  put(fake.cwd, ".pi/extensions/proj.ts", extension("THE PROJECT'S", "proj_tool"));
+  const seen = () => globalThis.__tramaExtensions ?? [];
+  globalThis.__tramaExtensions = [];
+  t.after(() => { delete globalThis.__tramaExtensions; delete globalThis.__tramaTrusted; delete globalThis.__tramaAskAsItEnds; });
+  return { ...fake, put, seen };
+}
+
+test("a call has the skills it chose, of the user's and the project's — and none it did not choose", async (t) => {
+  const fake = await furnished(t);
+  const skillsTold = () => [...fake.told().system.matchAll(/<name>(\w+)<\/name>/g)].map((match) => match[1]).sort();
+
+  // None chosen: none told of, and a prompt is the text it is.
+  for (const call of [{}, { skills: false }, { skills: [] }]) {
+    await fake.ask("/skill:greet somebody", call);
+    assert.deepEqual([skillsTold(), fake.told().user], [[], "/skill:greet somebody"], JSON.stringify(call));
+    assert.doesNotMatch(fake.told().system, /available_skills/);
+  }
+
+  // All of them: the model is told of those that are for it to take up, and one can be called up by name in the prompt.
+  await fake.ask("/skill:quiet now", { skills: true });
+  assert.deepEqual(skillsTold(), ["greet", "local"]);
+  assert.match(fake.told().user, /^<skill name="quiet" location=".*quiet\/SKILL\.md">[^]*Be quiet\.\n<\/skill>\n\nnow$/);
+  // ...and a prompt is read for skills, not for the templates the call did not choose.
+  await fake.ask("/review the diff", { skills: true });
+  assert.equal(fake.told().user, "/review the diff");
+
+  // Some by name: those, and no other — not to be told of, and not to be called up.
+  await fake.ask("/skill:greet somebody", { skills: ["local"] });
+  assert.deepEqual([skillsTold(), fake.told().user], [["local"], "/skill:greet somebody"]);
+  await fake.ask("say hello", { skills: ["greet", "quiet"] });
+  assert.deepEqual(skillsTold(), ["greet"]);
+
+  // What pi cannot give as asked is the call's failure, before the model is asked anything.
+  const before = fake.requests.length;
+  await assert.rejects(() => fake.ask("p", { skills: ["local", "nope"] }), { message: 'pi has no skill "nope". Its skills: local, greet, quiet.' });
+  const bare = await fakeProvider(t);
+  await assert.rejects(() => bare.ask("p", { skills: ["nope"] }), { message: 'pi has no skill "nope". Its skills: none.' });
+  await assert.rejects(() => bare.ask("p", { templates: ["nope"] }), { message: 'pi has no prompt template "nope". Its prompt templates: none.' });
+  assert.equal(await bare.ask("/skill:nope p", { skills: true, templates: true, tools: [] }), "hello from the fake", "all of none is none, and nothing to fail for");
+  assert.equal(bare.told().user, "/skill:nope p");
+  // pi tells a model of its skills only where it can read them: an agent with no way to read has none, whatever was loaded.
+  await assert.rejects(
+    () => fake.ask("p", { skills: true, tools: [] }),
+    { message: 'The agent cannot take up its skills (local, greet) with the tools []: pi tells a model of its skills only where it has "read" or "bash" to read them with.' },
+  );
+  await assert.rejects(() => fake.ask("p", { skills: ["greet"], tools: ["edit"] }), /cannot take up its skills \(greet\) with the tools \["edit"\]/);
+  // (What is looked for is what pi writes of these skills — not a word of it that a program's own instructions happen to hold.)
+  await assert.rejects(() => fake.ask("p", { skills: ["greet"], tools: [], system: "Mind the <available_skills> below.\n<name>greet</name>" }), /cannot take up its skills \(greet\)/);
+  assert.equal(fake.requests.length, before, "no model was asked anything");
+  // (One that is only ever called by name needs no reading by the model; and bash is a way to read.)
+  await fake.ask("/skill:quiet now", { skills: ["quiet"], tools: [] });
+  assert.match(fake.told().user, /^<skill name="quiet"/);
+  await fake.ask("p", { skills: ["greet"], tools: ["bash"] });
+  assert.deepEqual(skillsTold(), ["greet"]);
+});
+
+test("a call has the prompt templates it chose: a prompt that begins with the name of one is the template, filled in", async (t) => {
+  const fake = await furnished(t);
+
+  await fake.ask("/review the diff", { templates: true });
+  assert.equal(fake.told().user, "Review this, please: the diff");
+  await fake.ask("/proj the diff", { templates: true });
+  assert.equal(fake.told().user, "The project's template: the diff");
+  // A prompt that begins with no template's name is the text it is — and so is one for a skill, where no skills were chosen.
+  for (const prompt of ["/nope the diff", "/skill:greet somebody", "review the diff"]) {
+    await fake.ask(prompt, { templates: true });
+    assert.equal(fake.told().user, prompt);
+  }
+  assert.doesNotMatch(fake.told().system, /available_skills/);
+
+  await fake.ask("/proj the diff", { templates: ["proj"] });
+  assert.equal(fake.told().user, "The project's template: the diff");
+  await fake.ask("/review the diff", { templates: ["proj"] });
+  assert.equal(fake.told().user, "/review the diff");
+  for (const call of [{ templates: false }, { templates: [] }]) {
+    await fake.ask("/review the diff", call);
+    assert.equal(fake.told().user, "/review the diff", JSON.stringify(call));
+  }
+
+  const before = fake.requests.length;
+  await assert.rejects(() => fake.ask("/nope x", { templates: ["nope"] }), { message: 'pi has no prompt template "nope". Its prompt templates: proj, review.' });
+  assert.equal(fake.requests.length, before, "no model was asked anything");
+
+  // Both: each kind is chosen by itself.
+  await fake.ask("/review the diff", { templates: ["review"], skills: ["local"] });
+  assert.equal(fake.told().user, "Review this, please: the diff");
+  assert.match(fake.told().system, /<name>local<\/name>/);
+  await assert.rejects(() => fake.ask("p", { templates: ["greet"], skills: ["greet"] }), /pi has no prompt template "greet"/);
+  await assert.rejects(() => fake.ask("p", { templates: ["review"], skills: ["review"] }), /pi has no skill "review"/);
+});
+
+test("a call has the user's extensions where it asks for them — the user's own, and never the project's", async (t) => {
+  const fake = await furnished(t);
+
+  // Not asked for: none is loaded — no code but trama's and pi's has run.
+  await fake.ask("/shout loudly");
+  assert.deepEqual(fake.toolsOf(fake.requests.at(-1)), ["read", "bash", "edit", "write"]);
+  assert.equal(fake.told().user, "/shout loudly");
+  assert.deepEqual(fake.seen(), []);
+
+  // Asked for: the user's is loaded, told that a session begins and that it is over, and its tool is the agent's.
+  await fake.ask("say hello", { extensions: true, used: () => fake.seen().push("the call said what it used") });
+  assert.deepEqual(fake.toolsOf(fake.requests.at(-1)), ["read", "bash", "edit", "write", "hello_tool"]);
+  // (What the call used is said before its extensions are waited for: a count does not wait on them.)
+  assert.deepEqual(fake.seen(), ["the user's loaded", "the user's told of the start", "the call said what it used", "the user's told of the end"]);
+  // To an extension the project is not one to be trusted: what it holds, the program it runs could have written.
+  assert.equal(globalThis.__tramaTrusted, false);
+  assert.doesNotMatch(fake.told().system, /available_skills/);
+
+  // The rest of what a call has it has as without extensions: its own instructions, the project's, a template —
+  // and the project's own settings for pi (here: which tools an agent has where a call names none).
+  fake.put(fake.cwd, ".pi/settings.json", JSON.stringify({ defaultTools: ["read", "grep"] }));
+  await fake.ask("say hello");
+  assert.deepEqual(fake.toolsOf(fake.requests.at(-1)), ["read", "grep"]);
+  await fake.ask("say hello", { extensions: true });
+  assert.deepEqual(fake.toolsOf(fake.requests.at(-1)), ["read", "grep", "hello_tool"]);
+  assert.equal(globalThis.__tramaTrusted, false);
+  fake.put(fake.cwd, ".pi/settings.json", "{}");
+  fake.put(fake.cwd, "AGENTS.md", "In this project every answer ends with a full stop.\n");
+  for (const extensions of [true, false]) {
+    await fake.ask("/review the diff", { extensions, templates: true, system: "Answer in French." });
+    assert.equal(fake.told().user, "Review this, please: the diff", `extensions: ${extensions}`);
+    assert.match(fake.told().system, /Answer in French\./, `extensions: ${extensions}`);
+    assert.match(fake.told().system, /every answer ends with a full stop/, `extensions: ${extensions}`);
+  }
+  globalThis.__tramaExtensions = [];
+
+  // Its tools can be named among a call's, like any other; and what the project holds of skills is still the call's to choose.
+  await fake.ask("say hello", { extensions: true, tools: ["hello_tool", "read"], skills: ["local"] });
+  assert.deepEqual(fake.toolsOf(fake.requests.at(-1)).sort(), ["hello_tool", "read"]);
+  assert.match(fake.told().system, /<name>local<\/name>/);
+  await assert.rejects(() => fake.ask("p", { extensions: true, tools: ["proj_tool"] }), /cannot be given the tools \["proj_tool"\]/);
+  await assert.rejects(() => fake.ask("p", { tools: ["hello_tool"] }), /cannot be given the tools \["hello_tool"\]/, "nor an extension's tool without the extension");
+  assert.equal(fake.seen().some((line) => line.startsWith("THE PROJECT'S")), false, "the project's extension is never run");
+
+  // A prompt that begins with a command of an extension is that command: the model is not asked, and the call says so.
+  globalThis.__tramaExtensions = [];
+  const before = fake.requests.length;
+  await assert.rejects(() => fake.ask("/shout loudly", { extensions: true }), /The prompt was taken by an extension/);
+  assert.equal(fake.requests.length, before);
+  assert.deepEqual(fake.seen(), ["the user's loaded", "the user's told of the start", "shout loudly", "the user's told of the end"]);
+  // A command that asks the model itself, and waits for it, has the model's answer be the call's — and what that took is the call's.
+  globalThis.__tramaExtensions = [];
+  const heard = [];
+  assert.equal(await fake.ask("/ask what is the time", { extensions: true, used: (usage) => heard.push(usage.input) }), "hello from the fake");
+  assert.equal(fake.told().user, "the command asks: what is the time");
+  assert.deepEqual(fake.seen().slice(2), ["the command's question was answered", "the user's told of the end"]);
+  assert.deepEqual(heard, [700]);
+  // (...also where the command does not wait for the model itself: what it set going is the call's to wait for.)
+  const slow = await furnished(t, (_request, { sse }) => setTimeout(() => {
+    const stream = sse();
+    stream.says({ role: "assistant", content: "an answer that took a while" });
+    stream.says({}, "stop");
+    stream.used({ prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
+    stream.done();
+  }, 150));
+  assert.equal(await slow.ask("/ask-and-go what is the time", { extensions: true }), "an answer that took a while");
+  // (...nor even stay while pi sets the question going — which pi does in its own time, the longer where an
+  // extension looks at what is put to it first: what was put is waited for, not whether the session looks busy.)
+  assert.equal(await slow.ask("/ask-at-once what is the time", { extensions: true }), "an answer that took a while");
+  assert.equal(await slow.ask("/ask-at-once slowly, what is the time", { extensions: true }), "an answer that took a while");
+  assert.equal(slow.told().user, "the command asks: slowly, what is the time");
+  // One that asks twice has both answered, and the second answer is the call's.
+  globalThis.__tramaExtensions = [];
+  const twice = [];
+  assert.equal(await slow.ask("/ask-twice now", { extensions: true, used: (usage) => twice.push(usage.input + usage.output) }), "an answer that took a while");
+  assert.deepEqual([slow.told().user, twice], ["second: now", [30]]);
+  assert.deepEqual(slow.seen().slice(2), ["the first was answered", "the second was answered", "the user's told of the end"]);
+  // A call that is cancelled asks no more, though a command of it would: the first question is cut off, the second never put.
+  const asked = slow.requests.length;
+  const stop = new AbortController();
+  setTimeout(() => stop.abort(), 60);
+  await assert.rejects(() => slow.ask("/ask-twice now", { extensions: true, signal: stop.signal }), /Aborted/);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(slow.requests.length, asked + 1, "the model was not asked the second question");
+  // ...nor does a command that asks until it is satisfied go round for ever once its call is cancelled: the
+  // runner comes to other things — this test among them — and the command is not let wait again.
+  const round = new AbortController();
+  setTimeout(() => round.abort(), 60);
+  const warned = await captureConsole("warn", () => assert.rejects(() => slow.ask("/ask-until-told now", { extensions: true, signal: round.signal }), /Aborted/));
+  const sinceCancel = slow.requests.length;
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(slow.requests.length, sinceCancel, "and the model is asked no more");
+  assert.deepEqual(warned.messages, [], "and nothing is said of the command: it did not fail, its call was cancelled");
+  // What an extension asks while it is being told that the call is over is not put to the model: the call is over.
+  const ended = slow.requests.length;
+  await assert.rejects(() => slow.ask("/ask-as-it-ends", { extensions: true }), /The prompt was taken by an extension/);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  assert.equal(slow.requests.length, ended, "nothing was asked once the call had come to its end");
+  // ...unless the call says its prompt is text: then it is, to skills and to commands alike.
+  await fake.ask("/shout loudly", { extensions: true, skills: true, asText: true });
+  assert.equal(fake.told().user, "/shout loudly");
+  await fake.ask("/skill:greet somebody", { skills: true, asText: true });
+  assert.equal(fake.told().user, "/skill:greet somebody");
+  const answered = fake.requests.length;
+  await assert.rejects(() => fake.ask("p", { extensions: false, tools: ["hello_tool"] }), /cannot be given the tools/);
+
+  // An extension that cannot be loaded is the call's failure — where the call asked for extensions, and nowhere else.
+  fake.put(fake.agentDir, "extensions/broken.ts", "export default function () { throw new Error('this extension is broken'); }\n");
+  globalThis.__tramaExtensions = [];
+  await assert.rejects(() => fake.ask("p", { extensions: true }), /^Error: The extension .*broken\.ts is not as pi would have it: .*this extension is broken/);
+  assert.equal(fake.requests.length, answered, "no model was asked anything");
+  assert.deepEqual(fake.seen(), ["the user's loaded", "the user's told of the start", "the user's told of the end"], "what was loaded beside it is told that it is over, once");
+  assert.equal(await fake.ask("say hello"), "hello from the fake");
+});
+
+test("an extension that does not answer when it is told its session is over is not waited for beyond a while", async (t) => {
+  const fake = await furnished(t);
+  fake.put(fake.agentDir, "extensions/hello.ts", 'export default function (pi) { pi.on("session_shutdown", () => new Promise(() => {})); }\n');
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const answer = fake.ask("say hello", { extensions: true });
+  let settled = false;
+  answer.then(() => { settled = true; }, () => { settled = true; });
+  // (Real time passes while pi and the fake model work; the mocked clock is only what the wait for the extension goes by.)
+  const { setTimeout: later } = await import("node:timers/promises");
+  for (let waited = 0; waited < 200 && fake.requests.length === 0; waited++) await later(25, undefined, { ref: true }).catch(() => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  t.mock.timers.tick(4_999);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, "it is waited for");
+  t.mock.timers.tick(2);
+  assert.equal(await answer, "hello from the fake");
+});
+
+test("a backend says what a call has used each time its agent is about to ask the model again, and a call cancelled there asks no more", async (t) => {
+  // A model that has the agent read a file, twice, before it answers.
+  const fake = await fakeProvider(t, (_request, { sse }, hit) => {
+    const stream = sse();
+    if (hit % 3 !== 0) {
+      stream.says({ role: "assistant", tool_calls: [{ index: 0, id: `call-${hit}`, type: "function", function: { name: "read", arguments: JSON.stringify({ path: "a.txt" }) } }] });
+      stream.says({}, "tool_calls");
+    } else {
+      stream.says({ role: "assistant", content: "the answer" });
+      stream.says({}, "stop");
+    }
+    stream.used({ prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200 });
+    stream.done();
+  });
+  writeModelFile(joinPath(fake.cwd, "a.txt"), "what the file says");
+  const total = (usage) => usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+
+  const sofar = [], used = [];
+  assert.equal(await fake.ask("read a.txt, twice", { sofar: (usage) => sofar.push([fake.requests.length, total(usage), usage.model]), used: (usage) => used.push(total(usage)) }), "the answer");
+  // Before the second request and before the third: not before the first, when nothing is used, nor after the last.
+  assert.deepEqual(sofar, [[1, 1200, "fake/plain"], [2, 2400, "fake/plain"]]);
+  assert.deepEqual(used, [3600]);
+
+  // Cancelled when it says what the first request took: the model is not asked a second time.
+  const stop = new AbortController();
+  const heard = [];
+  const before = fake.requests.length;
+  await assert.rejects(() => fake.ask("read a.txt, twice", {
+    signal: stop.signal,
+    sofar: () => stop.abort(),
+    used: (usage) => heard.push(total(usage)),
+  }), /Aborted/);
+  assert.equal(fake.requests.length, before + 1, "the request that would have followed was not made");
+  assert.deepEqual(heard, [1200], "and what the call used is what the one request took");
+});
+
+test("two of the user's extensions with a tool of one name are not what a call asked for, and it is said for what it is", async (t) => {
+  const fake = await furnished(t);
+  fake.put(fake.agentDir, "extensions/twin.ts", `export default function (pi) {
+  pi.registerTool({ name: "hello_tool", label: "twin", description: "Another of the same name", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "hi" }] }; } });
+}
+`);
+  await assert.rejects(() => fake.ask("p", { extensions: true }), /^Error: The extension .*(twin|hello)\.ts is not as pi would have it: .*hello_tool.*conflicts/);
+  assert.equal(fake.requests.length, 0);
+  assert.equal(await fake.ask("p"), "hello from the fake");
+});
+
+test("a call cancelled while its extensions are being told that it begins lets them hear that out before they hear that it is over", async (t) => {
+  const fake = await fakeProvider(t);
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(joinPath(fake.agentDir, "extensions"));
+  writeModelFile(joinPath(fake.agentDir, "extensions", "slow.ts"), `export default function (pi) {
+  const seen = (globalThis.__tramaSlow ??= []);
+  pi.on("session_start", async () => { seen.push("setting up"); globalThis.__tramaSlowStarted?.(); await new Promise((resolve) => setTimeout(resolve, 150)); seen.push("set up"); });
+  pi.on("session_shutdown", async () => { seen.push("taking down"); });
+}
+`);
+  globalThis.__tramaSlow = [];
+  t.after(() => { delete globalThis.__tramaSlow; delete globalThis.__tramaSlowStarted; });
+
+  const stop = new AbortController();
+  globalThis.__tramaSlowStarted = () => setTimeout(() => stop.abort(), 20);
+  await assert.rejects(() => fake.ask("p", { extensions: true, signal: stop.signal }), /Aborted/);
+  assert.deepEqual(globalThis.__tramaSlow, ["setting up", "set up", "taking down"]);
+  assert.equal(fake.requests.length, 0);
+});
+
+test("a backend says what a call has used before pi has a long conversation summed up, as before it asks for the next turn", async (t) => {
+  // A model with little room: after the first turn the conversation is past what pi keeps, and pi asks for a summary of it.
+  const kinds = [];
+  const fake = await fakeProvider(t, (request, { sse }) => {
+    const summary = !request.tools?.length;
+    kinds.push(summary ? "a summary" : "a turn");
+    const stream = sse();
+    if (!summary && kinds.filter((kind) => kind === "a turn").length === 1) {
+      stream.says({ role: "assistant", tool_calls: [{ index: 0, id: "call-1", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "a.txt" }) } }] });
+      stream.says({}, "tool_calls");
+    } else {
+      stream.says({ role: "assistant", content: summary ? "what was done so far" : "the answer" });
+      stream.says({}, "stop");
+    }
+    stream.used({ prompt_tokens: 2800, completion_tokens: 200, total_tokens: 3000 });
+    stream.done();
+  }, "small");
+  writeModelFile(joinPath(fake.cwd, "a.txt"), "what the file says. ".repeat(200));
+  writeModelFile(joinPath(fake.agentDir, "settings.json"), JSON.stringify({ compaction: { reserveTokens: 500, keepRecentTokens: 100 } }));
+
+  const said = () => kinds.push("said");
+  assert.equal(await fake.ask("read a.txt and go on", { sofar: said }), "the answer");
+  assert.ok(kinds.includes("a summary"), `pi summed the conversation up: ${kinds}`);
+  // Each request after the first — the summary among them — has what was used so far said before it.
+  for (let at = 1; at < kinds.length; at++) {
+    if (kinds[at] !== "said") assert.equal(kinds[at - 1], "said", `request ${at} (${kinds[at]}) of ${kinds}`);
+  }
+
+  // Cancelled where that is said, the summary is not asked for.
+  kinds.length = 0;
+  const stop = new AbortController();
+  await assert.rejects(() => fake.ask("read a.txt and go on", { signal: stop.signal, sofar: () => stop.abort() }), /Aborted/);
+  assert.deepEqual(kinds, ["a turn"]);
+});
+
+test("a call that is cancelled is not held for good by an extension that does not return — nor one whose beginning an extension never hears out", async (t) => {
+  const { mkdirSync } = await import("node:fs");
+  const extension = (event) => `export default function (pi) {
+  pi.on("${event}", () => { globalThis.__tramaHeld?.(); return new Promise(() => {}); });
+  pi.on("session_shutdown", async () => { globalThis.__tramaLeft = (globalThis.__tramaLeft ?? 0) + 1; });
+}
+`;
+  t.after(() => { delete globalThis.__tramaHeld; delete globalThis.__tramaLeft; });
+  const { setTimeout: later } = await import("node:timers/promises");
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  for (const event of ["agent_end", "session_start"]) {
+    // (A pi of its own for each: an extension is read once where it is, whatever is written there after.)
+    const fake = await fakeProvider(t);
+    mkdirSync(joinPath(fake.agentDir, "extensions"));
+    writeModelFile(joinPath(fake.agentDir, "extensions", "held.ts"), extension(event));
+    globalThis.__tramaLeft = 0;
+    const held = new Promise((resolve) => { globalThis.__tramaHeld = resolve; });
+    const stop = new AbortController();
+    const call = fake.ask("say hello", { extensions: true, signal: stop.signal });
+    let settled = false;
+    call.then(() => { settled = true; }, () => { settled = true; });
+    await held;
+    await later(50);
+    // (The clock the wait goes by is the test's from here: no real time is to pass for it.)
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    stop.abort();
+    await settle();
+    t.mock.timers.tick(4_999);
+    await settle();
+    assert.equal(settled, false, `${event}: it is waited for a while`);
+    t.mock.timers.tick(2);
+    await assert.rejects(call, /Aborted/, event);
+    assert.equal(globalThis.__tramaLeft, 1, `${event}: and its extensions are told that it is over`);
+    assert.equal(fake.requests.length, event === "session_start" ? 0 : 1, `${event}: the model was asked only where the call got as far`);
+    t.mock.timers.reset();
+  }
+});
+
+test("an extension that sets its session going again whenever it stops does not hold the runner once the call is cancelled", async (t) => {
+  // However it does so: by putting another question when the agent has settled, or by a message of its own that starts a turn.
+  const { mkdirSync } = await import("node:fs");
+  const { setTimeout: later } = await import("node:timers/promises");
+  const again = {
+    "a question": `pi.sendUserMessage("go on");`,
+    "a message that starts a turn": `pi.sendMessage({ customType: "go-on", content: "go on", display: false }, { triggerTurn: true });`,
+  };
+  for (const [how, put] of Object.entries(again)) {
+    const fake = await fakeProvider(t);
+    mkdirSync(joinPath(fake.agentDir, "extensions"));
+    writeModelFile(joinPath(fake.agentDir, "extensions", "again.ts"), `export default function (pi) {
+  pi.on("agent_settled", async () => { globalThis.__tramaRounds = (globalThis.__tramaRounds ?? 0) + 1; ${put} });
+}
+`);
+    t.after(() => { delete globalThis.__tramaRounds; });
+    globalThis.__tramaRounds = 0;
+    const stop = new AbortController();
+    const call = fake.ask("say hello", { extensions: true, signal: stop.signal });
+    call.catch(() => {});
+    for (let waited = 0; waited < 400 && fake.requests.length < 3; waited++) await later(10);
+    assert.ok(fake.requests.length >= 3, `${how}: the extension keeps the session asking (${fake.requests.length})`);
+
+    // Cancelled: the model is asked no more, and the runner still comes to other things — the clock that gives the call up among them.
+    stop.abort();
+    await later(100);
+    const asked = fake.requests.length;
+    const started = Date.now();
+    await assert.rejects(call, /Aborted/, how);
+    assert.ok(Date.now() - started < 12_000, `${how}: the call was given up, ${Date.now() - started}ms after it was cancelled`);
+    assert.equal(fake.requests.length, asked, `${how}: nothing was asked after the cancel`);
+    // (What was under way when the session went comes to its end; nothing begins after.)
+    await later(300);
+    const rounds = globalThis.__tramaRounds;
+    await later(200);
+    assert.equal(globalThis.__tramaRounds, rounds, `${how}: and the session is not set going again once it is gone`);
+  }
+});
+
+test("what an extension sets going as its call ends neither reaches the model nor holds the runner", async (t) => {
+  const { mkdirSync } = await import("node:fs");
+  const { setTimeout: later } = await import("node:timers/promises");
+  const extensions = {
+    // It puts a question as it is told the call is over, and leaves: the question is still on its way when it has.
+    "a question still on its way": `export default function (pi) {
+  pi.on("input", async (event) => { if (String(event.text).includes("late")) await new Promise((resolve) => setTimeout(resolve, 150)); });
+  pi.on("session_shutdown", async () => { pi.sendUserMessage("a late question"); });
+}
+`,
+    // It sets the session going again each time it stops, from the moment it is told the call is over.
+    "a session set going again and again": `export default function (pi) {
+  let ended = false;
+  pi.on("session_shutdown", async () => { ended = true; pi.sendUserMessage("go on"); });
+  pi.on("agent_settled", async () => { if (ended) pi.sendUserMessage("go on"); });
+}
+`,
+  };
+  for (const [what, source] of Object.entries(extensions)) {
+    const fake = await fakeProvider(t);
+    mkdirSync(joinPath(fake.agentDir, "extensions"));
+    writeModelFile(joinPath(fake.agentDir, "extensions", "ending.ts"), source);
+    const started = Date.now();
+    assert.equal(await captureConsole("warn", () => fake.ask("say hello", { extensions: true })).then(({ result }) => result), "hello from the fake", what);
+    assert.ok(Date.now() - started < 9_000, `${what}: the call came to its end, ${Date.now() - started}ms after it began`);
+    await later(400);
+    assert.equal(fake.requests.length, 1, `${what}: the model was asked the call's own question, and no other`);
+  }
 });

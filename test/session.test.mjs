@@ -676,6 +676,12 @@ await ctx.done({ role: process.env.ROLE });`,
   assert.equal((await handle.wait()).status, "yielded");
   env.ROLE = "changed between the yield and the resume";
   assert.deepEqual(await (await handle.resume()).wait(), { status: "done", result: { role: "as spawned" } });
+  // ...and whatever kind of object that was: process.env — what is most often given — is no plain one.
+  const held = Object.assign(Object.create({ inherited: "not a variable of its own" }), { ROLE: "as spawned, from an object that is no plain one" });
+  const other = session.spawn("worker", { projectDir: workerDir, env: held, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.equal((await other.wait()).status, "yielded");
+  held.ROLE = "changed between the yield and the resume";
+  assert.deepEqual(await (await other.resume()).wait(), { status: "done", result: { role: "as spawned, from an object that is no plain one" } });
 
   // What is given for variables and is no object of them is refused for what it is, not taken apart into some.
   for (const given of [["ROLE=x"], "ab", 5]) {

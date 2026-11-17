@@ -181,6 +181,14 @@ const named: Schema = { a: ["string"] };
 export const fromNamed = await agent.generate({ prompt: "p", schema: named, cutOff: "keep", tools: [] });
 const options: AgentOptions = { cutOff: "keep", thinking: "low" };
 export const kept = await agent.instruct("p", options);
+export const furnished = await agent.instruct("/review p", { skills: true, templates: ["review"], extensions: true });
+export const some = await agent.generate({ prompt: "p", schema: flat, skills: ["pdf", "tables"], extensions: false });
+// @ts-expect-error — a typed answer's prompt is not read as a template
+export const typedTemplate = await agent.generate({ prompt: "/review p", schema: flat, templates: true });
+// @ts-expect-error — extensions have no names: all of the user's, or none
+export const byName = await agent.instruct("p", { extensions: ["mcp"] });
+// @ts-expect-error — skills are all, none, or named
+export const oneSkill = await agent.instruct("p", { skills: "pdf" });
 // @ts-expect-error — a field is said in words, or as what it holds
 export const notAWord = await agent.generate({ prompt: "p", schema: { a: 7 } });
 // @ts-expect-error — a reply that was cut off is kept, or the call fails

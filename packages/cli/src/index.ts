@@ -72,6 +72,24 @@ function parseArgs(args: string[]): Record<string, unknown> | undefined {
   return result;
 }
 
+/** Turn repeated `--budget cap=number` options into a budget (undefined if none were given). What a cap may be is the runner's to say. */
+function parseBudget(caps: string[]): Record<string, number> | undefined {
+  if (caps.length === 0) return undefined;
+  const given: Array<[string, number]> = [];
+  for (const cap of caps) {
+    const eq = cap.indexOf("=");
+    const amount = eq === -1 || cap.slice(eq + 1).trim() === "" ? NaN : Number(cap.slice(eq + 1));
+    if (Number.isNaN(amount)) {
+      throw new Error(`Invalid --budget format: "${cap}". Expected cap=number, as in cost=2.50, tokens=500000 or calls=40.`);
+    }
+    const name = cap.slice(0, eq);
+    if (given.some(([had]) => had === name)) throw new Error(`--budget ${name} is given twice.`);
+    given.push([name, amount]);
+  }
+  // (Made of its pairs: a cap by a name every object has from birth is then a cap like any other, to be refused as one.)
+  return Object.fromEntries(given);
+}
+
 /** Wrap a command so any failure is reported as a one-line error with a non-zero exit. */
 function command<A extends unknown[]>(run: (...args: A) => Promise<void>) {
   return async (...args: A) => {
@@ -111,7 +129,8 @@ cli
   .description("Execute a program")
   .option("--timeout <ms>", "Per-phase timeout in ms (applies to each run and repair attempt separately)")
   .option("--arg <key=value>", "Pass argument to the program (repeatable)", collectArg, [])
-  .action(command(async (name: string, opts: { timeout?: string; arg: string[] }) => {
+  .option("--budget <cap=number>", "Cap what the run may use of a model: cost (US dollars), tokens or calls (repeatable)", collectArg, [])
+  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[] }) => {
     let timeout: number | undefined;
     if (opts.timeout !== undefined) {
       timeout = Number(opts.timeout);
@@ -120,8 +139,9 @@ cli
       }
     }
     const args = parseArgs(opts.arg);
+    const budget = parseBudget(opts.budget);
     const projectDir = resolveProject(name);
-    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, signal }));
+    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, signal }));
     // (A run that a signal stopped has failed, and is not reported as that: see `command`.)
     if (result.status === "failed") {
       throw new Error(`Program failed: ${result.reason}`);

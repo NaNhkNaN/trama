@@ -13,7 +13,8 @@ import { createHash, randomBytes } from "crypto";
 import type { ShellResult, Workspace } from "./types.js";
 import type { RunOptions, TramaConfig, ProgramResult } from "./runner-types.js";
 import { onAbort, rejectOnAbort } from "./abort.js";
-import type { AgentBackend } from "./agent-backend.js";
+import type { AgentBackend, AgentUsage } from "./agent-backend.js";
+import { checkedBudget, createMeter, type Budget, type Meter } from "./budget.js";
 import { PiAdapter } from "./pi-adapter.js";
 import { LATEST_LOG_PATH, appendLogEntry, createContext } from "./context.js";
 import { createAgent, stripCodeFences } from "./agent.js";
@@ -217,7 +218,12 @@ function checkedConfig(merged: TramaConfig, source: string): TramaConfig {
   for (const [ok, msg] of checks) {
     if (!ok) throw new Error(`Invalid ${source}: ${msg}`);
   }
-  return merged;
+  if (merged.budget === undefined) return merged;
+  try {
+    return { ...merged, budget: checkedBudget(merged.budget, `"budget"`) };
+  } catch (err) {
+    throw new Error(`Invalid ${source}: ${messageOf(err)}`);
+  }
 }
 
 /** The global config, with the model/provider a project was created with taking precedence. */
@@ -234,19 +240,71 @@ export function loadProjectConfig(projectDir: string, meta = readProjectMeta(pro
 /**
  * What does the LLM work for a project. The only place that picks a backend:
  * everything else is handed one and does not know which it is.
+ *
+ * It is also where what is asked of a model is counted, and held to a
+ * budget (`meter`): every call passes here, whoever makes it. A call that
+ * comes when the budget is spent is refused; one under way is stopped where
+ * its agent would ask the model again — what the model was asked before
+ * that is used, and what it was answering is let finish. `spent` is told
+ * why, the first time either happens.
  */
-export function createBackend(config: TramaConfig): Backend {
+export function createBackend(config: TramaConfig, meter: Meter = createMeter(), spent: (why: string) => void = () => {}): Backend {
   const backend = new PiAdapter(config);
   // The calls that were cancelled.
   const cutOff = new Set<Promise<unknown>>();
+  // Why a call was first refused, or stopped, for the budget.
+  let refused: string | undefined;
+  const overBudget = (why: string): Error => {
+    if (refused === undefined) spent(why);
+    refused ??= why;
+    return new Error(why);
+  };
   return {
+    spent: () => meter.spent(),
+    refused: () => refused,
+    counts: () => meter.capped(),
     // The interface promises that a cancelled call rejects, and a run's end
     // waits on that. Every backend is held to it here, rather than trusted with it.
-    ask(prompt, call) {
-      const work = backend.ask(prompt, call);
-      const off = onAbort(call.signal, () => { cutOff.add(work); });
-      work.then(off, off);
-      return rejectOnAbort(work, call.signal);
+    async ask(prompt, call) {
+      let account: ReturnType<Meter["admit"]>;
+      try {
+        account = meter.admit();
+      } catch (err) {
+        throw overBudget(messageOf(err));
+      }
+      // Stops the call where the budget is reached while it is under way.
+      const over = new AbortController();
+      let why: string | undefined;
+      const signal = call.signal ? AbortSignal.any([call.signal, over.signal]) : over.signal;
+      const work = backend.ask(prompt, {
+        ...call,
+        signal,
+        sofar(usage) {
+          // (Once it is to stop, it is to stop — whatever is said of it after.)
+          const reached = account.sofar(usage);
+          why ??= reached;
+          if (why !== undefined) over.abort();
+          call.sofar?.(usage);
+        },
+        used(usage) {
+          account.sofar(usage);
+          call.used?.(usage);
+        },
+      });
+      const off = onAbort(signal, () => { cutOff.add(work); });
+      // What the call used is counted as its own until the backend has let go of it — which
+      // is when it has said the last of it — however long ago whoever asked was answered.
+      const settled = () => {
+        off();
+        account.close();
+      };
+      work.then(settled, settled);
+      try {
+        return await rejectOnAbort(work, signal);
+      } catch (err) {
+        // (Stopped by whoever asked, it was stopped by them, whatever the budget had come to.)
+        throw why !== undefined && !call.signal?.aborted ? overBudget(why) : err;
+      }
     },
     async letGo() {
       let giveUp: NodeJS.Timeout | undefined;
@@ -261,6 +319,12 @@ export function createBackend(config: TramaConfig): Backend {
 
 /** A backend as the runner holds it: one whose cancelled calls are answered at once, and can be waited for apart. */
 export interface Backend extends AgentBackend {
+  /** Why nothing more may be asked of it — the budget it counts in is spent — or nothing, while something may. */
+  spent?(): string | undefined;
+  /** Why a call of it was first refused or stopped for the budget, if one was — whatever the count has come to since. */
+  refused?(): string | undefined;
+  /** Whether what its calls use is held to anything: then what a call it cut off used is to be waited for, recorded or not. */
+  counts?(): boolean;
   /**
    * Resolves when the backend has let go of the calls that were cancelled so
    * far: whoever cancelled one went on at once, and the backend still had to
@@ -591,6 +655,8 @@ interface RunOnceOptions {
   label?: string;
   /** Variables the run was started with, over the runner's own (see RunOptions). */
   env?: Record<string, string>;
+  /** The count of what the run uses of a model: what the runs it asks for use is counted there too. */
+  meter?: Meter;
   /** Stops the run. */
   signal?: AbortSignal;
   /** Where the run is written down. One journal covers every attempt of a run. */
@@ -794,6 +860,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
         started: (run, path) => { if (run) journal.note("child", { seq, run, journal: path }); },
         // …and that run's journal says which call started it.
         parent: { run: journal.run, journal: journal.path, seq },
+        above: options.meter,
       }).finally(() => {
         release();
         nestedRuns.delete(nested);
@@ -1236,6 +1303,11 @@ async function executeProgram(options: ExecuteOptions): Promise<Execution> {
   // The program as it was is attempt 0; each fix is the next.
   for (let attempt = 1; attempt <= maxRepairAttempts; attempt++) {
     stillTheProject();
+    // A fix is asked of a model: where no more may be, none is asked for, and nothing is got ready for one.
+    const spent = options.backend.spent?.();
+    if (spent !== undefined) {
+      return failed(`${attempt === 1 ? "Program failed, and no repair was tried" : `Failed after ${attempt - 1} repair attempt(s), and no further repair was tried`}. ${spent}\n${lastError}`);
+    }
     const source: string = currentSource, error = lastError;
     // One copy of the project for the attempt: the fix is asked for in it, and tried in it.
     const tried = await withTempDir("trama-repair-", async (privateDir) => {
@@ -1272,7 +1344,10 @@ async function executeProgram(options: ExecuteOptions): Promise<Execution> {
  * Carry out a run under its journal. However it goes, the journal's last
  * record says so: the run's result, or why it could not be carried out —
  * after the agent calls that were cut off on the way have said what they
- * used. (A run that is not recorded has nothing to wait for.)
+ * used. (A run that is not recorded, and whose backend holds what calls use
+ * to nothing, has nothing to wait for.) Where the budget the backend counts
+ * in is spent by then — or a call was refused or stopped for it on the way —
+ * the record before the last says that.
  */
 async function journalled<T extends Execution>(journal: Journal, backend: Backend, run: (backend: Backend) => Promise<T>): Promise<T> {
   let end: Record<string, unknown> = {};
@@ -1284,7 +1359,9 @@ async function journalled<T extends Execution>(journal: Journal, backend: Backen
     end = { error: messageOf(err) };
     throw err;
   } finally {
-    if (journal.run) await backend.letGo();
+    if (journal.run || backend.counts?.()) await backend.letGo();
+    const spent = backend.spent?.() ?? backend.refused?.();
+    if (spent !== undefined) journal.note("budget", { spent });
     journal.note("end", end);
     journal.close();
   }
@@ -1328,14 +1405,16 @@ export async function validateProgram(
   candidate: string,
   options: {
     timeout: number; maxRepairAttempts: number; maxIterations: number; journalRuns?: number; signal?: AbortSignal;
-    as?: string; alone?: string;
+    as?: string; alone?: string; budget?: Budget; wrote?: AgentUsage[];
   },
 ): Promise<{ source: string; repairedError?: string; alone?: string }> {
   const { journalRuns = 0, signal, as = projectDir, timeout, maxRepairAttempts, maxIterations } = options;
   // (What is written down, and handed on, is what a validation is known to take: nothing else that came with it.)
   const limits = { timeout, maxRepairAttempts, maxIterations };
-  // Recorded with the project, though run in a copy of it.
-  const journal = openJournal(projectDir, journalRuns, { purpose: "validate", ...limits });
+  // Recorded with the project, though run in a copy of it. `budget` is for the record: the backend is what holds to it.
+  const journal = openJournal(projectDir, journalRuns, { purpose: "validate", ...limits, budget: options.budget });
+  // What writing the candidate used is on record with its validation: it happened in no run, and has no journal of its own.
+  for (const usage of options.wrote ?? []) journal.used("generate", usage);
   let alone: string | undefined;
   const byItself = (why: string) => {
     alone = why;
@@ -1570,7 +1649,10 @@ interface AskedFor {
   parent: { run: string; journal: string; seq: number };
   /** Called once this run has a journal of its own. */
   started(run: string, journal: string): void;
+  /** The count of what the run that asked uses of a model: what this one uses is counted there too, and held to it. */
+  above?: Meter;
 }
+
 
 /**
  * Run a project, in this process: this is what a runner does.
@@ -1619,6 +1701,9 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
     throw new Error(`Invalid maxRepairAttempts: ${maxRepairAttempts}. Must be a non-negative integer.`);
   }
   const env = options.env == null ? undefined : checkedEnv(options.env);
+  // Its own budget — the config's, for a run nobody's program asked for and that was given none — under the budgets above it.
+  const budget = options.budget != null ? checkedBudget(options.budget) : askedFor ? undefined : config.budget;
+  const meter = createMeter(budget, askedFor?.above);
 
   const journal = openJournal(projectDir, config.journalRuns, {
     purpose: "run",
@@ -1628,6 +1713,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
     workspace: options.workspaceDir,
     timeout,
     maxRepairAttempts,
+    budget,
     // (The names: what the variables hold is not for a journal.)
     env: env && Object.keys(env),
     args: options.args, // last: it is the one field of unknown size
@@ -1635,9 +1721,11 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   askedFor?.started(journal.run, journal.path);
   const stillTheProject = sameProjectAs(projectDir);
 
-  const { result, repair } = await journalled(journal, createBackend(config), (backend) => executeProgram({
+  const outOfBudget = (why: string) => console.warn(tagged(options.label, `[trama] ${why}`));
+  const { result, repair } = await journalled(journal, createBackend(config, meter, outOfBudget), (backend) => executeProgram({
     projectDir,
     backend,
+    meter,
     maxRepairAttempts,
     timeout,
     maxIterations: config.defaultMaxIterations,

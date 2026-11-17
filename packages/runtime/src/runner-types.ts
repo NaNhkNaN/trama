@@ -1,6 +1,9 @@
 // Runner-side types: what callers of "@trama-dev/runtime/runner" and the runtime's
 // own modules use. Nothing here is visible to a program.ts.
 
+import type { Budget } from "./budget.js";
+export type { Budget };
+
 export interface ProgramResult {
   status: "done" | "yielded" | "failed";
   /** Yield reason, or error summary for failed. */
@@ -38,6 +41,16 @@ export interface RunOptions {
    */
   env?: Record<string, string | undefined>;
   /**
+   * What the run may use of a model, in all: its program's agent calls, the
+   * requests for a fix, and everything the runs it asks for use. Once it is
+   * spent, a call that asks a model is refused, one that is under way is
+   * stopped where it would ask its model again, and no repair is tried. A
+   * run a program asks for is held to the budget of the run that asked as
+   * well: it can be given less, never more. Without it, a run nobody's
+   * program asked for has the config's `budget`, if that has one.
+   */
+  budget?: Budget;
+  /**
    * Stops the run: its program is stopped, no repair is attempted, and the
    * run ends as failed. A fix that was being tried leaves no trace.
    */
@@ -61,4 +74,10 @@ export interface TramaConfig extends ModelConfig {
    * is taken from the agent.
    */
   agentChanges: "keep" | "discard";
+  /**
+   * What a run may use of a model (see RunOptions) where it is not given a
+   * budget of its own — and what a `create` or an `update` may: writing the
+   * program and validating it, together. Without it, nothing is capped.
+   */
+  budget?: Budget;
 }

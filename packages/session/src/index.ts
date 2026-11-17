@@ -2,9 +2,9 @@ import { mkdtempSync } from "fs";
 import { join, resolve, sep } from "path";
 import { homedir, tmpdir } from "os";
 import { createWorkspace, runProgram } from "@trama-dev/runtime/runner";
-import type { ProgramResult, Workspace } from "@trama-dev/runtime/runner";
+import type { Budget, ProgramResult, Workspace } from "@trama-dev/runtime/runner";
 
-export type { ProgramResult, Workspace };
+export type { Budget, ProgramResult, Workspace };
 
 export interface SessionOptions {
   /** Directory for shared workspace artifacts. Created if it doesn't exist. A leading `~` is expanded. */
@@ -32,6 +32,13 @@ export interface SpawnOptions {
    * unless it is given here: `env: process.env` hands on all of it.)
    */
   env?: Record<string, string | undefined>;
+  /**
+   * What the participant may use of a model, each time it is run: its agent
+   * calls, the requests for a fix, and what the participants it spawns use.
+   * Spawned by a program, it is held to the budget of that program's run as
+   * well — it can be given less, never more.
+   */
+  budget?: Budget;
 }
 
 export interface ParticipantHandle {
@@ -49,18 +56,22 @@ export interface ParticipantHandle {
 }
 
 /**
- * A participant's variables as they are when it is spawned: one that is
- * resumed has those, whatever has become of the object since. What is no
- * object of variables, or cannot be read, is handed on as it is — to be
+ * A participant's variables, or its budget, as they are when it is spawned:
+ * one that is resumed has those, whatever has become of the object since.
+ * What is no object, or cannot be read, is handed on as it is — to be
  * refused for what it is when the participant is run, as its wait() says.
+ * So is a budget that is no plain object (`plain`): a copy of it would be
+ * one, and of nothing the thing held. (Variables are copied whatever holds
+ * them: `process.env` is no plain object, and is what is most often given.)
  */
-function asGiven(env: SpawnOptions["env"]): SpawnOptions["env"] {
-  const given: unknown = env;
-  if (typeof given !== "object" || given === null || Array.isArray(given)) return env;
+function asGiven<T extends object>(option: T | undefined, plain = false): T | undefined {
+  const given: unknown = option;
+  if (typeof given !== "object" || given === null || Array.isArray(given)) return option;
+  if (plain && ![Object.prototype, null].includes(Object.getPrototypeOf(given))) return option;
   try {
-    return { ...env };
+    return { ...option } as T;
   } catch {
-    return env;
+    return option;
   }
 }
 
@@ -114,6 +125,7 @@ export class Session {
   spawn(name: string, options: SpawnOptions): ParticipantHandle {
     const { args, timeout, maxRepairAttempts } = options;
     const env = asGiven(options.env);
+    const budget = asGiven(options.budget, true);
     const projectDir = toAbsolute(options.projectDir);
     const workspaceDir = this.workspaceDir;
 
@@ -125,7 +137,7 @@ export class Session {
     const startRun = (runArgs?: Record<string, unknown>): Promise<ProgramResult> => {
       state = "running";
       lastArgs = runArgs;
-      const run = runProgram({ projectDir, timeout, maxRepairAttempts, args: runArgs, workspaceDir, label: name, env });
+      const run = runProgram({ projectDir, timeout, maxRepairAttempts, args: runArgs, workspaceDir, label: name, env, budget });
       // An infrastructure error (the run could not happen at all) counts as failed.
       run.then(result => { state = result.status; }, () => { state = "failed"; });
       return run;

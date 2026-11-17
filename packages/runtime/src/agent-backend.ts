@@ -37,8 +37,32 @@ export interface AgentCall {
   thinking?: string;
   /** The agent's tools for this call, by name: these and no others. Without it, the agent's own choice. */
   tools?: string[];
+  /**
+   * The skills the agent has for this call, of those the backend finds for
+   * the user and where it works: all of them, or the ones named. Without it,
+   * or with `false` or none named: none.
+   */
+  skills?: boolean | string[];
+  /** The same of prompt templates: with one, a prompt that begins with its name is the template, filled in. */
+  templates?: boolean | string[];
+  /** Whether the agent has the user's own extensions of it: code of the user's that the backend runs. */
+  extensions?: boolean;
+  /**
+   * The prompt is text and nothing else: it goes to the model as written,
+   * and is not read for what it begins with — a skill called up by name, a
+   * command of an extension — though the call has skills or extensions.
+   */
+  asText?: boolean;
   /** Cancels the call. A cancelled call rejects; it never resolves with a partial answer. */
   signal?: AbortSignal;
+  /**
+   * Told what the call has used so far, each time its agent is about to ask
+   * the model again — for the next step of its work, or to have a long
+   * conversation summed up: whoever hears it may cancel the call there,
+   * before more is used. A backend that asks its model once, or cannot say,
+   * never calls it. (It does not throw.)
+   */
+  sofar?: (usage: AgentUsage) => void;
   /**
    * Told what the call used, at most once and before the call settles —
    * however it ended: a call that failed or was cancelled half-way has used

@@ -7,7 +7,8 @@ import { homedir } from "os";
 import { piVersion } from "./pi-adapter.js";
 import { stripCodeFences } from "./agent.js";
 import { onAbort, throwIfAborted } from "./abort.js";
-import type { AgentBackend } from "./agent-backend.js";
+import type { AgentUsage } from "./agent-backend.js";
+import { createMeter } from "./budget.js";
 import { LATEST_LOG_PATH } from "./context.js";
 import { readProjectMeta } from "./meta.js";
 import {
@@ -17,10 +18,10 @@ import {
 import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspace.js";
 import { parentBridge, remoteWorkspace, withOptions } from "./bridge-client.js";
 import { guardPath, identityOf, sameProjectAs } from "./path-guard.js";
-import { printJournals } from "./journal-view.js";
+import { printJournals, spentIn } from "./journal-view.js";
 import { messageOf } from "./errors.js";
 
-export type { ProgramResult, RunOptions } from "./runner-types.js";
+export type { Budget, ProgramResult, RunOptions } from "./runner-types.js";
 import type { ProgramResult, RunOptions, TramaConfig } from "./runner-types.js";
 export type { Workspace, ObserveResult } from "./types.js";
 import type { Workspace } from "./types.js";
@@ -195,12 +196,30 @@ export function resolveProject(name: string): string {
  * what comes back for a program only if something does: no program is not a
  * program that does nothing.
  */
-async function generateProgram(backend: AgentBackend, prepared: Prepared, prompt: string, system: string, signal?: AbortSignal): Promise<string> {
-  const program = stripCodeFences(await backend.ask(prompt, { cwd: prepared.copy, system, signal }));
+async function generateProgram(
+  backend: ReturnType<typeof createBackend>, prepared: Prepared, prompt: string, system: string, wrote: AgentUsage[], signal?: AbortSignal,
+): Promise<string> {
+  let reply: string;
+  try {
+    reply = await backend.ask(prompt, { cwd: prepared.copy, system, signal, used: (usage) => { wrote.push(usage); } });
+  } finally {
+    // What it took is said whatever came of it: it is on record only with a validation, and there may be none.
+    // (A call that was cut off — stopped, or by the budget — says what it took once its backend has let go of it.)
+    await backend.letGo();
+    if (wrote.length > 0) console.log(`[trama] writing the program used ${spentIn(wrote)}`);
+  }
+  const program = stripCodeFences(reply);
   throwIfAborted(signal);
   if (program === "") throw new Error("The model answered with no program.");
   return program;
 }
+
+/**
+ * The backend a create or an update asks: writing the program and validating
+ * it are held, together, to the config's budget — and it is said when that is spent.
+ */
+const backendFor = (config: TramaConfig) =>
+  createBackend(config, createMeter(config.budget), (why) => console.warn(`[trama] ${why}`));
 
 /** Carry what the agent made beside a program into the project the program is now in, and say what that was. */
 function keepPrepared(prepared: Prepared): void {
@@ -232,7 +251,8 @@ function keepPrepared(prepared: Prepared): void {
  * (see validateProgram).
  */
 async function validateCandidate(
-  projectDir: string, backend: ReturnType<typeof createBackend>, candidate: string, config: TramaConfig, prepared: Prepared, signal?: AbortSignal,
+  projectDir: string, backend: ReturnType<typeof createBackend>, candidate: string, config: TramaConfig, prepared: Prepared,
+  wrote: AgentUsage[], signal?: AbortSignal,
 ): Promise<{ validated: Awaited<ReturnType<typeof validateProgram>>; kept: boolean }> {
   let as: string | undefined, alone: string | undefined;
   if (config.agentChanges === "keep") {
@@ -251,6 +271,8 @@ async function validateCandidate(
     signal,
     as,
     alone,
+    budget: config.budget,
+    wrote,
   });
   return { validated, kept: as !== undefined && validated.alone === undefined };
 }
@@ -294,7 +316,8 @@ export async function createProject(
     };
     writeFileSync(join(projectDir, "meta.json"), JSON.stringify(meta, null, 2));
 
-    const backend = createBackend(config);
+    const backend = backendFor(config);
+    const wrote: AgentUsage[] = [];
 
     console.log(`Generating program for "${name}"...`);
     // (What the agent is given to look at is the project made here, and no other directory that is at its path by now.)
@@ -304,6 +327,7 @@ export async function createProject(
       const candidate = await generateProgram(backend, prepared,
         `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation.`,
         getSystemPrompt(config.agentChanges === "keep"),
+        wrote,
         options?.signal,
       );
       stillTheProject();
@@ -314,7 +338,7 @@ export async function createProject(
       keepProjectOnFailure = true;
 
       console.log("Validating program...");
-      const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, options?.signal);
+      const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, options?.signal);
       stillTheProject();
       installValidatedProgram(projectDir, validated, "create", prompt);
       if (kept) keepPrepared(prepared);
@@ -355,7 +379,8 @@ export async function updateProject(
     const state = loadState(projectDir);
     const meta = readProjectMeta(projectDir);
     const config = loadProjectConfig(projectDir, meta);
-    const backend = createBackend(config);
+    const backend = backendFor(config);
+    const wrote: AgentUsage[] = [];
 
     const systemPrompt =
       getSystemPrompt(config.agentChanges === "keep") +
@@ -369,12 +394,13 @@ export async function updateProject(
       const candidate = await generateProgram(backend, prepared,
         `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
         systemPrompt,
+        wrote,
         options?.signal,
       );
       stillTheProject();
 
       console.log("Validating updated program...");
-      const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, options?.signal);
+      const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, options?.signal);
       stillTheProject();
       installValidatedProgram(projectDir, validated, "update", prompt);
       if (kept) keepPrepared(prepared);
