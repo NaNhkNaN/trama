@@ -1,5 +1,5 @@
 import type { Agent } from "./types.js";
-import type { AgentBackend, AgentCall } from "./agent-backend.js";
+import { CutOff, type AgentBackend, type AgentCall } from "./agent-backend.js";
 import { isJsonObject } from "./serializable.js";
 
 /** A line of a reply that could be the edge of a fenced block: three or more backticks. */
@@ -97,46 +97,71 @@ export function stripCodeFences(text: string): string {
   return last ?? reply;
 }
 
-const SUPPORTED_SCHEMA_TYPES = new Set(["string", "number", "boolean"]);
+const SCHEMA_PRIMITIVES = new Set(["string", "number", "boolean"]);
 type SchemaPrimitive = "string" | "number" | "boolean";
 
-/**
- * Parse and validate the caller's schema declaration up front.
- * The part after ":" is a description and is ignored during validation.
- */
-function parseSchema(schema: Record<string, string>): Array<[string, SchemaPrimitive]> {
-  return Object.entries(schema).map(([key, typeDesc]) => {
-    // (What a field is to be is said in words: "number: how many". Anything else says nothing that is supported.)
-    const expectedType = typeof typeDesc === "string" ? typeDesc.split(":")[0].trim() : JSON.stringify(typeDesc);
-    if (typeof typeDesc !== "string" || !SUPPORTED_SCHEMA_TYPES.has(expectedType)) {
-      throw new Error(`Schema validation failed: unsupported schema type "${expectedType}" for key "${key}"`);
-    }
-    return [key, expectedType as SchemaPrimitive];
-  });
-}
+/** What a schema says a value is to be: a primitive by its name, an object by its fields, a list by the one shape all its items have. */
+type Shape = SchemaPrimitive | { fields: Array<[string, Shape]> } | { items: Shape };
+
+/** How the two shapes that are not named in a word are written, for whoever named them in one. */
+const HOW_WRITTEN = `a list is written as the shape of its items, in brackets: ["string"]; an object as its fields: { name: "string" }`;
+
+/** Where a value is in an answer, in words: null for the answer itself, and under that each field by its name. */
+type Where = string | null;
+const fieldOf = (where: Where, key: string): string => (where === null ? key : `${where}.${key}`);
 
 /**
- * Minimal shape validation + projection: verifies every schema key exists with
- * its declared primitive type, and returns an object containing only those keys.
+ * Read the caller's schema declaration, up front: what the value at `where`
+ * is to be. In words — "string", "number", "boolean", where what follows a
+ * ":" describes the value to the model and is not read here — or an object
+ * of such, or a list of one element: the shape of every item.
  */
-function extractBySchema(
-  result: unknown,
-  entries: Array<[string, SchemaPrimitive]>,
-): Record<string, unknown> {
-  if (!isJsonObject(result)) throw new Error("Schema validation failed: response is not an object");
-  const picked: Record<string, unknown> = {};
-  for (const [key, expectedType] of entries) {
-    if (!(key in result)) throw new Error(`Schema validation failed: missing key: ${key}`);
-    const val = result[key];
-    const actual = typeof val;
-    if (actual !== expectedType || (expectedType === "number" && !Number.isFinite(val))) {
-      throw new Error(
-        `Schema validation failed: ${key}: expected ${expectedType}, got ${actual === "number" ? String(val) : actual}`,
-      );
+function shapeOf(declared: unknown, where: Where): Shape {
+  if (Array.isArray(declared)) {
+    if (declared.length !== 1) {
+      throw new Error(`Schema validation failed: the list at "${where}" is written with ${declared.length} elements — it takes one, the shape of every item`);
     }
-    picked[key] = val;
+    return { items: shapeOf(declared[0], `${where}[]`) };
   }
-  return picked;
+  if (isJsonObject(declared)) {
+    return { fields: Object.entries(declared).map(([key, value]) => [key, shapeOf(value, fieldOf(where, key))]) };
+  }
+  // (Anything else says nothing that is supported — and is said back as JSON would write it, which is no word for a kind.)
+  const named = typeof declared === "string" ? declared.split(":")[0].trim() : JSON.stringify(declared);
+  if (!SCHEMA_PRIMITIVES.has(named)) {
+    throw new Error(`Schema validation failed: unsupported schema type "${named}" for key "${where}" (${HOW_WRITTEN})`);
+  }
+  return named as SchemaPrimitive;
+}
+
+const hasList = (shape: Shape): boolean =>
+  typeof shape !== "string" && ("items" in shape || shape.fields.some(([, field]) => hasList(field)));
+
+/** What a value is, said as a reply is told of it. */
+const said = (value: unknown): string =>
+  value === null ? "null" : Array.isArray(value) ? "a list" : typeof value === "number" ? String(value) : typeof value;
+
+/**
+ * Shape validation and projection: verifies that the value at `where` is of
+ * the shape declared — every field there, every item of a list — and returns
+ * it holding the declared fields and no others.
+ */
+function conform(value: unknown, shape: Shape, where: Where): unknown {
+  const mismatch = (expected: string) => new Error(`Schema validation failed: ${where}: expected ${expected}, got ${said(value)}`);
+  if (typeof shape === "string") {
+    if (typeof value !== shape || (shape === "number" && !Number.isFinite(value))) throw mismatch(shape);
+    return value;
+  }
+  if ("items" in shape) {
+    if (!Array.isArray(value)) throw mismatch("a list");
+    return value.map((item, index) => conform(item, shape.items, `${where}[${index}]`));
+  }
+  if (!isJsonObject(value)) throw where === null ? new Error("Schema validation failed: response is not an object") : mismatch("an object");
+  return Object.fromEntries(shape.fields.map(([key, field]) => {
+    // (A field is the reply's own: what every object has by birth is not something a reply said.)
+    if (!Object.hasOwn(value, key)) throw new Error(`Schema validation failed: missing key: ${fieldOf(where, key)}`);
+    return [key, conform(value[key], field, fieldOf(where, key))];
+  }));
 }
 
 /** Hears what a call used — each time its backend was asked: a `generate` that had to ask again is heard twice. */
@@ -157,21 +182,41 @@ const asked = (options: Pick<AgentCall, "model" | "thinking" | "tools" | "used">
  * `cwd`, and cancelled together through `signal`.
  */
 export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSignal): RunnerAgent {
+  /**
+   * Ask the backend — and of a reply that was cut off at the output limit,
+   * make what the call said to make of it: its failure, unless the call
+   * keeps such a reply, and there is something of it to keep.
+   */
+  const ask = async (prompt: string, call: AgentCall, cutOff: unknown): Promise<string> => {
+    if (cutOff !== undefined && cutOff !== "fail" && cutOff !== "keep") {
+      throw new Error(`cutOff is "fail" or "keep", not ${JSON.stringify(cutOff)}`);
+    }
+    try {
+      return await backend.ask(prompt, call);
+    } catch (err) {
+      if (cutOff === "keep" && err instanceof CutOff && err.text !== "") return err.text;
+      throw err;
+    }
+  };
+
   return {
     async instruct(prompt, options, used) {
-      const { system, model, thinking, tools } = options ?? {};
-      return backend.ask(prompt, { cwd, system, signal, ...asked({ model, thinking, tools, used }) });
+      const { system, model, thinking, tools, cutOff } = options ?? {};
+      return ask(prompt, { cwd, system, signal, ...asked({ model, thinking, tools, used }) }, cutOff);
     },
 
     async generate(input, used) {
-      const schemaEntries = parseSchema(input.schema);
+      if (!isJsonObject(input.schema)) throw new Error("Schema validation failed: a schema is an object of the fields the answer is to have");
+      const shape = shapeOf(input.schema, null);
       const schemaInstruction = `Respond with ONLY a JSON object matching this shape:\n${
         JSON.stringify(input.schema, null, 2)
-      }\nNo markdown. No explanation. Just the JSON.`;
+      }\n${
+        hasList(shape) ? "Where the shape shows a list, it shows one item: answer with as many as there are, each of that shape.\n" : ""
+      }No markdown. No explanation. Just the JSON.`;
 
       const fullPrompt = `${input.prompt}\n\n${schemaInstruction}`;
-      const { system, model, thinking } = input;
-      const call = { cwd, system, signal, ...asked({ model, thinking, used }) };
+      const { system, model, thinking, tools, cutOff } = input;
+      const call = { cwd, system, signal, ...asked({ model, thinking, tools, used }) };
 
       const parseAndValidate = (response: string): Record<string, unknown> => {
         const trimmed = response.trim();
@@ -184,17 +229,17 @@ export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSi
           const fenceMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
           parsed = JSON.parse(fenceMatch ? fenceMatch[1].trim() : trimmed);
         }
-        return extractBySchema(parsed, schemaEntries);
+        return conform(parsed, shape, null) as Record<string, unknown>;
       };
 
       // First attempt — backend errors (network/auth) propagate immediately.
       // Only parse/validation failures trigger a retry.
-      const response = await backend.ask(fullPrompt, call);
+      const response = await ask(fullPrompt, call, cutOff);
       try {
         return parseAndValidate(response) as any;
       } catch (firstError) {
         const retryPrompt = `Your previous response failed validation: ${firstError}.\nTry again.\n\n${fullPrompt}`;
-        const retryResponse = await backend.ask(retryPrompt, call);
+        const retryResponse = await ask(retryPrompt, call, cutOff);
         return parseAndValidate(retryResponse) as any;
       }
     }

@@ -155,5 +155,45 @@ test("the types of the program-facing API can be imported from where the API is"
   const { readFileSync } = await import("fs");
   const declarations = readFileSync(join(REPO_ROOT, "packages", "runtime", "dist", "client.d.ts"), "utf-8");
   const exported = /export type \{([^}]*)\}/.exec(declarations)?.[1].split(",").map(name => name.trim()).sort();
-  assert.deepEqual(exported, ["Agent", "Ctx", "ModelOptions", "ObserveResult", "ShellResult", "Thinking", "Tools", "Workspace"]);
+  assert.deepEqual(exported, ["Agent", "AgentOptions", "Ctx", "ObserveResult", "Schema", "SchemaField", "ShellResult", "Thinking", "Tools", "Workspace"]);
+});
+
+test("a schema and the options of a call type-check as a program would write them — inline, or held in a variable first", async (t) => {
+  const { execFileSync } = await import("child_process");
+  const { mkdtempSync, rmSync, writeFileSync } = await import("fs");
+  const { tmpdir } = await import("os");
+  const dir = mkdtempSync(join(tmpdir(), "trama-types-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const types = join(REPO_ROOT, "packages", "runtime", "dist", "types.js");
+  // (A module: a program awaits at its top.)
+  writeFileSync(join(dir, "program.mts"), `import type { Agent, AgentOptions, Schema } from ${JSON.stringify(types)};
+declare const agent: Agent;
+export const inline = await agent.generate<{ tags: string[] }>({ prompt: "p", schema: { tags: ["string"], failures: [{ test: "string", line: "number" }], meta: { grid: [["number"]] } } });
+const held = { tags: ["string"], failures: [{ test: "string", line: "number" }], meta: { ok: "boolean" } };
+export const fromHeld = await agent.generate({ prompt: "p", schema: held });
+const fixed = { tags: ["string"], meta: { ok: "boolean" } } as const;
+export const fromFixed = await agent.generate({ prompt: "p", schema: fixed });
+const flat = { a: "string", n: "number: how many" };
+export const fromFlat = await agent.generate({ prompt: "p", schema: flat });
+const old: Record<string, string> = { a: "string" };
+export const fromOld = await agent.generate({ prompt: "p", schema: old });
+const named: Schema = { a: ["string"] };
+export const fromNamed = await agent.generate({ prompt: "p", schema: named, cutOff: "keep", tools: [] });
+const options: AgentOptions = { cutOff: "keep", thinking: "low" };
+export const kept = await agent.instruct("p", options);
+// @ts-expect-error — a field is said in words, or as what it holds
+export const notAWord = await agent.generate({ prompt: "p", schema: { a: 7 } });
+// @ts-expect-error — a reply that was cut off is kept, or the call fails
+export const neither = await agent.instruct("p", { cutOff: "sometimes" });
+`);
+  writeFileSync(join(dir, "tsconfig.json"), JSON.stringify({
+    compilerOptions: { noEmit: true, strict: true, target: "es2022", module: "nodenext", moduleResolution: "nodenext", skipLibCheck: true, types: [] },
+    files: ["program.mts"],
+  }));
+  const tsc = join(REPO_ROOT, "node_modules", "typescript", "bin", "tsc");
+  try {
+    execFileSync(process.execPath, [tsc, "-p", dir], { encoding: "utf-8", stdio: "pipe" });
+  } catch (err) {
+    assert.fail(`the program does not type-check:\n${err.stdout}${err.stderr}`);
+  }
 });

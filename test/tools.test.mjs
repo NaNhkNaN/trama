@@ -4,7 +4,7 @@ import test from "node:test";
 import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { createTools } from "../packages/runtime/dist/tools.js";
-import { cappedBuffer } from "../packages/runtime/dist/child-process.js";
+import { cappedBuffer, checkedEnv } from "../packages/runtime/dist/child-process.js";
 import { cleanupTempDir, makeTempDir } from "./helpers.mjs";
 
 test("createTools read and write operate inside the project directory", async (t) => {
@@ -496,4 +496,91 @@ test("createTools fetch gives an answer that has no body an empty one", async (t
 
   const response = await createTools(projectDir).fetch(`http://127.0.0.1:${server.address().port}/`);
   assert.deepEqual([response.status, response.body], [204, ""]);
+});
+
+test("a command has the runner's variables, those its run was started with, and those it is given — in that order, and never the bridge's", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+  const { withEnv } = await import("./helpers.mjs");
+
+  await withEnv({ FROM_RUNNER: "runner", SHADOWED: "runner", TRAMA_PORT: "1234", TRAMA_INIT: "/somewhere" }, async () => {
+    const tools = createTools(projectDir, undefined, { FROM_RUN: "run", SHADOWED: "run", TWICE: "run" });
+    const show = 'printf %s "$FROM_RUNNER/$FROM_RUN/$SHADOWED/$TWICE/$ONCE/${TRAMA_PORT:-none}/${TRAMA_INIT:-none}"';
+    assert.equal((await tools.shell(show)).stdout, "runner/run/run/run//none/none");
+    assert.equal((await tools.shell(show, { env: { TWICE: "call", ONCE: "call" } })).stdout, "runner/run/run/call/call/none/none");
+    // What one command was given, the next has not.
+    assert.equal((await tools.shell(show, { env: {} })).stdout, "runner/run/run/run//none/none");
+    // The bridge's two are the runner's to give, whoever names them; and none given is none given, however that is said.
+    assert.equal((await tools.shell(show, { env: { TRAMA_PORT: "1", TRAMA_INIT: "x", ONCE: undefined } })).stdout, "runner/run/run/run//none/none");
+    assert.equal((await tools.shell(show, { env: null })).stdout, "runner/run/run/run//none/none");
+    await assert.rejects(() => tools.shell("true", { env: { "A B=C": "x" } }), /env has a name no variable can have: "A B=…"$/);
+    await assert.rejects(() => tools.shell("true", { env: { "A B": 1 } }), /env gives "A B" what is not text a variable can hold/);
+    await assert.rejects(() => tools.shell("true", { env: "A=1" }), /env is an object of variables/);
+  });
+  // Without any, a command has the runner's own as before.
+  assert.equal((await createTools(projectDir).shell('printf %s "${HOME:+has a home}"')).stdout, "has a home");
+});
+
+test("the shell that runs a command is the runner's, whatever PATH the command is given; and a command the system will not start is a result", async (t) => {
+  const { chmodSync } = await import("fs");
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+  // Something else of the shell's name, where a PATH that says "here" would find it.
+  writeFileSync(join(projectDir, "sh"), "#!/bin/sh\necho planted\n");
+  chmodSync(join(projectDir, "sh"), 0o755);
+
+  for (const tools of [createTools(projectDir), createTools(projectDir, undefined, { PATH: "" })]) {
+    for (const PATH of ["", ".", "/nonexistent"]) {
+      const result = await tools.shell('printf %s "ran with PATH=$PATH"; command -v ls >/dev/null 2>&1 || printf ", and finds no ls"', { env: { PATH } });
+      assert.deepEqual(result, { exitCode: 0, stdout: `ran with PATH=${PATH}, and finds no ls`, stderr: "" });
+    }
+  }
+  assert.deepEqual(await createTools(projectDir, undefined, { PATH: "" }).shell("printf ran"), { exitCode: 0, stdout: "ran", stderr: "" });
+
+  // More than the system hands a process: the command is not started, and that is what the call says.
+  const tooMuch = await createTools(projectDir).shell("true", { env: { BIG: "x".repeat(8 * 1024 * 1024) } });
+  assert.equal(tooMuch.exitCode, 1);
+  assert.match(tooMuch.stderr, /E2BIG/);
+});
+
+test("a runner that has no PATH finds the shell where the system keeps it, not in the project", async (t) => {
+  const { chmodSync } = await import("fs");
+  const { withEnv } = await import("./helpers.mjs");
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+  writeFileSync(join(projectDir, "sh"), "#!/bin/sh\necho planted\n");
+  chmodSync(join(projectDir, "sh"), 0o755);
+
+  const result = await withEnv({ PATH: undefined }, () => createTools(projectDir).shell("printf ran"));
+  assert.deepEqual(result, { exitCode: 0, stdout: "ran", stderr: "" });
+});
+
+test("the shell is sh to itself and in what it says, wherever the runner found it", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+  const tools = createTools(projectDir);
+
+  assert.equal((await tools.shell('printf %s "$0"')).stdout, "sh");
+  const unknown = await tools.shell("no-such-command-anywhere");
+  assert.equal(unknown.exitCode, 127);
+  assert.match(unknown.stderr, /^sh: /);
+  assert.equal((await tools.shell("echo hi", { cwd: "missing-dir" })).stderr, "spawn sh ENOENT");
+});
+
+test("what is given for variables is held to what variables are, and handed back as a copy", () => {
+  for (const none of [null, undefined, ["A=1"], "A=1", 5]) assert.throws(() => checkedEnv(none), /env is an object of variables: each a name, and its text/);
+  const given = { A: "1", NOT_GIVEN: undefined, TRAMA_PORT: "7", TRAMA_INIT: "/x", __proto__: null };
+  const checked = checkedEnv(given);
+  assert.deepEqual({ ...checked }, { A: "1" });
+  assert.notEqual(checked, given);
+});
+
+test("a directory called sh on the runner's PATH is no shell: the next is taken", async (t) => {
+  const { withEnv } = await import("./helpers.mjs");
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+  mkdirSync(join(projectDir, "bin", "sh"), { recursive: true });
+
+  const result = await withEnv({ PATH: `${join(projectDir, "bin")}:${process.env.PATH}` }, () => createTools(projectDir).shell("printf ran"));
+  assert.deepEqual(result, { exitCode: 0, stdout: "ran", stderr: "" });
 });

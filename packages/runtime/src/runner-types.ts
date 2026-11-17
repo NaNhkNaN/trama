@@ -31,6 +31,13 @@ export interface RunOptions {
   /** A name for this run — a participant's, say. Its output is shown under it. */
   label?: string;
   /**
+   * Variables for the run, over the runner's own: its program has them, and
+   * so do the shell commands it runs and the runs it asks for, each of which
+   * may be given more. One given as undefined is one not given. The journal
+   * has their names, not what they hold.
+   */
+  env?: Record<string, string | undefined>;
+  /**
    * Stops the run: its program is stopped, no repair is attempted, and the
    * run ends as failed. A fix that was being tried leaves no trace.
    */
@@ -46,4 +53,12 @@ export interface TramaConfig extends ModelConfig {
   defaultMaxIterations: number;
   /** How many runs of a project keep their journal. 0 records nothing. */
   journalRuns: number;
+  /**
+   * What becomes of what the agent that writes or fixes a program changes in
+   * the project beside the program — a package it installs, a file it puts
+   * right. "keep": it reaches the project with a program that then works,
+   * and only with one. "discard": none of it does; the program is all that
+   * is taken from the agent.
+   */
+  agentChanges: "keep" | "discard";
 }

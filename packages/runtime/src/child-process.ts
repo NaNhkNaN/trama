@@ -100,6 +100,34 @@ export interface SuperviseOptions {
   stopSignal?: AbortSignal;
 }
 
+/**
+ * A variable's name as it is shown, and written down. What follows a "=" in
+ * one is left out: a name cannot have one, and whoever wrote "KEY=value" for
+ * a name wrote a value there.
+ */
+export const variableName = (name: string): string => (name.includes("=") ? `${name.slice(0, name.indexOf("="))}=…` : name);
+
+/**
+ * Variables a caller gives for what it starts, over those it would have
+ * anyway: each a name and its text. Returns them as they were when asked —
+ * the caller's object is its own, to change afterwards — or throws, saying
+ * which, for what is none.
+ *
+ * Two things given are not taken. One given as undefined is one not given.
+ * And the two names by which a program finds its runner are the runner's to
+ * give, to each program its own: they are passed over — so that a program
+ * can hand on its whole environment (`env: process.env`), which holds them.
+ */
+export function checkedEnv(env: unknown): Record<string, string> {
+  if (typeof env !== "object" || env === null || Array.isArray(env)) throw new TypeError("env is an object of variables: each a name, and its text");
+  const given = Object.entries(env).filter(([name, value]) => value !== undefined && name !== "TRAMA_PORT" && name !== "TRAMA_INIT");
+  for (const [name, value] of given) {
+    if (name === "" || /[=\0]/.test(name)) throw new TypeError(`env has a name no variable can have: ${JSON.stringify(variableName(name))}`);
+    if (typeof value !== "string" || value.includes("\0")) throw new TypeError(`env gives ${JSON.stringify(name)} what is not text a variable can hold`);
+  }
+  return Object.fromEntries(given);
+}
+
 export interface ChildExit {
   code: number | null;
   signal: NodeJS.Signals | null;

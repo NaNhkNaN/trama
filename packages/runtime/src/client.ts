@@ -2,11 +2,11 @@
 // A thin wrapper that forwards every call to the runner's IPC server
 // (ipc-server.ts), which does the real work.
 
-import type { Ctx, Agent, ModelOptions, Thinking, ShellResult, Tools, ObserveResult, Workspace } from "./types.js";
-import { openBridge, remoteWorkspace } from "./bridge-client.js";
+import type { Ctx, Agent, AgentOptions, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace } from "./types.js";
+import { openBridge, remoteWorkspace, withOptions } from "./bridge-client.js";
 import { assertSerializable, toLogData } from "./serializable.js";
 
-export type { Ctx, Agent, ModelOptions, Thinking, ShellResult, Tools, ObserveResult, Workspace };
+export type { Ctx, Agent, AgentOptions, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace };
 
 const PORT = process.env.TRAMA_PORT;
 if (!PORT) {
@@ -61,15 +61,15 @@ export const ctx: Ctx = {
 };
 
 export const agent: Agent = {
-  instruct: (prompt, opts) => call("/agent/instruct", { prompt, ...opts }),
+  instruct: async (prompt, opts) => call("/agent/instruct", withOptions({ prompt }, opts)),
   generate: (input) => call("/agent/generate", input),
 };
 
 export const tools: Tools = {
   read: (path) => call("/tools/read", { path }),
   write: (path, content) => call("/tools/write", { path, content }),
-  shell: (cmd, opts) => call("/tools/shell", { command: cmd, ...opts }),
-  fetch: (url, opts) => call("/tools/fetch", { url, ...opts }),
+  shell: async (cmd, opts) => call("/tools/shell", withOptions({ command: cmd }, opts)),
+  fetch: async (url, opts) => call("/tools/fetch", withOptions({ url }, opts)),
 };
 
 /** workspace.* exists only inside a session — everywhere else it fails clearly, without a round trip. */

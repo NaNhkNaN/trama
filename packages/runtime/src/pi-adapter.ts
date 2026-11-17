@@ -1,6 +1,6 @@
 import type { AgentSession } from "@earendil-works/pi-coding-agent";
 import { onAbort, rejectOnAbort, throwIfAborted } from "./abort.js";
-import type { AgentBackend, AgentCall, AgentUsage } from "./agent-backend.js";
+import { CutOff, type AgentBackend, type AgentCall, type AgentUsage } from "./agent-backend.js";
 import type { ModelConfig } from "./runner-types.js";
 
 /**
@@ -63,15 +63,17 @@ function usageOf(session: AgentSession): AgentUsage | undefined {
  * takes a reply that failed out of that — one the provider refused as too
  * long, one cut off — and what is left there to be last is an earlier turn.
  * And an answer only if the model ended it itself: a reply that is the
- * provider's error, or was cut off at the output limit, is the call's failure.
+ * provider's error, or was cut off at the output limit, is the call's failure
+ * (the second with what there was of it: see CutOff). A reply cut off in the
+ * middle of a tool call is never the last: pi has the model make the call again.
  */
 function answerOf(session: AgentSession): string {
   const replies = session.sessionManager.getEntries()
     .flatMap(entry => (entry.type === "message" && entry.message.role === "assistant" ? [entry.message] : []));
   const reply = replies.at(-1);
+  const text = reply?.content.map(block => (block.type === "text" ? block.text : "")).join("") ?? "";
   if (reply?.stopReason === "error") throw new Error(`The model did not answer: ${reply.errorMessage ?? "no reason given"}`);
-  if (reply?.stopReason === "length") throw new Error("The model's answer was cut off at its output limit.");
-  const text = reply?.content.map(block => (block.type === "text" ? block.text : "")).join("");
+  if (reply?.stopReason === "length") throw new CutOff(text);
   if (!text) throw new Error("Empty response from LLM");
   return text;
 }

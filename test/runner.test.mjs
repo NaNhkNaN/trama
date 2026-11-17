@@ -437,6 +437,8 @@ test("loadConfig rejects invalid field values", (t) => {
     [{ defaultTimeout: -100 }, /defaultTimeout/],
     [{ provider: 123 }, /provider/],
     [{ model: "" }, /model/],
+    [{ agentChanges: "some" }, /"agentChanges" must be "keep" or "discard" \(got "some"\)/],
+    [{ agentChanges: true }, /"agentChanges" must be "keep" or "discard" \(got true\)/],
   ];
 
   for (const [override, pattern] of cases) {
@@ -1830,8 +1832,19 @@ for (const [endpoint, body] of [
   ["/run/program", { projectDir: "/nowhere", timeout: "soon" }],
   ["/run/program", { projectDir: "/nowhere", maxRepairAttempts: "many" }],
   ["/ctx/done", { state: [] }],
-  // A field the call does not declare is not an error; an optional one given as null was left out.
-  ["/tools/shell", { command: "echo carried out", stdio: "inherit", cwd: null, timeout: null }],
+  // An optional field given as null was left out. A field the call does not declare is refused: nothing would come of it.
+  ["/tools/shell", { command: "echo carried out", cwd: null, timeout: null }],
+  ["/tools/shell", { command: "echo not carried out", stdio: "inherit" }],
+  ["/agent/generate", { prompt: "p", schema: {}, tool: [] }],
+  ["/agent/generate", { prompt: "p", schema: {}, tools: "read" }],
+  // (Also one that every object has by birth, and one given as nothing. Of several, the first is named.)
+  ["/tools/shell", { command: "echo not carried out", toString: 1 }],
+  ["/tools/shell", { command: "echo not carried out", input: null, detached: true }],
+  // Variables are an object of names and their text. (Of a name that is none, what follows a "=" is not said back: it is a value.)
+  ["/tools/shell", { command: "true", env: "A=1" }],
+  ["/tools/shell", { command: "true", env: { A: 1 } }],
+  ["/tools/shell", { command: "true", env: { "A=B": "x" } }],
+  ["/run/program", { projectDir: "/nowhere", env: { A: null } }],
 ]) answers.push(await post(endpoint, body));
 await tools.write("answers.json", JSON.stringify(answers));
 await ctx.done();`,
@@ -1849,6 +1862,15 @@ await ctx.done();`,
     "400 Invalid field: maxRepairAttempts (expected number or undefined)",
     "400 Missing or invalid field: state (expected object)",
     '200 {"result":{"exitCode":0,"stdout":"carried out\\n","stderr":""}}',
+    "400 Unknown field: stdio (this call takes: command, cwd, timeout, env)",
+    "400 Unknown field: tool (this call takes: prompt, schema, system, model, thinking, tools, cutOff)",
+    "400 Invalid field: tools (expected strings or undefined)",
+    "400 Unknown field: toString (this call takes: command, cwd, timeout, env)",
+    "400 Unknown field: input (this call takes: command, cwd, timeout, env)",
+    "400 Invalid field: env (expected object or undefined)",
+    '400 Invalid field: env gives "A" what is not text a variable can hold',
+    '400 Invalid field: env has a name no variable can have: "A=…"',
+    '400 Invalid field: env gives "A" what is not text a variable can hold',
   ]);
 });
 
@@ -2259,7 +2281,7 @@ await ctx.done();
   assert.equal(result.status, "done");
   assert.equal(readFileSync(real, "utf-8"), "changed by someone else meanwhile, and longer");
   assert.equal(readFileSync(join(projectDir, "arrived.txt"), "utf-8"), "this one arrives");
-  assert.ok(messages.some(line => /1 change\(s\) the repaired run made did not reach the project/.test(line)), messages.join("\n"));
+  assert.ok(messages.some(line => /1 change\(s\) the repair made did not reach the project/.test(line)), messages.join("\n"));
   assert.ok(messages.some(line => /report\.txt — it was changed or removed in the project meanwhile/.test(line)), messages.join("\n"));
 
   const [journal] = readdirSync(join(projectDir, "logs", "journal"));
@@ -3212,4 +3234,598 @@ await ctx.done({ status, second, nameless, again });`,
   assert.deepEqual([result.result.second[0], /Duplicate run id: one/.test(result.result.second[1])], [400, true]);
   assert.deepEqual(result.result.nameless.map(([status, text]) => [status, /expected a non-empty string/.test(text)]), [[400, true], [400, true]]);
   assert.equal(result.result.again, 200);
+});
+
+test("an option is neither what the call is made with nor something that cannot be sent: the call is refused where it is made", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  const other = makeTempDir("trama-runner-");
+  const shared = makeTempDir("trama-runner-");
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(other); cleanupTempDir(shared); });
+  createProjectFixture(other, { scaffold: false, programSource: `import { ctx } from "@trama-dev/runtime";\nawait ctx.done();\n` });
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, agent, tools } from "@trama-dev/runtime";
+import { runProgram, createWorkspace } from "@trama-dev/runtime/runner";
+const said = (call) => call().then((answer) => answer, (err) => err.message);
+const any = (options) => options;
+const workspace = createWorkspace(${JSON.stringify(shared)});
+await workspace.write("x.txt", "as written");
+await ctx.done({
+  // An option named for what the call is made with would take its place: the other prompt asked, the other command run.
+  prompt: await said(() => agent.instruct("the prompt as written", any({ prompt: "another prompt" }))),
+  command: await said(() => tools.shell("echo as-written", any({ command: "echo another" }))),
+  url: await said(() => tools.fetch("http://127.0.0.1:1/", any({ url: "http://127.0.0.1:2/" }))),
+  pattern: await said(() => workspace.observe("x.txt", any({ pattern: "y.txt" }))),
+  dir: await said(() => workspace.observe("x.txt", any({ dir: "/somewhere/else" }))),
+  id: await said(() => runProgram(any({ projectDir: ${JSON.stringify(other)}, id: "mine" }))),
+  // One that JSON has no word for would be left out on the way, and the call carried out without it.
+  callback: await said(() => tools.shell("echo carried-out", any({ onOutput: () => {} }))),
+  symbol: await said(() => agent.instruct("p", any({ tools: [Symbol("read")] }))),
+  whole: await said(() => agent.generate(any(() => {}))),
+  // ...and the calls as they are meant still go through.
+  shell: (await tools.shell("echo as-written", { timeout: 5000 })).stdout,
+  none: [(await tools.shell("echo as-written", any(null))).stdout, await agent.instruct("p", any(null)), await agent.instruct("p", undefined)],
+  observe: await workspace.observe("x.txt", { timeout: 5000 }),
+  run: (await runProgram({ projectDir: ${JSON.stringify(other)} })).status,
+});`,
+  });
+
+  const originalAsk = llm.ask;
+  llm.ask = async (prompt) => `asked: ${prompt}`;
+  t.after(() => { llm.ask = originalAsk; });
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.deepEqual(result.result, {
+    prompt: "prompt is what the call is made with, and cannot be given as an option",
+    command: "command is what the call is made with, and cannot be given as an option",
+    url: "url is what the call is made with, and cannot be given as an option",
+    pattern: "pattern is what the call is made with, and cannot be given as an option",
+    dir: "dir is what the call is made with, and cannot be given as an option",
+    id: "id is what the call is made with, and cannot be given as an option",
+    callback: "onOutput is a function, which cannot be sent to the runner (/tools/shell)",
+    symbol: "item 0 of a list is a symbol, which cannot be sent to the runner (/agent/instruct)",
+    whole: "what the call is made with is a function, which cannot be sent to the runner (/agent/generate)",
+    shell: "as-written\n",
+    none: ["as-written\n", "asked: p", "asked: p"],
+    observe: "as written",
+    run: "done",
+  });
+});
+
+// --- What is beside a project is beside its copies ---
+
+const journalOf = (projectDir) => {
+  const dir = join(projectDir, "logs", "journal");
+  return readdirSync(dir).sort().map(name => readFileSync(join(dir, name), "utf-8").trim().split("\n").map(line => JSON.parse(line)));
+};
+
+test("what is beside a project is beside its copies: a program that reaches it by .. is repaired, and validated, like any other", async (t) => {
+  const home = makeTempDir("trama-among-");
+  const projectDir = join(home, "the-project");
+  createProjectFixture(projectDir, { scaffold: false, programSource: BOOM });
+  writeText(join(home, "shared.json"), JSON.stringify({ from: "beside" }));
+  writeText(join(home, "notes.txt"), "as it was");
+  writeText(join(home, "lib", "helper.mjs"), 'export const helped = "by a module beside the project";\n');
+  const reaches = (more = "") => `import { ctx } from "@trama-dev/runtime";
+import * as fs from "fs";
+import { helped } from "../lib/helper.mjs";
+const shared = JSON.parse(fs.readFileSync("../shared.json", "utf-8"));
+const beside = fs.readdirSync("..").sort();
+${more}
+await ctx.done({ shared, helped, beside, inTheProject: fs.realpathSync(".") === ${JSON.stringify(realpathSync(projectDir))} });`;
+  const originalRepair = llm.repair;
+  let agentRead;
+  llm.repair = async (_prompt, call) => {
+    agentRead = readFileSync(join(call.cwd, "..", "shared.json"), "utf-8");
+    return reaches(`fs.writeFileSync("../lib/written-by-the-run.txt", "it is there");
+fs.writeFileSync("../made-beside.txt", "beside the copy");
+fs.rmSync("../shared.json");
+fs.rmSync("../notes.txt");
+fs.writeFileSync("../notes.txt", "another, in its place");`);
+  };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(home); });
+
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done", result.reason);
+  assert.deepEqual(result.result, {
+    shared: { from: "beside" }, helped: "by a module beside the project", beside: ["lib", "notes.txt", "shared.json", "the-project"], inTheProject: false,
+  });
+  assert.equal(agentRead, '{"from":"beside"}');
+  // What a name beside the project leads to is the thing itself: what is done to it is done.
+  assert.equal(readFileSync(join(home, "lib", "written-by-the-run.txt"), "utf-8"), "it is there");
+  // A name made or taken away there is one beside the copy, and not beside the project — which is said, and is on record.
+  assert.deepEqual(readdirSync(home).sort(), ["lib", "notes.txt", "shared.json", "the-project"]);
+  assert.equal(readFileSync(join(home, "notes.txt"), "utf-8"), "as it was");
+  const notThere = "it was removed, or something else put there, beside the copy that was worked in: beside the project it is as it was";
+  const stranded = [
+    { path: "../made-beside.txt", why: "it was made beside the copy that was worked in, and goes with it: beside the project there is no such thing" },
+    { path: "../notes.txt", why: notThere },
+    { path: "../shared.json", why: notThere },
+  ];
+  assert.ok(messages.some(line => /3 change\(s\) the repair made did not reach the project/.test(line)), messages.join("\n"));
+  for (const { path, why } of stranded) assert.ok(messages.includes(`[trama]   ${path} — ${why}`), messages.join("\n"));
+  assert.deepEqual(journalOf(projectDir)[0].find(record => record.kind === "unmerged").files, stranded);
+
+  // And a candidate for such a project can be validated at all — which is what an update needs. Nothing is told of what it does beside its copy: that goes.
+  const candidate = reaches(`fs.writeFileSync("../made-in-a-validation.txt", "x");`);
+  const quiet = await captureConsole("warn", () =>
+    validateProgram(projectDir, createBackend(loadConfig()), candidate, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 }));
+  assert.equal(quiet.result.source, candidate);
+  assert.deepEqual(quiet.messages, []);
+  assert.deepEqual(readdirSync(home).sort(), ["lib", "notes.txt", "shared.json", "the-project"]);
+});
+
+test("a copy made in the directory its project is in does not stand beside itself, and stands beside nothing twice", async (t) => {
+  // (A project made where the runner makes its own directories: the one the copy is made in is beside the project.)
+  const projectDir = projectWith(BOOM);
+  writeText(join(projectDir, "..", `${basename(projectDir)}-neighbour.txt`), "beside it");
+  const originalRepair = llm.repair;
+  llm.repair = async () => `import { ctx } from "@trama-dev/runtime";\nimport * as fs from "fs";\nimport * as path from "path";
+const own = path.basename(fs.realpathSync(".."));
+const names = fs.readdirSync("..");
+await ctx.done({
+  own: /^trama-repair-/.test(own), listsItself: names.includes(own), itself: names.filter((name) => name === path.basename(process.cwd())).length,
+  neighbour: fs.readFileSync("../" + path.basename(process.cwd()) + "-neighbour.txt", "utf-8"), isIn: fs.statSync("..").mode & 0o777,
+});`;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); rmSync(`${projectDir}-neighbour.txt`, { force: true }); });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.deepEqual(result.result, { own: true, listsItself: false, itself: 1, neighbour: "beside it", isIn: 0o700 });
+});
+
+// --- What the agent asked for a fix does in the project ---
+
+const NEEDS = `import { ctx } from "@trama-dev/runtime";
+import * as fs from "fs";
+import { greeting } from "./helper.mjs";
+await ctx.done({ greeting, config: JSON.parse(fs.readFileSync("config.json", "utf-8")), stale: fs.existsSync("stale.txt") });`;
+
+/** A project whose program is sound and cannot run: what it imports is missing, what it reads is broken. */
+const projectThatNeeds = () => {
+  const projectDir = projectWith(NEEDS);
+  writeText(join(projectDir, "config.json"), "{ not json");
+  writeText(join(projectDir, "stale.txt"), "in the way");
+  return projectDir;
+};
+/** An agent that puts the project right, where it works, and answers with a program. */
+const mends = (answer, told = {}) => async (prompt, call) => {
+  Object.assign(told, {
+    kept: /what you change in this directory is kept, with the program you answer with, if that program then runs/.test(prompt),
+    discarded: /Nothing you change in this directory is kept/.test(prompt),
+    journal: /The record of the run that failed[^\n]* is at (\S+), a line of JSON for each/.exec(prompt)?.[1],
+    asked: prompt.split("\n").at(-1),
+  });
+  writeFileSync(join(call.cwd, "helper.mjs"), 'export const greeting = "from the agent";\n');
+  writeFileSync(join(call.cwd, "config.json"), '{"mended":true}');
+  rmSync(join(call.cwd, "stale.txt"));
+  return answer;
+};
+
+test("what the agent asked for a fix puts right in the project arrives with a fix that runs — where the program itself needed none, too", async (t) => {
+  const projectDir = projectThatNeeds();
+  const originalRepair = llm.repair;
+  const told = {};
+  llm.repair = async (prompt, call) => {
+    const answer = await mends(NEEDS, told)(prompt, call);
+    // The record of the failed run is there to be read, where the agent is told it is.
+    told.recorded = readFileSync(told.journal, "utf-8").trim().split("\n").map(line => JSON.parse(line)).some(record => record.kind === "exit");
+    return answer;
+  };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { result, messages } = await captureConsole("log", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.deepEqual(result, { status: "done", result: { greeting: "from the agent", config: { mended: true }, stale: false } });
+  const [journal] = readdirSync(join(projectDir, "logs", "journal"));
+  assert.deepEqual(told, {
+    kept: true, discarded: false, journal: join(realpathSync(projectDir), "logs", "journal", journal), recorded: true,
+    asked: "Output ONLY the fixed program: the whole of it, also where it is the project that needed fixing. No explanation.",
+  });
+  // In the project: what the agent made, changed and removed — and the program, as it was and allowing what it allowed.
+  assert.equal(readFileSync(join(projectDir, "helper.mjs"), "utf-8"), 'export const greeting = "from the agent";\n');
+  assert.equal(readFileSync(join(projectDir, "config.json"), "utf-8"), '{"mended":true}');
+  assert.equal(existsSync(join(projectDir, "stale.txt")), false);
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), NEEDS);
+  assert.equal(statSync(join(projectDir, "program.ts")).mode & 0o777, 0o600);
+  assert.equal(historyOf(projectDir).reasons.at(-1), "repair");
+  // Which paths, is said and is on record: the history keeps versions of the program only.
+  assert.ok(messages.includes("[trama] the agent asked for the fix changed 3 path(s) beside the program: config.json, helper.mjs, stale.txt"), messages.join("\n"));
+  const fix = journalOf(projectDir)[0].find(record => record.kind === "fix");
+  assert.deepEqual([fix.ok, fix.changed, fix.source], [true, ["config.json", "helper.mjs", "stale.txt"], NEEDS]);
+  assert.deepEqual(Object.keys(fix).filter(name => /^changed|^alone/.test(name)), ["changed"]);
+  assert.equal(journalOf(projectDir)[0].some(record => record.kind === "unmerged"), false);
+});
+
+test("what an agent did for a fix that does not run is gone with it: the next is asked in the project as it is, and a fix that changes nothing anywhere is none", async (t) => {
+  const projectDir = projectThatNeeds();
+  const originalRepair = llm.repair;
+  const asked = [];
+  llm.repair = async (prompt, call) => {
+    asked.push({ leftByTheFirst: existsSync(join(call.cwd, "helper.mjs")), program: readFileSync(join(call.cwd, "program.ts"), "utf-8") });
+    if (asked.length === 1) return mends('throw new Error("still broken");')(prompt, call);
+    return asked.at(-1).program; // as it is, with nothing done
+  };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 3, timeout: 20_000 });
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /Failed after 2 repair attempt\(s\)[\s\S]*still broken[\s\S]*The repair returned the program unchanged, and changed nothing else in the project\./);
+  assert.deepEqual(asked, [{ leftByTheFirst: false, program: NEEDS }, { leftByTheFirst: false, program: 'throw new Error("still broken");' }]);
+  assert.deepEqual(readdirSync(projectDir).filter(name => !["logs", "history", "node_modules"].includes(name)).sort(),
+    [".gitignore", "config.json", "meta.json", "package.json", "program.ts", "stale.txt"]);
+  assert.equal(readFileSync(join(projectDir, "config.json"), "utf-8"), "{ not json");
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), NEEDS);
+});
+
+test("the program is what the agent answers with, whatever it did to program.ts where it worked", async (t) => {
+  const FIX = `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ ran: "the answer" });`;
+  const projectDir = projectWith(BOOM);
+  const originalRepair = llm.repair;
+  llm.repair = async (_prompt, { cwd }) => {
+    // It tries a version of its own in place, makes it something to run, and puts a note beside it.
+    writeFileSync(join(cwd, "program.ts"), `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ ran: "the draft" });`);
+    chmodSync(join(cwd, "program.ts"), 0o755);
+    writeFileSync(join(cwd, "note.txt"), "tried in place");
+    return FIX;
+  };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 });
+  assert.deepEqual(result, { status: "done", result: { ran: "the answer" } });
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), FIX);
+  assert.equal(statSync(join(projectDir, "program.ts")).mode & 0o777, 0o600);
+  assert.equal(readFileSync(join(projectDir, "note.txt"), "utf-8"), "tried in place");
+  assert.deepEqual(leftovers(projectDir), []);
+  // What it changed beside the program is the note: the program's own place is no part of that.
+  assert.deepEqual(journalOf(projectDir)[0].find(record => record.kind === "fix").changed, ["note.txt"]);
+});
+
+test("an agent that makes program.ts a link to where it moved the program: its answer is put there, and the project has the link with what it leads to", async (t) => {
+  const FIX = `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ ran: "the answer" });`;
+  const projectDir = projectWith(BOOM);
+  const originalRepair = llm.repair;
+  llm.repair = async (_prompt, { cwd }) => {
+    mkdirSync(join(cwd, "src"));
+    renameSync(join(cwd, "program.ts"), join(cwd, "src", "main.ts"));
+    symlinkSync("src/main.ts", join(cwd, "program.ts"));
+    return FIX;
+  };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.deepEqual(result, { status: "done", result: { ran: "the answer" } });
+  assert.deepEqual(messages, []);
+  assert.equal(readlinkSync(join(projectDir, "program.ts")), "src/main.ts");
+  assert.equal(readFileSync(join(projectDir, "src", "main.ts"), "utf-8"), FIX);
+  assert.equal(statSync(join(projectDir, "src", "main.ts")).mode & 0o777, 0o600);
+  assert.deepEqual(leftovers(projectDir), []);
+});
+
+test("while a candidate is validated a fix is the program alone: nothing else of the validation is kept, so a fix that leaned on what its agent did would be installed without it", async (t) => {
+  const projectDir = projectThatNeeds();
+  const originalRepair = llm.repair;
+  const told = {};
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+  const before = readdirSync(projectDir).sort();
+  const validate = () => captureConsole("warn", () => captureConsole("log", () =>
+    validateProgram(projectDir, createBackend(loadConfig()), NEEDS, { timeout: 20_000, maxRepairAttempts: 1, maxIterations: 5 }).then(() => "passed", (err) => err.message)));
+
+  // The agent puts the project right, where it works, and answers with the program as it was: no fix, here.
+  llm.repair = async (prompt, call) => {
+    writeFileSync(join(call.cwd, "..", "made-beside-the-copy.txt"), "x");
+    return mends(NEEDS, told)(prompt, call);
+  };
+  const unchanged = await validate();
+  assert.match(unchanged.result.result, /Program failed: Failed after 1 repair attempt\(s\)[\s\S]*The repair returned the program unchanged\.$/);
+  assert.deepEqual([told.kept, told.discarded], [false, true]);
+  // One that leans on what the agent did does not find it where it is tried.
+  llm.repair = mends(`${NEEDS}\n// (changed)`);
+  assert.match((await validate()).result.result, /Program failed: Failed after 1 repair attempts[\s\S]*helper\.mjs/);
+  // And one that stands by itself passes. Of what was done beside a copy that goes whole, nothing is told.
+  llm.repair = async (prompt, call) => {
+    writeFileSync(join(call.cwd, "..", "made-beside-the-copy.txt"), "x");
+    return mends(`import { ctx } from "@trama-dev/runtime";\nimport * as fs from "fs";\nfs.writeFileSync("../made-by-the-run.txt", "x");\nawait ctx.done();`)(prompt, call);
+  };
+  const stands = await validate();
+  assert.equal(stands.result.result, "passed");
+  assert.deepEqual([stands.messages, stands.result.messages.filter(line => /agent asked for the fix/.test(line))], [[], []]);
+  assert.deepEqual(readdirSync(projectDir).sort(), before);
+  assert.equal(readFileSync(join(projectDir, "config.json"), "utf-8"), "{ not json");
+});
+
+test("where what an agent changes is to be discarded, a fix is the program alone: tried where the agent never was, and no fix if it is the program as it was", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  writeJson(join(fakeHome, ".trama", "config.json"), { agentChanges: "discard" });
+  const projectDir = projectThatNeeds();
+  const originalRepair = llm.repair;
+  const told = {};
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); cleanupTempDir(fakeHome); });
+  const state = () => [readdirSync(projectDir).filter(name => !["logs", "history", "node_modules"].includes(name)).sort(), readFileSync(join(projectDir, "config.json"), "utf-8")];
+  const asItWas = [[".gitignore", "config.json", "meta.json", "package.json", "program.ts", "stale.txt"], "{ not json"];
+
+  // The project put right and the program unchanged is, here, no fix: the program is all that would be taken.
+  llm.repair = mends(NEEDS, told);
+  const unchanged = await withEnv({ HOME: fakeHome }, () => runProgram({ projectDir, maxRepairAttempts: 2, timeout: 20_000 }));
+  assert.equal(unchanged.status, "failed");
+  assert.match(unchanged.reason, /Failed after 1 repair attempt\(s\)[\s\S]*The repair returned the program unchanged\.$/);
+  assert.deepEqual([told.kept, told.discarded, told.asked], [false, true, "Output ONLY the fixed program. No explanation."]);
+  assert.deepEqual(state(), asItWas);
+
+  // A program that leans on what the agent did where it worked does not find it where it is tried.
+  llm.repair = mends(`${NEEDS}\n// (changed)`);
+  const leaning = await withEnv({ HOME: fakeHome }, () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(leaning.status, "failed");
+  assert.match(leaning.reason, /helper\.mjs/);
+  assert.deepEqual(state(), asItWas);
+
+  // And one that stands by itself is a fix as it ever was: what its run did arrives, what the agent did does not.
+  llm.repair = mends(`import { ctx } from "@trama-dev/runtime";\nimport * as fs from "fs";\nfs.writeFileSync("by-the-run.txt", "x");\nawait ctx.done({ agents: fs.existsSync("helper.mjs") });`);
+  const { result, messages } = await captureConsole("log", () => withEnv({ HOME: fakeHome }, () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 })));
+  assert.deepEqual(result, { status: "done", result: { agents: false } });
+  assert.deepEqual(state(), [[...asItWas[0], "by-the-run.txt", "state.json"].sort(), "{ not json"]);
+  assert.equal(messages.some(line => /asked for the fix changed/.test(line)), false, messages.join("\n"));
+  assert.equal("changed" in journalOf(projectDir).at(-1).find(record => record.kind === "fix"), false);
+});
+
+// --- Variables for a run ---
+
+test("a run is given variables, and has them for its program, the commands it runs and the runs it asks for — its journal has their names, and not what they hold", async (t) => {
+  const SECRETS = { outer: "s3cret-of-the-outer-run", inner: "s3cret-of-the-inner-run", once: "s3cret-for-one-command" };
+  const inner = projectWith(`import { ctx, tools } from "@trama-dev/runtime";
+import * as fs from "fs";
+const want = JSON.parse(fs.readFileSync("want.json", "utf-8"));
+const said = await tools.shell('[ "$OUTER/$INNER/$ONCE" = "$(cat all.txt)" ] && printf same', { env: { ONCE: want.once } });
+await ctx.done({ own: process.env.OUTER === want.outer && process.env.INNER === want.inner, command: said.stdout });`);
+  const outer = projectWith(`import { ctx, tools } from "@trama-dev/runtime";
+import { runProgram } from "@trama-dev/runtime/runner";
+import * as fs from "fs";
+const want = JSON.parse(fs.readFileSync("want.json", "utf-8"));
+process.env.SET_BY_THE_PROGRAM = "its own";
+const plain = await tools.shell('[ "$OUTER/$SET_BY_THE_PROGRAM/$TRAMA_PORT/$TRAMA_INIT" = "$(cat plain.txt)" ] && printf same');
+const over = await tools.shell('printf %s "$OUTER"; command -v sh >/dev/null && printf " found"', { env: { OUTER: "for this command" } });
+const again = await tools.shell('[ "$OUTER" = "$(cat outer.txt)" ] && printf same');
+const refused = [];
+for (const env of [{ "": "x" }, { TRAMA_PORT: "1" }, { N: 1 }, { Z: "a\\0b" }, ["A"], "KEY=" + want.once, { ["KEY=" + want.once]: "x" }]) refused.push(await tools.shell("true", { env }).then(() => "carried out", (err) => err.message));
+const nested = await runProgram({ projectDir: ctx.input.args.inner, env: { INNER: want.inner }, maxRepairAttempts: 0, timeout: 20000 });
+await ctx.done({
+  own: process.env.OUTER === want.outer, bridge: Boolean(process.env.TRAMA_PORT && process.env.TRAMA_INIT),
+  plain: plain.stdout, over: over.stdout, again: again.stdout, refused, nested: nested.result,
+});`);
+  for (const dir of [inner, outer]) {
+    writeJson(join(dir, "want.json"), SECRETS);
+    writeText(join(dir, "all.txt"), [SECRETS.outer, SECRETS.inner, SECRETS.once].join("/"));
+    writeText(join(dir, "plain.txt"), `${SECRETS.outer}///`);
+    writeText(join(dir, "outer.txt"), SECRETS.outer);
+  }
+  t.after(() => { cleanupTempDir(inner); cleanupTempDir(outer); });
+
+  const result = await runProgram({ projectDir: outer, env: { OUTER: SECRETS.outer }, args: { inner }, maxRepairAttempts: 0, timeout: 40_000 });
+  assert.equal(result.status, "done", result.reason);
+  assert.deepEqual(result.result, {
+    own: true, bridge: true, plain: "same", over: "for this command found", again: "same",
+    refused: [
+      'trama runtime error: Invalid field: env has a name no variable can have: ""',
+      // (The two names a program finds its runner by are passed over, not refused: see the next test.)
+      "carried out",
+      'trama runtime error: Invalid field: env gives "N" what is not text a variable can hold',
+      'trama runtime error: Invalid field: env gives "Z" what is not text a variable can hold',
+      "trama runtime error: Invalid field: env (expected object or undefined)",
+      "trama runtime error: Invalid field: env (expected object or undefined)",
+      'trama runtime error: Invalid field: env has a name no variable can have: "KEY=…"',
+    ],
+    nested: { own: true, command: "same" },
+  });
+
+  // On record: which variables — of the run, of each call — and nothing of what they hold.
+  const [outerJournal] = journalOf(outer), [innerJournal] = journalOf(inner);
+  assert.deepEqual(outerJournal[0].env, ["OUTER"]);
+  assert.deepEqual(innerJournal[0].env, ["OUTER", "INNER"]);
+  const requests = (journal, endpoint) => journal.filter(record => record.kind === "call" && record.endpoint === endpoint).map(record => record.request.env);
+  assert.deepEqual(requests(outerJournal, "/tools/shell"), [undefined, ["OUTER"], undefined, [""], ["TRAMA_PORT"], ["N"], ["Z"], "(an array)", "(string)", ["KEY=…"]]);
+  assert.deepEqual(requests(outerJournal, "/run/program"), [["INNER"]]);
+  assert.deepEqual(requests(innerJournal, "/tools/shell"), [["ONCE"]]);
+  for (const dir of [inner, outer]) {
+    const text = readdirSync(join(dir, "logs", "journal")).map(name => readFileSync(join(dir, "logs", "journal", name), "utf-8")).join("\n");
+    for (const secret of Object.values(SECRETS)) assert.equal(text.includes(secret), false, `${secret} is in a journal of ${dir}`);
+  }
+
+  // Asked of a runner directly, what is no variable is refused before anything is run.
+  for (const [env, why] of [[{ N: 1 }, /env gives "N" what is not text a variable can hold/], [{ "A=secret": "x" }, /env has a name no variable can have: "A=…"$/], ["A=1", /env is an object of variables/], [["A=1"], /env is an object of variables/]]) {
+    await assert.rejects(() => runProgram({ projectDir: inner, env, maxRepairAttempts: 0, timeout: 20_000 }), why);
+  }
+  assert.equal(journalOf(inner).length, 1, "nothing was run, so nothing was recorded");
+});
+
+test("a fix is tried with the variables its run was started with", async (t) => {
+  const projectDir = projectWith(BOOM);
+  const originalRepair = llm.repair;
+  llm.repair = async () => `import { ctx, tools } from "@trama-dev/runtime";
+const said = await tools.shell('printf %s "$GIVEN"');
+await ctx.done({ own: process.env.GIVEN, command: said.stdout });`;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { result, messages } = await captureConsole("log", () => runProgram({ projectDir, env: { GIVEN: "to the run" }, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.deepEqual(result, { status: "done", result: { own: "to the run", command: "to the run" } });
+  assert.deepEqual(messages.filter(line => /asked for the fix changed/.test(line)), []);
+  // (And of a fix that is the program alone, the record says nothing of anything else.)
+  assert.deepEqual(Object.keys(journalOf(projectDir)[0].find(record => record.kind === "fix")).filter(name => /^changed|^alone/.test(name)), []);
+});
+
+test("an agent that only rewrote program.ts where it worked, and answers with the program as it was, has fixed nothing", async (t) => {
+  const projectDir = projectWith(BOOM);
+  const originalRepair = llm.repair;
+  llm.repair = async (_prompt, { cwd }) => { writeFileSync(join(cwd, "program.ts"), "// its own idea of the program"); return BOOM; };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 2, timeout: 20_000 });
+  assert.equal(result.status, "failed");
+  assert.match(result.reason, /Failed after 1 repair attempt\(s\)[\s\S]*The repair returned the program unchanged, and changed nothing else in the project\./);
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), BOOM);
+});
+
+test("of the many paths an agent changed for a fix, the journal has two hundred and says how many there were; the run shows ten", async (t) => {
+  const projectDir = projectWith(BOOM);
+  const originalRepair = llm.repair;
+  const name = (i) => `made-${String(i).padStart(3, "0")}.txt`;
+  llm.repair = async (_prompt, { cwd }) => {
+    for (let i = 0; i < 205; i++) writeFileSync(join(cwd, name(i)), "");
+    return `import { ctx } from "@trama-dev/runtime";\nawait ctx.done();`;
+  };
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { result, messages } = await captureConsole("log", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done", result.reason);
+  const ten = Array.from({ length: 10 }, (_, i) => name(i)).join(", ");
+  assert.ok(messages.includes(`[trama] the agent asked for the fix changed 205 path(s) beside the program: ${ten}, …`), messages.join("\n"));
+  const fix = journalOf(projectDir)[0].find(record => record.kind === "fix");
+  assert.deepEqual([fix.changed.length, fix.changed[0], fix.changed.at(-1), fix.changedInAll], [200, name(0), name(199), 205]);
+  assert.equal(readdirSync(projectDir).filter(entry => entry.startsWith("made-")).length, 205);
+});
+
+test("a program hands on its own environment by giving it: the two names it finds its runner by are passed over, and a variable given as undefined is one not given", async (t) => {
+  const inner = projectWith(`import { ctx, tools } from "@trama-dev/runtime";
+const said = await tools.shell('printf %s "$SET_BY_THE_OUTER/\${TRAMA_PORT:-none}"', { env: { ...process.env, NOT_GIVEN: undefined } });
+await ctx.done({ own: process.env.SET_BY_THE_OUTER, command: said.stdout, reached: "its own runner" });`);
+  const outer = projectWith(`import { ctx, tools } from "@trama-dev/runtime";
+import { runProgram } from "@trama-dev/runtime/runner";
+process.env.SET_BY_THE_OUTER = "handed on";
+const nested = await runProgram({ projectDir: ctx.input.args.inner, env: process.env, maxRepairAttempts: 0, timeout: 20000 });
+const command = await tools.shell('printf %s "$SET_BY_THE_OUTER/\${TRAMA_PORT:-none}/\${TRAMA_INIT:-none}"', { env: process.env });
+await ctx.done({ nested: nested.result ?? nested.reason, command: command.stdout });`);
+  t.after(() => { cleanupTempDir(inner); cleanupTempDir(outer); });
+
+  const result = await runProgram({ projectDir: outer, args: { inner }, maxRepairAttempts: 0, timeout: 40_000 });
+  assert.deepEqual(result, {
+    status: "done",
+    result: { nested: { own: "handed on", command: "handed on/none", reached: "its own runner" }, command: "handed on/none/none" },
+  });
+  // Asked of a runner directly, the same: and what was given is as it was when it was given, whatever becomes of the object.
+  const env = { GIVEN: "when asked", NOT_GIVEN: undefined, TRAMA_PORT: "1", TRAMA_INIT: "/nowhere" };
+  const shows = projectWith(`import { ctx, tools } from "@trama-dev/runtime";
+await new Promise((resolve) => setTimeout(resolve, 300));
+const said = await tools.shell('printf %s "$GIVEN/\${LATER:-none}"');
+await ctx.done({ own: [process.env.GIVEN, process.env.LATER ?? null, "NOT_GIVEN" in process.env], command: said.stdout });`);
+  t.after(() => cleanupTempDir(shows));
+  const run = runProgram({ projectDir: shows, env, maxRepairAttempts: 0, timeout: 20_000 });
+  Object.assign(env, { GIVEN: "changed afterwards", LATER: "put in afterwards" });
+  assert.deepEqual(await run, { status: "done", result: { own: ["when asked", null, false], command: "when asked/none" } });
+  assert.deepEqual(journalOf(shows)[0][0].env, ["GIVEN"]);
+});
+
+test("a program's calls reach its runner whatever proxy its environment names", async (t) => {
+  const { createServer: createHttpServer } = await import("node:http");
+  let caught = 0;
+  const proxy = createHttpServer((req, res) => { caught += 1; res.end(JSON.stringify({ result: null })); });
+  await new Promise((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+  const projectDir = projectWith(`import { ctx, tools } from "@trama-dev/runtime";\nawait tools.write("written.txt", "by the runner");\nawait ctx.done({ reached: true });`);
+  t.after(() => { proxy.close(); cleanupTempDir(projectDir); });
+
+  const env = { NODE_USE_ENV_PROXY: "1", HTTP_PROXY: `http://127.0.0.1:${proxy.address().port}`, http_proxy: `http://127.0.0.1:${proxy.address().port}`, NO_PROXY: "", no_proxy: "" };
+  const result = await runProgram({ projectDir, env, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.deepEqual(result, { status: "done", result: { reached: true } });
+  assert.equal(readFileSync(join(projectDir, "written.txt"), "utf-8"), "by the runner");
+  assert.equal(caught, 0);
+});
+
+test("an agent that leaves its copy where no program can be put, or moves it away, has its fix tried by itself — which is said — and nothing is done where a link leads", { skip: process.getuid?.() === 0 }, async (t) => {
+  const FIX = `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ ran: "the answer" });`;
+  const victim = makeTempDir("trama-victim-");
+  writeText(join(victim, "theirs.txt"), "somebody's own");
+  const leaves = {
+    "its copy closed to listing": (cwd) => chmodSync(cwd, 0o300),
+    "the directory its copy is in closed": (cwd) => chmodSync(join(cwd, ".."), 0o000),
+    "a directory where the program was": (cwd) => { rmSync(join(cwd, "program.ts")); mkdirSync(join(cwd, "program.ts")); },
+    "a link to somebody's directory where its copy was": (cwd) => { renameSync(cwd, `${cwd}-moved`); symlinkSync(victim, cwd); },
+    "nothing where its copy was": (cwd) => renameSync(cwd, `${cwd}-moved`),
+    // (A directory with nothing in it: taken for the copy, it would have the project emptied to match.)
+    "another directory where its copy was": (cwd) => { renameSync(cwd, `${cwd}-moved`); mkdirSync(cwd); },
+  };
+  const originalRepair = llm.repair;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(victim); });
+
+  for (const [what, does] of Object.entries(leaves)) {
+    const projectDir = projectWith(BOOM);
+    t.after(() => cleanupTempDir(projectDir));
+    let asked = 0;
+    llm.repair = async (_prompt, { cwd }) => {
+      asked += 1;
+      writeFileSync(join(cwd, "made-by-the-agent.txt"), "x");
+      does(cwd);
+      return FIX;
+    };
+    const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 2, timeout: 20_000 }));
+    assert.deepEqual(result, { status: "done", result: { ran: "the answer" } }, what);
+    assert.equal(asked, 1, what);
+    assert.equal(messages.length, 1, `${what}: ${messages.join("\n")}`);
+    assert.match(messages[0], /^\[trama\] the fix is tried by itself, and nothing else its agent did is kept: the copy the agent worked in cannot be used \(.+\)$/, what);
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), FIX, what);
+    assert.equal(existsSync(join(projectDir, "made-by-the-agent.txt")), false, what);
+    assert.equal(existsSync(join(projectDir, "meta.json")), true, what);
+    assert.equal(typeof journalOf(projectDir)[0].find(record => record.kind === "fix").alone, "string", what);
+    assert.deepEqual(readdirSync(victim), ["theirs.txt"], what);
+  }
+
+  // And where it left no place for a program and answers with the program as it was, there is nothing to try.
+  const projectDir = projectWith(BOOM);
+  t.after(() => cleanupTempDir(projectDir));
+  llm.repair = async (_prompt, { cwd }) => { writeFileSync(join(cwd, "made-by-the-agent.txt"), "x"); renameSync(cwd, `${cwd}-moved`); return BOOM; };
+  const result = await runProgram({ projectDir, maxRepairAttempts: 2, timeout: 20_000 });
+  assert.match(result.reason, /Failed after 1 repair attempt\(s\)[\s\S]*The repair returned the program unchanged\.$/);
+});
+
+test("what the runner writes for an agent is said with what the agent did: a module the agent made program.ts a link to holds the program, and is named", async (t) => {
+  const FIX = `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ ran: "the answer" });`;
+  const projectDir = projectWith(BOOM);
+  writeText(join(projectDir, "helper.ts"), "export const HELPER = 42;\n");
+  mkdirSync(join(projectDir, "data"));
+  const originalRepair = llm.repair;
+  llm.repair = async (_prompt, { cwd }) => {
+    rmSync(join(cwd, "program.ts"));
+    symlinkSync("helper.ts", join(cwd, "program.ts"));
+    // And it leaves a directory nobody may look into, with something in it.
+    writeFileSync(join(cwd, "data", "made.txt"), "by the agent");
+    chmodSync(join(cwd, "data"), 0o000);
+    return FIX;
+  };
+  t.after(() => { llm.repair = originalRepair; chmodSync(join(projectDir, "data"), 0o755); cleanupTempDir(projectDir); });
+
+  const { result, messages } = await captureConsole("log", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.deepEqual(result, { status: "done", result: { ran: "the answer" } });
+  assert.equal(readlinkSync(join(projectDir, "program.ts")), "helper.ts");
+  assert.equal(readFileSync(join(projectDir, "helper.ts"), "utf-8"), FIX);
+  const changed = process.getuid?.() === 0 ? ["data", "data/made.txt", "helper.ts"] : ["data", "data/made.txt", "helper.ts"];
+  assert.ok(messages.includes(`[trama] the agent asked for the fix changed 3 path(s) beside the program: ${changed.join(", ")}`), messages.join("\n"));
+  assert.deepEqual(journalOf(projectDir)[0].find(record => record.kind === "fix").changed, changed);
+  assert.equal(statSync(join(projectDir, "data")).mode & 0o777, 0o000);
+});
+
+test("a name beside a copy that is made to lead elsewhere is no longer what is beside the project: that is said too", async (t) => {
+  const home = makeTempDir("trama-among-");
+  const projectDir = join(home, "the-project");
+  createProjectFixture(projectDir, { scaffold: false, programSource: BOOM });
+  writeText(join(home, "one.json"), '"one"');
+  writeText(join(home, "other.json"), '"other"');
+  const originalRepair = llm.repair;
+  llm.repair = fixThat(`fs.rmSync("../one.json"); fs.symlinkSync(fs.realpathSync("../other.json"), "../one.json");`);
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(home); });
+
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done", result.reason);
+  assert.ok(messages.some(line => line.startsWith("[trama]   ../one.json — it was removed, or something else put there")), messages.join("\n"));
+  assert.equal(messages.some(line => /other\.json/.test(line)), false, messages.join("\n"));
+  assert.equal(readFileSync(join(home, "one.json"), "utf-8"), '"one"');
+});
+
+test("a fix that moves its program aside and writes another in its place, where the place it moved it to is taken: the project keeps the fix as it ran", async (t) => {
+  const projectDir = projectWith(BOOM);
+  // Somebody makes a file of the name the run moves its program to.
+  const fix = (await fixThat(`fs.writeFileSync(${JSON.stringify(join(projectDir, "old.ts"))}, "THEIRS");
+fs.renameSync("program.ts", "old.ts"); fs.writeFileSync("program.ts", ${JSON.stringify(SELF)});`)()).trimEnd();
+  const originalRepair = llm.repair;
+  llm.repair = async () => fix;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  // What the program was and what it made of itself are one thing: where the one does not arrive, the other does not.
+  assert.deepEqual(shapeOf(projectDir, ["program.ts", "old.ts"]), { "program.ts": `file 600 ${JSON.stringify(fix)}`, "old.ts": 'file 644 "THEIRS"' });
+  assert.ok(messages.some(line => /program\.ts — it is one thing with old\.ts, which did not arrive/.test(line)), messages.join("\n"));
 });

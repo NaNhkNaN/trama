@@ -48,9 +48,23 @@ export interface AgentCall {
   used?: (usage: AgentUsage) => void;
 }
 
+/**
+ * A reply that ended at the model's output limit, and not where the model
+ * would have ended it. It is not the answer — the call fails with this —
+ * and it carries what there was of the reply, for a caller that has a use
+ * for that. (The agent goes no further than the reply that was cut off: where
+ * that reply was leading up to something still to be done, it was not done.)
+ */
+export class CutOff extends Error {
+  constructor(readonly text: string) {
+    super("The model's answer was cut off at its output limit.");
+  }
+}
+
 export interface AgentBackend {
   /**
-   * Run one prompt to completion and return the agent's final text.
+   * Run one prompt to completion and return the agent's final text. A final
+   * reply that was cut off at the output limit is a rejection, with `CutOff`.
    *
    * Each call stands alone — nothing carries over from one to the next, and
    * everything a call depends on is in its arguments. A backend that cannot

@@ -10,7 +10,9 @@ import type { RunnerAgent } from "./agent.js";
 import type { RunContext } from "./context.js";
 import type { ProgramResult, RunRequest } from "./runner-types.js";
 import type { Journal, RecordedCall } from "./journal.js";
-import { isJsonObject } from "./serializable.js";
+import { describeJson, isJsonObject } from "./serializable.js";
+import { checkedEnv, variableName } from "./child-process.js";
+import { messageOf } from "./errors.js";
 
 const MAX_IPC_BODY = 50 * 1024 * 1024; // 50 MB
 const MAX_STOPPED_AHEAD = 1024;
@@ -53,7 +55,7 @@ const isOfKind = (value: unknown, kind: Kind): boolean =>
     : kind === "strings" ? Array.isArray(value) && value.every(item => typeof item === "string")
     : typeof value === kind;
 
-/** Read a call's declared fields out of a request body — refusing a body that does not hold them as declared. */
+/** Read a call's declared fields out of a request body — refusing a body that does not hold them as declared, or holds any other. */
 function read<F extends Fields>(body: unknown, fields: F): Args<F> {
   if (!isJsonObject(body)) throw new BadRequest("The request body must be a JSON object");
   const args: Record<string, unknown> = {};
@@ -70,13 +72,16 @@ function read<F extends Fields>(body: unknown, fields: F): Args<F> {
     }
     args[name] = value;
   }
+  // What a call does not declare it cannot do anything with: to pass it over would be to let its sender think it had.
+  const unknown = Object.keys(body).find(name => !Object.hasOwn(fields, name));
+  if (unknown !== undefined) throw new BadRequest(`Unknown field: ${unknown} (this call takes: ${Object.keys(fields).join(", ")})`);
   return args as Args<F>;
 }
 
 /**
  * A call: every field it takes, and what is done with them. The declaration
- * is the whole of what a handler sees of a request — a field that is not
- * declared does not reach it, and one that is arrives as the kind it says.
+ * is the whole of what a request may hold — a field that is not declared
+ * is refused, and one that is arrives as the kind it says.
  * (What is inside an object is the business of whoever it is handed to.)
  */
 function route<F extends Fields>(
@@ -85,6 +90,25 @@ function route<F extends Fields>(
 ): Route {
   return { handle: (body, connectionClosed, call) => handle(read(body, fields), connectionClosed, call) };
 }
+
+/** The variables a call gives, held to what variables are (see checkedEnv): what is none is the request's fault. */
+function envOf(env: Record<string, unknown> | undefined): Record<string, string> | undefined {
+  if (env === undefined) return undefined;
+  try {
+    return checkedEnv(env);
+  } catch (err) {
+    throw new BadRequest(`Invalid field: ${messageOf(err)}`);
+  }
+}
+
+/**
+ * A request as it is written down: all of it, but for what it gives as
+ * variables — a journal is no place for a key. Of variables the names are
+ * kept; of what is given in their place and is none, what kind of thing it is.
+ */
+const asRecorded = (body: unknown): unknown =>
+  !isJsonObject(body) || body.env == null ? body
+    : { ...body, env: isJsonObject(body.env) ? Object.keys(body.env).map(variableName) : `(${describeJson(body.env)})` };
 
 export interface IpcBackends {
   /**
@@ -139,19 +163,22 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run }: IpcBack
 
   return {
     "/agent/instruct": route(
-      { prompt: "string", system: "optional string", model: "optional string", thinking: "optional string", tools: "optional strings" },
+      { prompt: "string", system: "optional string", model: "optional string", thinking: "optional string", tools: "optional strings", cutOff: "optional string" },
       ({ prompt, ...options }, _closed, call) => agent.instruct(prompt, options as Parameters<RunnerAgent["instruct"]>[1], call.used),
     ),
     "/agent/generate": route(
-      { prompt: "string", schema: "object", system: "optional string", model: "optional string", thinking: "optional string" },
+      {
+        prompt: "string", schema: "object", system: "optional string", model: "optional string", thinking: "optional string",
+        tools: "optional strings", cutOff: "optional string",
+      },
       (input, _closed, call) => agent.generate(input as Parameters<RunnerAgent["generate"]>[0], call.used),
     ),
 
     "/tools/read": route({ path: "string" }, b => tools.read(b.path)),
     "/tools/write": route({ path: "string", content: "string" }, b => tools.write(b.path, b.content)),
     "/tools/shell": route(
-      { command: "string", cwd: "optional string", timeout: "optional number" },
-      b => tools.shell(b.command, { cwd: b.cwd, timeout: b.timeout }),
+      { command: "string", cwd: "optional string", timeout: "optional number", env: "optional object" },
+      b => tools.shell(b.command, { cwd: b.cwd, timeout: b.timeout, env: envOf(b.env) }),
     ),
     "/tools/fetch": route(
       { url: "string", method: "optional string", headers: "optional object", body: "optional string" },
@@ -172,9 +199,10 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run }: IpcBack
       {
         projectDir: "string", args: "optional object",
         timeout: "optional number", maxRepairAttempts: "optional number",
-        id: "optional string", label: "optional string", workspaceDir: "optional string",
+        id: "optional string", label: "optional string", workspaceDir: "optional string", env: "optional object",
       },
-      async ({ id, ...request }, connectionClosed, { seq }) => {
+      async ({ id, env, ...asked }, connectionClosed, { seq }) => {
+        const request: RunRequest = { ...asked, env: envOf(env) };
         if (id !== undefined) {
           if (id === "") throw new BadRequest("Invalid field: id (expected a non-empty string)");
           if (runsAskedFor.has(id)) throw new BadRequest(`Duplicate run id: ${id}`);
@@ -271,7 +299,7 @@ export function createIPCServer(backends: IpcBackends): Server {
         }
         const route = req.url && Object.hasOwn(routes, req.url) ? routes[req.url] : undefined;
         if (!route) return reply(404, "Not found");
-        call = backends.journal.call(req.url!, body);
+        call = backends.journal.call(req.url!, asRecorded(body));
         const result = (await route.handle(body, connectionClosed, call)) ?? null;
         const payload = JSON.stringify({ result });
         if (answerable()) call.end({ ok: true, result });

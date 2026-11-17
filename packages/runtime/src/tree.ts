@@ -88,6 +88,11 @@ function same(a: Entry | undefined, b: Entry | undefined): boolean {
   return false;
 }
 
+/** The paths at which two readings of a directory differ, a path before every path under it. */
+export function differences(before: Tree, after: Tree): string[] {
+  return [...new Set([...before.keys(), ...after.keys()])].filter((path) => !same(before.get(path), after.get(path))).sort(inOrder);
+}
+
 /** The names in a directory. One that is not text cannot be told from another, or looked up again: it throws. */
 function namesIn(dir: string): string[] {
   return readdirSync(dir, "buffer").map((raw) => {
@@ -160,10 +165,26 @@ function sameBytes(one: string, other: string): boolean {
   }
 }
 
-/** What a directory is and holds. The directory must be there, and all of it readable. */
-export function readTree(dir: string): Tree {
+/**
+ * What a directory is and holds. The directory must be there, and all of it
+ * readable — or, with `opening`, to be made so: a directory that may not be
+ * looked into is opened for the reading, and left allowing what it allowed.
+ * (That is for a directory that is the reader's own to open: a copy.)
+ */
+export function readTree(dir: string, opening = false): Tree {
   const tree: Tree = new Map();
-  walk(realRootOf(dir), (path, entry) => { tree.set(path, entry); });
+  const opened: Array<{ at: string; mode: number }> = [];
+  try {
+    walk(realRootOf(dir), (path, entry, at) => {
+      tree.set(path, entry);
+      if (opening && entry.kind === "dir" && (entry.mode & 0o500) !== 0o500) {
+        chmodSync(at, entry.mode | 0o500);
+        opened.push({ at, mode: entry.mode });
+      }
+    });
+  } finally {
+    for (const { at, mode } of opened.reverse()) chmodSync(at, mode);
+  }
   return tree;
 }
 

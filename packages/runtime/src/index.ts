@@ -12,10 +12,10 @@ import { LATEST_LOG_PATH } from "./context.js";
 import { readProjectMeta } from "./meta.js";
 import {
   loadConfig, loadProjectConfig, loadState, createBackend, validateProgram, installValidatedProgram,
-  withTempDir, ensureProjectScaffold, RUNTIME_TYPES, runProgram as runHere, whyNotReplaceable,
+  withTempDir, prepareProject, shownPaths, type Prepared, ensureProjectScaffold, RUNTIME_TYPES, runProgram as runHere, whyNotReplaceable,
 } from "./runner.js";
 import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspace.js";
-import { parentBridge, remoteWorkspace } from "./bridge-client.js";
+import { parentBridge, remoteWorkspace, withOptions } from "./bridge-client.js";
 import { guardPath, identityOf, sameProjectAs } from "./path-guard.js";
 import { printJournals } from "./journal-view.js";
 import { messageOf } from "./errors.js";
@@ -47,13 +47,12 @@ export async function runProgram(options: RunOptions): Promise<ProgramResult> {
     bridge.call("/run/stop", { id }).catch(() => { /* no runner left to tell */ });
   });
   try {
-    return await bridge.call("/run/program", {
+    return await bridge.call("/run/program", withOptions({ id }, {
       ...request,
-      id,
       // The runner does not share this program's working directory.
       projectDir: resolve(request.projectDir),
       workspaceDir: request.workspaceDir && resolve(request.workspaceDir),
-    });
+    }));
   } finally {
     offStop();
   }
@@ -149,13 +148,20 @@ process.on("SIGINT", () => {
 
 await new Promise<void>(() => {});`;
 
-function getSystemPrompt(): string {
+function getSystemPrompt(kept: boolean): string {
   return (
     `You are generating a TypeScript program for the trama runtime.\n\n` +
     `If the program is long-running (for example an HTTP server), call ctx.ready(...) after startup completes and handle SIGTERM/SIGINT for clean shutdown.\n\n` +
     `The workspace object is available when running in a session (shared artifact I/O between agents). ` +
     `ctx.yield(reason) suspends the program cooperatively — persists state and exits. ` +
     `ctx.resumed is true if this run follows a yield; ctx.yieldReason has the reason.\n\n` +
+    `You are working in a copy of the project's directory, which is where the program will run: ` +
+    `where the task speaks of the project's files, look at them. ` +
+    (kept
+      ? `What the program needs beside it — a package installed, a module it imports, a file it reads — ` +
+        `you can make here: it is kept, with the program, if the program then passes its validation. ` +
+        `The program itself is what you answer with, whatever you wrote to program.ts here.\n\n`
+      : `Nothing you write here is kept — only the program you answer with.\n\n`) +
     `Runtime API:\n${RUNTIME_TYPES}\n\n` +
     `Examples:\n${EXAMPLE_PROGRAMS}`
   );
@@ -183,24 +189,71 @@ export function resolveProject(name: string): string {
 // --- Helpers ---
 
 /**
- * Ask for a program — in an empty throwaway directory, so the agent's tools
- * cannot write into the real project — and take what comes back for one only
- * if something does: no program is not a program that does nothing.
+ * Ask for a program for a project — in a copy of the project (see Prepared),
+ * so that the agent can look at what the program is to work with and make
+ * what it needs, and its tools do not write into the real one — and take
+ * what comes back for a program only if something does: no program is not a
+ * program that does nothing.
  */
-async function generateProgram(backend: AgentBackend, prompt: string, system: string, signal?: AbortSignal): Promise<string> {
-  const program = stripCodeFences(await withTempDir("trama-gen-", (cwd) => backend.ask(prompt, { cwd, system, signal })));
+async function generateProgram(backend: AgentBackend, prepared: Prepared, prompt: string, system: string, signal?: AbortSignal): Promise<string> {
+  const program = stripCodeFences(await backend.ask(prompt, { cwd: prepared.copy, system, signal }));
   throwIfAborted(signal);
   if (program === "") throw new Error("The model answered with no program.");
   return program;
 }
 
-const validationOptions = (config: TramaConfig, signal?: AbortSignal) => ({
-  timeout: config.defaultTimeout,
-  maxRepairAttempts: config.maxRepairAttempts,
-  maxIterations: config.defaultMaxIterations,
-  journalRuns: config.journalRuns,
-  signal,
-});
+/** Carry what the agent made beside a program into the project the program is now in, and say what that was. */
+function keepPrepared(prepared: Prepared): void {
+  let kept: ReturnType<Prepared["keep"]>;
+  try {
+    kept = prepared.keep();
+  } catch (err) {
+    // The program is in the project. That what was made beside it cannot be carried over is said, and does not undo that.
+    console.warn(`[trama] what was made beside the program, while it was written, could not be carried into the project: ${messageOf(err)}`);
+    return;
+  }
+  const { changed, unmerged } = kept;
+  if (changed.length > 0) {
+    console.log(`[trama] ${changed.length} path(s) made or changed beside the program, while it was written: ${shownPaths(changed)}`);
+  }
+  if (unmerged.length > 0) {
+    console.warn(`[trama] ${unmerged.length} thing(s) done while the program was written did not reach the project:`);
+    for (const { path, why } of unmerged) console.warn(`[trama]   ${path} — ${why}`);
+  }
+}
+
+/**
+ * Validate a candidate for a project: in the project as the agent prepared
+ * it, where what the agent made is to be kept — or in the project as it is.
+ * `kept` says which: what was validated is what is then to be in the
+ * project. The agent's copy is no place to validate in where it is no longer
+ * the copy the agent was given (a link put in its place is not followed), or
+ * cannot be copied; the candidate is then validated by itself, which is said
+ * (see validateProgram).
+ */
+async function validateCandidate(
+  projectDir: string, backend: ReturnType<typeof createBackend>, candidate: string, config: TramaConfig, prepared: Prepared, signal?: AbortSignal,
+): Promise<{ validated: Awaited<ReturnType<typeof validateProgram>>; kept: boolean }> {
+  let as: string | undefined, alone: string | undefined;
+  if (config.agentChanges === "keep") {
+    try {
+      prepared.ready();
+      as = prepared.copy;
+    } catch (err) {
+      alone = messageOf(err);
+    }
+  }
+  const validated = await validateProgram(projectDir, backend, candidate, {
+    timeout: config.defaultTimeout,
+    maxRepairAttempts: config.maxRepairAttempts,
+    maxIterations: config.defaultMaxIterations,
+    journalRuns: config.journalRuns,
+    signal,
+    as,
+    alone,
+  });
+  return { validated, kept: as !== undefined && validated.alone === undefined };
+}
 
 // --- Public API ---
 
@@ -244,22 +297,28 @@ export async function createProject(
     const backend = createBackend(config);
 
     console.log(`Generating program for "${name}"...`);
-    const candidate = await generateProgram(backend,
-      `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation.`,
-      getSystemPrompt(),
-      options?.signal,
-    );
+    // (What the agent is given to look at is the project made here, and no other directory that is at its path by now.)
     stillTheProject();
+    await withTempDir("trama-gen-", async (privateDir) => {
+      const prepared = prepareProject(projectDir, privateDir);
+      const candidate = await generateProgram(backend, prepared,
+        `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation.`,
+        getSystemPrompt(config.agentChanges === "keep"),
+        options?.signal,
+      );
+      stillTheProject();
 
-    // From here on the project is kept even if validation fails, so the
-    // generated program can be inspected and fixed by hand.
-    writeFileSync(guardPath(projectDir, "program.ts"), candidate);
-    keepProjectOnFailure = true;
+      // From here on the project is kept even if validation fails, so the
+      // generated program can be inspected and fixed by hand.
+      writeFileSync(guardPath(projectDir, "program.ts"), candidate);
+      keepProjectOnFailure = true;
 
-    console.log("Validating program...");
-    const validated = await validateProgram(projectDir, backend, candidate, validationOptions(config, options?.signal));
-    stillTheProject();
-    installValidatedProgram(projectDir, validated, "create", prompt);
+      console.log("Validating program...");
+      const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, options?.signal);
+      stillTheProject();
+      installValidatedProgram(projectDir, validated, "create", prompt);
+      if (kept) keepPrepared(prepared);
+    });
 
     console.log(`Created ${name}. Run with: trama run ${name}`);
   } catch (err) {
@@ -299,23 +358,27 @@ export async function updateProject(
     const backend = createBackend(config);
 
     const systemPrompt =
-      getSystemPrompt() +
+      getSystemPrompt(config.agentChanges === "keep") +
       `\n\nOriginal prompt: ${meta.input.prompt}` +
       `\n\nCurrent program.ts:\n${originalSource}` +
       (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : "");
 
     console.log(`Updating "${name}"...`);
-    const candidate = await generateProgram(backend,
-      `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
-      systemPrompt,
-      options?.signal,
-    );
-    stillTheProject();
+    await withTempDir("trama-gen-", async (privateDir) => {
+      const prepared = prepareProject(projectDir, privateDir);
+      const candidate = await generateProgram(backend, prepared,
+        `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
+        systemPrompt,
+        options?.signal,
+      );
+      stillTheProject();
 
-    console.log("Validating updated program...");
-    const validated = await validateProgram(projectDir, backend, candidate, validationOptions(config, options?.signal));
-    stillTheProject();
-    installValidatedProgram(projectDir, validated, "update", prompt);
+      console.log("Validating updated program...");
+      const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, options?.signal);
+      stillTheProject();
+      installValidatedProgram(projectDir, validated, "update", prompt);
+      if (kept) keepPrepared(prepared);
+    });
   } catch (err) {
     throw unchanged(err);
   }

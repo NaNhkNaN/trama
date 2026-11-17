@@ -645,3 +645,44 @@ test("Session.createTemp stays inside tmpdir for an empty prefix and rejects tra
   }
 });
 
+test("a participant is given variables as any run is: its program has them, and the commands it runs", async (t) => {
+  const workerDir = makeTempDir("trama-session-worker-");
+  const session = await Session.createTemp();
+  t.after(() => { cleanupTempDir(workerDir); cleanupTempDir(session.workspaceDir); });
+  createProjectFixture(workerDir, {
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+const said = await tools.shell('printf %s "$ROLE"');
+await ctx.done({ own: process.env.ROLE ?? null, command: said.stdout });`,
+  });
+
+  const given = await session.spawn("reviewer", { projectDir: workerDir, env: { ROLE: "reviewer" }, maxRepairAttempts: 0, timeout: 20_000 }).wait();
+  assert.deepEqual(given, { status: "done", result: { own: "reviewer", command: "reviewer" } });
+  const plain = await session.spawn("nobody", { projectDir: workerDir, maxRepairAttempts: 0, timeout: 20_000 }).wait();
+  assert.deepEqual(plain, { status: "done", result: { own: null, command: "" } });
+});
+
+test("a participant that is resumed has the variables it was spawned with, whatever has become of the object they were given in", async (t) => {
+  const workerDir = makeTempDir("trama-session-worker-");
+  const session = await Session.createTemp();
+  t.after(() => { cleanupTempDir(workerDir); cleanupTempDir(session.workspaceDir); });
+  createProjectFixture(workerDir, {
+    programSource: `import { ctx } from "@trama-dev/runtime";
+if (!ctx.resumed) await ctx.yield("once");
+await ctx.done({ role: process.env.ROLE });`,
+  });
+
+  const env = { ROLE: "as spawned" };
+  const handle = session.spawn("worker", { projectDir: workerDir, env, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.equal((await handle.wait()).status, "yielded");
+  env.ROLE = "changed between the yield and the resume";
+  assert.deepEqual(await (await handle.resume()).wait(), { status: "done", result: { role: "as spawned" } });
+
+  // What is given for variables and is no object of them is refused for what it is, not taken apart into some.
+  for (const given of [["ROLE=x"], "ab", 5]) {
+    await assert.rejects(() => session.spawn("worker", { projectDir: workerDir, env: given, maxRepairAttempts: 0, timeout: 20_000 }).wait(), /env is an object of variables/);
+  }
+  // And what cannot be read at all is the participant's failure to start, told by its wait() as any is — not thrown at whoever spawns.
+  const unreadable = { get ROLE() { throw new Error("thrown by the caller's getter"); } };
+  const refused = session.spawn("worker", { projectDir: workerDir, env: unreadable, maxRepairAttempts: 0, timeout: 20_000 });
+  await assert.rejects(() => refused.wait(), /thrown by the caller's getter/);
+});

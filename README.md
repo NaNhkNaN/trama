@@ -142,7 +142,7 @@ For any context where you need to explain, justify, or reproduce what an agent d
 
 `trama update` is not prompt tuning. It is not config adjustment. It is rewriting the program itself.
 
-When you say `trama update optimizer "also track memory usage"`, the agent reads the current program, understands its structure, and produces a new version with the requested change. The old version is saved in `history/`. The change is a real code diff — not a hidden prompt mutation.
+When you say `trama update optimizer "also track memory usage"`, the agent reads the current program, understands its structure, and produces a new version with the requested change. It works in a copy of the project while it does, so it can look at what the program is to work with — `trama update report "use the columns of data/sample.csv"` — and make what the program needs beside it: a package installed, a module, a fixture. The candidate is validated in a copy of that copy; once it has been shown to run, the program reaches the project and what the agent made beside it comes with it, the paths printed. A candidate that does not pass takes nothing into the project. (`"agentChanges": "discard"` in `~/.trama/config.json` takes the program alone.) (A copy shields the project's own files. What a link in the project leads to outside it — the installed runtime under `node_modules`, a shared directory, the repository a git worktree belongs to — is the same place from the copy, and the agent's tools are not confined to where it works.) The old version is saved in `history/`. The change is a real code diff — not a hidden prompt mutation.
 
 This means orchestration is a living thing with a version history. The `history/` directory is a record of how your agent's behavior evolved, in a format anyone can read.
 
@@ -400,7 +400,7 @@ The runtime is what makes agent programs **self-contained and shareable**:
 - **IPC bridge** — programs communicate with the runtime through a local HTTP server. Every `ctx`, `agent`, `tools` and `workspace` call goes through this bridge, which gives the runtime a single point where it validates each request and can cancel work in flight when a run ends.
 - **State persistence** — `ctx.state` survives across runs via `checkpoint()` and `done()`. Programs can be long-running, interruptible, and resumable. `ctx.yield()` suspends a program cooperatively — persists state and exits, ready for the session layer to resume it later.
 - **Shared workspace** — when programs run in a session, they share a workspace for artifact I/O. Atomic writes, path guarding, and level-triggered observation (`workspace.observe()`) — without a message bus or coordination framework.
-- **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, and tries it on a private copy of the project. Only a fix that works is installed, along with what its run did to the project — files, directories, links and permissions; one that fails never touches the project. Up to 3 attempts. A `program.ts` you have made read-only is never replaced: it is run, and if it fails no fix is asked for. If something the fixed run did could not be carried into the project — because that place changed there in the meantime — the run says so, and its journal records it. In a session the fix runs against the live shared workspace, so a participant being repaired can still be heard and answered.
+- **Auto-repair** — when a program crashes, the runtime sends the error back to the LLM, gets a fix, and tries it on a private copy of the project — the copy the agent worked in when it was asked, so a fix may be to the project as well as to the program: a missing package installed, a broken config file put right. Only a fix that works is installed, along with what was done in the copy — by the agent and by the run: files, directories, links and permissions; one that fails takes nothing into the project. What the agent changed beside the program is printed and recorded in the journal. (While `create` or `update` validates a candidate, a fix is the program alone: nothing else of a validation is kept.) Up to 3 attempts. A `program.ts` you have made read-only is never replaced: it is run, and if it fails no fix is asked for. If something the fixed run did could not be carried into the project — because that place changed there in the meantime — the run says so, and its journal records it. In a session the fix runs against the live shared workspace, so a participant being repaired can still be heard and answered.
 - **A record of every run** — each call a program makes through the bridge is written down as it happens, with how it ended: what the agent was asked and answered, what was read and written, each command and its output, each program it started. `trama journal` shows it.
 - **Version history** — every create, update, and repair saves a snapshot. You can diff any two versions to see how the program evolved.
 - **Scaffolding** — the runtime creates package.json, the module symlink, gitignore, and the history and log directories, and checks them before every run. Recipients of a shared program don't need to set anything up.
@@ -631,17 +631,17 @@ await ctx.yield(reason)// cooperative suspension — persists state, exits proce
 ### agent — LLM calls
 
 ```typescript
-await agent.instruct(prompt, { system?, model?, thinking?, tools? })   // instruct the agent — may use tools autonomously
-await agent.generate<T>({ prompt, schema, system?, model?, thinking? }) // text in -> typed JSON out
+await agent.instruct(prompt, { system?, model?, thinking?, tools?, cutOff? })   // instruct the agent — may use tools autonomously
+await agent.generate<T>({ prompt, schema, system?, model?, thinking?, tools?, cutOff? }) // the same, answered as typed JSON
 ```
 
 `agent.instruct()` is **not** a simple text completion. The underlying pi-coding-agent runs a full agent loop and may autonomously use its built-in tools (bash, file read/write/edit) to fulfill the instruction. What you get back is the final text response.
 
-`agent.generate()` returns a typed object. The schema maps field names to primitive types:
+`agent.generate()` is the same agent, answering as a typed object: it may use its tools to find out what it is asked — read the file, run the tests — and gives its answer in the shape you name. The schema says what each field is to be:
 
 ```typescript
 const result = await agent.generate<{ score: number; reasoning: string }>({
-  prompt: "Rate this code",
+  prompt: "Rate the code in target.ts",
   schema: {
     score: "number: 1-10 quality rating",      // "type: description" format
     reasoning: "string: explain the rating",
@@ -650,7 +650,20 @@ const result = await agent.generate<{ score: number; reasoning: string }>({
 // result.score is a number, result.reasoning is a string
 ```
 
-Only `string`, `number`, and `boolean` are supported as schema types. The part after `:` is a description hint for the LLM (ignored during validation). Retries once on parse/validation failure.
+A field is `"string"`, `"number"` or `"boolean"` — the part after `:` is a description hint for the LLM (ignored during validation) — or an object of such fields, or a list, written as the shape of its items in brackets:
+
+```typescript
+const report = await agent.generate<{ passed: boolean; failures: Array<{ test: string; line: number }>; tags: string[] }>({
+  prompt: "Run the tests and say what failed.",
+  schema: {
+    passed: "boolean: did every test pass",
+    failures: [{ test: "string", line: "number: where it failed" }],   // a list of objects
+    tags: ["string"],                                                   // a list of strings
+  },
+});
+```
+
+The answer holds the fields you declared and no others, at every depth, each of the kind declared; a list may be empty. Where the reply is not of that shape the model is told where (`failures[1].line: expected number, got string`) and asked once more.
 
 A call can say how it is to be served:
 
@@ -665,26 +678,26 @@ const plan = await agent.instruct(`Decide how to split the config:\n${survey}`, 
 
 - `model` — the model for this call, as `"provider/model"`, in place of the project's.
 - `thinking` — how much the model is to think: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"` or `"max"`.
-- `tools` (`instruct` only) — the agent's tools for this call: exactly the ones named, `[]` for none. Left to itself pi takes `read`, `bash`, `edit` and `write`; it also has `grep`, `find` and `ls`, among others.
+- `tools` — the agent's tools for this call: exactly the ones named, `[]` for none. Left to itself pi takes `read`, `bash`, `edit` and `write`; it also has `grep`, `find` and `ls`, among others. A `generate` that is to be made from its prompt alone — nothing read, run or written — is one with `tools: []`.
+- `cutOff` — what to make of an answer that was cut off at the model's output limit: `"fail"` (as it is without the option) or `"keep"`.
 
-Each is honoured or the call fails. A model pi does not know, a level pi does not have for the model, a tool the agent has not got: pi itself would serve such a call with something else and say nothing, so trama checks what the call was given before the model is asked. Two things it cannot see to:
+Each is honoured or the call fails. A model pi does not know, a level pi does not have for the model, a tool the agent has not got: pi itself would serve such a call with something else and say nothing, so trama checks what the call was given before the model is asked. One thing it cannot see to: what a provider makes of a level is the provider's. For some models two levels pi offers come to the same request (`"minimal"` and `"low"` for several of Anthropic's, say), and a few take any level and send none.
 
-- What a provider makes of a level is the provider's. For some models two levels pi offers come to the same request (`"minimal"` and `"low"` for several of Anthropic's, say), and a few take any level and send none.
-- The spelling of the option itself. The bridge passes over a field it does not know, so `tool: [...]` restricts nothing — and neither does `tools` given to `generate`.
+An option that is not one of these is an error too, as is any option a call to the runtime does not take, or a value that cannot be sent to it (a callback, say): `tool: [...]`, misspelt, would otherwise restrict nothing and say nothing. This is so of the calls a program makes to its runtime — `agent`, `tools`, `workspace`, `ctx`, and `runProgram`. A `Session`, and `runProgram` called outside a program, are ordinary TypeScript, and take no notice of what they do not know.
 
-The answer of a call is the model's last reply, and only if the model ended it itself: a reply that is the provider's error fails the call with the provider's words, and so does one that was cut off at the output limit. And the prompt is text: it reaches the model as written, also where it begins like one of your own pi commands (`/review …`).
+The answer of a call is the model's last reply, and only if the model ended it itself: a reply that is the provider's error fails the call with the provider's words, and so does one that was cut off at the output limit — unless the call says `cutOff: "keep"`, and then it returns what there was of the reply, as if that were the answer (the call still fails where there was nothing of it: a reply cut off before its first word, or while the model was still thinking). That is for a call whose work is what the agent did with its tools, and whose closing words matter little: `await agent.instruct("add the endpoint and its tests", { cutOff: "keep" })` does not fail, and start over, because the summary at the end ran long. (A reply cut off in the middle of a tool call never ends a call: pi has the model make the call again. But the agent goes no further than a reply that was cut off in its words — where those were leading up to more work, the work was not done. And a typed answer that was cut off is seldom whole: `generate` holds what it kept to the schema like any reply, and asks again where it does not fit.) And the prompt is text: it reaches the model as written, also where it begins like one of your own pi commands (`/review …`).
 
 ### tools — I/O operations
 
 ```typescript
 await tools.read(path)                    // -> string (file contents)
 await tools.write(path, content)          // -> void
-await tools.shell(command, { cwd?, timeout? }) // -> { exitCode, stdout, stderr }
+await tools.shell(command, { cwd?, timeout?, env? }) // -> { exitCode, stdout, stderr }
 await tools.fetch(url, { method?, headers?, body? })
                                           // -> { status, body, headers }
 ```
 
-`read` and `write` are path-guarded to the project directory (traversal and symlink escape attempts throw — every link on the way to a path is followed, whether or not what it points at exists yet). A path is read the way the system reads it, so it names the same file as it would in the program's own `fs` calls: `dir/../file` goes up from where `dir` leads, and a path the system would not follow (`file.txt/`, `missing/..`) is refused. So is a path that leads to something other than a file or a directory — a named pipe, a socket, a device. `shell` defaults to a 30-second timeout; pass `{ timeout: 60000 }` for longer commands. A command is given no input: one that reads standard input finds it at an end. `fetch` returns the response body as a string (capped at 10MB).
+`read` and `write` are path-guarded to the project directory (traversal and symlink escape attempts throw — every link on the way to a path is followed, whether or not what it points at exists yet). A path is read the way the system reads it, so it names the same file as it would in the program's own `fs` calls: `dir/../file` goes up from where `dir` leads, and a path the system would not follow (`file.txt/`, `missing/..`) is refused. So is a path that leads to something other than a file or a directory — a named pipe, a socket, a device. `shell` defaults to a 30-second timeout; pass `{ timeout: 60000 }` for longer commands. A command is given no input: one that reads standard input finds it at an end. It has the runner's environment and the variables its run was started with; `{ env: { NAME: "value" } }` gives it more, for that command. What the program sets in its own `process.env` is not handed on unless it is given: `{ env: process.env }` hands on all of it. A variable given as `undefined` is one not given (there is no way to take one away), and the two by which a program finds its runner, `TRAMA_PORT` and `TRAMA_INIT`, are passed over whoever gives them. The journal records the names of the variables given, never their values — so write a value as a value: of a name like `"KEY=secret"`, which is refused, what follows the `=` is not repeated. The shell that runs the command is the one the runner's own `PATH` leads to, whatever `PATH` the command is given. `fetch` returns the response body as a string (capped at 10MB).
 
 Long-running programs should call `ctx.ready()` once startup completes so `create`/`update` smoke validation can treat "server is up" as success instead of waiting for process exit.
 
@@ -727,6 +740,7 @@ await session.workspace.write("brief.md", brief);
 const handle = session.spawn("check-sql", {
   projectDir: "~/.trama/projects/check-sql",
   args: { target: "src/" },
+  env: { REVIEW_DEPTH: "full" },   // optional: variables for this participant
 });
 
 const result = await handle.wait();
@@ -747,7 +761,7 @@ Each participant also has its own timeout, and its time is charged to it alone. 
 
 - A participant belongs to the program that spawned it. When that program's run ends — finished, failed, timed out, or yielded — its participants are stopped, whether or not the program is in a state to do anything about it. Stopping `trama run` stops all of them.
 - A participant's output appears in the runner's output, each line under the participant's name (`[check-sql] …`) — what it prints, and what the runner reports about it. It is not part of the output of the program that spawned it.
-- A participant runs with the runner's environment, not with the environment of the program that spawned it.
+- A participant runs with the runner's environment, not with the environment of the program that spawned it. What it is to have besides is given in `env` (`runProgram({ …, env })` takes the same): its program has those variables, and so do the commands it runs and the participants it spawns in turn. A program that wants its participants to have its whole environment says `env: process.env`. (`create` and `update` take no variables: a candidate is validated with the environment `trama` itself was started in.)
 - Programs may run programs up to 16 deep, and one runner carries up to 128 runs at a time. Past either, the participant is not run and `wait()` rejects — a program that spawns itself is stopped there rather than when the machine gives out.
 - The `trama` command is the exception: started by a program, as any other tool might be, it is a runner of its own, and what it runs is not part of the session.
 
@@ -789,7 +803,7 @@ An agent call's line ends with what it used, and the last line with what the run
 - **What the agent used is counted.** Each time the agent behind a call was asked, a `usage` record says which model served it, the tokens it read and wrote (and read from and wrote to a cache), and what pi's price list makes of that in US dollars — over everything the agent asked of the model for that call: every turn, every retry, a summary pi made of a conversation grown long. It is written when the call is over, however it ended: a call that failed, or was stopped half-way, has used what it used, and a run that is recorded waits for the calls it cut off to say so before its journal ends (up to five seconds, for a backend that does not let go). The same is recorded for each fix that was asked for. Nothing is recorded where nothing was counted — the provider was never reached, or does not say. Not counted at all: the calls `create` and `update` make to write a program, which happen outside any run.
 - **It is a record, not a control.** Nothing reads a journal back to change what a run does.
 
-What goes in it is what the program did: prompts and answers, the contents of files read and written, shell commands and their output. Keep that in mind before sharing one. One thing is held back on purpose: the values of credential-looking headers of a web request (`Authorization`, `Cookie`, `X-Api-Key`, anything with "key", "token" or "auth" in its name) are replaced by `[redacted]`. A secret a program puts anywhere else — in a URL, a prompt, a command — is recorded as written. Journals are readable by their owner only, and `logs/` is kept out of version control.
+What goes in it is what the program did: prompts and answers, the contents of files read and written, shell commands and their output. Keep that in mind before sharing one. Two things are held back on purpose: the values of credential-looking headers of a web request (`Authorization`, `Cookie`, `X-Api-Key`, anything with "key", "token" or "auth" in its name) are replaced by `[redacted]`, and of the variables given to a command or a run (`env`) only the names are written. A secret a program puts anywhere else — in a URL, a prompt, a command — is recorded as written. Journals are readable by their owner only, and `logs/` is kept out of version control.
 
 It is bounded in size. A text longer than 256 KB is cut to its beginning, and a record holds about 1 MB. A record that lost something says so in its `cuts`: which value, and what was there — a text's full length and hash, how many items a list had. A record without `cuts` is whole. A journal that has grown past 64 MB goes on recording how the run goes — attempts, exits, the end — but no more of its calls, nor what they used: the total `trama journal` shows for such a run is what is on record, and says so.
 
@@ -832,6 +846,10 @@ Two kinds of program are validated only part of the way, because running them to
 
 - A program that runs until it is stopped passes once it has called `ctx.ready()` and stayed up for two seconds.
 - A program that runs other programs passes at the moment it asks for the first one. That program is not started: what a session does is not what is being checked, and its participants would run for real — in their own projects, at their own cost. What the program does after that point is first exercised by `trama run`, where a crash is repaired as usual.
+
+**A copy shields the project's own files, and nothing else.** A fix is tried, a candidate validated, and both agents work, in a copy of the project. Beside the copy stands a link for each name beside the project, so that `..` leads where it leads from the project: a program that reads `../shared.json` or runs `../worker` can be repaired and updated. What is reached that way — like the shared workspace, an absolute path, or a link in the project that leads out of it — is the real thing, and what is done to it is done: in a validation, and by a fix that fails, too. The project itself is among it: from a directory beside the project, `..` is the real directory, so a module in `../lib` that writes `../my-project/data.txt` by that path writes the project's own file, not the copy's. Three limits: one level up only; a directory that may be passed through but not listed shows the copy nothing; and a *name* made or removed beside the copy (`../new.txt`, `rm ../shared.json`) is not made or removed beside the project — a repaired run says so, as `create` and `update` do of the agent's work — though what is done through a name (`rm -rf ../shared/`) is done to the real thing. With tens of thousands of names beside a project, every copy takes seconds.
+
+**`create`, `update` and a repair may change more of a project than `program.ts`.** The agent that writes or fixes a program works in the copy the program is then tried in, and what it changed there — files made, changed or removed, trama's own (`state.json`, `meta.json`, `history/`) among them — reaches the project with a program that ran, and only with one. The paths are printed (the first ten), and for a fix recorded in the journal (the first two hundred); `history/` versions the program only. Set `"agentChanges": "discard"` in `~/.trama/config.json` to take nothing from the agent but the program.
 
 **`agent.instruct()` gives the LLM autonomous tool access.** When your program calls `agent.instruct()`, the underlying pi-coding-agent may autonomously read files, write files, and run shell commands to fulfill the request. This is not a simple text-in/text-out call — the LLM can take multi-step actions within the project directory.
 

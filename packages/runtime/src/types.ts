@@ -72,34 +72,63 @@ export type Thinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" |
  * What a call may say about how it is served. Each is honoured or the call
  * fails: nothing asked for here is quietly left out.
  */
-export interface ModelOptions {
+export interface AgentOptions {
   /** Instructions for this call, on top of the agent's own. */
   system?: string;
   /** The model that serves this call, as "provider/model" — in place of the project's. */
   model?: string;
   /** How much the model is to think. A level pi does not have for the model is an error. */
   thinking?: Thinking;
+  /**
+   * The agent's tools for this call: exactly the ones named. `[]` for none —
+   * the answer is then made from the prompt alone, and nothing is read, run
+   * or written. Without it the agent has its own choice of them (read, bash,
+   * edit, write); pi has more than it chooses (grep, find, ls). A name the
+   * agent has no tool for is an error.
+   */
+  tools?: string[];
+  /**
+   * What to make of an answer that was cut off at the model's output limit.
+   * "fail", as it is without this: the call fails — the answer is not whole.
+   * "keep": the call returns what there was of it, as if it were the answer
+   * (and still fails where there was none: a reply cut off before its first
+   * word) — for a call whose work is what the agent did with its tools, and
+   * whose closing words matter little. (The agent goes no further than the
+   * reply that was cut off: where that was leading up to more work, the work
+   * was not done. A typed answer that was cut off is seldom whole.)
+   */
+  cutOff?: "fail" | "keep";
 }
+
+/**
+ * The shape of a typed answer, field by field. A field is "string", "number"
+ * or "boolean" — what follows a ":" describes it to the model — or an object
+ * of such fields, or a list, written as the shape of its items in brackets:
+ *
+ *   { summary: "string", passed: "boolean: did every test pass",
+ *     failures: [{ test: "string", line: "number" }], tags: ["string"] }
+ */
+export type Schema = { readonly [field: string]: SchemaField };
+/** (A list has one element: the shape of every item.) */
+export type SchemaField = string | Schema | readonly SchemaField[];
 
 export interface Agent {
   /**
    * Instruct the pi-coding-agent to perform a task. Returns plain text.
    * The underlying agent may autonomously use its tools to fulfill the
-   * instruction — its own choice of them (read, bash, edit, write), or
-   * exactly the ones named in `tools`: `[]` for none, and pi has more
-   * than it chooses (grep, find, ls). A name the agent has no tool for is
-   * an error.
+   * instruction.
    */
-  instruct(prompt: string, options?: ModelOptions & { tools?: string[] }): Promise<string>;
+  instruct(prompt: string, options?: AgentOptions): Promise<string>;
 
   /**
-   * Structured LLM call. Returns typed object matching the provided schema.
-   * Supported schema value prefixes: "string", "number", "boolean".
-   * Retries once on parse/validation failure.
+   * The same, with the answer as a typed object matching the schema: the
+   * agent may use its tools to find out what it is asked, and answers in
+   * that shape: the fields of the schema and no others, each as declared.
+   * Asks once more on a parse/validation failure.
    */
-  generate<T>(input: ModelOptions & {
+  generate<T>(input: AgentOptions & {
     prompt: string;
-    schema: Record<string, string>;
+    schema: Schema;
   }): Promise<T>;
 }
 
@@ -116,10 +145,17 @@ export interface Tools {
   /** Write a file. Path is relative to project dir. */
   write(path: string, content: string): Promise<void>;
 
-  /** Execute a shell command. Returns structured result. */
+  /**
+   * Execute a shell command. Returns structured result.
+   * `env` is variables for the command, over those it has anyway: the
+   * runner's, and those the run was started with. (What a program sets in
+   * its own process.env is the program's, and is not handed on unless it is
+   * given here: `env: process.env` hands on all of it.)
+   */
   shell(command: string, options?: {
     cwd?: string;
     timeout?: number;
+    env?: Record<string, string | undefined>;
   }): Promise<ShellResult>;
 
   /** HTTP fetch. Returns response body as string. */

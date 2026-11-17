@@ -1,9 +1,9 @@
 import { spawn } from "child_process";
-import { readFileSync, writeFileSync } from "fs";
-import { resolve, dirname } from "path";
+import { accessSync, constants, readFileSync, statSync, writeFileSync } from "fs";
+import { delimiter, resolve, dirname } from "path";
 import type { Tools, ShellResult } from "./types.js";
 import { guardPath, makeDirsIn, projectAt, realRootOf } from "./path-guard.js";
-import { superviseChild } from "./child-process.js";
+import { checkedEnv, superviseChild } from "./child-process.js";
 import { messageOf } from "./errors.js";
 import { signalGroup, stopGroups, stopWithThisProcess } from "./stopping.js";
 
@@ -11,12 +11,34 @@ const MAX_FETCH_BODY = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_SHELL_TIMEOUT = 30_000;
 const GROUP_SWEEP_MS = 250;
 
+/**
+ * The shell a command is run by: the `sh` that `path` — the runner's own
+ * PATH — leads to from where the command runs. Not the one a PATH given for
+ * the command would lead to: that PATH is for what the command runs, and one
+ * without a shell on it, or with something else of the name, is the
+ * command's affair. (Where none is found, the system is left to say so. A
+ * runner that has no PATH at all has the system's own, as it would have for
+ * anything it started.)
+ */
+function shellOn(path: string | undefined, cwd: string): string {
+  if (process.platform === "win32") return "sh";
+  for (const dir of (path ?? "/usr/bin:/bin").split(delimiter)) {
+    const at = resolve(cwd, dir, "sh");
+    try {
+      accessSync(at, constants.X_OK);
+      if (statSync(at).isFile()) return at;
+    } catch { /* not there, or not to be run: the next */ }
+  }
+  return "sh";
+}
+
 export interface ToolsWithCleanup extends Tools {
   /** Stop every shell command still running, and anything they left in the background. Resolves when they are gone. */
   stopActiveShells(): Promise<void>;
 }
 
-export function createTools(projectDir: string, signal?: AbortSignal): ToolsWithCleanup {
+/** `env` is the variables the run was started with, over the runner's own: every shell command has them. */
+export function createTools(projectDir: string, signal?: AbortSignal, env?: Record<string, string>): ToolsWithCleanup {
   const normalizedProjectDir = resolve(projectDir);
 
   // Each shell command leads its own process group, so background processes it
@@ -39,7 +61,8 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
   // and update still do when a program calls them. (This covers tools.shell
   // only: what the agent backend runs on its own takes its environment from
   // this process.)
-  const { TRAMA_PORT: _port, TRAMA_INIT: _init, ...shellEnv } = process.env;
+  const { TRAMA_PORT: _port, TRAMA_INIT: _init, ...runnersOwn } = process.env;
+  const shellEnv = { ...runnersOwn, ...env };
 
   const stopSweeping = () => {
     if (sweeper) clearInterval(sweeper);
@@ -96,13 +119,26 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
 
     async shell(command, options = {}): Promise<ShellResult> {
       const cwd = options.cwd ? guardPath(normalizedProjectDir, options.cwd) : normalizedProjectDir;
-      const child = spawn("sh", ["-c", command], {
-        cwd,
-        env: shellEnv,
-        // Nothing is ever sent to a command: one that reads its input finds it at an end, rather than waiting.
-        stdio: ["ignore", "pipe", "pipe"],
-        detached: true,
-      });
+      const env = options.env == null ? shellEnv : { ...shellEnv, ...checkedEnv(options.env) };
+      // The shell is started from where the runner finds it, and is `sh` to itself and to whoever it tells of
+      // itself, as it was when the system did the finding: in "$0", in what it says of a command it cannot find,
+      // and in what is said of a shell that could not be started.
+      const shell = shellOn(runnersOwn.PATH, cwd);
+      const notStarted = (why: unknown): ShellResult => ({ exitCode: 1, stdout: "", stderr: messageOf(why).replace(`spawn ${shell} `, "spawn sh ") });
+      let child;
+      try {
+        child = spawn(shell, ["-c", command], {
+          cwd,
+          env,
+          argv0: "sh",
+          // Nothing is ever sent to a command: one that reads its input finds it at an end, rather than waiting.
+          stdio: ["ignore", "pipe", "pipe"],
+          detached: true,
+        });
+      } catch (spawnError) {
+        // Refused by the system outright (more than it will hand a process, say) — a result, like any failure to start.
+        return notStarted(spawnError);
+      }
       const pgid = child.pid;
       if (pgid) {
         groups.set(pgid, { shellExited: false, forget: stopWithThisProcess(pgid) });
@@ -118,7 +154,7 @@ export function createTools(projectDir: string, signal?: AbortSignal): ToolsWith
         };
       } catch (spawnError) {
         // Failed to start (e.g. cwd does not exist) — a result, not an exception.
-        return { exitCode: 1, stdout: "", stderr: messageOf(spawnError) };
+        return notStarted(spawnError);
       }
     },
 

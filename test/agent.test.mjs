@@ -450,10 +450,13 @@ test("stripCodeFences leaves a program the fences it wrote down itself", async (
 
 test("createAgent generate takes a field's type from words, and nothing else for words", async () => {
   const agent = createAgent({ async ask() { return '{"a": "x"}'; } }, "/work");
-  for (const type of [["string"], { type: "string" }, 7, null]) {
+  for (const type of [7, null, true, "string[]", "list", "object", "String", ""]) {
     await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: type } }), /unsupported schema type/, JSON.stringify(type));
   }
   assert.deepEqual(await agent.generate({ prompt: "p", schema: { a: "string: any text" } }), { a: "x" });
+  // (A list and an object are not words: each is written as what it holds, and means that.)
+  await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: ["string"] } }), /a: expected a list, got string/);
+  await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: { type: "string" } } }), /a: expected an object, got string/);
 });
 
 // --- What a call asks of its backend, and what it is told the call used ---
@@ -476,9 +479,13 @@ test("createAgent hands the backend what a call asks for and nothing it did not,
   assert.deepEqual(calls[0], { cwd: "/work", system: "s", signal: undefined, model: "p/m", thinking: "high", tools: ["read"], used });
   assert.deepEqual(heard, [usage]);
 
-  // A generate that has to ask again has used both askings. (It is served without a say in the tools.)
+  // A generate that has to ask again has used both askings — and is asked as it was the first time. It has the same say as an instruct.
   assert.deepEqual(await agent.generate({ prompt: "p", schema: { a: "string" }, model: "p/m", thinking: "off", tools: ["read"] }, used), { a: "x" });
-  assert.deepEqual(calls[1], { cwd: "/work", system: undefined, signal: undefined, model: "p/m", thinking: "off", used });
+  assert.deepEqual(calls[1], { cwd: "/work", system: undefined, signal: undefined, model: "p/m", thinking: "off", tools: ["read"], used });
+  assert.deepEqual(await agent.generate({ prompt: "p", schema: { a: "string" }, tools: [] }), { a: "x" });
+  assert.deepEqual(calls.pop(), { cwd: "/work", system: undefined, signal: undefined, tools: [] });
+  assert.deepEqual(await agent.generate({ prompt: "p", schema: { a: "string" } }), { a: "x" });
+  assert.deepEqual(calls.pop(), { cwd: "/work", system: undefined, signal: undefined });
   assert.deepEqual(calls[2], calls[1]);
   assert.deepEqual(heard, [usage, usage, usage]);
 
@@ -786,4 +793,270 @@ test("a session is disposed of whatever becomes of telling what the call used", 
   });
   await assert.rejects(() => adapter.ask("p", { cwd: process.cwd(), used: () => { throw new Error("nowhere to write it"); } }), /nowhere to write it/);
   assert.equal(disposed, 1);
+});
+
+test("generate has the agent find out what it is asked and answer in the shape asked for — or answer from the prompt alone, where it is given no tools", async (t) => {
+  // A model that, given a way to read, reads the file it is asked about before it answers; and given none, says what it can.
+  const fake = await fakeProvider(t, (request, { sse }) => {
+    const stream = sse();
+    const canRead = (request.tools ?? []).some((tool) => tool.function.name === "read");
+    const hasRead = request.messages.find((message) => message.role === "tool");
+    if (canRead && !hasRead) {
+      stream.says({ role: "assistant", tool_calls: [{ index: 0, id: "call-1", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "result.txt" }) } }] });
+      stream.says({}, "tool_calls");
+    } else {
+      const passed = hasRead ? /12 passed, 0 failed/.test(JSON.stringify(hasRead.content)) : false;
+      stream.says({ role: "assistant", content: JSON.stringify({ passed, looked: Boolean(hasRead) }) });
+      stream.says({}, "stop");
+    }
+    stream.used({ prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 });
+    stream.done();
+  });
+  writeModelFile(joinPath(fake.cwd, "result.txt"), "12 passed, 0 failed");
+  const agent = createAgent({ ask: fake.ask }, fake.cwd);
+  const ask = { prompt: "did the tests in result.txt pass?", schema: { passed: "boolean", looked: "boolean" }, system: "be exact" };
+  const heard = [];
+
+  // As it is, with the agent's own tools: two requests, the second with what the file says.
+  assert.deepEqual(await agent.generate(ask, (usage) => heard.push(usage)), { passed: true, looked: true });
+  assert.equal(fake.requests.length, 2);
+  assert.deepEqual(fake.toolsOf(fake.requests[0]), ["read", "bash", "edit", "write"]);
+  assert.match(JSON.stringify(fake.requests[0].messages), /be exact/);
+  assert.deepEqual(heard.map(({ input, output }) => [input, output]), [[200, 20]]);
+
+  // With the tools it names, and no others.
+  assert.deepEqual(await agent.generate({ ...ask, tools: ["read", "grep"] }), { passed: true, looked: true });
+  assert.deepEqual(fake.toolsOf(fake.requests[2]), ["read", "grep"]);
+
+  // With none: one request, and nothing to look with.
+  fake.requests.length = 0;
+  assert.deepEqual(await agent.generate({ ...ask, tools: [] }), { passed: false, looked: false });
+  assert.equal(fake.requests.length, 1);
+  assert.deepEqual(fake.toolsOf(fake.requests[0]), []);
+});
+
+// --- The shape of a typed answer: lists, and objects within objects ---
+
+test("generate answers in lists and in objects within objects — every item and field as declared, and no others", async () => {
+  const prompts = [];
+  let reply;
+  const agent = createAgent({ async ask(prompt) { prompts.push(prompt); return JSON.stringify(reply); } }, "/work");
+  const schema = {
+    summary: "string: one line",
+    failures: [{ test: "string", line: "number: 1-based" }],
+    tags: ["string"],
+    meta: { ok: "boolean", grid: [["number"]], none: {} },
+  };
+
+  reply = {
+    summary: "two failed", extra: 1,
+    failures: [{ test: "a", line: 3, more: "x" }, { test: "b", line: 14 }],
+    tags: [],
+    meta: { ok: false, grid: [[1, 2], []], none: { anything: 1 }, also: [] },
+  };
+  assert.deepEqual(await agent.generate({ prompt: "p", schema }), {
+    summary: "two failed",
+    failures: [{ test: "a", line: 3 }, { test: "b", line: 14 }],
+    tags: [],
+    meta: { ok: false, grid: [[1, 2], []], none: {} },
+  });
+  // The model is shown the shape as it was written, and told what a list in it means — where there is one.
+  assert.equal(prompts.length, 1);
+  assert.ok(prompts[0].includes(JSON.stringify(schema, null, 2)));
+  assert.match(prompts[0], /\}\nWhere the shape shows a list, it shows one item: answer with as many as there are, each of that shape\.\nNo markdown\./);
+  reply = { a: "x", b: { c: 1 } };
+  await agent.generate({ prompt: "p", schema: { a: "string", b: { c: "number" } } });
+  assert.match(prompts[1], /\}\nNo markdown\. No explanation\. Just the JSON\.$/);
+  await agent.generate({ prompt: "p", schema: { a: "string", b: { c: ["number"] } } }).catch(() => {});
+  assert.match(prompts[2], /Where the shape shows a list/);
+
+  // A reply that is not of the shape is told where it is not — and asked again, once.
+  const good = () => ({ summary: "s", failures: [{ test: "a", line: 1 }, { test: "b", line: 2 }], tags: ["t"], meta: { ok: true, grid: [[1, 2]], none: {} } });
+  for (const [spoil, why] of [
+    [(r) => { r.failures = "none"; }, "failures: expected a list, got string"],
+    [(r) => { r.failures = { test: "a", line: 1 }; }, "failures: expected a list, got object"],
+    [(r) => { r.failures[1].line = "2"; }, "failures[1].line: expected number, got string"],
+    [(r) => { r.failures[1] = ["b", 2]; }, "failures[1]: expected an object, got a list"],
+    [(r) => { delete r.failures[0].test; }, "missing key: failures[0].test"],
+    [(r) => { r.tags = [1]; }, "tags[0]: expected string, got 1"],
+    [(r) => { r.tags = ["a", null]; }, "tags[1]: expected string, got null"],
+    [(r) => { r.meta = [true]; }, "meta: expected an object, got a list"],
+    [(r) => { r.meta = null; }, "meta: expected an object, got null"],
+    [(r) => { delete r.meta.ok; }, "missing key: meta.ok"],
+    [(r) => { r.meta.grid = [[1, "x"]]; }, "meta.grid[0][1]: expected number, got string"],
+    [(r) => { r.meta.grid = [1]; }, "meta.grid[0]: expected a list, got 1"],
+    [(r) => { r.meta.none = "x"; }, "meta.none: expected an object, got string"],
+  ]) {
+    reply = good();
+    spoil(reply);
+    prompts.length = 0;
+    await assert.rejects(() => agent.generate({ prompt: "p", schema }), { message: `Schema validation failed: ${why}` }, why);
+    assert.equal(prompts.length, 2, why);
+    assert.ok(prompts[1].startsWith(`Your previous response failed validation: Error: Schema validation failed: ${why}.`), why);
+  }
+  reply = ["not", "an", "object"];
+  await assert.rejects(() => agent.generate({ prompt: "p", schema }), { message: "Schema validation failed: response is not an object" });
+
+  // A schema that says nothing a reply could be held to is the program's own mistake, and no model is asked.
+  prompts.length = 0;
+  for (const [wrong, why] of [
+    [{ a: [] }, 'the list at "a" is written with 0 elements — it takes one, the shape of every item'],
+    [{ a: ["string", "number"] }, 'the list at "a" is written with 2 elements — it takes one, the shape of every item'],
+    [{ a: { b: [[]] } }, 'the list at "a.b[]" is written with 0 elements — it takes one, the shape of every item'],
+    [{ a: { b: "array" } }, 'unsupported schema type "array" for key "a.b" (a list is written as the shape of its items, in brackets: ["string"]; an object as its fields: { name: "string" })'],
+    [{ a: [7] }, 'unsupported schema type "7" for key "a[]" (a list is written as the shape of its items, in brackets: ["string"]; an object as its fields: { name: "string" })'],
+    [{ a: [{ b: [null] }] }, 'unsupported schema type "null" for key "a[].b[]" (a list is written as the shape of its items, in brackets: ["string"]; an object as its fields: { name: "string" })'],
+    [["string"], "a schema is an object of the fields the answer is to have"],
+    ["string", "a schema is an object of the fields the answer is to have"],
+    [null, "a schema is an object of the fields the answer is to have"],
+  ]) {
+    await assert.rejects(() => agent.generate({ prompt: "p", schema: wrong }), { message: `Schema validation failed: ${why}` }, JSON.stringify(wrong));
+  }
+  assert.equal(prompts.length, 0);
+
+  // A field named as something every object has by birth is a field like any other: the reply has it, or it is missing.
+  reply = { a: "x" };
+  await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: "string", b: { __proto__: null, valueOf: "string" } } }), /missing key: b/);
+  for (const name of ["toString", "constructor", "__proto__", "hasOwnProperty"]) {
+    const named = JSON.parse(`{ "a": "string", "o": { ${JSON.stringify(name)}: {} } }`);
+    reply = { a: "x", o: {} };
+    await assert.rejects(() => agent.generate({ prompt: "p", schema: named }), { message: `Schema validation failed: missing key: o.${name}` }, name);
+    reply = JSON.parse(`{ "a": "x", "o": { ${JSON.stringify(name)}: { "more": 1 } } }`);
+    const answer = await agent.generate({ prompt: "p", schema: named });
+    assert.deepEqual(Object.getOwnPropertyNames(answer.o), [name]);
+    assert.equal(Object.getPrototypeOf(answer.o), Object.prototype, name);
+  }
+  // ...and one with no name at all is a field too: what is said of it, and under it, is said of it.
+  reply = { "": "str" };
+  await assert.rejects(() => agent.generate({ prompt: "p", schema: { "": { x: "string" } } }), { message: "Schema validation failed: : expected an object, got string" });
+  reply = { "": {} };
+  await assert.rejects(() => agent.generate({ prompt: "p", schema: { "": { x: "string" } } }), { message: "Schema validation failed: missing key: .x" });
+  await assert.rejects(() => agent.generate({ prompt: "p", schema: { "": { x: "wrong" } } }), /unsupported schema type "wrong" for key "\.x"/);
+  reply = JSON.parse('{ "a": "x", "__proto__": { "b": "inherited" } }');
+  assert.deepEqual(Object.keys(await agent.generate({ prompt: "p", schema: JSON.parse('{ "__proto__": { "b": "string" } }') })), ["__proto__"]);
+});
+
+// --- A reply that was cut off at the output limit ---
+
+test("a reply that was cut off fails the call, unless the call keeps such a reply — then it is what there was of it", async (t) => {
+  const { CutOff } = await import("../packages/runtime/dist/agent-backend.js");
+  const calls = [];
+  let fate;
+  const agent = createAgent({ async ask(prompt, call) { calls.push({ prompt, call }); return fate(calls.length); } }, "/work");
+  const cut = (text) => () => { throw new CutOff(text); };
+  const cutOff = { message: "The model's answer was cut off at its output limit." };
+
+  fate = cut("part of an answ");
+  await assert.rejects(() => agent.instruct("p"), cutOff);
+  await assert.rejects(() => agent.instruct("p", { cutOff: "fail" }), cutOff);
+  await assert.rejects(() => agent.instruct("p", { cutOff: undefined }), cutOff);
+  assert.equal(await agent.instruct("p", { cutOff: "keep", system: "s" }), "part of an answ");
+  // The backend is asked the same either way: what is made of a reply that was cut off is made of it here.
+  assert.deepEqual(calls.map(({ call }) => call), [
+    { cwd: "/work", system: undefined, signal: undefined },
+    { cwd: "/work", system: undefined, signal: undefined },
+    { cwd: "/work", system: undefined, signal: undefined },
+    { cwd: "/work", system: "s", signal: undefined },
+  ]);
+
+  // There is nothing to keep of a reply cut off before its first word; and any other failure is still one.
+  fate = cut("");
+  await assert.rejects(() => agent.instruct("p", { cutOff: "keep" }), cutOff);
+  fate = () => { throw new Error("the model is away"); };
+  await assert.rejects(() => agent.instruct("p", { cutOff: "keep" }), { message: "the model is away" });
+  fate = () => { throw Object.assign(new Error("The model's answer was cut off at its output limit."), { text: "looks like one" }); };
+  await assert.rejects(() => agent.instruct("p", { cutOff: "keep" }), cutOff);
+
+  // What is neither is not an option, and nothing is asked under it.
+  calls.length = 0;
+  for (const what of ["yes", "", "Keep", true, null, 0, ["keep"]]) {
+    await assert.rejects(() => agent.instruct("p", { cutOff: what }), { message: `cutOff is "fail" or "keep", not ${JSON.stringify(what)}` });
+    await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: "string" }, cutOff: what }), { message: `cutOff is "fail" or "keep", not ${JSON.stringify(what)}` });
+  }
+  assert.equal(calls.length, 0);
+
+  // A typed answer is held to its shape either way. One that was cut off is not asked for again, as it stands...
+  fate = cut('{"a":"x"}');
+  await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: "string" } }), cutOff);
+  assert.equal(calls.length, 1);
+  // ...kept, it is the answer where it is whole for all that, and where it is not it is asked for once more.
+  assert.deepEqual(await agent.generate({ prompt: "p", schema: { a: "string" }, cutOff: "keep" }), { a: "x" });
+  calls.length = 0;
+  fate = (nth) => (nth === 1 ? cut('{"a":"x') : cut('{"a":"y"}'))();
+  assert.deepEqual(await agent.generate({ prompt: "p", schema: { a: "string" }, cutOff: "keep" }), { a: "y" });
+  assert.equal(calls.length, 2);
+  assert.match(calls[1].prompt, /^Your previous response failed validation/);
+  calls.length = 0;
+  fate = (nth) => (nth === 1 ? () => "not json" : cut('{"a":"z"}'))();
+  await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: "string" } }), cutOff);
+  assert.equal(calls.length, 2);
+});
+
+test("pi says of a reply that was cut off what there was of it: the last reply's words, and no earlier one's", async (t) => {
+  const { CutOff } = await import("../packages/runtime/dist/agent-backend.js");
+  let then;
+  const fake = await fakeProvider(t, (_request, { sse }, hit) => {
+    const stream = sse();
+    if (then === "after a tool" && hit === 1) {
+      stream.says({ role: "assistant", content: "Let me look at the file first.", tool_calls: [{ index: 0, id: "call-1", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "a.txt" }) } }] });
+      stream.says({}, "tool_calls");
+    } else if (then === "in a tool call" && hit === 1) {
+      stream.says({ role: "assistant", content: "Now the file.", tool_calls: [{ index: 0, id: "call-2", type: "function", function: { name: "read", arguments: '{"path": "a.t' } }] });
+      stream.says({}, "length");
+    } else if (then === "in a tool call") {
+      stream.says({ role: "assistant", content: "the answer" });
+      stream.says({}, "stop");
+    } else {
+      stream.says({ role: "assistant", content: "The answer, which is cut at the li" });
+      stream.says({}, "length");
+    }
+    stream.used({ prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200 });
+    stream.done();
+  });
+  writeModelFile(joinPath(fake.cwd, "a.txt"), "what the file says");
+  const agent = createAgent({ ask: fake.ask }, fake.cwd);
+  const heard = [];
+
+  for (const [how, model] of [["at once", undefined], ["after a tool", undefined], ["at once", "fake/terse"]]) {
+    then = how;
+    fake.requests.length = 0;
+    const failure = await fake.ask("read a.txt and answer", { ...(model && { model }) }).catch((err) => err);
+    assert.ok(failure instanceof CutOff, `${how} ${model}: ${failure}`);
+    assert.equal(failure.text, "The answer, which is cut at the li");
+    assert.equal(fake.requests.length, how === "after a tool" ? 2 : 1);
+    fake.requests.length = 0;
+    assert.equal(
+      await agent.instruct("read a.txt and answer", { cutOff: "keep", ...(model && { model }) }, (usage) => heard.push(usage.output)),
+      "The answer, which is cut at the li", `${how} ${model}`,
+    );
+  }
+  assert.deepEqual(heard, [200, 400, 200], "what a reply that was cut off took is counted like any other");
+
+  // Cut off in the middle of having something done is not this: pi does not do what it was only half told,
+  // has the model say it again, and the call goes on to its answer.
+  then = "in a tool call";
+  fake.requests.length = 0;
+  assert.equal(await fake.ask("read a.txt and answer"), "the answer");
+  assert.equal(fake.requests.length, 2);
+  assert.equal(fake.requests[1].messages.filter((message) => message.role === "tool").length, 1);
+});
+
+test("pi leaves nothing where it works but what the agent's tools put there: a directory an agent worked in differs by the agent's work alone", async (t) => {
+  const { readdirSync } = await import("node:fs");
+  const fake = await fakeProvider(t, (request, { sse }) => {
+    const stream = sse();
+    if (!request.messages.some((message) => message.role === "tool")) {
+      stream.says({ role: "assistant", tool_calls: [{ index: 0, id: "call-1", type: "function", function: { name: "write", arguments: JSON.stringify({ path: "made.txt", content: "by the agent" }) } }] });
+      stream.says({}, "tool_calls");
+    } else {
+      stream.says({ role: "assistant", content: "done" });
+      stream.says({}, "stop");
+    }
+    stream.used({ prompt_tokens: 10, completion_tokens: 1, total_tokens: 11 });
+    stream.done();
+  });
+  writeModelFile(joinPath(fake.cwd, "there-before.txt"), "x");
+
+  assert.equal(await fake.ask("make a file"), "done");
+  assert.deepEqual(readdirSync(fake.cwd, { recursive: true }).sort(), ["made.txt", "there-before.txt"]);
 });

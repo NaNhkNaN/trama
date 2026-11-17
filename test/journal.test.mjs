@@ -860,13 +860,15 @@ test("what an agent call asks for reaches its backend as asked, and what the cal
     programSource: `import { ctx, agent } from "@trama-dev/runtime";
 const told = (err: unknown) => String(err);
 const first = await agent.instruct("first", { system: "s", model: "p/m", thinking: "high", tools: ["read"] });
-const second = await agent.generate<{ a: string }>({ prompt: "second", schema: { a: "string" }, model: "p/m", thinking: "off" });
+const second = await agent.generate<{ a: string }>({ prompt: "second", schema: { a: "string" }, model: "p/m", thinking: "off", tools: ["read"] });
 const third = await agent.instruct("third").catch(told);
 const fourth = await agent.instruct("fourth", { tools: ["read", 1] } as any).catch(told);
 const fifth = await agent.instruct("fifth", { tools: "read" } as any).catch(told);
 const sixth = await agent.instruct("sixth", { thinking: 3 } as any).catch(told);
 const seventh = await agent.instruct("seventh", { tools: [], model: undefined, thinking: null } as any);
-await ctx.done({ first, second, third, fourth, fifth, sixth, seventh });`,
+const eighth = await agent.instruct("eighth", { tool: ["read"] } as any).catch(told);
+const ninth = await agent.generate({ prompt: "ninth", schema: { a: "string" }, tool: [] } as any).catch(told);
+await ctx.done({ first, second, third, fourth, fifth, sixth, seventh, eighth, ninth });`,
   });
 
   const asked = [];
@@ -891,11 +893,14 @@ await ctx.done({ first, second, third, fourth, fifth, sixth, seventh });`,
     fifth: "Error: trama runtime error: Invalid field: tools (expected strings or undefined)",
     sixth: "Error: trama runtime error: Invalid field: thinking (expected string or undefined)",
     seventh: "answer to seventh",
+    // An option that is none — misspelt, or not this call's — is not passed over: the program would think it had been taken.
+    eighth: "Error: trama runtime error: Unknown field: tool (this call takes: prompt, system, model, thinking, tools, cutOff)",
+    ninth: "Error: trama runtime error: Unknown field: tool (this call takes: prompt, schema, system, model, thinking, tools, cutOff)",
   });
   assert.deepEqual(asked, [
     { prompt: "first", system: "s", model: "p/m", thinking: "high", tools: ["read"] },
-    { prompt: "second", system: undefined, model: "p/m", thinking: "off" },
-    { prompt: "second, again", system: undefined, model: "p/m", thinking: "off" },
+    { prompt: "second", system: undefined, model: "p/m", thinking: "off", tools: ["read"] },
+    { prompt: "second, again", system: undefined, model: "p/m", thinking: "off", tools: ["read"] },
     { prompt: "third", system: undefined },
     { prompt: "seventh", system: undefined, tools: [] },
   ]);
@@ -920,7 +925,7 @@ await ctx.done({ first, second, third, fourth, fifth, sixth, seventh });`,
   assert.match(shown, /end: done  \(90 tokens  \$1\.2500 in all\)$/m);
   assert.doesNotMatch(shown, /asking for the fix/, "what a call used is said with the call, and only there");
   const listed = await captureConsole("log", async () => printJournals(projectDir, "it", { list: true }));
-  assert.match(listed.messages.join("\n"), /^\S+  run +8 calls  done  90 tokens  \$1\.2500$/m);
+  assert.match(listed.messages.join("\n"), /^\S+  run +10 calls  done  90 tokens  \$1\.2500$/m);
 });
 
 test("what asking for a fix used is on record with the run, whether or not a fix came back", async (t) => {
@@ -1098,4 +1103,41 @@ test("a run that has waited for what it cut off leaves nothing behind that keeps
   const before = waiting();
   assert.equal((await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 })).status, "done");
   assert.equal(waiting(), before, "the time it would have given a call that does not let go is not still running");
+});
+
+test("a program is given a reply that was cut off where it says to keep one, and a typed answer in lists and objects", async (t) => {
+  const { CutOff } = await import("../packages/runtime/dist/agent-backend.js");
+  const projectDir = makeTempDir("trama-journal-");
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, agent, type Schema } from "@trama-dev/runtime";
+const told = (err: unknown) => String(err);
+const failed = await agent.instruct("cut").catch(told);
+const kept = await agent.instruct("cut", { cutOff: "keep" });
+const neither = await agent.instruct("cut", { cutOff: "sometimes" } as any).catch(told);
+const notAWord = await agent.instruct("cut", { cutOff: true } as any).catch(told);
+const schema: Schema = { failures: [{ test: "string", line: "number" }], meta: { tags: ["string"] } };
+const typed = await agent.generate<{ failures: Array<{ test: string; line: number }>; meta: { tags: string[] } }>({ prompt: "typed", schema });
+const typedKept = await agent.generate({ prompt: "typed and cut", schema: { n: ["number"] }, cutOff: "keep" });
+const wrong = await agent.generate({ prompt: "typed", schema: { a: ["string", "number"] } } as any).catch(told);
+await ctx.done({ failed, kept, neither, notAWord, typed, typedKept, wrong });`,
+  });
+  const originalAsk = llm.ask;
+  llm.ask = async (prompt) => {
+    if (prompt === "cut") throw new CutOff("the work is done, and what is left to say is");
+    if (prompt.startsWith("typed and cut")) throw new CutOff('{"n":[1,2,3]}');
+    return JSON.stringify({ failures: [{ test: "a", line: 3, more: 1 }], meta: { tags: ["x", "y"], other: true }, beside: 1 });
+  };
+  t.after(() => { llm.ask = originalAsk; cleanupTempDir(projectDir); });
+
+  const { result } = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.deepEqual(result, {
+    failed: "Error: trama runtime error: Error: The model's answer was cut off at its output limit.",
+    kept: "the work is done, and what is left to say is",
+    neither: 'Error: trama runtime error: Error: cutOff is "fail" or "keep", not "sometimes"',
+    notAWord: "Error: trama runtime error: Invalid field: cutOff (expected string or undefined)",
+    typed: { failures: [{ test: "a", line: 3 }], meta: { tags: ["x", "y"] } },
+    typedKept: { n: [1, 2, 3] },
+    wrong: 'Error: trama runtime error: Error: Schema validation failed: the list at "a" is written with 2 elements — it takes one, the shape of every item',
+  });
 });

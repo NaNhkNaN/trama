@@ -24,6 +24,14 @@ export interface SpawnOptions {
   timeout?: number;
   /** Max repair attempts. */
   maxRepairAttempts?: number;
+  /**
+   * Variables for the participant, over the runner's own and those the run
+   * that spawns it was started with: its program has them, and so do the
+   * shell commands it runs and the participants it spawns in turn. (What the
+   * program that spawns it sets in its own process.env is not handed on
+   * unless it is given here: `env: process.env` hands on all of it.)
+   */
+  env?: Record<string, string | undefined>;
 }
 
 export interface ParticipantHandle {
@@ -38,6 +46,22 @@ export interface ParticipantHandle {
    * Throws if the participant is not in a yielded state.
    */
   resume(args?: Record<string, unknown>): Promise<ParticipantHandle>;
+}
+
+/**
+ * A participant's variables as they are when it is spawned: one that is
+ * resumed has those, whatever has become of the object since. What is no
+ * object of variables, or cannot be read, is handed on as it is — to be
+ * refused for what it is when the participant is run, as its wait() says.
+ */
+function asGiven(env: SpawnOptions["env"]): SpawnOptions["env"] {
+  const given: unknown = env;
+  if (typeof given !== "object" || given === null || Array.isArray(given)) return env;
+  try {
+    return { ...env };
+  } catch {
+    return env;
+  }
 }
 
 /** Make a path absolute, expanding a leading `~` to the user's home directory. */
@@ -89,6 +113,7 @@ export class Session {
    */
   spawn(name: string, options: SpawnOptions): ParticipantHandle {
     const { args, timeout, maxRepairAttempts } = options;
+    const env = asGiven(options.env);
     const projectDir = toAbsolute(options.projectDir);
     const workspaceDir = this.workspaceDir;
 
@@ -100,7 +125,7 @@ export class Session {
     const startRun = (runArgs?: Record<string, unknown>): Promise<ProgramResult> => {
       state = "running";
       lastArgs = runArgs;
-      const run = runProgram({ projectDir, timeout, maxRepairAttempts, args: runArgs, workspaceDir, label: name });
+      const run = runProgram({ projectDir, timeout, maxRepairAttempts, args: runArgs, workspaceDir, label: name, env });
       // An infrastructure error (the run could not happen at all) counts as failed.
       run.then(result => { state = result.status; }, () => { state = "failed"; });
       return run;
