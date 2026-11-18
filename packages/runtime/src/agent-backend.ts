@@ -45,8 +45,12 @@ export interface AgentCall {
   skills?: boolean | string[];
   /** The same of prompt templates: with one, a prompt that begins with its name is the template, filled in. */
   templates?: boolean | string[];
-  /** Whether the agent has the user's own extensions of it: code of the user's that the backend runs. */
-  extensions?: boolean;
+  /**
+   * Whether the agent has the user's own extensions of it — or, with
+   * "project", those of where it works as well: somebody's code, which the
+   * backend runs.
+   */
+  extensions?: boolean | "project";
   /**
    * The prompt is text and nothing else: it goes to the model as written,
    * and is not read for what it begins with — a skill called up by name, a
@@ -60,9 +64,20 @@ export interface AgentCall {
    * the model again — for the next step of its work, or to have a long
    * conversation summed up: whoever hears it may cancel the call there,
    * before more is used. A backend that asks its model once, or cannot say,
-   * never calls it. (It does not throw.)
+   * never calls it. (It does not throw.) Whoever hears it may take a moment
+   * over it — it is in another process, say — and return a promise: a
+   * backend that can wait for that before it asks its model does.
    */
-  sofar?: (usage: AgentUsage) => void;
+  sofar?: (usage: AgentUsage) => void | Promise<void>;
+  /**
+   * Told what the call has used as soon as a reply of its model's has come.
+   * Nothing waits for it, and nothing is cancelled by it: it is for whoever
+   * may lose the call before it says what it used in the end — the runner of
+   * a process that serves it, which may have to end that process. (And to
+   * pi's adapter it says that the call is counted elsewhere: what the call
+   * has used so far is then waited for, before its model is asked again.)
+   */
+  had?: (usage: AgentUsage) => void;
   /**
    * Told what the call used, at most once and before the call settles —
    * however it ended: a call that failed or was cancelled half-way has used

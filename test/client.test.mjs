@@ -182,6 +182,9 @@ export const fromNamed = await agent.generate({ prompt: "p", schema: named, cutO
 const options: AgentOptions = { cutOff: "keep", thinking: "low" };
 export const kept = await agent.instruct("p", options);
 export const furnished = await agent.instruct("/review p", { skills: true, templates: ["review"], extensions: true });
+export const theirs = await agent.instruct("p", { extensions: "project" });
+// @ts-expect-error — whose extensions is the user's, or the project's with them: no other word
+export const whose = await agent.instruct("p", { extensions: "user" });
 export const some = await agent.generate({ prompt: "p", schema: flat, skills: ["pdf", "tables"], extensions: false });
 // @ts-expect-error — a typed answer's prompt is not read as a template
 export const typedTemplate = await agent.generate({ prompt: "/review p", schema: flat, templates: true });

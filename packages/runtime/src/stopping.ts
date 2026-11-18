@@ -23,7 +23,7 @@
 // Nothing here listens for a signal or for the process exiting: the process
 // that hosts a runner keeps its own way of handling both.
 
-import { spawn, type ChildProcess } from "child_process";
+import { execFile, spawn, type ChildProcess } from "child_process";
 import * as fs from "fs";
 
 /** How long what was asked to stop gets to do so: a process group after SIGTERM, before it is sent SIGKILL; a backend's call after it was cancelled, before the run goes on without it. */
@@ -47,6 +47,90 @@ export function signalGroup(pgid: number, signal: NodeJS.Signals | 0): boolean {
   } catch {
     return false;
   }
+}
+
+/** How long the system is given to say what processes there are. */
+const PROCESSES_ASKED_MS = 2_000;
+
+/**
+ * What Linux says of its processes — each its id, its parent's and its
+ * group's — in files: there is nothing to start to learn it, and nothing that
+ * may be missing (a container often has no `ps`). Nothing, where there are no
+ * such files — or where they are not of the processes whoever asks is among:
+ * a container may have another's files before it, and a number read there
+ * is nobody's here. So the files are taken at their word only where they say
+ * of the asker (`self`) what it knows of itself: whose child it is (`parent`).
+ *
+ * It runs in two processes, here and in the watchdog, which is handed its
+ * text: it may use nothing but its arguments. So may the two that follow.
+ */
+export function processesOnFile(fs: Pick<typeof import("fs"), "readdirSync" | "readFileSync">, self: number, parent: number): number[][] {
+  const rows: number[][] = [];
+  let names: string[];
+  try {
+    names = fs.readdirSync("/proc");
+  } catch {
+    return rows;
+  }
+  for (const name of names) {
+    if (!/^[0-9]+$/.test(name)) continue;
+    try {
+      // "id (name) state parent group …": a name may hold anything, a ")" and a space among it —
+      // what follows the last ")" is what is told apart by spaces.
+      const stat = fs.readFileSync("/proc/" + name + "/stat", "utf8");
+      const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      const row = [Number(name), Number(after[1]), Number(after[2])];
+      if (row.every(Number.isInteger)) rows.push(row);
+    } catch { /* gone since it was listed */ }
+  }
+  return rows.some(row => row[0] === self && row[1] === parent) ? rows : [];
+}
+
+/** The same, of what `ps -Ao pid=,ppid=,pgid=` printed. */
+function processesListed(listed: string): number[][] {
+  return listed.split("\n").map(line => line.trim().split(/\s+/).map(Number)).filter(row => row.length === 3 && row.every(Number.isInteger));
+}
+
+/**
+ * Of such rows, the process groups of everything one process has under it —
+ * but for the group it leads, and that of whoever asks (`self`).
+ */
+function groupsAmong(rows: number[][], pid: number, self: number): number[] {
+  const under = new Set([pid]);
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const row of rows) {
+      if (under.has(row[1]) && !under.has(row[0])) {
+        under.add(row[0]);
+        grew = true;
+      }
+    }
+  }
+  const own = rows.find(row => row[0] === self);
+  const groups = new Set(rows.filter(row => under.has(row[0])).map(row => row[2]));
+  return [...groups].filter(group => group !== pid && !(own && group === own[2]));
+}
+
+/**
+ * The process groups of everything a process has under it, as the system has
+ * them at this moment — but for the group it leads, and this process's own.
+ * A process may start what it starts in groups of their own (pi does so with
+ * what an agent runs, and with an MCP server): the group it leads does not
+ * hold those, and once it is gone nothing says any more whose they were.
+ * (What has cut itself loose of its parent by then is nobody's to find; and
+ * where the system cannot be asked — it has no such files, and no `ps` that
+ * answers in a while — nothing is found.) Whoever asks is not held while a
+ * `ps` answers: it is asked of what is still there, and is to be stopped
+ * after.
+ */
+export async function groupsUnder(pid: number): Promise<number[]> {
+  let rows = processesOnFile(fs, process.pid, process.ppid);
+  if (rows.length === 0) {
+    rows = processesListed(await new Promise<string>((resolve) => {
+      execFile("ps", ["-Ao", "pid=,ppid=,pgid="], { encoding: "utf-8", timeout: PROCESSES_ASKED_MS, killSignal: "SIGKILL" }, (err, stdout) => resolve(err ? "" : stdout));
+    }));
+  }
+  return groupsAmong(rows, pid, process.pid);
 }
 
 // --- Removing what was made ---
@@ -81,10 +165,24 @@ function removeTree(fs: Pick<typeof import("fs"), "rmSync" | "readdirSync" | "ch
 // the runner had already asked to stop is not asked a second time.
 const WATCHDOG = `
 const fs = require("fs");
+const { execFileSync } = require("child_process");
 ${removeTree}
 ${signalGroup}
-const { grace, settle, poll } = JSON.parse(process.argv[1]);
-const lists = { g: new Set(), d: new Set(), asked: new Set() };
+${processesOnFile}
+${processesListed}
+${groupsAmong}
+const { grace, settle, poll, asking } = JSON.parse(process.argv[1]);
+const lists = { g: new Set(), d: new Set(), asked: new Set(), u: new Set() };
+// What the system says of its processes: by its files, or by ps — which this process can wait for.
+const processes = () => {
+  const rows = processesOnFile(fs, process.pid, process.ppid);
+  if (rows.length > 0) return rows;
+  try {
+    return processesListed(execFileSync("ps", ["-Ao", "pid=,ppid=,pgid="], { encoding: "utf8", timeout: asking, killSignal: "SIGKILL", stdio: ["ignore", "pipe", "ignore"] }));
+  } catch {
+    return [];
+  }
+};
 const alive = (pgid) => signalGroup(pgid, 0);
 const signal = signalGroup;
 
@@ -107,7 +205,12 @@ const takeOver = () => {
     for (const dir of lists.d) removeTree(fs, dir);
     process.exit(0);
   };
-  let left = [...lists.g].filter(alive);
+  // A group that is to be stopped with what is under it: what it started in groups of their own is
+  // looked for now, while it is there to be asked of — it may not be able to end them itself.
+  const led = [...lists.u].filter(alive);
+  const rows = led.length > 0 ? processes() : [];
+  const below = led.flatMap((pid) => groupsAmong(rows, pid, process.pid));
+  let left = [...new Set([...lists.g, ...below])].filter(alive);
   for (const pgid of left) { if (!lists.asked.has(pgid)) signal(pgid, "SIGTERM"); }
   let deadline = performance.now() + grace;
   let killed = false;
@@ -129,11 +232,11 @@ process.stdin.on("close", takeOver);
 process.stdin.on("error", takeOver);
 `;
 
-/** The watchdog's lists: process groups, temp directories, and the groups already asked to stop. */
-type List = "g" | "d" | "asked";
+/** The watchdog's lists: process groups, temp directories, the groups already asked to stop, and those to be stopped with what is under them. */
+type List = "g" | "d" | "asked" | "u";
 
 /** What the watchdog has been told about and not yet told to forget. */
-const listed: Record<List, Set<number | string>> = { g: new Set(), d: new Set(), asked: new Set() };
+const listed: Record<List, Set<number | string>> = { g: new Set(), d: new Set(), asked: new Set(), u: new Set() };
 let watchdog: ChildProcess | null = null;
 
 const tell = (to: ChildProcess, op: "+" | "-", list: List, item: number | string) => {
@@ -149,7 +252,7 @@ function startWatchdog(): ChildProcess | null {
   if (watchdog) return watchdog;
   let child: ChildProcess;
   try {
-    const timings = { grace: KILL_GRACE_MS, settle: KILL_SETTLE_MS, poll: STOP_POLL_MS };
+    const timings = { grace: KILL_GRACE_MS, settle: KILL_SETTLE_MS, poll: STOP_POLL_MS, asking: PROCESSES_ASKED_MS };
     // It is this file's own few lines, and is to start whatever this process was started with:
     // not with what NODE_OPTIONS would have it load first, or wait for (a debugger, say).
     const { NODE_OPTIONS: _options, ...env } = process.env;
@@ -172,7 +275,7 @@ function startWatchdog(): ChildProcess | null {
   (child.stdin as unknown as { unref?: () => void } | null)?.unref?.();
 
   watchdog = child;
-  for (const name of ["g", "d", "asked"] as const) {
+  for (const name of ["g", "d", "asked", "u"] as const) {
     for (const item of listed[name]) tell(child, "+", name, item);
   }
   return child;
@@ -203,13 +306,18 @@ function delist(from: List, item: number | string): void {
 
 /**
  * Register a process group this process started: if this process ends before
- * the returned function is called, the group is stopped.
+ * the returned function is called, the group is stopped. `withWhatIsUnder`:
+ * and so is what its leader has under it in groups of their own — for a
+ * process whose children are nobody's to keep (an agent's host; not a
+ * program, which may start what is to outlive it).
  */
-export function stopWithThisProcess(pgid: number): () => void {
+export function stopWithThisProcess(pgid: number, withWhatIsUnder = false): () => void {
   enlist("g", pgid);
+  if (withWhatIsUnder) enlist("u", pgid);
   return () => {
     delist("g", pgid);
     delist("asked", pgid);
+    delist("u", pgid);
   };
 }
 

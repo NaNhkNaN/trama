@@ -111,16 +111,19 @@ export interface AgentOptions {
    */
   templates?: boolean | string[];
   /**
-   * Whether the agent has the user's pi extensions — those of the user's pi
-   * directory and settings, not the ones pi has built in, and not the
-   * project's: an extension is code that runs in the runner. With them come
-   * the tools they add, the commands a prompt of `instruct` can then begin
-   * with ("/name"), and what they do to a session, the skills and templates
-   * they bring among it. One pi has something against is an error. Without
-   * any of `skills`, `templates` and `extensions`, a prompt is the text it
-   * is, whatever it begins with.
+   * Whether the agent has pi's extensions: `true` for the user's — those of
+   * the user's pi directory and settings, and the ones pi has built in, its
+   * MCP servers among them — or "project" for the project's own as well (its
+   * `.pi/extensions`, the MCP servers it names). With them come the tools
+   * they add, the commands a prompt of `instruct` can then begin with
+   * ("/name"), and what they do to a session, the skills and templates they
+   * bring among it. One pi has something against is an error. A call with
+   * extensions is served in a process of its own: what an extension gets
+   * wrong ends that call, and nothing else of the run. Without any of
+   * `skills`, `templates` and `extensions`, a prompt is the text it is,
+   * whatever it begins with.
    */
-  extensions?: boolean;
+  extensions?: boolean | "project";
   /**
    * What to make of an answer that was cut off at the model's output limit.
    * "fail", as it is without this: the call fails — the answer is not whole.

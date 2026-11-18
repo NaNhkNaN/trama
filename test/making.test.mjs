@@ -220,7 +220,12 @@ test("the program a project is made with for a program is validated with the var
 import { createProject } from "@trama-dev/runtime/runner";
 await ctx.done({ made: await createProject("needs-role", "write it").then(() => "created", (err: any) => String(err.message).split("\\n")[0]) });
 `);
-  standIn(t, { ask: async () => `import { ctx } from "@trama-dev/runtime";\nif (process.env.ROLE !== "the maker's") throw new Error("no ROLE here");\nawait ctx.done();\n` });
+  // (Whether the agent that writes it is served in a process of its own — which is where a run's variables are an agent's — is the adapter's to say.)
+  const apart = [];
+  standIn(t, { ask: async function () {
+    apart.push(this.apart);
+    return `import { ctx } from "@trama-dev/runtime";\nif (process.env.ROLE !== "the maker's") throw new Error("no ROLE here");\nawait ctx.done();\n`;
+  } });
 
   await withEnv({ HOME: fakeHome }, async () => {
     const without = await captureConsole("log", () => runProgram({ projectDir: makerDir, timeout: 30_000 }));
@@ -231,6 +236,8 @@ await ctx.done({ made: await createProject("needs-role", "write it").then(() => 
     assert.deepEqual(having.result.result, { made: "created" });
     // (The names of the variables are on the validation's record, as on a run's: not what they hold.)
     assert.deepEqual(journalsOf(join(projects, "needs-role")).at(-1)[0].env, ["ROLE"]);
+    // ...and the agent that wrote it had them too, where there were any.
+    assert.deepEqual(apart, [false, true]);
   });
 });
 

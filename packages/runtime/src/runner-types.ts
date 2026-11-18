@@ -35,9 +35,11 @@ export interface RunOptions {
   label?: string;
   /**
    * Variables for the run, over the runner's own: its program has them, and
-   * so do the shell commands it runs and the runs it asks for, each of which
-   * may be given more. One given as undefined is one not given. The journal
-   * has their names, not what they hold.
+   * so do the shell commands it runs, its agents, and the runs it asks for,
+   * each of which may be given more. (An agent has them by being served in a
+   * process of its own, started with them: which pi it finds, and which key
+   * for a provider, are then the run's.) One given as undefined is one not
+   * given. The journal has their names, not what they hold.
    */
   env?: Record<string, string | undefined>;
   /**

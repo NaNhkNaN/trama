@@ -580,8 +580,10 @@ async function fakeProvider(t, reply, config = "plain") {
     requests,
     toolsOf: (request) => (request.tools ?? []).map((tool) => tool.function.name),
     // (pi looks for a user's skills in their home as well: here, a home that has none.)
+    // A call is served in this process, where a test can see what an extension does: which is what a
+    // host does with a call that has extensions (see agent-host.test.mjs for the host itself).
     ask: (prompt, call = {}) =>
-      withEnv({ PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", HOME: agentDir }, () => adapter.ask(prompt, { cwd, ...call })),
+      withEnv({ PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", HOME: agentDir }, () => adapter.serve(prompt, { cwd, ...call })),
     /** What the model was told at the last request made: by the system, and by the user. */
     told: () => {
       const text = (message) => (typeof message?.content === "string" ? message.content : (message?.content ?? []).map((part) => part.text).join(""));
@@ -1457,7 +1459,8 @@ test("a call that is cancelled is not held for good by an extension that does no
   const { setTimeout: later } = await import("node:timers/promises");
   const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-  for (const event of ["agent_end", "session_start"]) {
+  // (A call that is held is given up sooner than a process that serves it would be ended: what it used is said then.)
+  for (const [event, waited] of [["agent_end", 3_000], ["session_start", 5_000]]) {
     // (A pi of its own for each: an extension is read once where it is, whatever is written there after.)
     const fake = await fakeProvider(t);
     mkdirSync(joinPath(fake.agentDir, "extensions"));
@@ -1474,7 +1477,7 @@ test("a call that is cancelled is not held for good by an extension that does no
     t.mock.timers.enable({ apis: ["setTimeout"] });
     stop.abort();
     await settle();
-    t.mock.timers.tick(4_999);
+    t.mock.timers.tick(waited - 1);
     await settle();
     assert.equal(settled, false, `${event}: it is waited for a while`);
     t.mock.timers.tick(2);

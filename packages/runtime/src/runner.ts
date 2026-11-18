@@ -248,8 +248,9 @@ export function loadProjectConfig(projectDir: string, meta = readProjectMeta(pro
  * that is used, and what it was answering is let finish. `spent` is told
  * why, the first time either happens.
  */
-export function createBackend(config: TramaConfig, meter: Meter = createMeter(), spent: (why: string) => void = () => {}): Backend {
-  const backend = new PiAdapter(config);
+export function createBackend(config: TramaConfig, meter: Meter = createMeter(), spent: (why: string) => void = () => {}, env?: Record<string, string>): Backend {
+  // (`env`: the variables of the run whose calls these are — its agents' too, as they are its program's and its commands'.)
+  const backend = new PiAdapter(config, env);
   // The calls that were cancelled.
   const cutOff = new Set<Promise<unknown>>();
   // Why a call was first refused, or stopped, for the budget.
@@ -306,6 +307,7 @@ export function createBackend(config: TramaConfig, meter: Meter = createMeter(),
         throw why !== undefined && !call.signal?.aborted ? overBudget(why) : err;
       }
     },
+    close: () => backend.close(),
     async letGo() {
       let giveUp: NodeJS.Timeout | undefined;
       await Promise.race([
@@ -339,6 +341,12 @@ export interface Backend extends AgentBackend {
   refused?(): string | undefined;
   /** Whether what its calls use is held to anything: then what a call it cut off used is to be waited for, recorded or not. */
   counts?(): boolean;
+  /**
+   * End what the backend kept to serve calls with — a process of its own for
+   * those that have extensions. Whatever it served is over: a run, a
+   * validation. (Asked again after this, it starts anew.)
+   */
+  close?(): Promise<void>;
   /**
    * Resolves when the backend has let go of the calls that were cancelled so
    * far: whoever cancelled one went on at once, and the backend still had to
@@ -1401,6 +1409,8 @@ async function journalled<T extends Execution>(journal: Journal, backend: Backen
     if (spent !== undefined) journal.note("budget", { spent });
     journal.note("end", end);
     journal.close();
+    // Nothing a run started outlives it: nor what served its agent calls.
+    await backend.close?.();
   }
 }
 
@@ -1793,7 +1803,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   const stillTheProject = sameProjectAs(projectDir);
 
   const outOfBudget = (why: string) => console.warn(tagged(options.label, `[trama] ${why}`));
-  const { result, repair } = await journalled(journal, createBackend(config, meter, saysOnce(meter, outOfBudget)), (backend) => executeProgram({
+  const { result, repair } = await journalled(journal, createBackend(config, meter, saysOnce(meter, outOfBudget), env), (backend) => executeProgram({
     projectDir,
     backend,
     meter,

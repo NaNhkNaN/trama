@@ -251,7 +251,8 @@ const budgetOf = (config: TramaConfig, asked: Asked) => (asked.above ? undefined
 function backendFor(config: TramaConfig, asked: Asked) {
   const say = (why: string) => console.warn(tagged(asked.label, `[trama] ${why}`));
   const { above } = asked;
-  return createBackend(config, createMeter(budgetOf(config, asked), above), above ? saysOnce(above, (why) => say(above.spent() ?? why)) : say);
+  // (Asked for by a run's program, the project is written by an agent of that run: with the run's variables.)
+  return createBackend(config, createMeter(budgetOf(config, asked), above), above ? saysOnce(above, (why) => say(above.spent() ?? why)) : say, asked.env);
 }
 
 /** Carry what the agent made beside a program into the project the program is now in, and say what that was. */

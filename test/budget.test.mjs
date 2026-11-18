@@ -685,9 +685,9 @@ const told = (err: any) => String(err.message);
 const went = [];
 went.push(await agent.instruct("first", { skills: true, templates: ["review"], extensions: true }));
 went.push(await agent.generate({ prompt: "second", schema: { a: "string" }, skills: ["pdf", "tables"], extensions: false }));
-went.push(await agent.instruct("third", { skills: [], templates: true }));
+went.push(await agent.instruct("third", { skills: [], templates: true, extensions: "project" }));
 went.push(await agent.instruct("fourth"));
-for (const bad of [{ skills: "all" }, { skills: [1] }, { templates: 1 }, { templates: { review: true } }, { extensions: "yes" }, { extensions: ["mcp"] }, { extensions: 1 }, { skill: true }]) {
+for (const bad of [{ skills: "all" }, { skills: [1] }, { templates: 1 }, { templates: { review: true } }, { extensions: ["mcp"] }, { extensions: 1 }, { skill: true }]) {
   went.push(await agent.instruct("refused", bad as any).catch(told));
 }
 went.push(await agent.generate({ prompt: "refused", schema: { a: "string" }, skills: 0 } as any).catch(told));
@@ -709,7 +709,8 @@ await ctx.done({ went });
     { prompt: "first", skills: true, templates: ["review"], extensions: true },
     // (A typed answer's prompt is text, whatever it begins with: the backend is told so where it might read it otherwise.)
     { prompt: "second", skills: ["pdf", "tables"], extensions: false, asText: true },
-    { prompt: "third", skills: [], templates: true },
+    // (Whose extensions is said in a word, and what word it may be is for what serves the call to say.)
+    { prompt: "third", skills: [], templates: true, extensions: "project" },
     { prompt: "fourth" },
   ]);
   assert.deepEqual(result.went, [
@@ -718,9 +719,8 @@ await ctx.done({ went });
     "trama runtime error: Invalid field: skills (expected boolean or strings or undefined)",
     "trama runtime error: Invalid field: templates (expected boolean or strings or undefined)",
     "trama runtime error: Invalid field: templates (expected boolean or strings or undefined)",
-    "trama runtime error: Invalid field: extensions (expected boolean or undefined)",
-    "trama runtime error: Invalid field: extensions (expected boolean or undefined)",
-    "trama runtime error: Invalid field: extensions (expected boolean or undefined)",
+    "trama runtime error: Invalid field: extensions (expected boolean or string or undefined)",
+    "trama runtime error: Invalid field: extensions (expected boolean or string or undefined)",
     "trama runtime error: Unknown field: skill (this call takes: prompt, system, model, thinking, tools, skills, extensions, cutOff, templates)",
     "trama runtime error: Invalid field: skills (expected boolean or strings or undefined)",
     "trama runtime error: Unknown field: templates (this call takes: prompt, schema, system, model, thinking, tools, skills, extensions, cutOff)",

@@ -32,6 +32,8 @@ interface FieldKinds {
   strings: string[];
   /** All or none of something, or some of it by name. */
   "boolean or strings": boolean | string[];
+  /** All or none of something, or which of it in a word. */
+  "boolean or string": boolean | string;
   /** Anything JSON can say. */
   any: unknown;
 }
@@ -61,6 +63,7 @@ const isOfKind = (value: unknown, kind: Kind): boolean =>
     : kind === "object" ? isJsonObject(value)
     : kind === "strings" ? isStrings(value)
     : kind === "boolean or strings" ? typeof value === "boolean" || isStrings(value)
+    : kind === "boolean or string" ? typeof value === "boolean" || typeof value === "string"
     : typeof value === kind;
 
 /** Read a call's declared fields out of a request body — refusing a body that does not hold them as declared, or holds any other. */
@@ -135,7 +138,7 @@ const asRecorded = (body: unknown): unknown =>
  */
 const HOW_SERVED = {
   system: "optional string", model: "optional string", thinking: "optional string", tools: "optional strings",
-  skills: "optional boolean or strings", extensions: "optional boolean", cutOff: "optional string",
+  skills: "optional boolean or strings", extensions: "optional boolean or string", cutOff: "optional string",
 } as const satisfies Fields;
 
 export interface IpcBackends {

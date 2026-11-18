@@ -27,7 +27,7 @@ export interface SpawnOptions {
   /**
    * Variables for the participant, over the runner's own and those the run
    * that spawns it was started with: its program has them, and so do the
-   * shell commands it runs and the participants it spawns in turn. (What the
+   * shell commands it runs, its agents, and the participants it spawns in turn. (What the
    * program that spawns it sets in its own process.env is not handed on
    * unless it is given here: `env: process.env` hands on all of it.)
    */
