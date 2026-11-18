@@ -9,6 +9,7 @@ import type { Tools, Workspace } from "./types.js";
 import type { RunnerAgent } from "./agent.js";
 import type { RunContext } from "./context.js";
 import type { ProgramResult, RunRequest } from "./runner-types.js";
+import type { MakeRequest } from "./runner.js";
 import type { Journal, RecordedCall } from "./journal.js";
 import { describeJson, isJsonObject } from "./serializable.js";
 import { checkedEnv, variableName } from "./child-process.js";
@@ -156,6 +157,8 @@ export interface IpcBackends {
    * to stop it. `seq` is the position of the call that asked for it.
    */
   run(request: RunRequest, stop: AbortSignal, seq: number): Promise<ProgramResult>;
+  /** Make a project, or change one, on the program's behalf — until it is done or `stop` says to stop. */
+  make(request: MakeRequest, stop: AbortSignal, seq: number): Promise<void>;
   /** Where every call, and how it ended, is written down. */
   journal: Journal;
   /**
@@ -172,11 +175,34 @@ function isAuthorized(header: string | undefined, token: string): boolean {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run }: IpcBackends): Record<string, Route> {
-  /** Runs the program has asked for and that have not ended, by the id it gave each. */
+function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: IpcBackends): Record<string, Route> {
+  /** What the program has asked for that lasts — a run, a project made — and has not ended, by the id it gave each. */
   const runsAskedFor = new Map<string, AbortController>();
-  /** Ids the program asked to stop before their run was seen here: such a run starts stopped. */
+  /** Ids the program asked to stop before what bears them was seen here: such a thing starts stopped. */
   const stoppedAhead = new Set<string>();
+
+  /**
+   * Carry out what a call asks for and that lasts as long as the call does,
+   * until it ends or is to stop: the program says so by the id it gave it,
+   * or is gone — its process died, or it gave up — and no longer wants it.
+   */
+  const lasting = async <T>(id: string | undefined, connectionClosed: Promise<void>, work: (stop: AbortSignal) => Promise<T>): Promise<T> => {
+    if (id !== undefined) {
+      if (id === "") throw new BadRequest("Invalid field: id (expected a non-empty string)");
+      if (runsAskedFor.has(id)) throw new BadRequest(`Duplicate run id: ${id}`);
+    }
+    const stop = new AbortController();
+    void connectionClosed.then(() => stop.abort());
+    if (id !== undefined) {
+      if (stoppedAhead.delete(id)) stop.abort();
+      runsAskedFor.set(id, stop);
+    }
+    try {
+      return await work(stop.signal);
+    } finally {
+      if (id !== undefined) runsAskedFor.delete(id);
+    }
+  };
 
   /** The workspace a call is about: the directory it names, or else the one this run was started with. */
   const workspaceOf = (dir: string | undefined): Workspace => {
@@ -228,27 +254,21 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run }: IpcBack
       },
       async ({ id, env, budget, ...asked }, connectionClosed, { seq }) => {
         const request: RunRequest = { ...asked, env: envOf(env), budget: budgetOf(budget) };
-        if (id !== undefined) {
-          if (id === "") throw new BadRequest("Invalid field: id (expected a non-empty string)");
-          if (runsAskedFor.has(id)) throw new BadRequest(`Duplicate run id: ${id}`);
-        }
-        const stop = new AbortController();
-        // A caller that is gone — its process died, or it gave up — no longer wants the run.
-        void connectionClosed.then(() => stop.abort());
-        // `id` is the name the program gave the run, to stop it by.
-        if (id !== undefined) {
-          if (stoppedAhead.delete(id)) stop.abort();
-          runsAskedFor.set(id, stop);
-        }
-        try {
-          return await run(request, stop.signal, seq);
-        } finally {
-          if (id !== undefined) runsAskedFor.delete(id);
-        }
+        return lasting(id, connectionClosed, stop => run(request, stop, seq));
       },
     ),
-    // Stop a run asked for above. The call that asked for it still gets its
-    // answer — a failed run — once the run is over.
+    // Nor does a program make a project, or change one: its runner does, as it runs one — under the
+    // run's budget, on its record, and stopped with it.
+    "/project/create": route(
+      { name: "string", prompt: "string", model: "optional string", args: "optional object", id: "optional string" },
+      ({ id, ...asked }, connectionClosed, { seq }) => lasting(id, connectionClosed, stop => make({ kind: "create", ...asked }, stop, seq)),
+    ),
+    "/project/update": route(
+      { name: "string", prompt: "string", id: "optional string" },
+      ({ id, ...asked }, connectionClosed, { seq }) => lasting(id, connectionClosed, stop => make({ kind: "update", ...asked }, stop, seq)),
+    ),
+    // Stop a run asked for above, or a project being made. The call that asked
+    // for it still gets its answer — a failed run, an error — once it is over.
     "/run/stop": route({ id: "string" }, b => {
       if (b.id === "") throw new BadRequest("Invalid field: id (expected a non-empty string)");
       const asked = runsAskedFor.get(b.id);

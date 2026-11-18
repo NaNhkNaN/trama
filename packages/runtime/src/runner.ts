@@ -317,6 +317,20 @@ export function createBackend(config: TramaConfig, meter: Meter = createMeter(),
   };
 }
 
+/** The budgets of which it has been said that they are spent. */
+const saidSpent = new WeakSet<Meter>();
+
+/**
+ * Say that a budget is spent, once for the budget — whoever comes up against
+ * it first: the run's own backend, or the backend of a project being made
+ * for the run's program, of which there may be many.
+ */
+export const saysOnce = (meter: Meter, say: (why: string) => void) => (why: string): void => {
+  if (saidSpent.has(meter)) return;
+  saidSpent.add(meter);
+  say(why);
+};
+
 /** A backend as the runner holds it: one whose cancelled calls are answered at once, and can be waited for apart. */
 export interface Backend extends AgentBackend {
   /** Why nothing more may be asked of it — the budget it counts in is spent — or nothing, while something may. */
@@ -657,6 +671,8 @@ interface RunOnceOptions {
   env?: Record<string, string>;
   /** The count of what the run uses of a model: what the runs it asks for use is counted there too. */
   meter?: Meter;
+  /** How a project is made or changed where the run's program asks for that (see Making). Without it, nothing is. */
+  making?: Making;
   /** Stops the run. */
   signal?: AbortSignal;
   /** Where the run is written down. One journal covers every attempt of a run. */
@@ -678,7 +694,7 @@ function tail(text: string, max = 20_000): string {
 }
 
 /** A line as it is shown for a run: under the run's name, if it has one. */
-const tagged = (label: string | undefined, line: string) => label ? `[${label}] ${line}` : line;
+export const tagged = (label: string | undefined, line: string) => label ? `[${label}] ${line}` : line;
 
 /** The longest stretch of output held back while waiting for its line to end. */
 const MAX_HELD_LINE = 64 * 1024;
@@ -813,8 +829,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
 
   // The program's own time. It stops while a run the program asked for is in flight.
   const allowance = createAllowance(timeout);
-  // Set when a validation ended because the program asked for another to be run.
-  let handedOff = false;
+  // Set when a validation ended because the program asked for another to be run, or for a project to be made or changed.
+  let handedOff: false | "starts another program" | "has a project made or changed" = false;
   // Runs the program has asked for and that are still going. They belong to this run.
   const nestedRuns = new Set<Promise<unknown>>();
   const workspaces = new Map<string, Workspace>();
@@ -826,6 +842,14 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   // The workspace of the session this run is part of, if it is part of one.
   const sessionWorkspace = workspaceDir ? workspaceAt(workspaceDir) : null;
   const tools = createTools(projectDir, runEnded.signal, options.env);
+  // As far as a validation goes: the program asks its runner for what would be real — a run, a project
+  // made. The call is left unanswered — an answer would only send the program on to do more — until
+  // the program, which is being stopped, lets go of it.
+  const handOff = (what: Exclude<typeof handedOff, false>, stop: AbortSignal): Promise<never> => {
+    handedOff = what;
+    validated.abort();
+    return rejectOnAbort(new Promise<never>(() => {}), stop);
+  };
   // Known only to this run's program, through its init file.
   const token = randomBytes(32).toString("hex");
   // Whether the program's process has ended. (Nothing is an answer to it after that, and it is no longer there to stop.)
@@ -839,15 +863,28 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     workspaceAt,
     journal,
     programOver: () => programOver,
-    run: (request, stop, seq) => {
-      if (validating) {
-        // As far as a validation goes. The call is left unanswered — an answer
-        // would only send the program on to do more — until the program,
-        // which is being stopped, lets go of it.
-        handedOff = true;
-        validated.abort();
-        return rejectOnAbort(new Promise<never>(() => {}), stop);
+    make: (request, stop, seq) => {
+      if (validating) return handOff("has a project made or changed", stop);
+      if (!options.making) {
+        throw new Error("This runner was not given a way to make projects: createProject and updateProject are carried out where a run is started by way of @trama-dev/runtime/runner.");
       }
+      // The run's own, as a run it asks for is: under its budget, with its variables, stopped when it
+      // ends or when the program no longer wants it, and not over before this is. (But the program's
+      // clock goes on: what it has made is its own work, with no timeout but the program's.)
+      const made = options.making(request, {
+        signal: AbortSignal.any([runEnded.signal, stop]),
+        above: options.meter,
+        label,
+        env: options.env,
+        parent: { run: journal.run, journal: journal.path, seq },
+        // (What it starts is a validation: of the program the project is made with.)
+        started: (run, path) => { if (run) journal.note("child", { seq, run, journal: path, purpose: "validate" }); },
+      }).finally(() => { nestedRuns.delete(made); });
+      nestedRuns.add(made);
+      return made;
+    },
+    run: (request, stop, seq) => {
+      if (validating) return handOff("starts another program", stop);
       // The program is waiting, not working: its clock stops for as long as
       // the run it asked for lasts, which has a timeout of its own. That run
       // is stopped when this one ends, or when the program no longer wants it.
@@ -861,7 +898,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
         // …and that run's journal says which call started it.
         parent: { run: journal.run, journal: journal.path, seq },
         above: options.meter,
-      }).finally(() => {
+      }, options.making).finally(() => {
         release();
         nestedRuns.delete(nested);
       });
@@ -926,7 +963,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       // A validation that reached a hand-off in time was decided there: how the
       // program goes down, cut off in mid-flow, says nothing about it.
       const passedAtHandOff = handedOff && !exit.timedOut;
-      if (passedAtHandOff) console.log(tagged(label, "[trama] validated up to where it starts another program"));
+      if (passedAtHandOff) console.log(tagged(label, `[trama] validated up to where it ${handedOff}`));
       return {
         child: passedAtHandOff ? { exitCode: 0, stdout: exit.stdout, stderr: exit.stderr } : toChildResult(exit),
         // How the program's process ended, for the record.
@@ -1406,19 +1443,24 @@ export async function validateProgram(
   options: {
     timeout: number; maxRepairAttempts: number; maxIterations: number; journalRuns?: number; signal?: AbortSignal;
     as?: string; alone?: string; budget?: Budget; wrote?: AgentUsage[];
+    /** Where a run's program asked for the project to be made or changed: the run's name and variables are the validation's, and the two journals point at each other. */
+    label?: string; env?: Record<string, string>; askedFor?: Pick<AskedFor, "parent" | "started">;
   },
 ): Promise<{ source: string; repairedError?: string; alone?: string }> {
-  const { journalRuns = 0, signal, as = projectDir, timeout, maxRepairAttempts, maxIterations } = options;
+  const { journalRuns = 0, signal, as = projectDir, timeout, maxRepairAttempts, maxIterations, label, env, askedFor } = options;
   // (What is written down, and handed on, is what a validation is known to take: nothing else that came with it.)
   const limits = { timeout, maxRepairAttempts, maxIterations };
   // Recorded with the project, though run in a copy of it. `budget` is for the record: the backend is what holds to it.
-  const journal = openJournal(projectDir, journalRuns, { purpose: "validate", ...limits, budget: options.budget });
+  const journal = openJournal(projectDir, journalRuns, {
+    purpose: "validate", label, parent: askedFor?.parent, ...limits, budget: options.budget, env: env && Object.keys(env),
+  });
+  askedFor?.started(journal.run, journal.path);
   // What writing the candidate used is on record with its validation: it happened in no run, and has no journal of its own.
   for (const usage of options.wrote ?? []) journal.used("generate", usage);
   let alone: string | undefined;
   const byItself = (why: string) => {
     alone = why;
-    console.warn(`[trama] the program is validated by itself, and nothing else its agent did is kept: the copy the agent worked in cannot be used (${why})`);
+    console.warn(tagged(label, `[trama] the program is validated by itself, and nothing else its agent did is kept: the copy the agent worked in cannot be used (${why})`));
   };
   if (options.alone !== undefined) byItself(options.alone);
   const validatedIn = (prepared: string) => withTempDir("trama-validate-", async (privateDir) => {
@@ -1437,6 +1479,8 @@ export async function validateProgram(
       backend,
       depth: 0,
       validating: { readyGraceMs: VALIDATION_READY_GRACE_MS },
+      label,
+      env,
       signal,
       journal,
     });
@@ -1641,6 +1685,33 @@ const MAX_RUN_DEPTH = 16;
 const MAX_RUNS_IN_FLIGHT = 128;
 let runsInFlight = 0;
 
+/** A project a program asks its runner to make, or to change (see createProject and updateProject). */
+export interface MakeRequest {
+  kind: "create" | "update";
+  name: string;
+  prompt: string;
+  model?: string;
+  args?: Record<string, unknown>;
+}
+
+/**
+ * What a project is made or changed under where a run's program asked for
+ * it: that run's — stopped with it, counted in its budget, shown under its
+ * name, validated with its variables, and on record beside its journal.
+ */
+export interface AskedToMake extends Pick<AskedFor, "parent" | "started" | "above"> {
+  signal: AbortSignal;
+  label?: string;
+  env?: Record<string, string>;
+}
+
+/**
+ * How a project is made or changed for a program that asks its runner to.
+ * The runner is handed it by what starts runs (the runner surface): it is
+ * that which knows how a program is written, and it stands on this.
+ */
+export type Making = (request: MakeRequest, asked: AskedToMake) => Promise<void>;
+
 /** What a run is told when a program asked for it, rather than a person or a host. */
 interface AskedFor {
   /** How many runs deep it is: one more than the run that asked. */
@@ -1661,7 +1732,7 @@ interface AskedFor {
  * call). One runner carries the whole tree of runs, so it is also where the
  * tree is kept from growing without bound.
  */
-export async function runProgram(options: RunOptions, askedFor?: AskedFor): Promise<ProgramResult> {
+export async function runProgram(options: RunOptions, askedFor?: AskedFor, making?: Making): Promise<ProgramResult> {
   const depth = askedFor?.depth ?? 0;
   if (depth > MAX_RUN_DEPTH) {
     throw new Error(
@@ -1674,13 +1745,13 @@ export async function runProgram(options: RunOptions, askedFor?: AskedFor): Prom
   }
   runsInFlight += 1;
   try {
-    return await runProject(options, depth, askedFor);
+    return await runProject(options, depth, askedFor, making);
   } finally {
     runsInFlight -= 1;
   }
 }
 
-async function runProject(options: RunOptions, depth: number, askedFor?: AskedFor): Promise<ProgramResult> {
+async function runProject(options: RunOptions, depth: number, askedFor?: AskedFor, making?: Making): Promise<ProgramResult> {
   const { projectDir } = options;
 
   if (!existsSync(join(projectDir, "meta.json"))) {
@@ -1722,10 +1793,11 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   const stillTheProject = sameProjectAs(projectDir);
 
   const outOfBudget = (why: string) => console.warn(tagged(options.label, `[trama] ${why}`));
-  const { result, repair } = await journalled(journal, createBackend(config, meter, outOfBudget), (backend) => executeProgram({
+  const { result, repair } = await journalled(journal, createBackend(config, meter, saysOnce(meter, outOfBudget)), (backend) => executeProgram({
     projectDir,
     backend,
     meter,
+    making,
     maxRepairAttempts,
     timeout,
     maxIterations: config.defaultMaxIterations,

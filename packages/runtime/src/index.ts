@@ -14,9 +14,10 @@ import { readProjectMeta } from "./meta.js";
 import {
   loadConfig, loadProjectConfig, loadState, createBackend, validateProgram, installValidatedProgram,
   withTempDir, prepareProject, shownPaths, type Prepared, ensureProjectScaffold, RUNTIME_TYPES, runProgram as runHere, whyNotReplaceable,
+  tagged, saysOnce, type AskedToMake, type Making,
 } from "./runner.js";
 import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspace.js";
-import { parentBridge, remoteWorkspace, withOptions } from "./bridge-client.js";
+import { parentBridge, remoteWorkspace, withOptions, type Bridge } from "./bridge-client.js";
 import { guardPath, identityOf, sameProjectAs } from "./path-guard.js";
 import { printJournals, spentIn } from "./journal-view.js";
 import { messageOf } from "./errors.js";
@@ -26,37 +27,50 @@ import type { ProgramResult, RunOptions, TramaConfig } from "./runner-types.js";
 export type { Workspace, ObserveResult } from "./types.js";
 import type { Workspace } from "./types.js";
 
-// --- Running a project, and reaching a workspace ---
+// --- Running a project, making one, and reaching a workspace ---
 //
-// A program never runs another program: it asks its runner to. So these two do
-// their work in this process only when this process is not itself a program.
-// Inside one they are calls on the bridge, carried out by the one runner that
-// owns every run in the tree — which is how it can time them, stop them, and
-// see them.
+// A program never runs another program, nor makes or changes a project: it
+// asks its runner to. So these do their work in this process only when this
+// process is not itself a program. Inside one they are calls on the bridge,
+// carried out by the one runner that owns every run in the tree — which is
+// how it can time them, stop them, count what they use, and see them.
 
-/** Run a project to an outcome: done, yielded, or failed. */
-export async function runProgram(options: RunOptions): Promise<ProgramResult> {
-  const bridge = parentBridge();
-  if (!bridge) return runHere(options);
-
-  // A signal cannot cross the bridge, but what it says can: the runner is told
-  // to stop the run, and this call still waits for the run to be over — the
-  // same as outside a program.
-  const { signal, ...request } = options;
+/**
+ * Ask this program's runner for something that lasts as long as the call
+ * does — a run, a project made. A signal cannot cross the bridge, but what
+ * it says can: the runner is told to stop it, and this call still waits for
+ * it to be over — the same as outside a program.
+ */
+async function overBridge<T>(bridge: Bridge, endpoint: string, asked: Record<string, unknown>, signal?: AbortSignal): Promise<T> {
   const id = randomUUID();
   const offStop = onAbort(signal, () => {
     bridge.call("/run/stop", { id }).catch(() => { /* no runner left to tell */ });
   });
   try {
-    return await bridge.call("/run/program", withOptions({ id }, {
-      ...request,
-      // The runner does not share this program's working directory.
-      projectDir: resolve(request.projectDir),
-      workspaceDir: request.workspaceDir && resolve(request.workspaceDir),
-    }));
+    return await bridge.call(endpoint, withOptions({ id }, asked));
   } finally {
     offStop();
   }
+}
+
+/** How this runner makes or changes a project for a program that asks it to (see Making). */
+const making: Making = (request, asked) =>
+  request.kind === "create"
+    ? createHere(request.name, request.prompt, { model: request.model, args: request.args, signal: asked.signal }, asked)
+    : updateHere(request.name, request.prompt, { signal: asked.signal }, asked);
+
+/** Run a project to an outcome: done, yielded, or failed. */
+export async function runProgram(options: RunOptions): Promise<ProgramResult> {
+  const bridge = parentBridge();
+  if (!bridge) return runHere(options, undefined, making);
+
+  const { signal, ...request } = options;
+  return overBridge(bridge, "/run/program", {
+    ...request,
+    // The runner does not share this program's working directory.
+    projectDir: resolve(request.projectDir),
+    workspaceDir: request.workspaceDir && resolve(request.workspaceDir),
+  }, signal);
 }
 
 /** The shared workspace in a directory, created if it does not exist: read, write, list, observe. */
@@ -198,6 +212,7 @@ export function resolveProject(name: string): string {
  */
 async function generateProgram(
   backend: ReturnType<typeof createBackend>, prepared: Prepared, prompt: string, system: string, wrote: AgentUsage[], signal?: AbortSignal,
+  label?: string,
 ): Promise<string> {
   let reply: string;
   try {
@@ -206,7 +221,7 @@ async function generateProgram(
     // What it took is said whatever came of it: it is on record only with a validation, and there may be none.
     // (A call that was cut off — stopped, or by the budget — says what it took once its backend has let go of it.)
     await backend.letGo();
-    if (wrote.length > 0) console.log(`[trama] writing the program used ${spentIn(wrote)}`);
+    if (wrote.length > 0) console.log(tagged(label, `[trama] writing the program used ${spentIn(wrote)}`));
   }
   const program = stripCodeFences(reply);
   throwIfAborted(signal);
@@ -215,14 +230,33 @@ async function generateProgram(
 }
 
 /**
- * The backend a create or an update asks: writing the program and validating
- * it are held, together, to the config's budget — and it is said when that is spent.
+ * What a project is made or changed under where a run's program asked its
+ * runner for that (see AskedToMake) — and nothing, where a person or a host
+ * did: then it is nobody's but its own.
  */
-const backendFor = (config: TramaConfig) =>
-  createBackend(config, createMeter(config.budget), (why) => console.warn(`[trama] ${why}`));
+type Asked = Partial<AskedToMake>;
+
+/**
+ * The budget a create or an update is held to, writing the program and
+ * validating it together: the config's — or, where a run's program asked
+ * for it, that run's and those above it, and not the config's a second time.
+ */
+const budgetOf = (config: TramaConfig, asked: Asked) => (asked.above ? undefined : config.budget);
+
+/**
+ * The backend a create or an update asks: held to its budget, and it is said
+ * when that is spent — once, and where a run's program asked, once for that
+ * run, in the run's own words: a program may ask for many projects.
+ */
+function backendFor(config: TramaConfig, asked: Asked) {
+  const say = (why: string) => console.warn(tagged(asked.label, `[trama] ${why}`));
+  const { above } = asked;
+  return createBackend(config, createMeter(budgetOf(config, asked), above), above ? saysOnce(above, (why) => say(above.spent() ?? why)) : say);
+}
 
 /** Carry what the agent made beside a program into the project the program is now in, and say what that was. */
-function keepPrepared(prepared: Prepared): void {
+function keepPrepared(prepared: Prepared, label?: string): void {
+  const console = shownUnder(label);
   let kept: ReturnType<Prepared["keep"]>;
   try {
     kept = prepared.keep();
@@ -252,7 +286,7 @@ function keepPrepared(prepared: Prepared): void {
  */
 async function validateCandidate(
   projectDir: string, backend: ReturnType<typeof createBackend>, candidate: string, config: TramaConfig, prepared: Prepared,
-  wrote: AgentUsage[], signal?: AbortSignal,
+  wrote: AgentUsage[], signal: AbortSignal | undefined, asked: Asked,
 ): Promise<{ validated: Awaited<ReturnType<typeof validateProgram>>; kept: boolean }> {
   let as: string | undefined, alone: string | undefined;
   if (config.agentChanges === "keep") {
@@ -271,19 +305,54 @@ async function validateCandidate(
     signal,
     as,
     alone,
-    budget: config.budget,
+    budget: budgetOf(config, asked),
     wrote,
+    label: asked.label,
+    env: asked.env,
+    askedFor: asked.parent && asked.started && { parent: asked.parent, started: asked.started },
   });
   return { validated, kept: as !== undefined && validated.alone === undefined };
 }
 
+/** What is shown of a project being made, under the name of the run that asked for it — if one did, and has one. */
+const shownUnder = (label: string | undefined) => ({
+  log: (line: string) => console.log(tagged(label, line)),
+  warn: (line: string) => console.warn(tagged(label, line)),
+});
+
 // --- Public API ---
 
+/** Generate a program for a new project from a prompt, validate it, and make it the project's. */
 export async function createProject(
   name: string,
   prompt: string,
   options?: { model?: string; args?: Record<string, unknown>; signal?: AbortSignal },
 ): Promise<void> {
+  const bridge = parentBridge();
+  if (!bridge) return createHere(name, prompt, options);
+  const { signal, ...asked } = options ?? {};
+  await overBridge(bridge, "/project/create", withOptions({ name, prompt }, asked), signal);
+}
+
+/** Generate a new program for a project from a prompt and its current one, validate it, and put it in the other's place. */
+export async function updateProject(
+  name: string,
+  prompt: string,
+  options?: { signal?: AbortSignal },
+): Promise<void> {
+  const bridge = parentBridge();
+  if (!bridge) return updateHere(name, prompt, options);
+  const { signal, ...asked } = options ?? {};
+  await overBridge(bridge, "/project/update", withOptions({ name, prompt }, asked), signal);
+}
+
+async function createHere(
+  name: string,
+  prompt: string,
+  options?: { model?: string; args?: Record<string, unknown>; signal?: AbortSignal },
+  asked: Asked = {},
+): Promise<void> {
+  const console = shownUnder(asked.label);
   validateProjectName(name);
   throwIfAborted(options?.signal);
   const projectDir = join(projectsDir(), name);
@@ -316,7 +385,7 @@ export async function createProject(
     };
     writeFileSync(join(projectDir, "meta.json"), JSON.stringify(meta, null, 2));
 
-    const backend = backendFor(config);
+    const backend = backendFor(config, asked);
     const wrote: AgentUsage[] = [];
 
     console.log(`Generating program for "${name}"...`);
@@ -329,6 +398,7 @@ export async function createProject(
         getSystemPrompt(config.agentChanges === "keep"),
         wrote,
         options?.signal,
+        asked.label,
       );
       stillTheProject();
 
@@ -338,10 +408,10 @@ export async function createProject(
       keepProjectOnFailure = true;
 
       console.log("Validating program...");
-      const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, options?.signal);
+      const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, options?.signal, asked);
       stillTheProject();
       installValidatedProgram(projectDir, validated, "create", prompt);
-      if (kept) keepPrepared(prepared);
+      if (kept) keepPrepared(prepared, asked.label);
     });
 
     console.log(`Created ${name}. Run with: trama run ${name}`);
@@ -353,11 +423,13 @@ export async function createProject(
   }
 }
 
-export async function updateProject(
+async function updateHere(
   name: string,
   prompt: string,
   options?: { signal?: AbortSignal },
+  asked: Asked = {},
 ): Promise<void> {
+  const console = shownUnder(asked.label);
   const projectDir = resolveProject(name);
   const unchanged = (why: unknown) =>
     new Error(`Update failed — the program is unchanged.\n${messageOf(why)}`);
@@ -379,7 +451,7 @@ export async function updateProject(
     const state = loadState(projectDir);
     const meta = readProjectMeta(projectDir);
     const config = loadProjectConfig(projectDir, meta);
-    const backend = backendFor(config);
+    const backend = backendFor(config, asked);
     const wrote: AgentUsage[] = [];
 
     const systemPrompt =
@@ -396,14 +468,15 @@ export async function updateProject(
         systemPrompt,
         wrote,
         options?.signal,
+        asked.label,
       );
       stillTheProject();
 
       console.log("Validating updated program...");
-      const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, options?.signal);
+      const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, options?.signal, asked);
       stillTheProject();
       installValidatedProgram(projectDir, validated, "update", prompt);
-      if (kept) keepPrepared(prepared);
+      if (kept) keepPrepared(prepared, asked.label);
     });
   } catch (err) {
     throw unchanged(err);

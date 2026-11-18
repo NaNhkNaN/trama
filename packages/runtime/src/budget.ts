@@ -5,9 +5,7 @@
 // fix, and — counted in the budget of each run above it too — all that the
 // runs it asks for put to theirs. Nothing a program is given raises it.
 // It is a guard and no wall: a program is not confined, and one that set out
-// to could find other ways to a model. (One such way is trama's own: a
-// program that calls createProject or updateProject does so in its own
-// process, with a runner of its own that counts apart.)
+// to could find other ways to a model.
 
 import type { AgentUsage } from "./agent-backend.js";
 import { describeJson, isJsonObject } from "./serializable.js";

@@ -37,6 +37,8 @@ const oneLine = (value: unknown, max: number): string => {
 function gist(request: Record<string, unknown> | undefined): string {
   // A run that was asked for is best known by the name it was given.
   if (typeof request?.label === "string") return oneLine(`${request.label}  (${request.projectDir})`, 60);
+  // ...and a project that was asked for by its own.
+  if (typeof request?.name === "string") return oneLine(`${request.name}: ${typeof request.prompt === "string" ? request.prompt : ""}`, 60);
   for (const field of ["prompt", "command", "path", "pattern", "url", "message", "projectDir", "reason"]) {
     if (request?.[field] !== undefined) return oneLine(request[field], 60);
   }
@@ -108,7 +110,7 @@ function printJournal(path: string, records: JournalRecord[]): void {
         console.log(`${at}  ${oneLine(record.spent, 100)}`);
         break;
       case "child":
-        console.log(`${at}  #${String(record.seq).padEnd(3)} started run ${record.run}`);
+        console.log(`${at}  #${String(record.seq).padEnd(3)} started ${record.purpose === "validate" ? "validation" : "run"} ${record.run}`);
         break;
       case "fix-request":
         console.log(`${at}  fix asked for: ${oneLine(record.error, 80)}`);
