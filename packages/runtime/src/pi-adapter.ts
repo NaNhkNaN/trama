@@ -5,7 +5,7 @@ import { createAgentHosts } from "./agent-hosts.js";
 import { CutOff, addReply, atLeast, nothingYet, type AgentBackend, type AgentCall, type AgentUsage, type Tally } from "./agent-backend.js";
 import * as http from "http";
 import * as https from "https";
-import { dataOf, notAsked, usageAtEnd, type RelayEvent, type RelayModel } from "./model-relay.js";
+import { dataOf, isData, notAsked, usageAtEnd, wholeOf, type RelayEvent, type RelayModel, type RelayWay } from "./model-relay.js";
 import type { ModelConfig } from "./runner-types.js";
 
 /**
@@ -188,8 +188,11 @@ interface Asking {
   stopped?: () => boolean;
   /** Told that a reply has come. */
   replied?: () => void;
-  /** Has the model asked elsewhere, where it can be: the reply — or undefined, and the model is asked here. */
-  elsewhere?: (model: RelayModel, context: unknown, options?: Record<string, unknown>) => Promise<Reply | undefined>;
+  /**
+   * Has the model asked elsewhere, where it can be: the reply — or undefined, and the model is asked here.
+   * (`headers`: whether the request's asker made its headers other than they were — see `watch`.)
+   */
+  elsewhere?: (by: RelayWay, model: RelayModel, context: unknown, options: Record<string, unknown> | undefined, headers: { changed: boolean }) => Promise<Reply | undefined>;
   /** How many replies are being gone through at this moment, of what was asked on the session's account: a model is at work for it. */
   answering: number;
   /** How many requests are being made ready at this moment: something is about to be asked — or is not, after all. */
@@ -253,6 +256,45 @@ function either(own: unknown, cut: AbortSignal): { signal: AbortSignal; release:
 const HANDS_IN = ["before_provider_request", "before_provider_headers", "after_provider_response", "provider_stream_event"];
 
 /**
+ * What pi's agent has every request of its own go with, to be told of what
+ * a provider is sent and answers: pi's own, which do nothing where no
+ * extension has a hand in (HANDS_IN). A request that goes with all of them,
+ * by the way the agent asks, is one the agent makes for itself — or one made
+ * with all the agent's was made with, which is the same to a provider.
+ */
+const HOOKS = ["onPayload", "onResponse", "onProviderStreamEvent"];
+
+/**
+ * What else goes with a request the agent makes for itself, and is nothing
+ * a provider is handed: what the agent's loop calls as a turn goes, which pi
+ * passes along with what a provider is to have. (The functions of
+ * pi-agent-core's `createLoopConfig` that pi sets, less the hooks above. The
+ * rest of what a loop is set up by is data, and goes as any data.) Named,
+ * because it cannot be told otherwise: a function of the loop's is a
+ * function like one an asker might mean a provider to have. A pi whose loop
+ * is set up by a function more has its agent's requests asked where the call
+ * is served, until it is named here.
+ */
+const LOOPS = ["beforeToolCall", "afterToolCall", "finishTurn", "prepareRequest", "prepareNextTurn", "convertToLlm", "transformContext", "getSteeringMessages", "getFollowUpMessages"];
+
+/**
+ * What a provider is asked by, of what it has: whether what comes of it comes
+ * as the events of a reply, and the way a relay asks by in its place (none,
+ * of a reply that was to be fetched later: it is fetched where it was asked
+ * for). Whatever else a provider has is not asking a model.
+ */
+const ASKED_BY = new Map<PropertyKey, { events: boolean; way?: RelayWay }>([
+  ["stream", { events: true, way: "stream" }],
+  ["streamSimple", { events: true, way: "streamSimple" }],
+  ["fetchDeferred", { events: true }],
+  ["generateImages", { events: false, way: "generateImages" }],
+  ["classify", { events: false, way: "classify" }],
+]);
+
+/** What is said of a request that is not made: its call is to ask no more. */
+const NO_MORE = "The call is to ask no more.";
+
+/**
  * What a request to a provider goes by, that is a process's own: its
  * variables — a provider's key may be one — and its ways to the network. An
  * extension may make them other than they were: read a file of variables,
@@ -287,12 +329,28 @@ function asItWas(): boolean {
  * made to stand aside for this.)
  */
 function watch(models: Models, asking: Asking): void {
-  type Provider = Record<PropertyKey, unknown> & { stream(...sent: unknown[]): Reply; streamSimple(...sent: unknown[]): Reply };
+  type Provider = Record<PropertyKey, unknown>;
+  type Options = Record<string, unknown> | undefined;
   type Prepared = { provider: object; model: RelayModel; options: Record<string, unknown> };
   const standing = models as unknown as { prepareRequest(model: RelayModel, options?: Record<string, unknown>): Promise<Prepared> };
   const prepare = standing.prepareRequest.bind(models);
-  const refused = async function* (model: RelayModel): Reply {
-    yield notAsked(model, "The call is to ask no more.");
+  // A provider for a call that is to ask no more: whatever it is asked by, the request ends as one that was
+  // cancelled before it was sent — or, where what comes of it comes all at once, fails saying so. But to have
+  // a provider give up a reply it was keeping for later is to ask no model: that is done, whoever is stopped.
+  const refusing = (model: RelayModel, options: Options) => {
+    const refused = async function* (): Reply {
+      yield notAsked(model, NO_MORE);
+    };
+    const failed = async () => { throw new Error(NO_MORE); };
+    return {
+      stream: refused, streamSimple: refused, fetchDeferred: refused, generateImages: failed, classify: failed,
+      cancelDeferred: async (_model: unknown, handle: unknown) => {
+        const real = await prepare(model, options);
+        const cancel = (real.provider as Provider).cancelDeferred;
+        if (typeof cancel !== "function") throw new Error(`Provider ${model.provider} does not support deferred responses`);
+        await cancel.call(real.provider, real.model, handle, real.options);
+      },
+    };
   };
   // A provider that is an extension's own code may ask another model by these same models, and hand back what
   // that model answered — there and then, from a queue of its own, or a reply it had asked for before: a reply
@@ -326,38 +384,65 @@ function watch(models: Models, asking: Asking): void {
   };
   // And every request goes with the word that stops it (Asking.cut), beside whatever its asker gave it to be
   // stopped by: asked here or elsewhere, by pi or by an extension for itself.
-  const stoppable = (options: Record<string, unknown> | undefined) => {
+  const stoppable = (options: Options) => {
     const { signal, release } = either(options?.signal, asking.cut.signal);
     return { options: { ...options, signal }, release };
+  };
+  // What a request's asker would make of its headers (pi's agent has a function go with every request of its
+  // own, for extensions that would: it makes nothing of them where none does) is seen as it is made: whether
+  // the headers came out of it other than they went in — name by name, in their order, and a name with nothing
+  // under it a name all the same: pi lays headers one over another by all of that.
+  // (What cannot be told at all is not what it was, for all that can be said of it.)
+  const told = (headers: unknown): string | undefined => {
+    try {
+      return JSON.stringify(headers !== null && typeof headers === "object"
+        ? Object.entries(headers).map(([name, value]) => [name, value === undefined ? 0 : [value]]) : [headers]);
+    } catch {
+      return undefined;
+    }
+  };
+  const seeing = (options: Options, headers: { changed: boolean }): Options => {
+    const theirs = options?.transformHeaders;
+    if (typeof theirs !== "function") return options;
+    return {
+      ...options,
+      transformHeaders: async (had: unknown) => {
+        const were = told(had);
+        const made: unknown = await theirs(had);
+        if (were === undefined || told(made) !== were) headers.changed = true;
+        return made;
+      },
+    };
   };
   standing.prepareRequest = async (model, options) => {
     count("readying", 1);
     try {
       await asking.before?.();
-      // (Asked no more: the request ends as one that was cancelled before it was sent.)
-      if (asking.stopped?.()) return { provider: { stream: () => refused(model), streamSimple: () => refused(model) }, model, options: options ?? {} };
-      const prepared = await prepare(model, options);
-      const provider = prepared.provider as Provider;
+      // (Asked no more.)
+      if (asking.stopped?.()) return { provider: refusing(model, options), model, options: options ?? {} };
+      const headers = { changed: false };
+      const prepared = await prepare(model, seeing(options, headers));
       return {
         ...prepared,
-        provider: new Proxy(provider, {
+        provider: new Proxy(prepared.provider as Provider, {
           get(target, key) {
-            if (key === "stream") {
-              return (...sent: unknown[]) => {
-                const here = stoppable(sent[2] as Record<string, unknown> | undefined);
-                return heard(target.stream(sent[0], sent[1], here.options), here.release);
-              };
-            }
-            if (key === "streamSimple") {
-              return (...sent: unknown[]) => {
-                const there = stoppable(options), here = stoppable(sent[2] as Record<string, unknown> | undefined);
-                return heard((async function* () {
-                  yield* await asking.elsewhere?.(model, sent[1], there.options) ?? target.streamSimple(sent[0], sent[1], here.options);
-                })(), there.release, here.release);
-              };
-            }
             const value: unknown = Reflect.get(target, key, target);
-            return typeof value === "function" ? value.bind(target) : value;
+            if (typeof value !== "function") return value;
+            const by = ASKED_BY.get(key);
+            if (!by) return value.bind(target);
+            // A model is asked: what a provider is handed is the model, what it is to be sent, and the options.
+            // Elsewhere, where that can be — or here, by the provider itself. What comes all at once is made a
+            // reply of one event, and counted and waited for as any reply; and whoever asked is given it whole.
+            return (...sent: unknown[]) => {
+              const there = stoppable(options), here = stoppable(sent[2] as Options);
+              const reply = heard((async function* (): Reply {
+                const elsewhere = by.way && await asking.elsewhere?.(by.way, model, sent[1], there.options, headers);
+                if (elsewhere) yield* elsewhere;
+                else if (by.events) yield* value.call(target, sent[0], sent[1], here.options) as Reply;
+                else yield { type: "done", message: await value.call(target, sent[0], sent[1], here.options) };
+              })(), there.release, here.release);
+              return by.events ? reply : wholeOf(reply);
+            };
           },
         }),
       };
@@ -420,13 +505,41 @@ function account(asking: Asking, call: Asked, signal: AbortSignal | undefined, s
   // a reply used is then read where no extension is. Not where an extension has made the model's
   // provider its own, has a hand in what a provider is sent and answers, or has made
   // this process other than it was in what a request goes by — the model is then asked here, as the
-  // extension means it to be — nor where the request is not one that can be handed over (see dataOf).
+  // extension means it to be — nor where the request is not one that can be handed over: something
+  // goes with it that is not data, and whoever asked may mean something by it (see dataOf).
   if (relay && call.extensions) {
-    asking.elsewhere = async (model, context, options) => {
-      const data = dataOf(options), its = session();
-      if (!data || !its || !asItWas() || asking.models.getRegisteredProviderIds().includes(model.provider)) return undefined;
+    asking.elsewhere = async (by, model, context, options = {}, headers) => {
+      const its = session();
+      if (!its || !asItWas() || asking.models.getRegisteredProviderIds().includes(model.provider)) return undefined;
       if (HANDS_IN.some(event => its.extensionRunner.hasHandlers(event))) return undefined;
-      return relay.ask({ model, context, options: data, ...(asking.over && { answered: true }) }, options?.signal as AbortSignal | undefined);
+      // All that goes with a request is data, or the request is not handed over: whoever made it may mean
+      // something by it. But what is known to be nothing a provider is handed is left out first.
+      // What would make something of the request's headers, where that was seen to be nothing (see `watch`):
+      // the request is the same without it.
+      if (headers.changed) return undefined;
+      const left = new Set(["transformHeaders"]);
+      // pi's own hooks, which do nothing here (see HANDS_IN) — and are pi's own where they are the very ones
+      // the session's agent has: any other is its asker's hand in the request.
+      const agent = its.agent as unknown as Record<string, unknown>;
+      for (const hook of HOOKS) {
+        if (options[hook] === undefined) continue;
+        if (options[hook] !== agent[hook]) return undefined;
+        left.add(hook);
+      }
+      // And of a request the agent makes for itself, the rest of what its loop is set up by (see LOOPS); and
+      // in its conversation, which is of pi's making, what a tool kept beside its result — no provider is
+      // sent that, so it need not be what it was on the other side.
+      const agents = by === "streamSimple" && HOOKS.every(hook => options[hook] === agent[hook]);
+      if (agents) for (const name of LOOPS) left.add(name);
+      let data: Record<string, unknown> | undefined;
+      try {
+        data = dataOf(Object.fromEntries(Object.entries(options).filter(([name]) => !left.has(name))));
+        if (!data || (!agents && !isData(context))) return undefined;
+      } catch {
+        // (What cannot be gone through — it goes deeper than can be followed — is not known to be data.)
+        return undefined;
+      }
+      return relay.ask({ ...(by !== "streamSimple" && { by }), model, context, options: data, ...(asking.over && { answered: true }) }, options.signal as AbortSignal | undefined);
     };
   }
   return stopped;

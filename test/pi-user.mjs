@@ -16,7 +16,7 @@ import { cleanupTempDir, makeTempDir, withEnv } from "./helpers.mjs";
  * with a few words.
  */
 export async function user(t, reply) {
-  const requests = [], headers = [];
+  const requests = [], headers = [], paths = [];
   // How many requests whoever asked let go of before they were answered.
   let dropped = 0;
   const sse = (res) => {
@@ -33,6 +33,8 @@ export async function user(t, reply) {
       uses: (usage) => send([], usage),
     };
   };
+  // What is asked for all at once, and not as the events of a reply — images, what a classifier makes of a state — is answered so.
+  const atOnce = (res) => ({ whole: (body) => { res.writeHead(200, { "Content-Type": "application/json" }); res.end(JSON.stringify(body)); } });
   const server = createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => { body += chunk; });
@@ -40,8 +42,9 @@ export async function user(t, reply) {
       const request = JSON.parse(body);
       requests.push(request);
       headers.push(req.headers);
+      paths.push(req.url);
       res.on("close", () => { if (!res.writableEnded) dropped += 1; });
-      if (reply) return reply(request, sse(res), requests.length);
+      if (reply) return reply(request, request.stream === false || !req.url.endsWith("/chat/completions") ? atOnce(res) : sse(res), requests.length, req.url);
       const stream = sse(res);
       stream.says({ role: "assistant", content: "hello from the fake" });
       stream.says({}, "stop");
@@ -68,7 +71,7 @@ export async function user(t, reply) {
     cleanupTempDir(cwd);
   });
   return {
-    agentDir, cwd, requests, headers, adapter, env, put, port: server.address().port, dropped: () => dropped,
+    agentDir, cwd, requests, headers, paths, adapter, env, put, port: server.address().port, dropped: () => dropped,
     ask: (prompt, call = {}) => withEnv(env, () => adapter.ask(prompt, { cwd, ...call })),
     toolsOf: (request) => (request.tools ?? []).map((tool) => tool.function.name),
     /** What extensions wrote down, each line as [the process it was in, what happened]. */

@@ -2,6 +2,18 @@
 
 All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`) are released together under one version.
 
+## Unreleased
+
+### Changed
+
+- **What an extension asks a model for itself is asked by the call's runner too**, where it was asked by the process that serves the call: a request by the options of the model's own provider (`ctx.modelRegistry.complete`, `.stream` — how pi's own example extensions ask), an image (`generateImages`), a classifier's word (`classify`). What each used is then read where no extension is, as it is of the agent's own requests. A provider's options are its own and are not known by name, so the rule is by what they are: a request is handed over where everything that goes with it is plain data — text, numbers, lists and records of those — and asked where the call is served, as before, where something is not, or is the asker's own to ask by (a function such as `onPayload` or `onResponse`, an `apiKey`, a `fetch`, a date, an object of a library's). A reply that is to be fetched later (`deferred`) is asked for and fetched where the call is served.
+- **An image, a classifier's word, and a reply fetched later are the call's as a reply is**: counted as they come, waited for where an extension asks as its session ends, and stopped when the call is cancelled or the time pi gives a request is up. They were said before they were asked, and no more. A request that is refused — the call cancelled, or out of budget — ends saying so (`The call is to ask no more.`), where an image or a classifier's refusal said the provider had no such thing. To have a provider give up a reply it was keeping (`cancelDeferred`) asks no model, and is refused nobody.
+
+### Fixed
+
+- **A request an extension makes as pi's agent does (`streamSimple`), with a function of its own in it, is asked where the extension is.** It was handed over without the function — `onPayload`, `onResponse`, `onProviderStreamEvent`, which were then never called; a `transformHeaders`, whose headers the request was then asked without. What is left out of a request that is handed over is what is known to be nothing a provider is handed: pi's own hooks (the very ones the session's agent has), which do nothing where no extension listens for the four provider events; and, of a request the agent makes for itself, what its loop calls as a turn goes.
+- **A name with nothing under it is what it was where a request is asked by the runner.** An option such as `headers: { "x-configured": undefined }` or `samplingParams: { top_p: undefined }` takes a header, or a parameter, of the model's own out of a request; handed over, the name was lost on the way, and the model's own was sent. (And what an asker makes of a request's headers is seen by that too: a `transformHeaders` that only takes a name out, or moves one, has made them other than they were.)
+
 ## 0.6.0 — 2026-11-18
 
 ### Added

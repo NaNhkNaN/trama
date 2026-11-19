@@ -14,9 +14,14 @@
 // asks its model itself, as it always did — and what it used is what its
 // process says. This is not a wall: pi does not hold an extension to it.
 //
+// A model: one that is asked for a reply as pi's agent asks, or by its
+// provider's own options (which is how an extension asks that would have the
+// whole answer: pi's `complete`), one that makes images, one that classifies.
+//
 // Three things are here: the one that asks (createModelRelay), and the two
 // ends of a channel between it and a session (relayClient, relayServer).
 
+import { randomUUID } from "crypto";
 import { createRequire } from "module";
 import { pathToFileURL } from "url";
 import { onAbort } from "./abort.js";
@@ -27,8 +32,26 @@ const loadPi = () => import("@earendil-works/pi-coding-agent");
 /** A model as pi has it in its catalog: plain data. */
 export type RelayModel = { provider: string; id: string; api?: string } & Record<string, unknown>;
 
+/**
+ * The ways pi has of asking a model, that a relay asks by: for a reply, as
+ * pi's agent asks (by options that are any provider's) or by the options of
+ * the model's own provider; for images; for what a classifier makes of a
+ * state. Each is a method of pi's models by that name.
+ */
+export type RelayWay = "streamSimple" | "stream" | "generateImages" | "classify";
+
+/** Of each way: the type of model it asks, as pi's catalog has them — and whether what comes of it comes as the events of a reply (and not all at once). */
+const WAYS = new Map<unknown, { of: "chat" | "image" | "classifier"; events: boolean }>([
+  ["streamSimple", { of: "chat", events: true }],
+  ["stream", { of: "chat", events: true }],
+  ["generateImages", { of: "image", events: false }],
+  ["classify", { of: "classifier", events: false }],
+]);
+
 /** A request of a model: plain data, all of it. */
 export interface RelayRequest {
+  /** The way the model is asked: as pi's agent asks, where it is not said. */
+  by?: RelayWay;
   /** The model, as the session that asks has it. */
   model: RelayModel;
   /** What the model is to be sent: as pi hands it to a provider. */
@@ -39,7 +62,13 @@ export interface RelayRequest {
   answered?: true;
 }
 
-/** An event of a reply, as pi's stream of it has them. The last is of type "done" or "error", and has the reply whole. */
+/**
+ * An event of a reply, as pi's stream of it has them. The last is of type
+ * "done" or "error", and has the reply whole. What comes all at once —
+ * images, a classifier's answers — comes as a reply of one event, "done",
+ * with it as its `message`: so that it is counted, and waited for, as any
+ * reply is (see `wholeOf`).
+ */
 export type RelayEvent = { type: string } & Record<string, unknown>;
 
 export interface ModelRelay {
@@ -51,22 +80,109 @@ export interface ModelRelay {
   ask(request: RelayRequest, signal?: AbortSignal): Promise<AsyncIterable<RelayEvent> | undefined>;
 }
 
-/** The options of a request that are data, and mean something to a provider. (The rest is pi's agent's own, and functions.) */
-const DATA_OPTIONS = [
-  "temperature", "samplingParams", "maxTokens", "transport", "cacheRetention", "sessionId", "disableContinuation",
-  "websocketConnectTimeoutMs", "metadata", "toolChoice", "reasoning", "thinkingBudgets", "env", "headers", "identity",
-  "timeoutMs", "maxRetries", "maxRetryDelayMs",
-] as const;
+/**
+ * Whether a value is data: what it is on the other side of a channel is what
+ * it is here. Text, numbers that are numbers, yes and no, nothing; and lists
+ * and plain records of those. Not a function, nor anything that is of a kind
+ * of its own (a date, a signal, bytes; a list or a record that is more than
+ * one), nor what holds itself, nor what says of itself something other than
+ * it shows. (What a record has by a symbol, or has and does not show, is no
+ * part of it on any channel, and a provider is sent none of it either: pi's
+ * schemas have such.)
+ */
+export function isData(value: unknown, within: Set<object> = new Set()): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value !== "object" || within.has(value)) return false;
+  // (A list or a record, and of no kind of its own: nor one that would be said otherwise than it shows.)
+  const kind: unknown = Object.getPrototypeOf(value);
+  if (Array.isArray(value) ? kind !== Array.prototype : kind !== Object.prototype && kind !== null) return false;
+  if (typeof (value as { toJSON?: unknown }).toJSON === "function") return false;
+  within.add(value);
+  try {
+    // (A place of a list that has nothing is something else on the other side; a name of a record that has nothing is no
+    // name there. A list is gone through place by place, as a channel goes through it — not as it would have itself gone through.)
+    if (Array.isArray(value)) return Array.from({ length: value.length }, (_, at) => value[at] as unknown).every(one => isData(one, within));
+    return Object.values(value).every(one => one === undefined || isData(one, within));
+  } finally {
+    within.delete(value);
+  }
+}
 
 /**
- * Of the options a session asks with, those that go with a relayed request —
- * or undefined where one is there that cannot go, and would be missed: a key
- * of the asker's own, a way of its own to reach the provider, a reply that is
- * to be fetched later.
+ * The options a session asks with, as those that go with a relayed request —
+ * or undefined where one is there that cannot go, and would be missed.
+ *
+ * What goes is whatever is data, by whatever name: a provider's own options
+ * are its own, and are not known here by name. What cannot go: a key of the
+ * asker's own, a way of its own to reach the provider, a span to report to,
+ * a reply that is to be fetched later (it is fetched where it was asked
+ * for) — and anything else that is not data: a provider may read whatever
+ * it is given, and what goes with a request is its asker's to mean something
+ * by. (What whoever hands a request over knows to be nothing a provider is
+ * handed, they leave out first: see `account`, pi-adapter.ts.) The word to
+ * stop by is no option here: it goes beside the request.
  */
 export function dataOf(options: Record<string, unknown> = {}): Record<string, unknown> | undefined {
   if (["apiKey", "fetch", "telemetry", "deferred"].some(key => options[key] !== undefined)) return undefined;
-  return Object.fromEntries(DATA_OPTIONS.filter(key => options[key] !== undefined).map(key => [key, options[key]]));
+  const data = Object.entries(options).filter(([key]) => key !== "signal");
+  if (data.some(([, value]) => value !== undefined && !isData(value))) return undefined;
+  // (Each under its own name, whatever the name: none of them is taken for anything else.)
+  return Object.fromEntries(data);
+}
+
+/**
+ * Data as it goes on a channel, where a record in it has nothing under a
+ * name. A channel carries no such name — and to have nothing under a name is
+ * not to be without it, where records are laid one over another, name by
+ * name and in the order of their names (as pi lays a request's headers, and
+ * what a model is sampled by, over the model's own). So a word is put under
+ * each such name, that is nothing else: said beside the data (`mark`), and
+ * taken out again where the data is had (`unmarked`). The name then stands
+ * where it stood, with nothing under it.
+ */
+export function marked<T>(data: T): { data: T; mark?: string } {
+  const mark = `nothing:${randomUUID()}`;
+  let found = false;
+  const copy = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(copy);
+    if (value === null || typeof value !== "object") return value;
+    return Object.fromEntries(Object.entries(value).map(([name, one]) => {
+      if (one !== undefined) return [name, copy(one)];
+      found = true;
+      return [name, mark];
+    }));
+  };
+  const made = copy(data) as T;
+  // (A copy either way: what goes on the channel is what the data shows, name by name, whatever else it has.)
+  return found ? { data: made, mark } : { data: made };
+}
+
+/** Data that came by a channel (see `marked`), with nothing under the names of its records that the mark is under. (In a list the mark is a word like any: nothing is ever marked there.) */
+export function unmarked<T>(data: T, mark: unknown): T {
+  if (typeof mark !== "string" || mark === "") return data;
+  const clear = (value: unknown): void => {
+    if (value === null || typeof value !== "object") return;
+    for (const [name, one] of Object.entries(value)) {
+      if (one === mark && !Array.isArray(value)) (value as Record<string, unknown>)[name] = undefined;
+      else clear(one);
+    }
+  };
+  clear(data);
+  return data;
+}
+
+/**
+ * What came of asking a model, of a reply that is gone through to its end:
+ * the reply whole — or, of a request that failed before it was one, its
+ * failure thrown (as pi's own `generateImages` and `classify` have what a
+ * provider throws, and make of it what they give back).
+ */
+export async function wholeOf(reply: AsyncIterable<RelayEvent>): Promise<unknown> {
+  let last: RelayEvent | undefined;
+  for await (const event of reply) last = event;
+  if (last?.type === "done") return last.message;
+  throw new Error(String((last?.error as { errorMessage?: unknown } | undefined)?.errorMessage ?? "The model was not asked."));
 }
 
 /** What a reply used, as pi has it on the reply. */
@@ -201,14 +317,21 @@ export function createModelRelay(): ModelRelay & { close(): Promise<void> } {
       try {
         const found = await (models ??= loadPi().then(pi => pi.ModelRuntime.create()));
         const { provider, id } = request.model;
-        const own = found.getModel(provider, id);
+        const by = request.by ?? "streamSimple";
+        // (A way that is none of these is not one to ask by, whatever pi's models have by that name.)
+        const way = WAYS.get(by);
+        if (!way) return undefined;
+        const own: unknown = way.of === "chat" ? found.getModel(provider, id) : found.getModelOfType(way.of, provider, id);
         // The same model, to the letter, with a key to ask it by — and a provider nobody has had a hand in.
         if (!own || JSON.stringify(own) !== JSON.stringify(request.model) || !found.hasConfiguredAuth(provider)) return undefined;
         // (What goes with a request is held to here as where it was sent from: whoever sent it may not be who should have.)
         const options = dataOf(request.options);
         if (!options) return undefined;
         if (typeof options.sessionId === "string") sessions.add(options.sessionId);
-        reply = found.streamSimple(own, request.context as Parameters<Models["streamSimple"]>[1], { ...options, signal: stop.signal });
+        // (pi's models, asked by the name of the way: each takes the model, what it is to be sent, and the options.)
+        const ask = (found as unknown as Record<RelayWay, (model: unknown, context: unknown, options: Record<string, unknown>) => unknown>)[by].bind(found);
+        const asked = ask(own, request.context, { ...options, signal: stop.signal });
+        reply = way.events ? asked as AsyncIterable<unknown> : (async function* () { yield { type: "done", message: await asked }; })();
       } catch {
         // (A pi that cannot be had here is not one to ask by: whoever asked asks itself.)
         models = undefined;
@@ -239,7 +362,7 @@ export function createModelRelay(): ModelRelay & { close(): Promise<void> } {
 // --- The two ends of a channel ---
 
 /** What the end that asks sends: a request, or that one it sent is cancelled. */
-export type RelayAsked = { relay: { id: number; request: RelayRequest } } | { relayAbort: number };
+export type RelayAsked = { relay: { id: number; request: RelayRequest; mark?: string } } | { relayAbort: number };
 /** What the end that answers sends: an event of the reply to a request, or that the request is not one it can serve. */
 export type RelayAnswered = { relayed: { id: number; event: RelayEvent } | { id: number; not: true } };
 
@@ -294,7 +417,9 @@ export function relayClient(send: (message: RelayAsked) => void): { relay: Model
           end: () => add(notAsked(request.model, "The process that was asking the model ended before the reply had come.", "error")),
         });
         try {
-          send({ relay: { id, request } });
+          // (Where its options have nothing under a name, that is said: the channel would not say it.)
+          const { data: options, mark } = marked(request.options);
+          send({ relay: { id, request: { ...request, options }, mark } });
         } catch {
           // (A request that cannot be put on the channel — something in it is not data — is one nobody served.)
           off();
@@ -326,9 +451,21 @@ export function relayServer(
   on: { refuse?: (request: RelayRequest) => boolean | Promise<boolean>; replied?: (usage: ReplyUsage) => void } = {},
 ): { heard(message: RelayAsked): void; close(): void } {
   const asking = new Map<number, AbortController>();
-  const serve = async (id: number, request: RelayRequest, stop: AbortController) => {
+  // What cannot be said — the channel will not carry it, or is gone — is not said: whoever asks for others
+  // is not failed by one of them.
+  const say = (answer: RelayAnswered) => {
     try {
-      if (await on.refuse?.(request)) return send({ relayed: { id, event: notAsked(request.model, "The call is to ask no more.") } });
+      send(answer);
+    } catch { /* (Nobody is there to hear it.) */ }
+  };
+  const serve = async (id: number, request: RelayRequest, stop: AbortController) => {
+    // Of a request that is not asked, what is said back of its model is its names: whatever else came as
+    // the model may be nothing the channel will carry.
+    let model: RelayModel = { provider: "", id: "" };
+    try {
+      const { provider, id: name, api } = request.model;
+      model = { provider: String(provider), id: String(name), ...(typeof api === "string" && { api }) };
+      if (await on.refuse?.(request)) return send({ relayed: { id, event: notAsked(model, "The call is to ask no more.") } });
       const events = await relay.ask(request, stop.signal);
       if (!events) return send({ relayed: { id, not: true } });
       for await (const event of events) {
@@ -337,7 +474,12 @@ export function relayServer(
         send({ relayed: { id, event } });
       }
     } catch (err) {
-      send({ relayed: { id, event: notAsked(request.model, `The model could not be asked: ${messageOf(err)}`, "error") } });
+      // (Whatever was thrown, and whether or not it can be said what.)
+      let why = "it cannot be said why";
+      try {
+        why = messageOf(err);
+      } catch { /* (As it is.) */ }
+      say({ relayed: { id, event: notAsked(model, `The model could not be asked: ${why}`, "error") } });
     } finally {
       asking.delete(id);
     }
@@ -345,10 +487,19 @@ export function relayServer(
   return {
     heard(message) {
       if ("relayAbort" in message) return asking.get(message.relayAbort)?.abort();
-      const { id, request } = message.relay;
+      const { id, request, mark } = message.relay;
+      // (A request by a number another is being asked by is nobody's: what would stop it would stop the other.)
+      if (asking.has(id)) return;
+      let asked: RelayRequest;
+      try {
+        asked = { ...request, options: unmarked(request.options, mark) };
+      } catch {
+        // (What cannot be gone through — it goes deeper than anything a request goes with — is not one to serve.)
+        return say({ relayed: { id, not: true } });
+      }
       const stop = new AbortController();
       asking.set(id, stop);
-      void serve(id, request, stop);
+      void serve(id, asked, stop);
     },
     close() {
       for (const stop of asking.values()) stop.abort();

@@ -6,7 +6,7 @@ import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
 import { createMeter } from "../packages/runtime/dist/budget.js";
 import { CutOff } from "../packages/runtime/dist/agent-backend.js";
 import { createBackend } from "../packages/runtime/dist/runner.js";
-import { dataOf, leaner, notAsked, relayClient, relayServer, usageAtEnd, whole } from "../packages/runtime/dist/model-relay.js";
+import { createModelRelay, dataOf, isData, leaner, marked, notAsked, relayClient, relayServer, unmarked, usageAtEnd, whole, wholeOf } from "../packages/runtime/dist/model-relay.js";
 import { EXTENSION, hostsHere, user } from "./pi-user.mjs";
 import { isAlive, waitFor, withEnv } from "./helpers.mjs";
 
@@ -20,10 +20,16 @@ const keyOf = (headers) => headers.authorization;
 /** The user's models, with a key that is whatever TRAMA_TEST_KEY is where the model is asked: which says who asked. */
 const withKeyBy = (it) => it.put(it.agentDir, "models.json", JSON.stringify({ providers: { fake: {
   baseUrl: `http://127.0.0.1:${it.port}/v1`, api: "openai-completions", apiKey: "$TRAMA_TEST_KEY",
+  // (A header the provider's every request goes with, unless a request says otherwise.)
+  headers: { "x-configured": "yes" },
   models: [
     { id: "plain", cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } },
     // A model whose prompt cache does not last, and is dear to miss: pi keeps such a cache warm, by requests of its own.
     { id: "warm", cost: { input: 1000, output: 2, cacheRead: 0.5, cacheWrite: 0 }, promptCache: { short: 11 } },
+    // A model that thinks: its provider has an option of its own for how hard.
+    { id: "thinks", reasoning: true, cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } },
+    // A model that is sampled its own way.
+    { id: "sampled", samplingParams: { top_p: 0.5, seed: 7 }, cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } },
   ],
 } } }));
 /** A call, with the key the runner has at the time. */
@@ -44,11 +50,16 @@ const SAYS_LITTLE = `if (!globalThis.saysLittle) {
       return send(of ? { [of]: { ...message[of], input: 1, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } } : message, ...rest);
     };
   }`;
-/** An extension's code that asks the model something for itself, by pi, when `event` comes — each of the ways named, in turn — and writes down how each went. */
+/**
+ * An extension's code that asks the model something for itself, by pi, when `event` comes — each of the ways named,
+ * in turn — and writes down how each went. As pi's agent asks ("streamSimple"); by the options of the model's own
+ * provider ("complete"); and so, with a hand of its own in the asking ("itself": it would see what the provider is
+ * sent) — which is asked where the extension is, whoever asks its call's model otherwise.
+ */
 const ASKS_AT = (event, ...ways) => `pi.on("${event}", async (_event, ctx) => {
     const context = { messages: [{ role: "user", content: [{ type: "text", text: "an extension asks" }], timestamp: Date.now() }] };
     for (const way of ${JSON.stringify(ways)}) {
-      const reply = way === "complete" ? await ctx.modelRegistry.complete(ctx.model, context, {}) : await ctx.modelRegistry.streamSimple(ctx.model, context, {}).result();
+      const reply = way === "streamSimple" ? await ctx.modelRegistry.streamSimple(ctx.model, context, {}).result() : await ctx.modelRegistry.complete(ctx.model, context, way === "itself" ? { onPayload: () => undefined } : {});
       note("asked for itself at ${event}, by " + way + ": " + reply.stopReason);
     }
   });`;
@@ -139,25 +150,25 @@ test("what an extension asks a model for itself is on its call's account: counte
   for (const where of ["here", "in a process of its own"]) {
     const it = await user(t);
     withKeyBy(it);
-    it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `${ASKS_AT("agent_end", "streamSimple", "complete")}\n  ${ASKS_AT("session_shutdown", "streamSimple")}\n  ${ASKS_AFTER}`));
+    it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `${ASKS_AT("agent_end", "streamSimple", "complete", "itself")}\n  ${ASKS_AT("session_shutdown", "streamSimple")}\n  ${ASKS_AFTER}`));
     // (Served here by the adapter itself, as a host serves a call; or by a host.)
     const ask = (prompt, call) => withEnv({ ...it.env, TRAMA_TEST_KEY: "a key" }, () => (where === "here" ? it.adapter.serve(prompt, { cwd: it.cwd, ...call }) : it.adapter.ask(prompt, { cwd: it.cwd, ...call })));
 
     const said = [], had = [];
     assert.equal(await ask("say hello", { extensions: true, had: (usage) => had.push(total(usage)), sofar: (usage) => said.push(["sofar", total(usage)]), used: (usage) => said.push(["used", total(usage)]) }), "hello from the fake", where);
-    // (Whoever counts was told as each of the four replies came — whoever asked for it, by whichever way, and the last
+    // (Whoever counts was told as each of the five replies came — whoever asked for it, by whichever way, and the last
     // as the session was ending — and not only before the next request, or at the end.)
-    assert.deepEqual([...new Set(had)], [1200, 2400, 3600, 4800], where);
-    // The agent's request, and the extension's three — by either of pi's ways of asking, the last as it was told that
+    assert.deepEqual([...new Set(had)], [1200, 2400, 3600, 4800, 6000], where);
+    // The agent's request, and the extension's four — by each of pi's ways of asking, the last as it was told that
     // its session was over (to sum up what was done, say): each used something, what had been used was said before
     // each of them was made, and what the call used in the end has all of them.
-    assert.deepEqual(asked(it), ["asked for itself at agent_end, by streamSimple: stop", "asked for itself at agent_end, by complete: stop", "asked for itself at session_shutdown, by streamSimple: stop"], where);
-    assert.equal(it.requests.length, 4, where);
-    assert.deepEqual(said, [["sofar", 1200], ["sofar", 2400], ["sofar", 3600], ["used", 4800]], where);
+    assert.deepEqual(asked(it), ["asked for itself at agent_end, by streamSimple: stop", "asked for itself at agent_end, by complete: stop", "asked for itself at agent_end, by itself: stop", "asked for itself at session_shutdown, by streamSimple: stop"], where);
+    assert.equal(it.requests.length, 5, where);
+    assert.deepEqual(said, [["sofar", 1200], ["sofar", 2400], ["sofar", 3600], ["sofar", 4800], ["used", 6000]], where);
     // Once its session was gone, nothing more was asked on its account.
-    await waitFor(() => asked(it).length === 4, "what the extension asked late to have ended");
-    assert.equal(asked(it)[3], "asked for itself after all was over: aborted", where);
-    assert.equal(it.requests.length, 4, where);
+    await waitFor(() => asked(it).length === 5, "what the extension asked late to have ended");
+    assert.equal(asked(it)[4], "asked for itself after all was over: aborted", where);
+    assert.equal(it.requests.length, 5, where);
 
     // Under a budget its request is one the call may not have: the model is not asked.
     await withEnv({ ...it.env, TRAMA_TEST_KEY: "a key" }, async () => {
@@ -165,7 +176,7 @@ test("what an extension asks a model for itself is on its call's account: counte
       t.after(() => backend.close());
       // (A backend's calls with extensions are served by hosts: here that is what is asked of it either way.)
       await assert.rejects(() => backend.ask("say hello", { cwd: it.cwd, extensions: true }), /The budget is spent: 1200 tokens used of 1000/, where);
-      assert.equal(it.requests.length, 5, `${where}: the extension's requests were not made`);
+      assert.equal(it.requests.length, 6, `${where}: the extension's requests were not made`);
     });
   }
 
@@ -230,6 +241,19 @@ test("a request pi makes of its own to keep a provider's cache warm is the call'
     // (Each such request was said before it was made — when one request had been made, and then two — and what it used is in the count.)
     assert.deepEqual(said.slice(0, -1), it.requests.slice(1).map((_request, at) => ["sofar", at + 1]));
     assert.deepEqual(said.at(-1), ["used", 1200 * it.requests.length]);
+  }
+
+  // Served in a process of its own, such a request is asked by the runner, as the agent's turns are.
+  {
+    const { it, config } = await one("agent_end");
+    const hosted = new PiAdapter(config);
+    t.after(() => hosted.close());
+    const ask = (key) => withEnv({ ...it.env, TRAMA_TEST_KEY: key }, () => hosted.ask("say hello", { cwd: it.cwd, extensions: true }));
+    await ask("the first");
+    const before = it.requests.length;
+    await ask("the second");
+    assert.ok(it.requests.length - before >= 2, `pi asked again to keep the cache warm: ${it.requests.length - before} requests`);
+    assert.deepEqual(it.headers.slice(before).map(keyOf), it.requests.slice(before).map(() => "Bearer the second"));
   }
 
   // And a call whose budget is spent by its one answer has no cache kept warm at more cost.
@@ -365,8 +389,10 @@ test("a request goes over a channel and its reply comes back: served, not served
   const reply = (text, usage) => ({ type: "done", reason: "stop", message: { role: "assistant", content: [{ type: "text", text }], usage: { input: usage, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0 } } } });
   // Somebody who asks: knows one model, answers in two events, and waits to be cancelled where asked to.
   const cancelled = [];
+  const asked = [];
   const knows = {
     async ask(request, signal) {
+      asked.push(request);
       if (request.model.id !== "plain") return undefined;
       return (async function* () {
         if (request.context === "wait") {
@@ -383,7 +409,8 @@ test("a request goes over a channel and its reply comes back: served, not served
   // The two ends, joined as two processes would join them: each message a copy, and a turn later.
   let refuse = false;
   const used = [];
-  const later = (to) => (message) => { const copy = JSON.parse(JSON.stringify(message)); setImmediate(() => to(copy)); };
+  const sent = [];
+  const later = (to) => (message) => { const copy = JSON.parse(JSON.stringify(message)); sent.push(JSON.parse(JSON.stringify(message))); setImmediate(() => to(copy)); };
   const server = relayServer(knows, later((answer) => client.heard(answer.relayed)), { refuse: () => refuse, replied: (usage) => used.push(usage.input) });
   const client = relayClient(later((message) => server.heard(message)));
   const all = async (events) => { const got = []; for await (const event of events) got.push(event); return got; };
@@ -393,6 +420,33 @@ test("a request goes over a channel and its reply comes back: served, not served
   assert.deepEqual(served.map((event) => event.type), ["start", "done"]);
   assert.equal(served[1].message.content[0].text, "answer to one");
   assert.deepEqual(used, [7]);
+  // What goes with a request is what it was on the other side: also where a record has nothing under a name, which the
+  // channel itself does not say — and the name is where it was among the record's names.
+  const options = { temperature: 0, nothing: undefined, headers: { "x-configured": undefined, "X-Configured": "mine", "x-own": "said" }, deep: [{ list: [{ unset: undefined, set: null }] }] };
+  await all(await client.relay.ask({ model, context: "one", options }));
+  assert.deepEqual(asked.at(-1).options, options);
+  assert.deepEqual([Object.keys(asked.at(-1).options), Object.keys(asked.at(-1).options.headers), Object.keys(asked.at(-1).options.deep[0].list[0])], [["temperature", "nothing", "headers", "deep"], ["x-configured", "X-Configured", "x-own"], ["unset", "set"]]);
+  // (Said beside the request by a word that is under each such name on the way; and nothing is said beside a request that has none.)
+  const [plain, sparse] = sent.filter((message) => "relay" in message).map((message) => message.relay);
+  assert.equal("mark" in plain, false);
+  assert.deepEqual(plain.request.options, {});
+  assert.match(sparse.mark, /^nothing:[0-9a-f-]{36}$/);
+  assert.deepEqual(sparse.request.options, { temperature: 0, nothing: sparse.mark, headers: { "x-configured": sparse.mark, "X-Configured": "mine", "x-own": "said" }, deep: [{ list: [{ unset: sparse.mark, set: null }] }] });
+  // A request by a number another is being asked by is not served: nothing is asked, and the other is not disturbed.
+  const first = client.relay.ask({ model, context: "wait", options: {} });
+  await waitFor(() => asked.at(-1)?.context === "wait", "the request to be being asked", 2000);
+  const at = asked.length, number = sent.findLast((message) => "relay" in message).relay.id;
+  server.heard({ relay: { id: number, request: { model, context: "one", options: {} } } });
+  // And one that goes with what cannot be gone through is not served, and fails nobody.
+  let deep = {};
+  for (let depth = 0; depth < 100_000; depth += 1) deep = { deep };
+  server.heard({ relay: { id: 10_000, request: { model, context: "one", options: deep }, mark: "x" } });
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(asked.length, at);
+  assert.deepEqual(sent.at(-1), { relayed: { id: 10_000, not: true } });
+  server.heard({ relayAbort: number });
+  assert.deepEqual((await all(await first)).map((event) => event.error.errorMessage), ["Aborted"]);
+  cancelled.length = 0;
   // Not one the other end can ask: nothing comes, and whoever asked knows to ask by itself.
   assert.equal(await client.relay.ask({ model: { ...model, id: "other" }, context: "two", options: {} }), undefined);
   // Refused: it ends as a request that was cancelled, and nothing was asked.
@@ -412,21 +466,158 @@ test("a request goes over a channel and its reply comes back: served, not served
   // Whoever asked is done while a reply is waited for: it ends there as cancelled. And the other end, done, asks no further.
   // The other end gone while a reply is waited for: it ends there as failed — nobody cancelled it — and nothing more is asked by this end.
   // And the other end, done, asks no further.
-  const left = client.relay.ask({ model, context: "wait", options: {} });
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  const left = client.relay.ask({ model, context: "wait", options: {} }), had = asked.length;
+  await waitFor(() => asked.length > had, "the request to be being asked", 2000);
   client.close();
   server.close();
   assert.deepEqual((await all(await left)).map((event) => [event.reason, event.error.stopReason, event.error.errorMessage]), [["error", "error", "The process that was asking the model ended before the reply had come."]]);
   assert.deepEqual(cancelled, ["wait", "wait"]);
   assert.equal(await client.relay.ask({ model, context: "four", options: {} }), undefined);
 
+  // What cannot be said back fails nobody: whoever asks for others goes on. And of a request that is not asked, what
+  // is said of its model is its names — whatever else came as the model may be nothing a channel will carry.
+  const unsaid = [];
+  const onUnsaid = (err) => unsaid.push(err);
+  process.on("unhandledRejection", onUnsaid);
+  // (A request that is refused; one that cannot be asked whether it is; one that is served; one nobody here can serve.)
+  const unheard = () => { throw new RangeError("cannot be said"); };
+  for (const [on, id] of [[{ refuse: () => true }, "plain"], [{ refuse: () => { throw new Error("nobody to ask whether"); } }, "plain"], [{}, "plain"], [{}, "other"]]) {
+    relayServer(knows, unheard, on).heard({ relay: { id: 1, request: { model: { ...model, id }, context: "one", options: {} } } });
+  }
+  // (Nor does what came as a model and is none, or one whose names will not be said; nor what cannot be gone through, with nobody to hear that.)
+  const odd = [];
+  const hears = relayServer(knows, (answer) => odd.push(answer));
+  hears.heard({ relay: { id: 3, request: { model: null, context: "one", options: {} } } });
+  hears.heard({ relay: { id: 4, request: { model: { provider: { toString() { throw new Error("no name"); } }, id: "plain" }, context: "one", options: {} } } });
+  relayServer(knows, unheard).heard({ relay: { id: 5, request: { model, context: "one", options: deep }, mark: "x" } });
+  // (Nor a request that cannot so much as be taken up; nor whoever is asked whether, failing by what cannot be said.)
+  hears.heard({ relay: { id: 6, request: Object.defineProperty({ model, context: "one", options: {} }, "more", { enumerable: true, get() { throw new Error("not to be read"); } }) } });
+  relayServer(knows, (answer) => odd.push(answer), { refuse: () => { throw Object.create(null); } }).heard({ relay: { id: 7, request: { model, context: "one", options: {} } } });
+  const back = [];
+  relayServer(knows, (answer) => back.push(answer), { refuse: () => true }).heard({ relay: { id: 2, request: { model: { provider: "fake", id: "plain", api: { deep: "as it likes" }, more: 10n }, context: "one", options: {} } } });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  process.off("unhandledRejection", onUnsaid);
+  assert.deepEqual(unsaid, []);
+  // (Each is answered, as not served or as failed; the model named by its names where it had any that could be said.)
+  const answered = Object.fromEntries(odd.map((answer) => [answer.relayed.id, answer.relayed.not ? "not served" : [answer.relayed.event.type, answer.relayed.event.error.provider, answer.relayed.event.error.errorMessage.replace(/^(The model could not be asked: ).*(null|name|why)\.?$/, "$1…$2")]]));
+  assert.deepEqual(answered, {
+    3: ["error", "", "The model could not be asked: …null"],
+    4: ["error", "", "The model could not be asked: …name"],
+    6: "not served",
+    7: ["error", "fake", "The model could not be asked: …why"],
+  });
+  // (And each is done with: the same number can be asked by again.)
+  odd.length = 0;
+  for (const id of [3, 6]) hears.heard({ relay: { id, request: { model, context: "one", options: {} } } });
+  await waitFor(() => odd.length === 4, "the requests to be answered", 2000);
+  assert.deepEqual(odd.map((answer) => [answer.relayed.id, answer.relayed.event.type]).sort(), [[3, "done"], [3, "start"], [6, "done"], [6, "start"]]);
+  assert.deepEqual(back.map((answer) => [answer.relayed.event.error.provider, answer.relayed.event.error.model, answer.relayed.event.error.api, answer.relayed.event.error.errorMessage]), [["fake", "plain", undefined, "The call is to ask no more."]]);
+
   // A request that cannot be put on the channel at all is one nobody served.
   const mute = relayClient(() => { throw new TypeError("Do not know how to serialize a BigInt"); });
   assert.equal(await mute.relay.ask({ model, context: { n: 10n }, options: {} }), undefined);
-  // What goes with a request is what of its options is data; a request with something that cannot go is not one to hand over.
-  assert.deepEqual(dataOf({ reasoning: "high", sessionId: "s", headers: { a: "b" }, signal: stop.signal, onPayload: () => {}, toolExecution: "parallel", maxRetries: undefined }), { reasoning: "high", sessionId: "s", headers: { a: "b" } });
+});
+
+test("what goes with a request that is handed over is what of its options is data, by whatever name; and a request with something that would be missed is not handed over", async () => {
+  const stop = new AbortController();
+  // Data is what is the same on the other side of a channel: text, numbers, yes and no, nothing, and lists and plain records of those.
+  for (const data of ["text", "", 0, -1.5, true, false, null, [], {}, [1, "two", null, [true]], { a: { b: [{ c: null }] } }, Object.assign(Object.create(null), { a: 1 }), { nothing: undefined }, { [Symbol("kind")]: "of pi's schemas", a: 1 }]) assert.equal(isData(data), true, JSON.stringify(data));
+  const itself = { name: "holds itself" };
+  itself.self = itself;
+  const twice = { shared: [1] };
+  for (const [what, not] of [
+    ["nothing at all", undefined], ["a function", () => {}], ["a number that is none", NaN], ["a number without end", Infinity], ["a number too large for one", 10n], ["a symbol", Symbol("one")],
+    ["a date", new Date(0)], ["bytes", new Uint8Array(2)], ["a map", new Map()], ["a signal", stop.signal], ["a thing of a kind of its own", new (class Thing { a = 1; })()],
+    ["a list that would have itself gone through otherwise than place by place", Object.assign([() => {}, new Date(0)], { [Symbol.iterator]: function* () { yield 1; } })],
+    ["a list of a kind of its own", new (class List extends Array {})(1, 2)], ["a list that says otherwise than it shows", Object.assign([1], { toJSON: () => "other" })],
+    ["a record that says otherwise than it shows, and does not show that", Object.defineProperty({ a: 1 }, "toJSON", { value: () => "other" })], ["a record that holds one such", { a: [Object.defineProperty({}, "toJSON", { value: () => 1 })] }],
+    ["a list with a gap", [1, undefined]], ["a list with a hole", [1, , 3]], ["a record with a function", { a: { b: () => {} } }], ["a list with a date", [[new Date(0)]]], ["what holds itself", itself],
+  ]) assert.equal(isData(not), false, what);
+  // (What is held twice, and not by itself, is data: it is two of the same on the other side.)
+  assert.equal(isData({ one: twice, two: twice, list: [twice, twice] }), true);
+
+  // What goes with a request: all of it, as it is — but the word to stop by, which goes beside it.
+  assert.deepEqual(dataOf({ reasoningEffort: "high", serviceTier: "flex", thinking: { enabled: true, budgetTokens: 1024 }, signal: stop.signal, maxRetries: undefined, headers: { a: undefined } }),
+    { reasoningEffort: "high", serviceTier: "flex", thinking: { enabled: true, budgetTokens: 1024 }, maxRetries: undefined, headers: { a: undefined } });
   assert.deepEqual(dataOf(undefined), {});
+  // Anything that is not data, and the request is not one to hand over: whoever made it may mean something by it.
+  for (const [name, value] of [["onPayload", () => {}], ["convertToLlm", () => {}], ["client", new (class Client {})()], ["since", new Date(0)], ["list", [undefined]], ["signals", { signal: stop.signal }]]) assert.equal(dataOf({ reasoningEffort: "high", [name]: value }), undefined, name);
+  // Nor is one with a key of the asker's own, a way of its own to the provider, a span to report to, a reply to be fetched later.
   for (const cannotGo of ["apiKey", "fetch", "telemetry", "deferred"]) assert.equal(dataOf({ reasoning: "high", [cannotGo]: "x" }), undefined, cannotGo);
+
+  // An option is under its own name, whatever the name.
+  const named = dataOf(JSON.parse('{ "__proto__": { "sessionId": "another\'s" }, "constructor": 1 }'));
+  assert.deepEqual([Object.keys(named), named.sessionId, Object.getPrototypeOf(named) === Object.prototype], [["__proto__", "constructor"], undefined, true]);
+
+  // Where data has nothing under a name, a word is put there for the way that is nothing else in the data, and
+  // taken out again: the name is then where it was, with nothing under it.
+  const sparse = { a: undefined, b: { c: undefined, d: [{ e: undefined, f: 1 }, null, "text"] }, g: null, h: 0, i: undefined };
+  const { data: onTheWay, mark } = marked(sparse);
+  assert.match(mark, /^nothing:[0-9a-f-]{36}$/);
+  assert.notEqual(marked(sparse).mark, mark);
+  assert.deepEqual(onTheWay, { a: mark, b: { c: mark, d: [{ e: mark, f: 1 }, null, "text"] }, g: null, h: 0, i: mark });
+  assert.deepEqual(sparse.b.d[0], { e: undefined, f: 1 }, "what was marked is a copy");
+  const came = unmarked(JSON.parse(JSON.stringify(onTheWay)), mark);
+  assert.deepEqual(came, sparse);
+  assert.deepEqual([Object.keys(came), Object.keys(came.b), Object.keys(came.b.d[0])], [["a", "b", "g", "h", "i"], ["c", "d"], ["e", "f"]]);
+  // Data that has no such name goes as it is, and nothing is said beside it.
+  for (const full of [undefined, null, "text", 3, [], {}, { a: null, b: [1, { c: false }] }]) assert.deepEqual(marked(full), { data: full });
+  // (A copy, either way: of what the data shows, name by name.)
+  const shown = { a: 1, b: [{ c: "x" }] };
+  Object.defineProperty(shown, "toJSON", { value: () => "something else" });
+  assert.deepEqual(JSON.parse(JSON.stringify(marked(shown).data)), { a: 1, b: [{ c: "x" }] });
+  // The word is taken out from under a record's names, and nowhere else; and what is no such word takes nothing out.
+  assert.deepEqual(unmarked({ a: "m", list: ["m", { b: "m", c: "mm" }], "m": 1 }, "m"), { a: undefined, list: ["m", { b: undefined, c: "mm" }], "m": 1 });
+  for (const none of [undefined, null, "", 7, {}, ["m"]]) assert.deepEqual(unmarked({ a: "m", b: "", c: 7 }, none), { a: "m", b: "", c: 7 }, JSON.stringify(none));
+  const own = unmarked(JSON.parse('{ "__proto__": "m", "a": { "__proto__": "m" } }'), "m");
+  assert.deepEqual([Object.keys(own), Object.keys(own.a), Object.getPrototypeOf(own) === Object.prototype, "m" in {}], [["__proto__", "a"], ["__proto__"], true, false]);
+
+  // What comes all at once comes as a reply of one event, and is had whole of it; a request that failed before it was one fails, saying why.
+  const reply = async function* (...events) { yield* events; };
+  assert.deepEqual(await wholeOf(reply({ type: "done", message: { output: ["an image"] } })), { output: ["an image"] });
+  assert.deepEqual(await wholeOf(reply({ type: "start" }, { type: "done", message: "the last" })), "the last");
+  await assert.rejects(() => wholeOf(reply(notAsked({ provider: "p", id: "m" }, "The call is to ask no more."))), { message: "The call is to ask no more." });
+  await assert.rejects(() => wholeOf(reply()), { message: "The model was not asked." });
+  await assert.rejects(() => wholeOf(reply({ type: "start" })), { message: "The model was not asked." });
+});
+
+test("a relay asks by the ways pi has of asking a model, and by nothing else its models can do", async (t) => {
+  const it = await user(t, ofAllKinds());
+  withAllKinds(it);
+  await withEnv({ ...it.env, TRAMA_TEST_KEY: "a key" }, async () => {
+    const relay = createModelRelay();
+    t.after(() => relay.close());
+    const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
+    const models = await ModelRuntime.create();
+    const chat = models.getModel("fake", "plain"), painter = models.getModelOfType("image", "openrouter", "black-forest-labs/flux-3-image"), judge = models.getModelOfType("classifier", "openrouter", "~liquid/d1-latest");
+    const context = { messages: [{ role: "user", content: [{ type: "text", text: "asked by a relay" }], timestamp: 1 }] };
+    const lastOf = async (events) => { let last; for await (const event of events) last = event; return last; };
+    // Each way: the model it is for, of its kind — and the reply, to its last event, which has what it used.
+    assert.equal(usageAtEnd(await lastOf(await relay.ask({ model: chat, context, options: {} }))).input, 1000);
+    // (By the provider's own options: one that is nothing to a request as pi's agent makes it is sent — and not, asked that way.)
+    const thinks = models.getModel("fake", "thinks");
+    assert.equal(usageAtEnd(await lastOf(await relay.ask({ by: "stream", model: thinks, context, options: { temperature: 0.5, reasoningEffort: "low" } }))).input, 1000);
+    assert.deepEqual([it.requests.at(-1).temperature, it.requests.at(-1).reasoning_effort], [0.5, "low"]);
+    assert.equal(usageAtEnd(await lastOf(await relay.ask({ model: thinks, context, options: { reasoningEffort: "low" } }))).input, 1000);
+    assert.equal(it.requests.at(-1).reasoning_effort, undefined);
+    const images = await lastOf(await relay.ask({ by: "generateImages", model: painter, context: { input: [{ type: "text", text: "a heron" }] }, options: {} }));
+    assert.deepEqual([images.type, images.message.stopReason, images.message.output.length, usageAtEnd(images).output], ["done", "stop", 1, 2000]);
+    const judged = await lastOf(await relay.ask({ by: "classify", model: judge, context: { state: {}, questions: { how: { type: "choice", instructions: "How?", criteria: { standard: "a", complex: "b" } } } }, options: {} }));
+    assert.deepEqual([judged.type, judged.message.answers.how.choice, usageAtEnd(judged).input], ["done", "standard", 300]);
+    assert.equal(it.requests.length, 5);
+    // A model of one kind is not asked by the way of another: it is not the model the asker has.
+    assert.equal(await relay.ask({ by: "classify", model: painter, context: {}, options: {} }), undefined);
+    assert.equal(await relay.ask({ by: "generateImages", model: chat, context: {}, options: {} }), undefined);
+    assert.equal(await relay.ask({ by: "stream", model: judge, context, options: {} }), undefined);
+    // And a way that is none of these is not one to ask by, whatever pi's models have by that name.
+    for (const by of ["login", "logout", "refresh", "setRuntimeApiKey", "getAuth", "cancelDeferred", "fetchDeferred", "streamDeferred", "complete", "constructor", "toString", "__proto__", "", 7]) {
+      assert.equal(await relay.ask({ by, model: chat, context, options: {} }), undefined, String(by));
+    }
+    assert.equal(it.requests.length, 5);
+    // What cannot go with a request is held to here as where it was sent from.
+    assert.equal(await relay.ask({ by: "stream", model: chat, context, options: { apiKey: "another's" } }), undefined);
+    assert.equal(it.requests.length, 5);
+  });
 });
 
 test("a reply that was asked for elsewhere is handed to its session as pi makes a reply: with the whole of it so far, as each part comes", async (t) => {
@@ -531,12 +722,17 @@ test("a request made up by an extension and put on its process's channel is the 
   const it = await user(t);
   withKeyBy(it);
   // A command that says to the runner, as trama's own code in its process would, that the call has a request for its model.
-  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `pi.registerCommand("forge", { description: "asks the runner itself", handler: async (_args, ctx) => {
+  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `pi.registerCommand("forge", { description: "asks the runner itself", handler: async (args, ctx) => {
     note("forging");
     await new Promise((resolve) => setTimeout(resolve, 300));
     const context = { messages: [{ role: "user", content: [{ type: "text", text: "made up" }], timestamp: Date.now() }] };
     process.send({ relay: { id: 424242, request: { model: ctx.model, context, options: {} } } });
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    // (Until the runner has answered it, however long that takes it — or, told to be brief, for a moment: nobody may answer.)
+    await new Promise((resolve) => {
+      const heard = (word) => { if (word?.relayed?.id === 424242 && (word.relayed.not || ["done", "error"].includes(word.relayed.event?.type))) resolve(); };
+      process.on("message", heard);
+      setTimeout(resolve, args.includes("briefly") ? 600 : 20_000).unref();
+    });
   } });`));
 
   // While the call lasts: the model is asked, and what that used is the call's — though its process, which asked nothing, says it used nothing.
@@ -548,7 +744,7 @@ test("a request made up by an extension and put on its process's channel is the 
 
   // Once the call is cancelled: nothing is asked for it.
   const stop = new AbortController(), noted = it.seen().length;
-  const call = askedWith(it, "a key", "/forge", { extensions: true, signal: stop.signal });
+  const call = askedWith(it, "a key", "/forge briefly", { extensions: true, signal: stop.signal });
   call.catch(() => {});
   await waitFor(() => it.seen().length > noted + 1, "the command to begin");
   stop.abort();
@@ -579,6 +775,22 @@ test("a conversation that holds what cannot be sent is no reason for a call to f
   // could not: what is sent of a conversation is all of it, as it is — a provider may be one that takes it so.
   assert.deepEqual(it.headers.slice(-2).map(keyOf), ["Bearer the second", "Bearer the first"]);
   assert.match(JSON.stringify(it.requests.at(-1).messages), /ten/);
+
+  // And what a tool keeps that can be sent, though it is not what it was on the other side — a date, a list with a
+  // gap in it — is nothing a provider is sent of the agent's conversation: its model is asked by the runner all the same.
+  const kept = await user(t, (request, stream) => {
+    if (!request.messages.some((message) => message.role === "tool")) stream.calls("keeps");
+    else { stream.says({ role: "assistant", content: "hello from the fake" }); stream.says({}, "stop"); }
+    stream.done();
+  });
+  withKeyBy(kept);
+  kept.put(kept.agentDir, "extensions/mine.ts", EXTENSION("mine", `pi.registerTool({ name: "keeps", label: "keeps", description: "Keeps", parameters: { type: "object", properties: {} }, async execute() {
+    return { content: [{ type: "text", text: "kept" }], details: { when: new Date(0), list: [1, undefined] } };
+  } });`));
+  await askedWith(kept, "the first", "say hello", { extensions: true });
+  assert.equal(await askedWith(kept, "the second", "say hello", { extensions: true }), "hello from the fake");
+  assert.deepEqual(kept.headers.slice(-2).map(keyOf), ["Bearer the second", "Bearer the second"]);
+  assert.match(JSON.stringify(kept.requests.at(-1).messages), /kept/);
 });
 
 test("a process an extension has made other than it was — its variables, its way to the network — asks its call's model itself", async (t) => {
@@ -724,7 +936,7 @@ test("a call that has its answer keeps it: what an extension would ask beside it
   {
     const it = await user(t, twice);
     withKeyBy(it);
-    it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", ASKS_AT("session_shutdown", "streamSimple", "complete")));
+    it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", ASKS_AT("session_shutdown", "streamSimple", "complete", "itself")));
     await withEnv({ ...it.env, TRAMA_TEST_KEY: "a key" }, async () => {
       const spent = [];
       const backend = createBackend({ provider: "fake", model: "plain" }, createMeter({ tokens: 2000 }), (why) => spent.push(why));
@@ -733,7 +945,7 @@ test("a call that has its answer keeps it: what an extension would ask beside it
       assert.equal(await backend.ask("read a.txt", { cwd: it.cwd, extensions: true, used: (usage) => used.push(total(usage)), sofar: (usage, answered) => told.push([total(usage), answered]) }), "the answer");
       // (Whoever a program has listening is told what the backend was: how much, and whether the call had its answer by then.)
       assert.deepEqual(told, [[1200, false], [2400, true]]);
-      assert.deepEqual(asked(it), ["asked for itself at session_shutdown, by streamSimple: aborted", "asked for itself at session_shutdown, by complete: aborted"]);
+      assert.deepEqual(asked(it), ["asked for itself at session_shutdown, by streamSimple: aborted", "asked for itself at session_shutdown, by complete: aborted", "asked for itself at session_shutdown, by itself: aborted"]);
       assert.equal(it.requests.length, 2);
       assert.deepEqual(used, [2400]);
       // (A request was refused for the budget, and that is said, as it is of any.)
@@ -744,8 +956,8 @@ test("a call that has its answer keeps it: what an extension would ask beside it
       t.after(() => roomy.close());
       used.length = 0;
       assert.equal(await roomy.ask("read a.txt", { cwd: it.cwd, extensions: true, used: (usage) => used.push(total(usage)) }), "the answer");
-      assert.deepEqual(asked(it).slice(2), ["asked for itself at session_shutdown, by streamSimple: stop", "asked for itself at session_shutdown, by complete: stop"]);
-      assert.deepEqual(used, [4800]);
+      assert.deepEqual(asked(it).slice(3), ["asked for itself at session_shutdown, by streamSimple: stop", "asked for itself at session_shutdown, by complete: stop", "asked for itself at session_shutdown, by itself: stop"]);
+      assert.deepEqual(used, [6000]);
     });
   }
 
@@ -928,10 +1140,10 @@ const withoutTimes = (notes) => notes.map((what) => what.replace(/ at \d+$/, "")
 
 test("an extension that is asking a model as its session ends is waited for, past the while it is given when it asks nothing: it is answered, and what it asked is the call's", async (t) => {
   // Three seconds, then five and a half: more than the five an extension is given, together and the second by itself.
-  // The first is asked by the runner (as pi asks), the second where the extension is (by a provider's own options).
+  // The first is asked by the runner (as pi asks), the second where the extension is (it has a hand of its own in the asking).
   const it = await user(t, slowForExtensions((nth) => (nth === 1 ? 3000 : 5500)));
   withKeyBy(it);
-  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `${ASKS_AT("session_shutdown", "streamSimple", "complete")}
+  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `${ASKS_AT("session_shutdown", "streamSimple", "itself")}
   pi.on("session_shutdown", async () => { note("told of the end at " + Date.now()); });`));
   const used = [], began = Date.now();
   const answer = await withEnv({ ...it.env, TRAMA_TEST_KEY: "a key" }, () => it.adapter.ask("say hello", { cwd: it.cwd, extensions: true, used: (usage) => used.push(total(usage)) }));
@@ -941,7 +1153,7 @@ test("an extension that is asking a model as its session ends is waited for, pas
   assert.ok(back - began >= 8500, `the call came back after ${back - began} ms`);
   assert.ok(back - notedAt(it, "told") < 8500 + 4000, `the call came back ${back - notedAt(it, "told")} ms after its extensions were told of the end`);
   // Both were answered by the time the call came back, and both are in what it says it used.
-  assert.deepEqual(notedBy(it, "asked"), ["asked for itself at session_shutdown, by streamSimple: stop", "asked for itself at session_shutdown, by complete: stop"]);
+  assert.deepEqual(notedBy(it, "asked"), ["asked for itself at session_shutdown, by streamSimple: stop", "asked for itself at session_shutdown, by itself: stop"]);
   assert.deepEqual(used, [3600]);
   assert.equal(it.dropped(), 0);
 });
@@ -972,9 +1184,10 @@ test("the while an extension is given as its session ends is its own, all told: 
 });
 
 test("what an extension has asked beside its answer to the session's end is waited for too", async (t) => {
-  // (One request at a time — as pi asks, then by a provider's own options — so that nothing else is being asked
-  // while it is on its way from being made ready to being answered.)
-  for (const ask of ["ctx.modelRegistry.streamSimple(ctx.model, context, {}).result()", "ctx.modelRegistry.complete(ctx.model, context, {})"]) {
+  // (One request at a time — as pi asks, by a provider's own options, and so with a hand of the extension's own in
+  // it, which is asked where the extension is — so that nothing else is being asked while it is on its way from
+  // being made ready to being answered.)
+  for (const ask of ["ctx.modelRegistry.streamSimple(ctx.model, context, {}).result()", "ctx.modelRegistry.complete(ctx.model, context, {})", "ctx.modelRegistry.complete(ctx.model, context, { onPayload: () => undefined })"]) {
     const it = await user(t, slowForExtensions(() => 1500));
     withKeyBy(it);
     it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `pi.on("session_shutdown", (_event, ctx) => {
@@ -1000,14 +1213,16 @@ test("an extension asking as its session ends is waited for no longer than pi gi
     const context = { messages: [{ role: "user", content: [{ type: "text", text: "an extension asks" }], timestamp: Date.now() }] };
     // (Each with something of its own to be stopped by, which never says so: a signal of the system's, and one of the extension's own making.)
     const made = Object.assign(new EventTarget(), { aborted: false, reason: undefined, throwIfAborted() {} });
-    const replies = await Promise.all([ctx.modelRegistry.streamSimple(ctx.model, context, { signal: new AbortController().signal }).result(), ctx.modelRegistry.complete(ctx.model, context, { signal: made })]);
+    const madeToo = Object.assign(new EventTarget(), { aborted: false, reason: undefined, throwIfAborted() {} });
+    const replies = await Promise.all([ctx.modelRegistry.streamSimple(ctx.model, context, { signal: new AbortController().signal }).result(), ctx.modelRegistry.complete(ctx.model, context, { signal: made }), ctx.modelRegistry.complete(ctx.model, context, { signal: madeToo, onPayload: () => undefined })]);
     note("asked both: " + replies.map((reply) => reply.stopReason).join(", "));
   });`;
   for (const [where, settings] of [["in a process of its own", { retry: { provider: { timeoutMs: 2000 } } }], ["here", { httpIdleTimeoutMs: 2000 }]]) {
     const it = await user(t, slowForExtensions(() => undefined));
     withKeyBy(it);
     it.put(it.agentDir, "settings.json", JSON.stringify(settings));
-    // Asked both ways at once: as pi asks — by the runner, where the call is served apart — and by a provider's own options.
+    // Asked all at once: as pi asks and by a provider's own options — by the runner, where the call is served apart —
+    // and with a hand of the extension's own in the asking, which is asked where the extension is.
     it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", BOTH));
     const used = [], began = Date.now();
     const call = { cwd: it.cwd, extensions: true, used: (usage) => used.push(total(usage)) };
@@ -1017,13 +1232,13 @@ test("an extension asking as its session ends is waited for no longer than pi gi
       assert.equal(answer, "hello from the fake", where);
       // (After the two seconds, and long before the five minutes pi gives where its settings say nothing.)
       assert.ok(took >= 2000 && took < 60_000, `${where}: the call came back after ${took} ms`);
-      // Neither request was left being made: the model's server saw both let go of.
-      await waitFor(() => it.dropped() === 2, `${where}: both requests to be let go of`, 2000);
+      // No request was left being made: the model's server saw all three let go of.
+      await waitFor(() => it.dropped() === 3, `${where}: the three requests to be let go of`, 2000);
       await waitFor(() => notedBy(it, "asked").length === 1, `${where}: the extension to have heard`, 2000);
     });
-    assert.deepEqual(notedBy(it, "asked"), ["asked both: aborted, aborted"], where);
+    assert.deepEqual(notedBy(it, "asked"), ["asked both: aborted, aborted, aborted"], where);
     assert.deepEqual(used, [1200], where);
-    assert.equal(it.requests.length, 3, where);
+    assert.equal(it.requests.length, 4, where);
   }
 });
 
@@ -1043,7 +1258,7 @@ test("where pi gives a request no limit, or the longest there is, an extension a
 test("a call that is cancelled while its extension is asking, as the session ends, has that stopped at once — where the extension is, too", async (t) => {
   const it = await user(t, slowForExtensions(() => undefined));
   withKeyBy(it);
-  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", ASKS_AT("session_shutdown", "complete")));
+  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", ASKS_AT("session_shutdown", "itself")));
   const cancel = new AbortController();
   const call = withEnv({ ...it.env, TRAMA_TEST_KEY: "a key" }, () => it.adapter.ask("say hello", { cwd: it.cwd, extensions: true, signal: cancel.signal }));
   call.catch(() => {});
@@ -1053,7 +1268,7 @@ test("a call that is cancelled while its extension is asking, as the session end
   await waitFor(() => it.dropped() === 1, "the request to be let go of", 3000);
   // (Whether a call that had its answer when it was cancelled still gives it is not what this is about.)
   await call.then(() => {}, () => {});
-  assert.deepEqual(notedBy(it, "asked"), ["asked for itself at session_shutdown, by complete: aborted"]);
+  assert.deepEqual(notedBy(it, "asked"), ["asked for itself at session_shutdown, by itself: aborted"]);
 });
 
 test("a reply that is stopped at the limit has used what it had used by then, and that is the call's — wherever it was asked", async (t) => {
@@ -1063,7 +1278,7 @@ test("a reply that is stopped at the limit has used what it had used by then, an
     stream.says({ role: "assistant", content: "the beginning of a summary" });
     stream.uses({ prompt_tokens: 5000, completion_tokens: 700, total_tokens: 5700 });
   };
-  for (const [pool, way] of [["the runner asks", "streamSimple"], ["a process of the run's asks", "streamSimple"], ["the call's own process asks", "complete"]]) {
+  for (const [pool, way] of [["the runner asks", "streamSimple"], ["the runner asks, by a provider's own options", "complete"], ["a process of the run's asks", "streamSimple"], ["the call's own process asks", "itself"]]) {
     const it = await user(t, inPart);
     withKeyBy(it);
     it.put(it.agentDir, "settings.json", JSON.stringify({ retry: { provider: { timeoutMs: 1500 } } }));
@@ -1332,4 +1547,423 @@ test("nor does it where the question was put while the call was still at its wor
   assert.deepEqual(notedBy(it, "asked"), ["asked beside the agent: aborted"]);
   assert.deepEqual(heard, [[1200, false]]);
   assert.equal(it.requests.length, 1);
+});
+
+// --- The other ways pi has of asking a model: by a provider's own options, for images, of a classifier, for a reply kept for later ---
+
+/** What an extension asks with: one message, of the text given. */
+const SAYING = `const saying = (text) => ({ messages: [{ role: "user", content: [{ type: "text", text }], timestamp: Date.now() }] });`;
+/** The text of the last message of a request, as the model's server saw it. */
+const lastSaid = (request) => request.messages.at(-1).content.at(-1).text;
+
+test("what an extension asks by a provider's own options is asked by the call's runner too, where all that goes with it is data — and where the extension is, where something is not, or is the asker's own", async (t) => {
+  const it = await user(t);
+  withKeyBy(it);
+  // Each asks by pi, with what it is named for; and writes down how it went.
+  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `pi.on("agent_end", async (_event, ctx) => {
+    ${SAYING}
+    const models = ctx.modelRegistry, model = ctx.model;
+    const ways = {
+      "complete, bare": () => models.complete(model, saying("complete, bare"), {}),
+      "complete, with data": () => models.complete(model, saying("complete, with data"), { temperature: 0.25, headers: { "x-mine": "said" }, sessionId: "its own", nothing: undefined, deep: { list: [1, "two", null, { three: true }] } }),
+      "stream": () => models.stream(model, saying("stream"), { maxTokens: 64 }).result(),
+      "complete, with an option of the provider's own": () => models.complete(models.find("fake", "thinks"), saying("complete, with an option of the provider's own"), { reasoningEffort: "low" }),
+      "complete, with a hook": () => models.complete(model, saying("complete, with a hook"), { onResponse: () => {} }),
+      "complete, with what is no data": () => models.complete(model, saying("complete, with what is no data"), { since: new Date(0) }),
+      "complete, with a list that has a gap": () => models.complete(model, saying("complete, with a list that has a gap"), { list: [1, undefined] }),
+      "complete, with a key of its own": () => models.complete(model, saying("complete, with a key of its own"), { apiKey: "its own" }),
+      "complete, of what is no data": () => models.complete(model, { messages: [{ role: "user", content: [{ type: "text", text: "complete, of what is no data" }], timestamp: Date.now(), at: new Date(0) }] }, {}),
+      "streamSimple, with a hook": () => models.streamSimple(model, saying("streamSimple, with a hook"), { onPayload: () => undefined }).result(),
+      "streamSimple, its headers made other": () => models.streamSimple(model, saying("streamSimple, its headers made other"), { transformHeaders: (headers) => ({ ...headers, "x-made": "other" }) }).result(),
+      "streamSimple, its headers left": () => models.streamSimple(model, saying("streamSimple, its headers left"), { transformHeaders: (headers) => ({ ...headers }) }).result(),
+      "streamSimple, its headers made none": () => models.streamSimple(model, saying("streamSimple, its headers made none"), { transformHeaders: () => null }).result(),
+      "streamSimple, a header that cannot be told": () => models.streamSimple(model, saying("streamSimple, a header that cannot be told"), { transformHeaders: (headers) => ({ ...headers, "x-big": 10n }) }).result(),
+      "complete, with what goes deeper than can be followed": () => { let deep = {}; for (let at = 0; at < 20000; at += 1) deep = { deep }; return models.complete(model, saying("complete, with what goes deeper than can be followed"), { deep }); },
+      "streamSimple, a header taken out": () => models.streamSimple(model, saying("streamSimple, a header taken out"), { transformHeaders: (headers) => ({ ...headers, "User-Agent": undefined }) }).result(),
+      "streamSimple, its headers in another order": () => models.streamSimple(model, saying("streamSimple, its headers in another order"), { headers: { "x-one": "1", "x-two": "2" }, transformHeaders: (headers) => Object.fromEntries(Object.entries(headers).reverse()) }).result(),
+      "streamSimple, with a function that is nothing to a provider": () => models.streamSimple(model, saying("streamSimple, with a function that is nothing to a provider"), { mine: () => {} }).result(),
+    };
+    for (const [name, ask] of Object.entries(ways)) note("asked " + name + ": " + (await ask()).stopReason);
+  });`));
+  // The process that serves the calls is started with one key, and the runner has another by the next call.
+  await askedWith(it, "the first", "say hello", { extensions: true });
+  const before = it.requests.length, used = [];
+  await askedWith(it, "the second", "say hello", { extensions: true, used: (usage) => used.push(total(usage)) });
+  const who = Object.fromEntries(it.requests.slice(before + 1).map((request, at) => [lastSaid(request), keyOf(it.headers[before + 1 + at])]));
+  const RUNNER = "Bearer the second", HOST = "Bearer the first";
+  assert.deepEqual(who, {
+    "complete, bare": RUNNER,
+    "complete, with data": RUNNER,
+    "stream": RUNNER,
+    "complete, with an option of the provider's own": RUNNER,
+    // A hook of the asker's own is its hand in the request; what is no data may mean something to a provider, and
+    // would not be what it is on the other side; a key of the asker's own is the key the request is to be made by.
+    "complete, with a hook": HOST,
+    "complete, with what is no data": HOST,
+    "complete, with a list that has a gap": HOST,
+    "complete, with a key of its own": "Bearer its own",
+    "complete, of what is no data": HOST,
+    "streamSimple, with a hook": HOST,
+    "streamSimple, its headers made other": HOST,
+    // (What made nothing of the headers is no hand in the request. Any other function is one its asker may mean
+    // something by, whatever pi's providers make of it today: only of a request pi's agent makes for itself is
+    // what is not data left behind.)
+    "streamSimple, its headers left": RUNNER,
+    // (A name with nothing under it is a name; and so is the order they are in: pi lays headers one over another by both.)
+    "streamSimple, its headers made none": HOST,
+    // (What cannot be told, or followed to its end, is not known to be what it was, or to be data: such a request is
+    // asked where it was made, as pi would ask it.)
+    "streamSimple, a header that cannot be told": HOST,
+    "complete, with what goes deeper than can be followed": HOST,
+    "streamSimple, a header taken out": HOST,
+    "streamSimple, its headers in another order": HOST,
+    "streamSimple, with a function that is nothing to a provider": HOST,
+  });
+  // What went with a request went with it, wherever it was asked.
+  const sent = (text) => it.requests.findLastIndex((request) => lastSaid(request) === text);
+  assert.equal(it.requests[sent("complete, with data")].temperature, 0.25);
+  assert.equal(it.headers[sent("complete, with data")]["x-mine"], "said");
+  assert.equal(it.requests[sent("stream")].max_completion_tokens ?? it.requests[sent("stream")].max_tokens, 64);
+  assert.equal(it.headers[sent("streamSimple, its headers made other")]["x-made"], "other");
+  // (A header pi's provider has of its own, which the request's are laid over: named with nothing under it, it is not pi's.)
+  assert.match(it.headers[sent("streamSimple, its headers left")]["user-agent"], /^pi\//);
+  assert.doesNotMatch(it.headers[sent("streamSimple, a header taken out")]["user-agent"], /^pi\//);
+  // (An option that is the provider's own, and nothing to a request as pi's agent makes one: asked by the way it was asked by.)
+  assert.equal(it.requests[sent("complete, with an option of the provider's own")].reasoning_effort, "low");
+  assert.equal(it.headers[sent("streamSimple, a header that cannot be told")]["x-big"], "10");
+  // Every one was answered, and is in what the call used: the agent's request, and the eighteen.
+  assert.deepEqual(notedBy(it, "asked").slice(-18).map((what) => what.slice(what.lastIndexOf(": ") + 2)), Array(18).fill("stop"));
+  assert.deepEqual(used, [19 * 1200]);
+});
+
+/** A user whose pi has an image model and a classifier answered by the test's server, beside the chat model: with a key that says who asked. */
+const withAllKinds = (it) => it.put(it.agentDir, "models.json", JSON.stringify({ providers: {
+  fake: { baseUrl: `http://127.0.0.1:${it.port}/v1`, api: "openai-completions", apiKey: "$TRAMA_TEST_KEY", models: [{ id: "plain", cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } }, { id: "thinks", reasoning: true, cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } }] },
+  // (One of pi's own providers, reached at the test's server: it has models that make images, and models that classify.)
+  openrouter: { baseUrl: `http://127.0.0.1:${it.port}/v1`, apiKey: "$TRAMA_TEST_KEY" },
+} }));
+/** A model's server that answers each kind as its kind is answered — after `late(kind)` ms, or never where that is undefined. */
+const ofAllKinds = (late = () => 0) => (request, stream, _nth, path) => {
+  const kind = path.endsWith("/systemone") ? "classifier" : request.stream === false ? "image" : "chat";
+  const answer = () => {
+    if (kind === "classifier") return stream.whole({ answers: { how: { type: "choice", choice: "standard", probabilities: { standard: 0.9, complex: 0.1 }, confidence: 0.9 } }, usage: { input_tokens: 300, output_tokens: 5 } });
+    if (kind === "image") return stream.whole({ id: "made", usage: { prompt_tokens: 40, completion_tokens: 2000 }, choices: [{ message: { content: "", images: [{ image_url: { url: "data:image/png;base64,AAAA" } }] } }] });
+    stream.says({ role: "assistant", content: "hello from the fake" });
+    stream.says({}, "stop");
+    stream.done();
+  };
+  const after = late(kind);
+  if (after === 0) answer();
+  else if (after !== undefined) setTimeout(answer, after);
+};
+/** An extension's code that asks for an image, and then a classifier, when `event` comes — with `options` — and writes down what came of each. */
+const ASKS_ALL_KINDS_AT = (event, options = "{}") => `pi.on("${event}", async (_event, ctx) => {
+    const models = ctx.modelRegistry;
+    const images = await models.generateImages(models.findOfType("image", "openrouter", "black-forest-labs/flux-3-image"), { input: [{ type: "text", text: "a heron at low tide" }] }, ${options});
+    note("asked for an image: " + images.stopReason + ", " + (images.errorMessage ?? images.output.filter((one) => one.type === "image").length + " made"));
+    const judged = await models.classify(models.findOfType("classifier", "openrouter", "~liquid/d1-latest"), { state: { prompt: "say hello" }, questions: { how: { type: "choice", instructions: "How hard is it?", criteria: { standard: "Ordinary", complex: "Hard" } } } }, ${options});
+    note("asked a classifier: " + judged.stopReason + ", " + (judged.errorMessage ?? judged.answers.how.choice));
+  });`;
+/** What the image and the classifier's answer used, as the server above says: 2040 and 305. */
+const IMAGE = 2040, JUDGED = 305;
+
+test("a model that makes images and one that classifies are asked by the call's runner as any model is: counted as their replies come, said before they are asked, and asked where the extension is where it has a hand in it", async (t) => {
+  const kinds = (it, from) => it.paths.slice(from).map((path, at) => [path.endsWith("/systemone") ? "classifier" : it.requests[from + at].stream === false ? "image" : "chat", keyOf(it.headers[from + at])]);
+  const RUNNER = "Bearer the second", HOST = "Bearer the first";
+  // (Who asks the agent's model, and who the other two: a session where an extension has a hand in every request asks
+  // all its models itself; a request that goes with a hook of its asker's is that one request.)
+  for (const [how, body, options, agents, asker] of [
+    ["nobody has a hand in the asking", "", "{}", RUNNER, RUNNER],
+    ["an extension hears what a provider answers", `pi.on("after_provider_response", () => {});`, "{}", HOST, HOST],
+    ["the request goes with a hook of its asker's", "", "{ onResponse: () => {} }", RUNNER, HOST],
+  ]) {
+    const it = await user(t, ofAllKinds());
+    withAllKinds(it);
+    it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `${ASKS_ALL_KINDS_AT("agent_end", options)}\n  ${body}`));
+    await askedWith(it, "the first", "say hello", { extensions: true });
+    const before = it.requests.length, said = [], had = [];
+    await askedWith(it, "the second", "say hello", { extensions: true, had: (usage) => had.push(total(usage)), sofar: (usage) => said.push(["sofar", total(usage)]), used: (usage) => said.push(["used", total(usage)]) });
+    assert.deepEqual(kinds(it, before), [["chat", agents], ["image", asker], ["classifier", asker]], how);
+    assert.deepEqual(notedBy(it, "asked").slice(-2), ["asked for an image: stop, 1 made", "asked a classifier: stop, standard"], how);
+    // What each used is the call's: said as its reply came, said before the next was asked, and in what the call used.
+    assert.deepEqual([...new Set(had)], [1200, 1200 + IMAGE, 1200 + IMAGE + JUDGED], how);
+    assert.deepEqual(said, [["sofar", 1200], ["sofar", 1200 + IMAGE], ["used", 1200 + IMAGE + JUDGED]], how);
+  }
+});
+
+test("a call that is out of budget has no image made and nothing classified: neither is asked, and each ends saying so — whoever would have asked", async (t) => {
+  const refused = ["asked for an image: error, The call is to ask no more.", "asked a classifier: error, The call is to ask no more."];
+  // By a backend, held to a budget the agent's reply has spent: served in a process of its own, its models asked by the runner.
+  {
+    const it = await user(t, ofAllKinds());
+    withAllKinds(it);
+    it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", ASKS_ALL_KINDS_AT("session_shutdown")));
+    await withEnv({ ...it.env, TRAMA_TEST_KEY: "a key" }, async () => {
+      const backend = createBackend({ provider: "fake", model: "plain" }, createMeter({ tokens: 1000 }));
+      t.after(() => backend.close());
+      const used = [];
+      assert.equal(await backend.ask("say hello", { cwd: it.cwd, extensions: true, used: (usage) => used.push(total(usage)) }), "hello from the fake");
+      assert.deepEqual(notedBy(it, "asked"), refused);
+      assert.equal(it.requests.length, 1);
+      assert.deepEqual(used, [1200]);
+      // And with room, an image's cost in tokens is the budget's as any reply's is: the classifier is not asked once the image has spent it.
+      const roomy = createBackend({ provider: "fake", model: "plain" }, createMeter({ tokens: 3000 }));
+      t.after(() => roomy.close());
+      used.length = 0;
+      assert.equal(await roomy.ask("say hello", { cwd: it.cwd, extensions: true, used: (usage) => used.push(total(usage)) }), "hello from the fake");
+      assert.deepEqual(notedBy(it, "asked").slice(2), ["asked for an image: stop, 1 made", refused[1]]);
+      assert.deepEqual(used, [1200 + IMAGE]);
+      assert.equal(roomy.refused(), `The budget is spent: ${1200 + IMAGE} tokens used of 3000.`);
+    });
+  }
+  // By what serves the call, here: whoever hears what the call has used says no once it has its answer.
+  {
+    const it = await user(t, ofAllKinds());
+    withAllKinds(it);
+    it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", ASKS_ALL_KINDS_AT("session_shutdown")));
+    const heard = [];
+    assert.equal(await withEnv({ ...it.env, TRAMA_TEST_KEY: "a key" }, () => it.adapter.serve("say hello", { cwd: it.cwd, extensions: true, sofar: (usage, answered) => { heard.push([total(usage), answered]); return !answered; } })), "hello from the fake");
+    assert.deepEqual(notedBy(it, "asked"), refused);
+    // (Asked once, of the image; and no more, having said no.)
+    assert.deepEqual(heard, [[1200, true]]);
+    assert.equal(it.requests.length, 1);
+  }
+});
+
+test("an extension that is having an image made, or something classified, as its session ends is waited for as one asking for a reply is — and what is still asked when the time is up, or the call cancelled, is stopped where it is asked", async (t) => {
+  // Waited for, past the five seconds extensions are given: a classifier that takes five and a half. Served apart, and asked by the runner.
+  {
+    const it = await user(t, ofAllKinds((kind) => (kind === "classifier" ? 5500 : 0)));
+    withAllKinds(it);
+    it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", ASKS_ALL_KINDS_AT("session_shutdown")));
+    const used = [], began = Date.now();
+    await withEnv({ ...it.env, TRAMA_TEST_KEY: "a key" }, () => it.adapter.ask("say hello", { cwd: it.cwd, extensions: true, used: (usage) => used.push(total(usage)) }));
+    assert.ok(Date.now() - began >= 5500, `the call came back after ${Date.now() - began} ms`);
+    assert.deepEqual(notedBy(it, "asked"), ["asked for an image: stop, 1 made", "asked a classifier: stop, standard"]);
+    assert.deepEqual(used, [1200 + IMAGE + JUDGED]);
+    assert.equal(it.dropped(), 0);
+  }
+  // Stopped when the time pi gives a request is up: an image that is never made. Where the call is served apart (the
+  // runner asks), and here (what serves the call asks).
+  for (const where of ["in a process of its own", "here"]) {
+    const it = await user(t, ofAllKinds((kind) => (kind === "image" ? undefined : 0)));
+    withAllKinds(it);
+    it.put(it.agentDir, "settings.json", JSON.stringify({ retry: { provider: { timeoutMs: 1500 } } }));
+    it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", ASKS_ALL_KINDS_AT("session_shutdown")));
+    const call = { cwd: it.cwd, extensions: true }, began = Date.now();
+    await withEnv({ ...it.env, TRAMA_TEST_KEY: "a key" }, async () => {
+      assert.equal(await (where === "here" ? it.adapter.serve("say hello", call) : it.adapter.ask("say hello", call)), "hello from the fake", where);
+      const took = Date.now() - began;
+      assert.ok(took >= 1500 && took < 60_000, `${where}: the call came back after ${took} ms`);
+      await waitFor(() => it.dropped() === 1, `${where}: the request to be let go of`, 2000);
+      await waitFor(() => notedBy(it, "asked").length === 2, `${where}: the extension to have heard of both`, 2000);
+    });
+    // The image's making was stopped; and the classifier, which the extension came to when its session was gone, was not asked.
+    assert.match(notedBy(it, "asked")[0], /^asked for an image: aborted, /, where);
+    assert.equal(notedBy(it, "asked")[1], "asked a classifier: error, The call is to ask no more.", where);
+    assert.equal(it.requests.length, 2, where);
+  }
+  // Stopped at once when the call is cancelled.
+  {
+    const it = await user(t, ofAllKinds((kind) => (kind === "classifier" ? undefined : 0)));
+    withAllKinds(it);
+    it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", ASKS_ALL_KINDS_AT("session_shutdown")));
+    const cancel = new AbortController();
+    const call = withEnv({ ...it.env, TRAMA_TEST_KEY: "a key" }, () => it.adapter.ask("say hello", { cwd: it.cwd, extensions: true, signal: cancel.signal }));
+    call.catch(() => {});
+    await waitFor(() => it.requests.length === 3, "the classifier to be asked", 30_000);
+    cancel.abort();
+    await waitFor(() => it.dropped() === 1, "the request to be let go of", 3000);
+    await call.then(() => {}, () => {});
+    await waitFor(() => notedBy(it, "asked a classifier").length === 1, "the extension to have heard", 2000);
+    assert.match(notedBy(it, "asked a classifier")[0], /^asked a classifier: aborted, /);
+  }
+});
+
+/**
+ * An extension with a provider of pi's own making, for tests: one that keeps a reply for later, when asked to, and
+ * writes it out at `speed` tokens a second when it is fetched. `body` is what the extension does with it.
+ */
+const KEEPS_FOR_LATER = (speed, body) => `import { appendFileSync } from "node:fs";
+import { fauxAssistantMessage, fauxProvider } from "@earendil-works/pi-ai";
+export default function (pi) {
+  const note = (what) => appendFileSync(process.env.TRAMA_TEST_SEEN, process.pid + " " + what + "\\n");
+  const faux = fauxProvider({ provider: "later", tokensPerSecond: ${speed} });
+  pi.registerProvider(faux.provider);
+  const context = { messages: [{ role: "user", content: [{ type: "text", text: "an extension asks" }], timestamp: Date.now() }] };
+  /** Has a reply of sixty words kept for later; gives the model, and what the reply is to be fetched by. */
+  const kept = async (ctx) => {
+    const model = ctx.modelRegistry.find("later", faux.models[0].id);
+    faux.setResponses([fauxAssistantMessage(Array(60).fill("word").join(" "))]);
+    const first = await ctx.modelRegistry.streamSimple(model, context, { deferred: true }).result();
+    return { model, handle: first.deferred, first };
+  };
+  /** How a call of pi's went, that may throw. */
+  const tried = (work) => work.then(() => "done", (err) => "threw: " + err.message);
+  ${body}
+}
+`;
+
+test("a reply that was kept for later is the call's when it is fetched: counted, said as it comes, waited for as the session ends, and stopped with the call — and to have a provider give one up is refused nobody", async (t) => {
+  // Counted: asked for as the agent ends, where the call is served (a provider of an extension's is nobody else's to ask).
+  for (const where of ["here", "in a process of its own"]) {
+    const it = await user(t);
+    it.put(it.agentDir, "extensions/later.ts", KEEPS_FOR_LATER(2000, `pi.on("agent_end", async (_event, ctx) => {
+    const { model, handle, first } = await kept(ctx);
+    const fetched = await ctx.modelRegistry.runtime.fetchDeferred(model, handle, {});
+    note("fetched: " + first.stopReason + ", then " + fetched.stopReason + ", which used " + (fetched.usage.input + fetched.usage.output));
+  });`));
+    const used = [], had = [], call = { cwd: it.cwd, extensions: true, had: (usage) => had.push(total(usage)), used: (usage) => used.push(total(usage)) };
+    await withEnv(it.env, () => (where === "here" ? it.adapter.serve("say hello", call) : it.adapter.ask("say hello", call)));
+    const fetched = Number(notedBy(it, "fetched").at(-1)?.match(/^fetched: deferred, then stop, which used (\d+)$/)?.[1]);
+    assert.ok(fetched > 0, `${where}: ${notedBy(it, "fetched")}`);
+    assert.deepEqual(used, [1200 + fetched], where);
+    assert.equal(had.at(-1), 1200 + fetched, where);
+  }
+
+  // Waited for: fetched as the session ends, by an extension that does not wait for it — three seconds of writing.
+  {
+    const it = await user(t);
+    it.put(it.agentDir, "extensions/later.ts", KEEPS_FOR_LATER(20, `pi.on("session_shutdown", async (_event, ctx) => {
+    const { model, handle } = await kept(ctx);
+    void ctx.modelRegistry.runtime.fetchDeferred(model, handle, {}).then((fetched) => note("fetched: " + fetched.stopReason + " at " + Date.now()));
+  });`));
+    const used = [];
+    await it.ask("say hello", { extensions: true, used: (usage) => used.push(total(usage)) });
+    const back = Date.now();
+    assert.deepEqual(withoutTimes(notedBy(it, "fetched")), ["fetched: stop"]);
+    assert.ok(back >= notedAt(it, "fetched"), `the call came back ${notedAt(it, "fetched") - back} ms before the reply had`);
+    assert.ok(used[0] > 1200, `the call used ${used[0]}`);
+  }
+
+  // Stopped with the call: cancelled while the reply is being fetched. What is asked after is refused — but not
+  // that the provider give the reply up, which asks no model: of a provider that can; of one that cannot, it fails as it would for anyone.
+  {
+    const it = await user(t);
+    it.put(it.agentDir, "extensions/later.ts", KEEPS_FOR_LATER(2, `pi.on("session_shutdown", async (_event, ctx) => {
+    const { model, handle } = await kept(ctx);
+    const runtime = ctx.modelRegistry.runtime;
+    note("fetching");
+    note("fetched: " + (await runtime.fetchDeferred(model, handle, {})).stopReason);
+    const again = await runtime.fetchDeferred(model, handle, {});
+    note("fetched again: " + again.stopReason + ", " + again.errorMessage);
+    note("had it given up: " + await tried(runtime.cancelDeferred(model, handle, {})) + ", " + faux.state.cancelledDeferred.length + " given up");
+    note("had another give one up: " + await tried(runtime.cancelDeferred(ctx.model, handle, {})));
+  });`));
+    const cancel = new AbortController();
+    const call = it.ask("say hello", { extensions: true, signal: cancel.signal });
+    call.catch(() => {});
+    await waitFor(() => notedBy(it, "fetching").length === 1, "the reply to be being fetched", 30_000);
+    cancel.abort();
+    await call.then(() => {}, () => {});
+    await waitFor(() => notedBy(it, "had another").length === 1, "the extension to have done all it does", 5000);
+    assert.deepEqual(notedBy(it, "fetched"), ["fetched: aborted", "fetched again: aborted, The call is to ask no more."]);
+    assert.deepEqual(notedBy(it, "had"), ["had it given up: done, 1 given up", "had another give one up: threw: Provider fake does not support deferred responses"]);
+  }
+});
+
+test("what pi asks for itself beside its agent's turns — a summary of a conversation grown long — is asked by the call's runner as the turns are", async (t) => {
+  // A model with little room: after the first turn the conversation is past what pi keeps, and pi asks for a summary of it.
+  const kinds = [];
+  const it = await user(t, (request, stream) => {
+    const summary = !request.tools?.length;
+    kinds.push(summary ? "a summary" : "a turn");
+    if (!summary && kinds.filter((kind) => kind === "a turn").length === 1) stream.calls("read", { path: "a.txt" });
+    else { stream.says({ role: "assistant", content: summary ? "what was done so far" : "the answer" }); stream.says({}, "stop"); }
+    stream.done({ prompt_tokens: 2800, completion_tokens: 200, total_tokens: 3000 });
+  });
+  it.put(it.agentDir, "models.json", JSON.stringify({ providers: { fake: {
+    baseUrl: `http://127.0.0.1:${it.port}/v1`, api: "openai-completions", apiKey: "$TRAMA_TEST_KEY",
+    models: [{ id: "plain", contextWindow: 3000, maxTokens: 500, cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } }],
+  } } }));
+  it.put(it.agentDir, "settings.json", JSON.stringify({ compaction: { reserveTokens: 500, keepRecentTokens: 100 } }));
+  it.put(it.cwd, "a.txt", "what the file says. ".repeat(200));
+  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine"));
+  // The process that serves the calls is started with one key, and the runner has another by the next call.
+  await askedWith(it, "the first", "read a.txt and go on", { extensions: true });
+  const before = it.requests.length;
+  kinds.length = 0;
+  const used = [];
+  assert.equal(await askedWith(it, "the second", "read a.txt and go on", { extensions: true, used: (usage) => used.push(total(usage)) }), "the answer");
+  assert.ok(kinds.includes("a summary") && kinds.includes("a turn"), `pi summed the conversation up: ${kinds}`);
+  assert.deepEqual(it.headers.slice(before).map(keyOf), kinds.map(() => "Bearer the second"));
+  assert.deepEqual(used, [kinds.length * 3000]);
+});
+
+test("a request that has nothing under a name is the same request asked by the runner: what the name takes out of it is out", async (t) => {
+  const it = await user(t);
+  withKeyBy(it);
+  // Each asked twice: as it is — by the runner — and with a hook of the extension's own, which has it asked where the extension is.
+  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `pi.on("agent_end", async (_event, ctx) => {
+    ${SAYING}
+    const models = ctx.modelRegistry, sampled = models.find("fake", "sampled");
+    const ways = {
+      "a parameter of the model's own, by complete": (text, more) => models.complete(sampled, saying(text), { samplingParams: { top_p: undefined }, ...more }),
+      "a parameter of the model's own, by streamSimple": (text, more) => models.streamSimple(sampled, saying(text), { samplingParams: { top_p: undefined }, ...more }).result(),
+      "a header of the provider's own": (text, more) => models.complete(ctx.model, saying(text), { headers: { "x-configured": undefined, "x-own": "said" }, ...more }),
+      // (pi lays headers one over another in the order of their names, and takes a name for the same whatever its case.)
+      "a header taken out, and then put in": (text, more) => models.complete(ctx.model, saying(text), { headers: { "x-configured": undefined, "X-Configured": "mine" }, ...more }),
+      "a header put in, and then taken out": (text, more) => models.complete(ctx.model, saying(text), { headers: { "X-Configured": "mine", "x-configured": undefined }, ...more }),
+    };
+    for (const [name, ask] of Object.entries(ways)) for (const [where, more] of [["handed over", {}], ["asked here", { onResponse: () => {} }]]) note("asked " + name + ", " + where + ": " + (await ask(name + ", " + where, more)).stopReason);
+  });`));
+  await askedWith(it, "the first", "say hello", { extensions: true });
+  const before = it.requests.length;
+  await askedWith(it, "the second", "say hello", { extensions: true });
+  const seen = Object.fromEntries(it.requests.slice(before + 1).map((request, at) => {
+    const headers = it.headers[before + 1 + at];
+    return [lastSaid(request), { by: keyOf(headers), top_p: request.top_p, seed: request.seed, configured: headers["x-configured"], own: headers["x-own"] }];
+  }));
+  const RUNNER = "Bearer the second", HOST = "Bearer the first";
+  for (const [where, by] of [["handed over", RUNNER], ["asked here", HOST]]) {
+    // (The model's own way of being sampled, less what the request took out of it; the provider's own header, taken out.)
+    for (const way of ["by complete", "by streamSimple"]) assert.deepEqual(seen[`a parameter of the model's own, ${way}, ${where}`], { by, top_p: undefined, seed: 7, configured: "yes", own: undefined }, `${way}, ${where}`);
+    assert.deepEqual(seen[`a header of the provider's own, ${where}`], { by, top_p: undefined, seed: undefined, configured: undefined, own: "said" }, where);
+    assert.equal(seen[`a header taken out, and then put in, ${where}`].by, by, where);
+  }
+  // (Whatever pi makes of each order, it makes the same of it wherever the request is asked.)
+  for (const order of ["a header taken out, and then put in", "a header put in, and then taken out"]) {
+    assert.deepEqual({ ...seen[`${order}, handed over`], by: 0 }, { ...seen[`${order}, asked here`], by: 0 }, order);
+  }
+  assert.notEqual(seen["a header taken out, and then put in, handed over"].configured, seen["a header put in, and then taken out, handed over"].configured);
+  // (And a request that says nothing of either has both.)
+  assert.equal(it.headers[before]["x-configured"], "yes");
+});
+
+test("a provider of an extension's that passes what the agent asked with on to another model, with a hook of its own in it, has that model asked where it is: the hook is its hand in the request", async (t) => {
+  const priced = { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 };
+  // The provider is handed all the agent's request goes with — pi's own hooks among it — and asks a model of pi's with
+  // that: as it is; with a hook of its own in the place of one of pi's; and with something more that is no data.
+  // (The provider is the call's own model's, made the extension's; the model it asks is another provider's, which is pi's.)
+  const PASSES_ON = (more, by) => `let models;
+  const by = "${by}";
+  pi.on("session_start", (_event, ctx) => { models = ctx.modelRegistry; });
+  pi.registerProvider("fake", { name: "Outer", baseUrl: "http://127.0.0.1:9/unused", apiKey: "none", api: "outer-api",
+    models: [{ id: "plain", name: "plain", reasoning: false, input: ["text"], cost: ${JSON.stringify(priced)}, contextWindow: 100000, maxTokens: 4000 }],
+    streamSimple: (_model, context, options) => models[by](models.find("inner", "i1"), context, { ...options, apiKey: undefined, headers: undefined, env: undefined, ${more} }),
+  });`;
+  for (const [how, more, asker, noted, by = "streamSimple"] of [
+    ["as it is", "", "Bearer the second", []],
+    ["with a hook of its own", `onResponse: (response) => { note("its hook was called: " + response.status); }`, "Bearer the first", ["its hook was called: 200"]],
+    ["with something more that is no data", `since: new Date(0)`, "Bearer the first", []],
+    ["with a function of its own under a name the provider might read", `mine: () => {}`, "Bearer the first", []],
+    // (Without all of pi's own hooks it is not a request as the agent makes one; nor is it one asked by the options of
+    // the model's own provider, which may read whatever it is given: what the agent's loop is set up by stays with either.)
+    ["with one of pi's hooks taken out", `onProviderStreamEvent: undefined`, "Bearer the first", []],
+    ["as it is, by the options of the model's own provider", "", "Bearer the first", [], "stream"],
+  ]) {
+    const it = await user(t);
+    it.put(it.agentDir, "models.json", JSON.stringify({ providers: {
+      fake: { baseUrl: `http://127.0.0.1:${it.port}/v1`, api: "openai-completions", apiKey: "$TRAMA_TEST_KEY", models: [{ id: "plain", cost: priced }] },
+      inner: { baseUrl: `http://127.0.0.1:${it.port}/v1`, api: "openai-completions", apiKey: "$TRAMA_TEST_KEY", models: [{ id: "i1", cost: priced }] },
+    } }));
+    it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", PASSES_ON(more, by)));
+    const ask = (key, call = {}) => withEnv({ ...it.env, TRAMA_TEST_KEY: key }, () => it.adapter.ask("say hello", { cwd: it.cwd, extensions: true, ...call }));
+    await ask("the first");
+    const before = it.requests.length, from = notedBy(it, "its hook").length, used = [];
+    assert.equal(await ask("the second", { used: (usage) => used.push(total(usage)) }), "hello from the fake", how);
+    assert.deepEqual(it.headers.slice(before).map(keyOf), [asker], how);
+    assert.deepEqual(notedBy(it, "its hook").slice(from), noted, how);
+    assert.deepEqual(used, [1200], how);
+  }
 });
