@@ -7,6 +7,8 @@
 // caller. Nothing outside the backend's own file knows which agent, harness or
 // model is behind it.
 
+import type { ModelRelay } from "./model-relay.js";
+
 /**
  * What a call used, as far as its backend knows: the tokens the model read and
  * wrote, the ones it read from a cache and wrote to one, and what the backend's
@@ -20,6 +22,41 @@ export interface AgentUsage {
   cacheRead: number;
   cacheWrite: number;
   cost: number;
+}
+
+/** What replies used, added up as they came — by whoever saw them come. */
+export interface Tally {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+}
+
+export const nothingYet = (): Tally => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 });
+
+/** Add to a tally what one reply used, as a model's reply says it. */
+export function addReply(tally: Tally, used: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } }): void {
+  tally.input += used.input;
+  tally.output += used.output;
+  tally.cacheRead += used.cacheRead;
+  tally.cacheWrite += used.cacheWrite;
+  tally.cost += used.cost.total;
+}
+
+/**
+ * A count, and what was seen besides: of each figure, the greater. Two
+ * counts of one call, made at two places, are each a count of what passed
+ * there — and what passed at both is most of it. (Where each saw something
+ * the other did not, this is still short of the whole: it is the least the
+ * call used, which is what a count that may be short is to be.) Nothing,
+ * where no tokens were counted at either.
+ */
+export function atLeast(usage: AgentUsage | undefined, seen?: Tally): AgentUsage | undefined {
+  const most = (figure: keyof Tally) => Math.max(usage?.[figure] ?? 0, seen?.[figure] ?? 0);
+  const input = most("input"), output = most("output"), cacheRead = most("cacheRead"), cacheWrite = most("cacheWrite");
+  if (input + output + cacheRead + cacheWrite === 0) return undefined;
+  return { ...(usage?.model !== undefined && { model: usage.model }), input, output, cacheRead, cacheWrite, cost: most("cost") };
 }
 
 /** Of a report, what a report is declared to hold — whatever else a backend put beside it. */
@@ -60,28 +97,45 @@ export interface AgentCall {
   /** Cancels the call. A cancelled call rejects; it never resolves with a partial answer. */
   signal?: AbortSignal;
   /**
-   * Told what the call has used so far, each time its agent is about to ask
-   * the model again — for the next step of its work, or to have a long
-   * conversation summed up: whoever hears it may cancel the call there,
-   * before more is used. A backend that asks its model once, or cannot say,
-   * never calls it. (It does not throw.) Whoever hears it may take a moment
-   * over it — it is in another process, say — and return a promise: a
-   * backend that can wait for that before it asks its model does.
+   * Told what the call has used so far, each time its model is about to be
+   * asked again — for the next step of the agent's work, to have a long
+   * conversation summed up, or for anything else that is asked of a model on
+   * the call's account: whoever hears it may cancel the call there, before
+   * more is used. A backend that asks its model once, or cannot say, never
+   * calls it. (It does not throw.) Whoever hears it may take a moment over
+   * it — it is in another process, say — and return a promise: a backend
+   * that can wait for that before it asks its model does.
+   *
+   * `answered`: the call is over by now — it has its answer, or has
+   * failed — and what would be asked is asked beside that: by an
+   * extension, as it is told that the session is over. Such a call is not
+   * to be cancelled for what it has used: what it ended with stands.
+   * Whoever hears says `false` instead (or resolves to it), and the model
+   * is then not asked.
    */
-  sofar?: (usage: AgentUsage) => void | Promise<void>;
+  sofar?: (usage: AgentUsage, answered?: boolean) => unknown;
   /**
    * Told what the call has used as soon as a reply of its model's has come.
    * Nothing waits for it, and nothing is cancelled by it: it is for whoever
-   * may lose the call before it says what it used in the end — the runner of
-   * a process that serves it, which may have to end that process. (And to
-   * pi's adapter it says that the call is counted elsewhere: what the call
-   * has used so far is then waited for, before its model is asked again.)
+   * counts — what the call has used is known to them from then, and not
+   * only when the call next asks or is over — and for whoever may lose the
+   * call before it says what it used in the end: the runner of a process
+   * that serves it, which may have to end that process.
    */
   had?: (usage: AgentUsage) => void;
   /**
+   * Somebody to ask the model by, for a call that is served where code runs
+   * that is neither trama's nor the backend's — an extension's, in a process
+   * of its own: what a reply used is then read where no such code is. A
+   * backend asks by it where it can, and by itself where it cannot.
+   */
+  relay?: ModelRelay;
+  /**
    * Told what the call used, at most once and before the call settles —
    * however it ended: a call that failed or was cancelled half-way has used
-   * what it used. A backend that cannot know, or a call that used nothing,
+   * what it used. (When all is over that could use anything on the call's
+   * account: what an extension asks a model as it is told that the session
+   * ends is the call's too.) A backend that cannot know, or a call that used nothing,
    * says nothing. (It does not throw: what it is told is only written down.)
    */
   used?: (usage: AgentUsage) => void;

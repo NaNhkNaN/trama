@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { execFileSync, spawn } from "node:child_process";
-import { createServer } from "node:http";
+import { ChildProcess, execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -11,87 +10,13 @@ import { CutOff } from "../packages/runtime/dist/agent-backend.js";
 import { createMeter } from "../packages/runtime/dist/budget.js";
 import { createBackend, runProgram } from "../packages/runtime/dist/runner.js";
 import { groupsUnder, processesOnFile } from "../packages/runtime/dist/stopping.js";
+import { EXTENSION, hostsHere, user } from "./pi-user.mjs";
 import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, waitFor, withEnv } from "./helpers.mjs";
 
 // A call that has extensions is served by pi in a process of its own. Here that process is real, and so
 // is pi; the model is a server in this process, and the user is a directory of the test's. What an
 // extension does it does in the host, where this process cannot see it: so it writes it down, with the
 // process it did it in.
-
-/**
- * A user with a pi of their own — one extension in it, and whatever else a test puts there — a project,
- * and a model. `reply(request, respond, hit)` answers each request; without it every request is answered
- * with a few words.
- */
-async function user(t, reply) {
-  const requests = [];
-  const sse = (res) => {
-    res.writeHead(200, { "Content-Type": "text/event-stream" });
-    const send = (choices, usage) => res.write(`data: ${JSON.stringify({ id: "x", object: "chat.completion.chunk", created: 1, model: "fake", choices, ...(usage && { usage }) })}\n\n`);
-    return {
-      says: (delta, finish = null) => send([{ index: 0, delta, finish_reason: finish }]),
-      calls: (name, args = {}) => {
-        send([{ index: 0, delta: { role: "assistant", tool_calls: [{ index: 0, id: `call-${requests.length}`, type: "function", function: { name, arguments: JSON.stringify(args) } }] }, finish_reason: null }]);
-        send([{ index: 0, delta: {}, finish_reason: "tool_calls" }]);
-      },
-      done: (usage = { prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200 }) => { send([], usage); res.end("data: [DONE]\n\n"); },
-    };
-  };
-  const server = createServer((req, res) => {
-    let body = "";
-    req.on("data", (chunk) => { body += chunk; });
-    req.on("end", () => {
-      const request = JSON.parse(body);
-      requests.push(request);
-      if (reply) return reply(request, sse(res), requests.length);
-      const stream = sse(res);
-      stream.says({ role: "assistant", content: "hello from the fake" });
-      stream.says({}, "stop");
-      stream.done();
-    });
-  });
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const agentDir = makeTempDir("trama-host-agent-"), cwd = makeTempDir("trama-host-cwd-");
-  const log = join(agentDir, "seen.log");
-  const put = (dir, path, text) => {
-    mkdirSync(dirname(join(dir, path)), { recursive: true });
-    writeFileSync(join(dir, path), text);
-  };
-  put(agentDir, "models.json", JSON.stringify({ providers: { fake: { baseUrl: `http://127.0.0.1:${server.address().port}/v1`, api: "openai-completions", apiKey: "none", models: [{ id: "plain", cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } }] } } }));
-  put(agentDir, "seen.log", "");
-  put(cwd, "a.txt", "what the file says");
-  const adapter = new PiAdapter({ provider: "fake", model: "plain" });
-  const env = { PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", HOME: agentDir, TRAMA_TEST_SEEN: log };
-  t.after(async () => {
-    await adapter.close();
-    server.closeAllConnections();
-    server.close();
-    cleanupTempDir(agentDir);
-    cleanupTempDir(cwd);
-  });
-  return {
-    agentDir, cwd, requests, adapter, env, put,
-    ask: (prompt, call = {}) => withEnv(env, () => adapter.ask(prompt, { cwd, ...call })),
-    toolsOf: (request) => (request.tools ?? []).map((tool) => tool.function.name),
-    /** What extensions wrote down, each line as [the process it was in, what happened]. */
-    seen: () => readFileSync(log, "utf-8").split("\n").filter(Boolean).map((line) => [Number(line.slice(0, line.indexOf(" "))), line.slice(line.indexOf(" ") + 1)]),
-    pids: () => [...new Set(readFileSync(log, "utf-8").split("\n").filter(Boolean).map((line) => Number(line.slice(0, line.indexOf(" ")))))],
-  };
-}
-
-/** How many hosts this process has at the moment. */
-const hostsHere = () => execFileSync("ps", ["-Ao", "pid=,ppid=,command="], { encoding: "utf-8" }).split("\n")
-  .filter((line) => line.includes("agent-host.js") && Number(line.trim().split(/\s+/)[1]) === process.pid).length;
-
-/** An extension that writes down, with the process it is in, that a session began — and has a tool, and whatever more `body` gives it. */
-const EXTENSION = (name, body = "") => `import { appendFileSync, readFileSync } from "node:fs";
-export default function (pi) {
-  const note = (what) => appendFileSync(process.env.TRAMA_TEST_SEEN, process.pid + " " + what + "\\n");
-  pi.on("session_start", async (_event, ctx) => { note("${name}: a session begins, the project trusted: " + ctx.isProjectTrusted()); });
-  pi.registerTool({ name: "${name}_tool", label: "${name}", description: "A tool of an extension", parameters: { type: "object", properties: {} }, async execute() { note("${name}: its tool is used"); return { content: [{ type: "text", text: "the ${name} tool answers" }] }; } });
-  ${body}
-}
-`;
 
 test("a call that has extensions is served by pi in a process of its own, and one without in this one", async (t) => {
   const it = await user(t, (request, stream, hit) => {
@@ -739,4 +664,45 @@ await ctx.done({ answer: await agent.instruct("what were you given") });
   assert.deepEqual((await run({ TRAMA_TEST_GIVEN: "the run's" })).result.result, { answer: "hello from the fake" });
   assert.match(told(), /given: \[the run's\]/);
   assert.equal(hostsHere(), 0, "the run being over, its process is gone");
+});
+
+test("a process that waits for its hosts to be gone is held until they are: what comes after the wait comes", async (t) => {
+  // A host that is free keeps nobody waiting. One that is being ended is waited for — and whoever waits may have
+  // nothing else to wait for: the trama command at the end of a run. A process that nothing holds ends, well and
+  // without a word, though something in it is waited for; and of a host that is ending, the system says for a
+  // moment that it is not there before it says that it has ended. In that moment the wait is all that is left.
+  const it = await user(t);
+  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine"));
+
+  // So: a host is held from when it is to be ended, whatever it was before.
+  const held = [];
+  const { ref, unref } = ChildProcess.prototype;
+  ChildProcess.prototype.ref = function () { held.push([this.pid, "held"]); return ref.call(this); };
+  ChildProcess.prototype.unref = function () { held.push([this.pid, "let go"]); return unref.call(this); };
+  t.after(() => Object.assign(ChildProcess.prototype, { ref, unref }));
+  assert.equal(await it.ask("say hello", { extensions: true }), "hello from the fake");
+  const [host] = it.pids();
+  const of = () => held.filter(([pid]) => pid === host).map(([, what]) => what);
+  assert.equal(of().at(-1), "let go");
+  await it.adapter.close();
+  assert.equal(of().at(-1), "held");
+  assert.equal(isAlive(host), false);
+
+  // And a process of its own, with nothing but that wait, comes to what is after it. (Where the moment is one the
+  // system has, it is not every time that it is come upon: this says that it goes well, the lines above why.)
+  const script = `import { PiAdapter } from ${JSON.stringify(pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "pi-adapter.js")).href)};
+const adapter = new PiAdapter({ provider: "fake", model: "plain" });
+console.log(await adapter.ask("say hello", { cwd: ${JSON.stringify(it.cwd)}, extensions: true }));
+await adapter.close();
+console.log("closed");
+process.exitCode = 7;
+`;
+  for (let round = 0; round < 3; round += 1) {
+    const runner = spawn(process.execPath, ["--input-type=module", "-e", script], { env: { ...process.env, ...it.env }, stdio: ["ignore", "pipe", "inherit"] });
+    let said = "";
+    runner.stdout.on("data", (chunk) => { said += chunk; });
+    const code = await new Promise((resolve) => runner.once("close", resolve));
+    assert.equal(said, "hello from the fake\nclosed\n");
+    assert.equal(code, 7);
+  }
 });

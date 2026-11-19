@@ -280,12 +280,29 @@ export function createBackend(config: TramaConfig, meter: Meter = createMeter(),
       const work = backend.ask(prompt, {
         ...call,
         signal,
-        sofar(usage) {
-          // (Once it is to stop, it is to stop — whatever is said of it after.)
+        sofar(usage, answered) {
           const reached = account.sofar(usage);
+          call.sofar?.(usage, answered);
+          // A call that is over keeps what it ended with — its answer, or its own failure: what would be
+          // asked beside it is not asked, and that is all. (It is a request refused for the budget all the
+          // same, and said as one.)
+          if (answered) {
+            const spent = why ?? reached;
+            if (spent === undefined) return true;
+            overBudget(spent);
+            return false;
+          }
+          // (Once it is to stop, it is to stop — whatever is said of it after.)
           why ??= reached;
-          if (why !== undefined) over.abort();
-          call.sofar?.(usage);
+          if (why === undefined) return true;
+          over.abort();
+          return false;
+        },
+        // (What the call has used is counted from when it is known: nothing is stopped for it here — a reply that
+        // has come is not taken back — but whatever is asked next, by this call or another, is asked against it.)
+        had(usage) {
+          account.sofar(usage);
+          call.had?.(usage);
         },
         used(usage) {
           account.sofar(usage);

@@ -14,7 +14,8 @@
 import { fork, type ChildProcess } from "child_process";
 import { fileURLToPath } from "url";
 import { onAbort, throwIfAborted } from "./abort.js";
-import { CutOff, type AgentCall, type AgentUsage } from "./agent-backend.js";
+import { CutOff, addReply, atLeast, nothingYet, type AgentCall, type AgentUsage } from "./agent-backend.js";
+import { createModelRelay, relayClient, relayServer, type ModelRelay } from "./model-relay.js";
 import type { FromHost, SentCall, ToHost } from "./agent-host.js";
 import { messageOf } from "./errors.js";
 import type { ModelConfig } from "./runner-types.js";
@@ -35,12 +36,21 @@ function saidBy(message: unknown): FromHost | undefined {
   const said = message as Record<string, unknown>;
   const counted = (usage: unknown): usage is AgentUsage => typeof usage === "object" && usage !== null;
   if (said.ready === true) return { ready: true };
-  if (counted(said.sofar)) return { sofar: said.sofar };
+  if (counted(said.sofar)) return { sofar: said.sofar, ...(said.answered === true && { answered: true }) };
   if (counted(said.had)) return { had: said.had };
   if (counted(said.used)) return { used: said.used };
   if (typeof said.answer === "string") return { answer: said.answer };
   if (typeof said.cutOff === "string") return { cutOff: said.cutOff };
   if (typeof said.error === "string") return { error: said.error };
+  // What a call would have a model asked, and what a model answered (see model-relay.ts).
+  const held = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
+  const { relay, relayAbort, relayed } = said;
+  if (held(relay) && typeof relay.id === "number" && held(relay.request)) {
+    const { model, options } = relay.request;
+    if (held(model) && typeof model.provider === "string" && typeof model.id === "string" && held(options)) return { relay } as FromHost;
+  }
+  if (typeof relayAbort === "number") return { relayAbort };
+  if (held(relayed) && typeof relayed.id === "number" && (relayed.not === true || (held(relayed.event) && typeof relayed.event.type === "string"))) return { relayed } as FromHost;
   return undefined;
 }
 
@@ -64,7 +74,7 @@ export interface AgentHosts {
 }
 
 /** Of a call, what can be sent to another process. */
-const sendable = ({ signal: _signal, used: _used, sofar: _sofar, had: _had, ...call }: AgentCall): SentCall => call;
+const sendable = ({ signal: _signal, used: _used, sofar: _sofar, had: _had, relay: _relay, ...call }: AgentCall): SentCall => call;
 
 /**
  * The hosts of one runner's calls. `env`: variables the hosts are started
@@ -77,6 +87,11 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
 
   /** Put an end to a host, and to what it has under it. Resolves when they are gone. */
   const end = async (host: Host): Promise<void> => {
+    // Whoever waits for a host to be gone is held until it is seen to be. (A free host keeps nobody waiting —
+    // see `release` — and a process held by nothing else would end in the middle of this wait, well and without
+    // a word, the moment the host's group was gone and before the host was seen to end: whatever was to come
+    // after — a run's failure said, its exit code — would not.)
+    host.process.ref();
     if (!host.gone) {
       host.gone = true;
       const at = free.indexOf(host);
@@ -132,6 +147,43 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
     return host;
   };
 
+  /**
+   * Who asks the models of the calls these hosts serve (see model-relay.ts).
+   * Where the hosts are this process's own in all but being apart, that is
+   * this process: with its pi, and the keys it has. Where they were started
+   * with variables — a run's, which may name another pi and other keys — it
+   * is a process started with the same, that serves no call and so has
+   * nobody's code in it but pi's and trama's: started when it is first
+   * wanted, and again if it was lost.
+   */
+  let asker: { host: Host; asks: ReturnType<typeof relayClient> } | undefined;
+  const apart: ModelRelay = {
+    async ask(request, signal) {
+      try {
+        if (!asker || asker.host.gone) {
+          const host = start();
+          const child = host.process;
+          // (It keeps nobody waiting: a call that has asked by it is waited for by its own host.)
+          child.unref();
+          child.channel?.unref();
+          const asks = relayClient((message) => { if (child.connected) child.send(message satisfies ToHost, () => {}); });
+          child.on("message", (word: unknown) => {
+            const said = saidBy(word);
+            if (said && "relayed" in said) asks.heard(said.relayed);
+          });
+          child.once("exit", () => asks.close());
+          asker = { host, asks };
+        }
+        const { host, asks } = asker;
+        await host.ready;
+        return await asks.relay.ask(request, signal);
+      } catch {
+        // (A process that cannot be had is not one to ask by: whoever asked asks itself.)
+        return undefined;
+      }
+    },
+  };
+
   return {
     async ask(config, prompt, call) {
       throwIfAborted(call.signal);
@@ -154,6 +206,42 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
           let giveUp: NodeJS.Timeout | undefined, offAbort = () => {}, isOver = false;
           // What the call last said it had used, and whether it has said what it used in the end.
           let last: AgentUsage | undefined, usedSaid = false;
+          // What the replies used that the call's model was asked for from here: seen come, and nobody's word.
+          // A count the host says is taken for no less than that.
+          const seen = nothingYet();
+          // How many replies were seen, and how many had been when the call was last told what it had used;
+          // and whether whoever was told has said, of the call when it was over, that nothing more may be asked
+          // on its account. (Said of a call still at its work, a no stops nothing: such a call is stopped by
+          // being cancelled — see AgentCall.sofar. Here as where the call is served.)
+          let replies = 0, told = 0, noMore = false;
+          let asksHere: ReturnType<typeof createModelRelay> | undefined;
+          let asked: ReturnType<typeof relayServer> | undefined;
+          const asking = () => asked ??= relayServer(
+            env ? apart : asksHere = createModelRelay(),
+            (answer) => { if (child.connected) child.send(answer satisfies ToHost, () => {}); },
+            {
+              // A model is not asked for a call that has not been told of all it was seen to use: the host says
+              // what the call has used before each request (below) — and where a request comes that it did not
+              // say that before, the call is told from here (as of a call that is over, where the request
+              // says it is asked beside one). A no to such a request is a no from then on, whatever is asked
+              // after and whatever it says of itself. And a call that is cancelled, or done with, has its model
+              // asked no more, whatever in its host would have it asked.
+              async refuse(request) {
+                if (!noMore && replies !== told) {
+                  told = replies;
+                  const sofar = atLeast(last, seen), answered = request.answered === true;
+                  if (sofar && await call.sofar?.(sofar, answered) === false && answered) noMore = true;
+                }
+                return noMore || isOver || call.signal?.aborted === true;
+              },
+              replied(used) {
+                addReply(seen, used);
+                replies += 1;
+                const had = atLeast(last, seen);
+                if (had) call.had?.(had);
+              },
+            },
+          );
           /** The call is over: by an answer of the host's, which is then free again — or without one, and the host is ended. */
           const over = (settle: () => void, hostIsWell: boolean) => {
             if (isOver) return;
@@ -162,28 +250,40 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
             clearTimeout(giveUp);
             child.off("message", heard);
             child.off("exit", exited);
+            asked?.close();
+            void asksHere?.close();
             if (hostIsWell && !host.gone) release();
             // A host that is ended with a call in it never says what the call used in the end: what
-            // it last said the call had used is then all that is known of it, and what the call is taken
-            // to have used.
-            else if (!usedSaid && last) call.used?.(last);
+            // it last said the call had used — and what was seen of it here — is then all that is
+            // known of it, and what the call is taken to have used. (And a host that is well and
+            // says nothing, of a call whose model was asked from here, is not taken at its silence.)
+            if (!usedSaid) {
+              const used = atLeast(last, seen);
+              if (used) call.used?.(used);
+            }
             settle();
           };
           const heard = (word: unknown) => {
             const message = saidBy(word);
             if (!message) return;
+            if ("relay" in message || "relayAbort" in message) return asking().heard(message);
             if ("sofar" in message) {
-              last = message.sofar;
-              // The host waits to hear whether the call is to go on. (Where hearing what it used cancelled
-              // the call, the host has been told that first, below: this then tells it nothing.)
-              void Promise.resolve(call.sofar?.(message.sofar)).then(() => {
-                if (!isOver && child.connected) child.send({ go: true } satisfies ToHost, () => {});
+              const sofar = atLeast(last = message.sofar, seen);
+              told = replies;
+              // The host waits to hear whether the call is to go on — or, of a call that has its answer, whether
+              // what would be asked beside it may be. (Where hearing what it used cancelled the call, the host
+              // has been told that first, below: this then tells it nothing.)
+              void Promise.resolve(sofar && call.sofar?.(sofar, message.answered === true)).then((go) => {
+                if (go === false && message.answered === true) noMore = true;
+                if (!isOver && child.connected) child.send({ go: go !== false } satisfies ToHost, () => {});
               });
             } else if ("had" in message) {
-              last = message.had;
+              const had = atLeast(last = message.had, seen);
+              if (had) call.had?.(had);
             } else if ("used" in message) {
               usedSaid = true;
-              call.used?.(message.used);
+              const used = atLeast(message.used, seen);
+              if (used) call.used?.(used);
             }
             else if ("answer" in message) over(() => resolve(message.answer), true);
             else if ("cutOff" in message) over(() => reject(new CutOff(message.cutOff)), true);
@@ -198,6 +298,8 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
           });
           // A cancelled call is asked to stop where it is, and waited for no longer than anything asked to stop is.
           offAbort = onAbort(call.signal, () => {
+            // (What its model is being asked from here is asked no further, whether or not its host hears.)
+            asked?.close();
             if (child.connected) child.send({ abort: true } satisfies ToHost, () => {});
             giveUp = setTimeout(() => over(() => reject(new Error("Aborted")), false), KILL_GRACE_MS);
           });

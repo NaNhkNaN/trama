@@ -1,8 +1,11 @@
-import type { AgentSession, ExtensionFactory, InlineExtension, ResourceLoader, SettingsManager as Settings } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ExtensionFactory, InlineExtension, ModelRuntime as Models, ResourceLoader, SettingsManager as Settings } from "@earendil-works/pi-coding-agent";
 import { onAbort, rejectOnAbort, throwIfAborted } from "./abort.js";
 import { messageOf } from "./errors.js";
 import { createAgentHosts } from "./agent-hosts.js";
-import { CutOff, type AgentBackend, type AgentCall, type AgentUsage } from "./agent-backend.js";
+import { CutOff, addReply, atLeast, nothingYet, type AgentBackend, type AgentCall, type AgentUsage, type Tally } from "./agent-backend.js";
+import * as http from "http";
+import * as https from "https";
+import { dataOf, notAsked, usageAtEnd, type RelayEvent, type RelayModel } from "./model-relay.js";
 import type { ModelConfig } from "./runner-types.js";
 
 /**
@@ -37,7 +40,7 @@ async function builtInExtensions(): Promise<InlineExtension[]> {
 const warnedUnknownModels = new Set<string>();
 
 /** What a call may ask of its session, beyond where it works and what it is told. */
-type Asked = Pick<AgentCall, "model" | "thinking" | "tools" | "skills" | "templates" | "extensions" | "asText">;
+type Asked = Pick<AgentCall, "model" | "thinking" | "tools" | "skills" | "templates" | "extensions" | "asText" | "sofar" | "had" | "used" | "relay">;
 
 const nameOf = (model: { provider: string; id: string }): string => `${model.provider}/${model.id}`;
 
@@ -57,8 +60,18 @@ interface Found { skills: string[]; templates: string[] }
 type SkillsAsTold = Awaited<ReturnType<typeof loadPi>>["formatSkillsForPrompt"];
 const WAYS_TO_READ = ["read", "bash", "indirect"] as const;
 
-/** How long an extension is given to hear that its session is over — and, where a call is cancelled while it is still being told that one begins, to have heard that first. */
+/**
+ * How long an extension is given to hear that its session is over, while it is not asking a model — and, where a
+ * call is cancelled while it is still being told that one begins, to have heard that first. (While it is asking a
+ * model, it is waited for: see leaveExtensions.)
+ */
 const EXTENSION_LEAVE_MS = 5_000;
+
+/** How long pi gives a request to a provider, where its settings do not say: the most a model is waited for, at work for extensions as their session ends. */
+const REQUEST_MS = 300_000;
+
+/** How long what was stopped is given to end, and say what it had used, before the count is closed. */
+const STOPPED_MS = 1_000;
 
 /**
  * How long a cancelled call is waited for where something holds it. Less
@@ -147,21 +160,276 @@ function whyNotTheTools(session: AgentSession, tools: string[] | undefined): str
     : `The agent cannot be given the tools ${JSON.stringify(tools)}: pi would give it ${JSON.stringify(given)}.`;
 }
 
-/** The name of trama's own extension that says what a call has used as each reply comes (see createSession). */
-const COUNTS = "trama-counts";
-
 /** What is kept of a session that has extensions, beside the session. */
 interface Extended {
   /** What its extensions have put to the model and is not yet over. */
   puts: Set<Promise<void>>;
   /** Whether its call has come to its end. */
   over: boolean;
-  /** Says what the call has used so far, where the model is about to be asked again — and waits for whoever hears it. */
-  sofar?: () => Promise<void>;
   /** Looks, once, at what the agent has when the model is about to be asked for the first time (see whyNotTheTools). */
   look?: () => void;
-  /** Says what the call has used, a reply of its model's having come that is not on the session's record yet. */
-  had?: (reply: Counted) => void;
+}
+
+/** The events of a reply, as a provider gives them: pi asks no more of them than to be gone through, to the last. */
+type Reply = AsyncIterable<RelayEvent>;
+
+/**
+ * Where trama stands when a session's model is asked (see `watch`). What a
+ * call has to say there is put in by `account`, as its session is made.
+ */
+interface Asking {
+  /** The session's models: what was watched. */
+  models: Models;
+  /** What the replies that came used, all told: everything a model was asked on the session's account, by whoever asked. */
+  seen: Tally;
+  /** Waited for before a model is asked: whoever counts hears what the call has used so far, and may cancel it there. */
+  before?: () => Promise<void>;
+  /** Whether nothing more is to be asked: the call is cancelled, or over. */
+  stopped?: () => boolean;
+  /** Told that a reply has come. */
+  replied?: () => void;
+  /** Has the model asked elsewhere, where it can be: the reply — or undefined, and the model is asked here. */
+  elsewhere?: (model: RelayModel, context: unknown, options?: Record<string, unknown>) => Promise<Reply | undefined>;
+  /** How many replies are being gone through at this moment, of what was asked on the session's account: a model is at work for it. */
+  answering: number;
+  /** How many requests are being made ready at this moment: something is about to be asked — or is not, after all. */
+  readying: number;
+  /** Told when either number changes. */
+  changed?: () => void;
+  /** Stops what is being asked: the call was cancelled, or its session is gone. Every request made on the session's account goes with its signal. */
+  cut: AbortController;
+  /**
+   * Whether the call has come to its end; and whether its session is gone — its extensions told that it is
+   * over, and heard out. Between the two an extension may still ask a model for itself (to sum up what was
+   * done, say), and that is the call's: what the call used is what it had used when its session was gone.
+   */
+  over: boolean;
+  gone: boolean;
+  /** Says that the call cannot have what it named, where that is found as its run begins (see `serve`): it is then stopped as a cancelled call is. */
+  refusal: AbortController;
+  /** Says to stop a call that is at its work: it was cancelled, or cannot have what it named. (Made by `account`.) */
+  stop?: AbortSignal;
+}
+
+/**
+ * A signal that says to stop when either does. One of them is whatever an
+ * asker gave its request to be stopped by — which need not be a signal of
+ * the system's own making (a library's, an older runtime's): such a one is
+ * listened to as far as it can be, and the request is asked all the same.
+ */
+function either(own: unknown, cut: AbortSignal): { signal: AbortSignal; release: () => void } {
+  const nothing = () => {};
+  if (own === undefined || own === null) return { signal: cut, release: nothing };
+  if (own instanceof AbortSignal) return { signal: AbortSignal.any([own, cut]), release: nothing };
+  const both = new AbortController();
+  const theirs = own as { aborted?: unknown; reason?: unknown; addEventListener?: unknown; removeEventListener?: unknown };
+  const byThem = () => both.abort(theirs.reason);
+  const byCut = () => both.abort(cut.reason);
+  if (theirs.aborted === true) byThem();
+  else if (cut.aborted) byCut();
+  else {
+    cut.addEventListener("abort", byCut, { once: true });
+    try {
+      if (typeof theirs.addEventListener === "function") theirs.addEventListener("abort", byThem, { once: true });
+    } catch {
+      // (Not one that can be listened to: the request is stopped by what stops the call, and by nothing else.)
+    }
+  }
+  return {
+    signal: both.signal,
+    // (When the request is over: nothing of it is left listening to either.)
+    release: () => {
+      cut.removeEventListener("abort", byCut);
+      try {
+        if (typeof theirs.removeEventListener === "function") theirs.removeEventListener("abort", byThem);
+      } catch {
+        // (As it could not be listened to.)
+      }
+    },
+  };
+}
+
+/** What an extension may have a hand in, of a request to a provider: a session where one does asks its model itself. */
+const HANDS_IN = ["before_provider_request", "before_provider_headers", "after_provider_response", "provider_stream_event"];
+
+/**
+ * What a request to a provider goes by, that is a process's own: its
+ * variables — a provider's key may be one — and its ways to the network. An
+ * extension may make them other than they were: read a file of variables,
+ * put something of its own before every request the process makes. A request
+ * asked from another process would then not be the request this one makes,
+ * and nothing in the request says so. So what they are is kept from before
+ * the first extension is loaded in this process (`asLoaded`), and a session
+ * hands its requests over only while they are that still (`asItWas`). It is
+ * what can be told, and not all an extension can do: one that reaches under
+ * these is not seen.
+ */
+const shapeOf = () => ({
+  variables: JSON.stringify(process.env),
+  ways: [globalThis.fetch, (globalThis as Record<symbol, unknown>)[Symbol.for("undici.globalDispatcher.1")], http.globalAgent, https.globalAgent],
+});
+let asLoaded: ReturnType<typeof shapeOf> | undefined;
+function asItWas(): boolean {
+  if (!asLoaded) return false;
+  const now = shapeOf();
+  return now.variables === asLoaded.variables && now.ways.every((way, at) => way === asLoaded!.ways[at]);
+}
+
+/**
+ * Stand where a session's models are asked. pi asks a model in more places
+ * than one — its agent for a turn, for a summary of a long conversation or of
+ * a branch, to keep a provider's cache warm while a session waits; and an
+ * extension may ask by the session's models for itself — and every one of
+ * them comes by one step: the request is made ready, and handed to the
+ * model's provider. So that step is where a call is asked whether its model
+ * may be asked again, and the provider's reply is where what it used is seen.
+ * (pi does not export the step: it is a method of what trama made, and is
+ * made to stand aside for this.)
+ */
+function watch(models: Models, asking: Asking): void {
+  type Provider = Record<PropertyKey, unknown> & { stream(...sent: unknown[]): Reply; streamSimple(...sent: unknown[]): Reply };
+  type Prepared = { provider: object; model: RelayModel; options: Record<string, unknown> };
+  const standing = models as unknown as { prepareRequest(model: RelayModel, options?: Record<string, unknown>): Promise<Prepared> };
+  const prepare = standing.prepareRequest.bind(models);
+  const refused = async function* (model: RelayModel): Reply {
+    yield notAsked(model, "The call is to ask no more.");
+  };
+  // A provider that is an extension's own code may ask another model by these same models, and hand back what
+  // that model answered — there and then, from a queue of its own, or a reply it had asked for before: a reply
+  // that passes here twice, and used what it used once. So what a reply used is counted by the reply: once for
+  // each account of usage that passes, wherever and however often it passes. (pi hands a reply on as it is; a
+  // provider that makes a copy of one, account and all, has made another reply of it as far as can be told.)
+  const counted = new WeakSet<object>();
+  // What is being asked at this moment is kept count of, for whoever waits on it (see leaveExtensions): the
+  // replies that are being gone through, and the requests that are being made ready. (A request that is made
+  // ready and then not asked — its asker was stopped before it came to that — never was one a model worked on.)
+  const count = (of: "answering" | "readying", by: number) => {
+    asking[of] += by;
+    asking.changed?.();
+  };
+  const heard = async function* (reply: Reply, ...released: Array<() => void>): Reply {
+    count("answering", 1);
+    try {
+      for await (const event of reply) {
+        const used = usageAtEnd(event);
+        if (used && !counted.has(used)) {
+          counted.add(used);
+          addReply(asking.seen, used);
+          asking.replied?.();
+        }
+        yield event;
+      }
+    } finally {
+      count("answering", -1);
+      for (const release of released) release();
+    }
+  };
+  // And every request goes with the word that stops it (Asking.cut), beside whatever its asker gave it to be
+  // stopped by: asked here or elsewhere, by pi or by an extension for itself.
+  const stoppable = (options: Record<string, unknown> | undefined) => {
+    const { signal, release } = either(options?.signal, asking.cut.signal);
+    return { options: { ...options, signal }, release };
+  };
+  standing.prepareRequest = async (model, options) => {
+    count("readying", 1);
+    try {
+      await asking.before?.();
+      // (Asked no more: the request ends as one that was cancelled before it was sent.)
+      if (asking.stopped?.()) return { provider: { stream: () => refused(model), streamSimple: () => refused(model) }, model, options: options ?? {} };
+      const prepared = await prepare(model, options);
+      const provider = prepared.provider as Provider;
+      return {
+        ...prepared,
+        provider: new Proxy(provider, {
+          get(target, key) {
+            if (key === "stream") {
+              return (...sent: unknown[]) => {
+                const here = stoppable(sent[2] as Record<string, unknown> | undefined);
+                return heard(target.stream(sent[0], sent[1], here.options), here.release);
+              };
+            }
+            if (key === "streamSimple") {
+              return (...sent: unknown[]) => {
+                const there = stoppable(options), here = stoppable(sent[2] as Record<string, unknown> | undefined);
+                return heard((async function* () {
+                  yield* await asking.elsewhere?.(model, sent[1], there.options) ?? target.streamSimple(sent[0], sent[1], here.options);
+                })(), there.release, here.release);
+              };
+            }
+            const value: unknown = Reflect.get(target, key, target);
+            return typeof value === "function" ? value.bind(target) : value;
+          },
+        }),
+      };
+    } finally {
+      // (Made ready, or not: counted until whoever had it made ready has had their turn to ask for the reply,
+      // which is counted from there — so that no moment between the two is one in which nothing is being asked.)
+      setImmediate(() => count("readying", -1));
+    }
+  };
+}
+
+/**
+ * Have what is asked on a session's account be its call's, from before the
+ * session is there: an extension may ask a model as it is told that the
+ * session begins, and that is the call's as much as what its agent asks —
+ * also where the call then fails before its agent was ever set going.
+ *
+ * Each time a model is about to be asked, what the call has used so far is
+ * said, and whoever hears it waited for: they may cancel the call there, and
+ * the model is then not asked. (One at a time: whoever hears it is told of
+ * one request, and answers for that one.) And a call that was cancelled, or
+ * whose session is gone, asks no more, whoever would have it ask — its agent,
+ * pi keeping a cache warm, an extension for itself. Gives back what says to
+ * stop the call while it is at its work.
+ */
+function account(asking: Asking, call: Asked, signal: AbortSignal | undefined, session: () => AgentSession | undefined): AbortSignal {
+  const { sofar, had, relay } = call;
+  const stopped = signal ? AbortSignal.any([signal, asking.refusal.signal]) : asking.refusal.signal;
+  asking.stop = stopped;
+  const counted = () => {
+    const its = session();
+    return its ? usageOf(its, asking.seen) : atLeast(undefined, asking.seen);
+  };
+  let heard: Promise<void> = Promise.resolve();
+  // (A call that has its answer is not cancelled for what it has used: whoever hears says instead that
+  // nothing more may be asked beside it — and nothing is, from then.)
+  let noMore = false;
+  // (What stops a call in its work — it was cancelled, or cannot have the tools it named — stops what is asked
+  // on its account. Once it is over, a call that could not have its tools is one that failed, like any: what
+  // an extension asks beside it, as it is told the session ends, is asked. And nothing is, once what was being
+  // asked has been stopped — the session is being let go of: there is nobody left to say what the call has
+  // used to, and to wait for.)
+  const halted = () => asking.cut.signal.aborted || (asking.over ? signal?.aborted === true : stopped.aborted);
+  asking.stopped = () => asking.gone || noMore || halted();
+  // (Whoever hears what the call has used is not waited for once it is to ask no more, whatever they would
+  // say: the call was cancelled or cannot have what it named, while it is at its work — and, whenever the
+  // wait began, once what was being asked has been stopped.)
+  const atWork = AbortSignal.any([stopped, asking.cut.signal]);
+  asking.before = () => heard = heard.then(async () => {
+    const usage = sofar && !asking.gone && !noMore && !halted() && counted();
+    if (usage && await rejectOnAbort(Promise.resolve(sofar(usage, asking.over)), asking.over ? asking.cut.signal : atWork).catch(() => {}) === false && asking.over) noMore = true;
+  });
+  // (As soon as a reply has come, what the call has used is said to whoever would not otherwise know
+  // it, were this process to be ended: before the reply is anybody else's to hear of.)
+  asking.replied = () => {
+    const usage = had && !asking.gone && counted();
+    if (usage) had(usage);
+  };
+  // Where the call has extensions and somebody to ask its model by, its model is asked by them: what
+  // a reply used is then read where no extension is. Not where an extension has made the model's
+  // provider its own, has a hand in what a provider is sent and answers, or has made
+  // this process other than it was in what a request goes by — the model is then asked here, as the
+  // extension means it to be — nor where the request is not one that can be handed over (see dataOf).
+  if (relay && call.extensions) {
+    asking.elsewhere = async (model, context, options) => {
+      const data = dataOf(options), its = session();
+      if (!data || !its || !asItWas() || asking.models.getRegisteredProviderIds().includes(model.provider)) return undefined;
+      if (HANDS_IN.some(event => its.extensionRunner.hasHandlers(event))) return undefined;
+      return relay.ask({ model, context, options: data, ...(asking.over && { answered: true }) }, options?.signal as AbortSignal | undefined);
+    };
+  }
+  return stopped;
 }
 
 /**
@@ -171,38 +439,113 @@ interface Extended {
  * model and is still on its way there is seen off too, before the session is
  * gone: it is stopped as it begins to ask (see `ask`), where a session that
  * is disposed of under it would let it through.
+ *
+ * An extension that is asking a model is not one that does not answer: it
+ * may be summing up what was done, and a model takes the time it takes — a
+ * quarter of a minute for a page, a minute where it thinks first. So there
+ * are two clocks, and one of them runs at a time. The while extensions are
+ * given is their own, all told: it runs while no model is at work on what
+ * was asked on the session's account, and stands while one is. And the time
+ * a model may be at work for them, all told, is what pi gives one request of
+ * its own (`most`; none, where pi has no limit): it runs while a reply is
+ * being gone through. What they have all been told, and is still being asked
+ * beside what they answered, is waited for the same way. (A request that is
+ * only ever made ready — a session set going again and stopped as it begins,
+ * over and over — is no model at work: it is on their own time.) When either
+ * has run out, whoever let go of the session stops what is still asked (see
+ * Asking.cut): nothing is left being asked for a reply on the account of a
+ * session that is gone, to be nobody's.
  */
-async function leaveExtensions(session: AgentSession, puts: Set<Promise<void>>): Promise<void> {
-  const left = async () => {
+async function leaveExtensions(session: AgentSession, puts: Set<Promise<void>>, asking: Asking | undefined, most: number): Promise<void> {
+  const left = (async () => {
     await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
     while (puts.size > 0) await Promise.allSettled([...puts]);
-  };
-  await within(left(), EXTENSION_LEAVE_MS);
+  })().catch(() => {});
+  await new Promise<void>((resolve) => {
+    // Whether they have all answered, and whether the wait is over; what is left of their own time, and of a
+    // model's for them; and the clock that runs one of those down — which, and since when.
+    let told = false, ended = false, theirs = EXTENSION_LEAVE_MS, models = most > 0 ? most : Infinity;
+    let clock: NodeJS.Timeout | undefined, atWork = false, since = performance.now();
+    const done = () => {
+      if (ended) return;
+      ended = true;
+      clearTimeout(clock);
+      if (asking) asking.changed = undefined;
+      asking?.cut.signal.removeEventListener("abort", look);
+      resolve();
+    };
+    const look = () => {
+      if (ended) return;
+      const now = performance.now();
+      if (atWork) models -= now - since;
+      else theirs -= now - since;
+      clearTimeout(clock);
+      // (What was stopped — the call was cancelled — is no model at work, however long it takes to end: it is
+      // given a moment for that when the wait is over, like anything that is stopped. See allEnded.)
+      const asked = asking && !asking.cut.signal.aborted ? asking : undefined;
+      atWork = asked !== undefined && asked.answering > 0;
+      since = now;
+      if (!atWork && told && !asked?.readying) return done();
+      const has = atWork ? models : theirs;
+      // (A timer takes no more than this.)
+      clock = has === Infinity ? undefined : setTimeout(done, Math.min(Math.max(0, has), 2 ** 31 - 1));
+    };
+    if (asking) asking.changed = look;
+    asking?.cut.signal.addEventListener("abort", look, { once: true });
+    void left.then(() => {
+      told = true;
+      look();
+    });
+    look();
+  });
+}
+
+/** Wait until no reply is being gone through on a session's account — what was stopped ends, and says what it had used — or for a moment, whichever is less. */
+function allEnded(asking: Asking): Promise<void> {
+  return new Promise((resolve) => {
+    if (asking.answering <= 0) return resolve();
+    const over = () => {
+      clearTimeout(late);
+      asking.changed = undefined;
+      resolve();
+    };
+    const late = setTimeout(over, STOPPED_MS);
+    asking.changed = () => { if (asking.answering <= 0) over(); };
+  });
+}
+
+/**
+ * The most a model is waited for, at work for a session's extensions as it
+ * ends: what pi gives a request of its own, as the session's settings have
+ * it — the time for a request to a provider, or else the time a connection
+ * may be silent, which is none at all where the settings say so. What the
+ * settings have that pi itself would not take is not taken here either:
+ * then it is what pi gives where they say nothing.
+ */
+function longestAsked(session: AgentSession): number {
+  try {
+    const settings = session.settingsManager as Partial<Settings> | undefined;
+    const own: unknown = settings?.getProviderRetrySettings?.().timeoutMs;
+    if (typeof own === "number" && Number.isFinite(own) && own > 0) return own;
+    const silent: unknown = settings?.getHttpIdleTimeoutMs?.();
+    return typeof silent === "number" && silent >= 0 ? silent : REQUEST_MS;
+  } catch {
+    return REQUEST_MS;
+  }
 }
 
 /**
  * What a session has used: pi's own count, over everything the session asked
- * of its model — a summary it made of a long conversation included. Nothing,
- * where no tokens were counted: the model was never reached, or does not say.
+ * of its model — a summary it made of a long conversation included — and
+ * what trama saw come (`seen`: see `watch`), where that is more: a reply that
+ * has come and is not on pi's record yet, and what an extension asked for
+ * itself, which never is. Nothing, where no tokens were counted: the model
+ * was never reached, or does not say.
  */
-function usageOf(session: AgentSession, more?: Counted): AgentUsage | undefined {
+function usageOf(session: AgentSession, seen?: Tally): AgentUsage | undefined {
   const { tokens, cost } = session.getSessionStats();
-  const input = tokens.input + (more?.input ?? 0), output = tokens.output + (more?.output ?? 0);
-  const cacheRead = tokens.cacheRead + (more?.cacheRead ?? 0), cacheWrite = tokens.cacheWrite + (more?.cacheWrite ?? 0);
-  if (input + output + cacheRead + cacheWrite === 0) return undefined;
-  return {
-    ...(session.model && { model: nameOf(session.model) }),
-    input, output, cacheRead, cacheWrite, cost: cost + (more?.cost.total ?? 0),
-  };
-}
-
-/** What a reply of a model's used, as pi has it on the reply — and adds it up into what a session used, once the reply is on its record. */
-interface Counted {
-  input: number;
-  output: number;
-  cacheRead: number;
-  cacheWrite: number;
-  cost: { total: number };
+  const { input, output, cacheRead, cacheWrite } = tokens;
+  return atLeast({ ...(session.model && { model: nameOf(session.model) }), input, output, cacheRead, cacheWrite, cost }, seen);
 }
 
 /**
@@ -265,13 +608,7 @@ export class PiAdapter implements AgentBackend {
     await this.hosts.close();
   }
 
-  /**
-   * `counted`: whether what the session uses is counted in another process
-   * (see `serve`). Such a session has trama's own handlers among its
-   * extensions — which is where pi waits for a handler — whether or not the
-   * call has any extension of the user's.
-   */
-  private async createSession(cwd: string, systemPrompt?: string, signal?: AbortSignal, asked: Asked = {}, counted = false): Promise<AgentSession> {
+  private async createSession(cwd: string, systemPrompt?: string, signal?: AbortSignal, asked: Asked = {}): Promise<AgentSession> {
     // Each step below is given up on the moment the call is cancelled.
     const raceAbort = <T>(step: Promise<T>) => rejectOnAbort(step, signal);
 
@@ -321,51 +658,33 @@ export class PiAdapter implements AgentBackend {
     const wary = asked.extensions && !withProjects
       ? Object.assign(Object.create(SettingsManager.create(cwd, agentDir)) as Settings, { isProjectTrusted: () => false })
       : undefined;
-    const extended: Extended | undefined = asked.extensions || counted ? { puts: new Set(), over: false } : undefined;
+    const extended: Extended | undefined = asked.extensions ? { puts: new Set(), over: false } : undefined;
     if (extended) {
       // A session that is to ask no more — its call cancelled, or over — is stopped each time it begins to
       // (see `ask`); and an extension may set it going again each time it stops, by more ways than one. All
       // of that is done without the runner coming to anything else: not to the clock that is to give the
       // call up, nor to any other run. So each beginning of such a session waits a turn of the runner's —
       // by a handler of trama's own among the extensions, which is what pi waits for when a run begins.
-      // And before the model is asked again — for a turn, or to sum a long conversation up — what the
-      // call has used so far is said from there too, and whoever hears it waited for: a session with
-      // extensions is served in a process of its own, and what it is counted against is in the runner.
+      // And where the agent's model is about to be asked for the first time — for a turn, or to sum a
+      // conversation up — what the agent has by then is looked at from there too (see whyNotTheTools).
       const breathes: ExtensionFactory = (pi) => {
         pi.on("agent_start", async () => {
           if (extended.over || signal?.aborted) await new Promise(resolve => setImmediate(resolve));
         });
-        const said = async () => {
+        const looks = () => {
           extended.look?.();
           extended.look = undefined;
-          await extended.sofar?.();
         };
-        pi.on("turn_start", said);
-        pi.on("session_before_compact", said);
+        pi.on("turn_start", looks);
+        pi.on("session_before_compact", looks);
       };
-      // And as soon as a reply of the model's has come, what the call has used is said — to whoever would
-      // otherwise not know it if this process had to be ended. By a handler that hears of the reply before
-      // any other extension's does: one of theirs may be what stops the process. (pi puts a reply on the
-      // session's record when all have heard of it.)
-      const counts: InlineExtension = {
-        name: COUNTS,
-        factory: (pi) => {
-          pi.on("message_end", (event) => {
-            if (event.message.role === "assistant") extended.had?.(event.message.usage);
-          });
-        },
-      };
+      const builtIn = await raceAbort(builtInExtensions());
+      // (What this process is, before anything of an extension's is loaded in it: see shapeOf.)
+      asLoaded ??= shapeOf();
       const own = new DefaultResourceLoader({
         cwd,
         agentDir,
-        // (A call without extensions has trama's two, and nothing that is found or built in.)
-        noExtensions: !asked.extensions,
-        extensionFactories: [...(asked.extensions ? await raceAbort(builtInExtensions()) : []), counts, breathes],
-        // (pi has what it was handed after what it found: the one that counts is put before them all.)
-        extensionsOverride: (loaded) => ({
-          ...loaded,
-          extensions: [...loaded.extensions].sort((a, b) => Number(b.path === `<inline:${COUNTS}>`) - Number(a.path === `<inline:${COUNTS}>`)),
-        }),
+        extensionFactories: [...builtIn, breathes],
         settingsManager: SettingsManager.create(cwd, agentDir, { projectTrusted: withProjects }),
         // (Nothing but its extensions is asked of it, and so it need find nothing else.)
         noSkills: true,
@@ -397,6 +716,8 @@ export class PiAdapter implements AgentBackend {
     // to undefined, in which case pi falls back to its own default selection;
     // a model a call names is that model or the call fails.
     const modelRuntime = await raceAbort(ModelRuntime.create({ signal }));
+    const asking: Asking = { models: modelRuntime, seen: nothingYet(), answering: 0, readying: 0, cut: new AbortController(), over: false, gone: false, refusal: new AbortController() };
+    watch(modelRuntime, asking);
     // (A call names it "provider/model": the provider's name ends at a stroke, and either name may have more of them.)
     const strokes = [...(asked.model ?? "").matchAll(/\//g)].map(stroke => stroke.index);
     const model = asked.model === undefined
@@ -422,8 +743,24 @@ export class PiAdapter implements AgentBackend {
     let session: AgentSession | undefined;
     // The telling of extensions that a session begins, while it lasts.
     let beginning: Promise<void> | undefined;
+    const stopped = account(asking, asked, signal, () => session);
+    // (A call that is cancelled asks no more — and what is being asked for it then is asked no further, whoever
+    // asked: from here, while its session is being made — and let go of, should that fail. Once the session
+    // is there, it is whoever has it who listens: see `serve`.)
+    const offCut = onAbort(signal, () => asking.cut.abort());
     try {
       ({ session } = await raceAbort(sessionPromise));
+      this.asking.set(session, asking);
+      // A session that is set going again once its call is over, or stopped, is stopped as it begins to: a
+      // command of an extension that asks the model once more, or what an extension starts while it is being
+      // told that the call is over.
+      if (asked.sofar || asked.extensions) {
+        const here = session;
+        here.subscribe((event) => {
+          if (event.type !== "turn_start" && event.type !== "compaction_start") return;
+          if (asking.over || stopped.aborted) void here.abort().catch(() => {});
+        });
+      }
       // An extension is told that its session has begun, as pi tells it where pi runs by itself:
       // that is when it sets itself up. What goes wrong in one later is said, and is not the call's failure.
       // A command of one can wait for the model it asked, as it can there; the session is one call's, and
@@ -477,17 +814,29 @@ export class PiAdapter implements AgentBackend {
       const refusal = whyNotAsAsked(session, asked, serving, found, formatSkillsForPrompt);
       if (refusal) throw new Error(refusal);
       if (!model) this.warnUnknownModel(serving);
+      offCut();
       return session;
     } catch (err) {
       // A session that is here is let go of, once, before the call fails — its extensions, if they were
       // still being told that it begins, having heard that out first (or been given the while they are
       // given to hear of its end). Where the call was cancelled before the session came, it may still
       // come: it is disposed of when it does, and no extension was told of it.
-      if (session) {
-        if (beginning) await within(beginning, EXTENSION_LEAVE_MS);
-        await this.letGoOf(session, asked);
-      } else {
-        sessionPromise.then(({ session: late }) => late.dispose()).catch(() => {});
+      // The call is over, failed; and what its extensions asked a model, as they were told that the session
+      // begins and that it is over, is what it used — said when the session is gone, as of any call.
+      asking.over = true;
+      if (extended) extended.over = true;
+      try {
+        if (session) {
+          if (beginning) await within(beginning, EXTENSION_LEAVE_MS);
+          await this.letGoOf(session, asked);
+        } else {
+          sessionPromise.then(({ session: late }) => late.dispose()).catch(() => {});
+        }
+      } finally {
+        asking.gone = true;
+        offCut();
+        const usage = session && asked.used && usageOf(session, asking.seen);
+        if (usage) asked.used!(usage);
       }
       throw err;
     }
@@ -495,14 +844,21 @@ export class PiAdapter implements AgentBackend {
 
   /** What is kept of each session that has extensions. */
   private extended = new WeakMap<AgentSession, Extended>();
+  /** Where trama stands when each session's model is asked. */
+  private asking = new WeakMap<AgentSession, Asking>();
 
   /** Be done with a session: its extensions, where it has any, told first that it is over. */
   private async letGoOf(session: AgentSession, asked: Asked): Promise<void> {
+    const asking = this.asking.get(session);
     try {
-      if (asked.extensions) await leaveExtensions(session, this.extended.get(session)?.puts ?? new Set());
+      if (asked.extensions) await leaveExtensions(session, this.extended.get(session)?.puts ?? new Set(), asking, longestAsked(session));
     } catch (err) {
       console.warn(`[trama] an extension could not be told its session is over: ${messageOf(err)}`);
     } finally {
+      // What is still being asked on its account — it was waited for as long as anything is — is asked no
+      // further; and has a moment to end, and say what it had used: that is the call's too.
+      asking?.cut.abort();
+      if (asking && asked.extensions) await allEnded(asking);
       session.dispose();
     }
   }
@@ -536,60 +892,45 @@ export class PiAdapter implements AgentBackend {
    * the session's record what the request that was cut off had taken by then.
    */
   async serve(prompt: string, call: AgentCall): Promise<string> {
-    const { cwd, system, signal, used, sofar, had } = call;
+    const { cwd, system, signal, used, sofar } = call;
     throwIfAborted(signal);
 
-    // (Whoever is told what the call has used as its replies come — `had` — is in another process.)
-    const session = await this.createSession(cwd, system, signal, call, had !== undefined);
+    const session = await this.createSession(cwd, system, signal, call);
+    // (A call that is cancelled asks no more — and what is being asked for it then is asked no further, whoever
+    // asked: while it is at its work, and while its extensions are told that it is over.)
+    const offCut = onAbort(signal, () => this.asking.get(session)?.cut.abort());
     let offAbort = () => {};
-    // Whether the call has come to its end: what it used is what it had used by then.
-    let over = false;
+    // What is kept of the call where its model is asked (see `account`): whether it has come to its end, and
+    // whether its session is gone. (A session that was not made here has nothing asked on its account that
+    // is seen: what is kept of its call is then kept here alone.)
+    const asking = this.asking.get(session);
+    const its: Pick<Asking, "over" | "gone" | "refusal"> = asking ?? { over: false, gone: false, refusal: new AbortController() };
     // What is kept of the session beside it, where it has extensions.
     const extended = this.extended.get(session);
     // Why the call cannot have the tools it named, where that was found as its run began. It is
     // then stopped as a cancelled call is — it asks nothing, and what would hold it is not waited
     // for long — and fails with that.
     let refused: string | undefined;
-    const refusal = new AbortController();
-    const stopped = signal ? AbortSignal.any([signal, refusal.signal]) : refusal.signal;
+    const stopped = asking?.stop ?? (signal ? AbortSignal.any([signal, its.refusal.signal]) : its.refusal.signal);
 
     try {
       throwIfAborted(signal);
       offAbort = onAbort(signal, () => { session.abort().catch(() => {}); });
-      // Each time the model is about to be asked again, what the call has used so far is said:
-      // whoever hears it may cancel the call there, and the model is then not asked.
-      // (pi asks its model for the next turn, and — between two turns — to sum up a conversation grown long.)
-      // And a call that was cancelled, or is over, asks no more, whatever sets its session going again
-      // after that: a command of an extension that asks the model once more is stopped as it begins to,
-      // and so is what an extension starts while it is being told that the call is over.
-      // (A session with extensions has said it by then, and been heard: see createSession.)
+      // Where the agent has not the tools the call named, that is found as its run begins (see
+      // createSession), and the call is stopped as one that was cancelled is.
       if (extended && call.extensions) {
         extended.look = () => {
           refused = whyNotTheTools(session, call.tools);
           if (refused === undefined) return;
-          // (The session is stopped where it hears next that a turn begins — just after this: see below.)
+          // (The session is stopped where it hears next that a turn begins — just after this: see createSession.)
           extended.over = true;
-          refusal.abort();
+          its.refusal.abort();
         };
       }
-      if (extended && had) {
-        extended.had = (reply) => {
-          const usage = !over && usageOf(session, reply);
-          if (usage) had(usage);
-        };
-      }
-      if (extended && sofar) {
-        extended.sofar = async () => {
-          const usage = !over && !stopped.aborted && usageOf(session);
-          if (usage) await sofar(usage);
-        };
-      }
-      if (sofar || call.extensions) {
+      if (!asking && (sofar || call.extensions)) {
         session.subscribe((event) => {
           if (event.type !== "turn_start" && event.type !== "compaction_start") return;
-          if (over || stopped.aborted) return void session.abort().catch(() => {});
-          const usage = sofar && !extended && usageOf(session);
-          if (usage) void sofar(usage);
+          if (its.over || stopped.aborted) void session.abort().catch(() => {});
         });
       }
 
@@ -618,15 +959,17 @@ export class PiAdapter implements AgentBackend {
       return answerOf(session, taken);
     } finally {
       offAbort();
-      over = true;
+      its.over = true;
       if (extended) extended.over = true;
       try {
-        // What the call used is said when it is over, however it ended — and before its extensions are
-        // waited for: a count is not to wait on them.
-        const usage = used && usageOf(session);
-        if (usage) used(usage);
-      } finally {
         await this.letGoOf(session, call);
+      } finally {
+        // What the call used is said when all is over that could use anything on its account, however it
+        // ended. (Whoever counts has not waited for this: they were told as each reply came.)
+        its.gone = true;
+        offCut();
+        const usage = used && usageOf(session, this.asking.get(session)?.seen);
+        if (usage) used(usage);
       }
     }
   }

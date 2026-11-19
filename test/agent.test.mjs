@@ -301,6 +301,11 @@ test("PiAdapter.ask cleans up abort listeners after successful calls", async () 
   }
 
   assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+  // Nor is one left by a call that fails before its session is made: it names a model there is not.
+  for (let i = 0; i < 3; i++) {
+    await assert.rejects(adapter.ask("to nobody", { cwd: process.cwd(), model: "nope/none", signal: controller.signal }), /Unknown model/);
+  }
+  assert.equal(getEventListeners(controller.signal, "abort").length, 0);
   controller.abort();
   await assert.rejects(
     async () => adapter.ask("after abort", { cwd: process.cwd(), signal: controller.signal }),
@@ -1225,8 +1230,9 @@ test("a call has the user's extensions where it asks for them — the user's own
   // Asked for: the user's is loaded, told that a session begins and that it is over, and its tool is the agent's.
   await fake.ask("say hello", { extensions: true, used: () => fake.seen().push("the call said what it used") });
   assert.deepEqual(fake.toolsOf(fake.requests.at(-1)), ["read", "bash", "edit", "write", "hello_tool"]);
-  // (What the call used is said before its extensions are waited for: a count does not wait on them.)
-  assert.deepEqual(fake.seen(), ["the user's loaded", "the user's told of the start", "the call said what it used", "the user's told of the end"]);
+  // (What the call used is said when its extensions have been told that it is over: one of them may ask a model for
+  // itself as it is told, and that is the call's. Whoever counts does not wait for it — they hear as each reply comes.)
+  assert.deepEqual(fake.seen(), ["the user's loaded", "the user's told of the start", "the user's told of the end", "the call said what it used"]);
   // To an extension the project is not one to be trusted: what it holds, the program it runs could have written.
   assert.equal(globalThis.__tramaTrusted, false);
   assert.doesNotMatch(fake.told().system, /available_skills/);

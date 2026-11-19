@@ -698,7 +698,7 @@ await ctx.done({ went });
   });
   const asked = [];
   standIn(t, {
-    ask: async (prompt, { cwd, signal, used, sofar, system, ...call }) => {
+    ask: async (prompt, { cwd, signal, used, sofar, had, system, ...call }) => {
       asked.push({ prompt: prompt.split("\n")[0], ...call });
       return prompt.startsWith("second") ? '{"a":"x"}' : `answer to ${prompt}`;
     },

@@ -8,40 +8,50 @@
 //
 // One call at a time, asked for and answered over the channel to the runner
 // that started this process. The serving is the adapter's, as it is in a
-// runner: nothing here knows what pi is.
+// runner: nothing here knows what pi is. And the call's model is asked over
+// the same channel, where it can be (see model-relay.ts): by the runner,
+// where no extension is.
 
 import { PiAdapter } from "./pi-adapter.js";
 import { CutOff, type AgentCall, type AgentUsage } from "./agent-backend.js";
 import type { ModelConfig } from "./runner-types.js";
 import { messageOf } from "./errors.js";
+import { createModelRelay, relayClient, relayServer, withRepliesWhole, type RelayAnswered, type RelayAsked } from "./model-relay.js";
 import { groupsUnder, signalGroup } from "./stopping.js";
 
 /** What a call is made of that can be sent: all of it but where to say what it used, and what cancels it. */
-export type SentCall = Omit<AgentCall, "signal" | "used" | "sofar" | "had">;
+export type SentCall = Omit<AgentCall, "signal" | "used" | "sofar" | "had" | "relay">;
 
 /**
  * What a runner says to a host: a call to serve; that the call it is serving
- * may go on, having said what it has used so far; or that it is cancelled.
+ * may go on, having said what it has used so far; that it is cancelled; and
+ * what a model answers that the call had asked by its runner (see
+ * model-relay.ts). And to a host that serves no call, but asks models for
+ * the calls of others — the runner's own, where the run was given variables,
+ * which a process is to be started with to ask by them: what to ask.
  */
-export type ToHost = { ask: { config: ModelConfig; prompt: string; call: SentCall } } | { go: true } | { abort: true };
+export type ToHost = { ask: { config: ModelConfig; prompt: string; call: SentCall } } | { go: boolean } | { abort: true } | RelayAnswered | RelayAsked;
 
 /**
  * What a host says to its runner: that it is there; what the call has used
  * so far, where its model is about to be asked again (and the host waits to
  * hear that it may be); what it has used, as each reply of its model's has
  * come (which nothing waits for: it is what is known of the call if this
- * process has to be ended); what it used in the end; and how the call ended —
+ * process has to be ended); what it used in the end; how the call ended —
  * its answer, an answer cut off at the output limit (with what there was of
- * it), or its failure.
+ * it), or its failure; and what the call would have a model asked (or, of a
+ * host that asks for others: what the model answered).
  */
 export type FromHost =
   | { ready: true }
-  | { sofar: AgentUsage }
+  | { sofar: AgentUsage; answered?: true }
   | { had: AgentUsage }
   | { used: AgentUsage }
   | { answer: string }
   | { cutOff: string }
-  | { error: string };
+  | { error: string }
+  | RelayAsked
+  | RelayAnswered;
 
 const say = (message: FromHost): void => {
   // (A runner that is gone is told nothing: this process is on its way out with it.)
@@ -55,20 +65,26 @@ let cancel: AbortController | undefined;
  * it used so far, and whoever counts that is in the runner: the model is not
  * asked before the runner has said whether the call is to go on.
  */
-let goOn: (() => void) | undefined;
-const answered = () => {
-  goOn?.();
+let goOn: ((go: boolean) => void) | undefined;
+const answered = (go: boolean) => {
+  goOn?.(go);
   goOn = undefined;
 };
+/** The end that asks, of what the call being served has its model asked by: this process's runner. */
+const asks = relayClient(say);
+/** The end that answers, where this process is one that asks models for the calls of others: with its own pi, and the keys it was started with. */
+let answers: ReturnType<typeof relayServer> | undefined;
 /** Whether this process has been told to end. What it was serving is then stopped, and how that ended is not said: its runner hears that the process did. */
 let leaving = false;
 
 process.on("message", (message: ToHost) => {
-  if ("go" in message) return answered();
+  if ("go" in message) return answered(message.go);
   if ("abort" in message) {
     cancel?.abort();
-    return answered();
+    return answered(false);
   }
+  if ("relayed" in message) return asks.heard(message.relayed);
+  if ("relay" in message || "relayAbort" in message) return (answers ??= relayServer(createModelRelay(), say)).heard(message);
   // (A process that has been told to end serves nothing more: whoever asked hears that it ended.)
   if (leaving) return;
   const { config, prompt, call } = message.ask;
@@ -78,9 +94,10 @@ process.on("message", (message: ToHost) => {
     signal: serving.signal,
     used: (usage) => say({ used: usage }),
     had: (usage) => say({ had: usage }),
-    sofar: (usage) => new Promise<void>((resolve) => {
+    relay: withRepliesWhole(asks.relay),
+    sofar: (usage, has) => new Promise<boolean>((resolve) => {
       goOn = resolve;
-      say({ sofar: usage });
+      say({ sofar: usage, ...(has && { answered: true }) });
     }),
   }).then(
     (answer) => { if (!leaving) say({ answer }); },
@@ -99,7 +116,7 @@ const leave = (asked?: NodeJS.Signals) => {
   if (leaving) return;
   leaving = true;
   cancel?.abort();
-  answered();
+  answered(false);
   void groupsUnder(process.pid).then((groups) => {
     for (const group of groups) signalGroup(group, "SIGKILL");
     // (Asked to end, it ends as what was asked to: whoever waits for it is told how it went.)

@@ -873,7 +873,7 @@ await ctx.done({ first, second, third, fourth, fifth, sixth, seventh, eighth, ni
 
   const asked = [];
   const originalAsk = llm.ask;
-  llm.ask = async (prompt, { cwd, signal, used, sofar, ...call }) => {
+  llm.ask = async (prompt, { cwd, signal, used, sofar, had, ...call }) => {
     assert.equal(typeof sofar, "function", "a backend is always given where to say what a call has used so far");
     asked.push({ prompt: prompt.startsWith("Your previous response failed validation") ? "second, again" : prompt.split("\n")[0], ...call });
     // (What a report holds beside what a report is declared to hold is not what a record is made of.)
