@@ -22,7 +22,9 @@
 // ends of a channel between it and a session (relayClient, relayServer).
 
 import { randomUUID } from "crypto";
+import { readFileSync } from "fs";
 import { createRequire } from "module";
+import { join } from "path";
 import { pathToFileURL } from "url";
 import { onAbort } from "./abort.js";
 import { messageOf } from "./errors.js";
@@ -290,11 +292,34 @@ export function whole(event: RelayEvent, state: SoFar): RelayEvent {
 
 // --- The one that asks ---
 
+/**
+ * Where pi's own pi-ai keeps what it exports by a name: looked for where pi
+ * would look for the package (beside it, then in each `node_modules` above),
+ * and read from what the package says it exports to an `import`. Not by
+ * `require.resolve`: pi-ai is a package to be imported and nothing else, and
+ * asked for as one to be required it is not found — which is how nothing was
+ * let go of, with no word of it, in 0.6.0 and 0.6.1.
+ */
+function inPisAi(name: string): string {
+  const lookedIn = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent")).resolve.paths("@earendil-works/pi-ai") ?? [];
+  for (const dir of lookedIn) {
+    const root = join(dir, "@earendil-works", "pi-ai");
+    let exported: unknown;
+    try {
+      exported = JSON.parse(readFileSync(join(root, "package.json"), "utf-8")).exports?.[name]?.import;
+    } catch {
+      continue; // not here: pi's is further up
+    }
+    if (typeof exported === "string") return join(root, exported);
+    break;
+  }
+  throw new Error(`pi-ai exports no ${name}`);
+}
+
 /** What pi keeps for a session where its model is asked, let go of. (pi's own, had by its file: it is no part of what pi exports.) */
 async function letGoOf(sessions: Iterable<string>): Promise<void> {
   try {
-    const kept = createRequire(import.meta.resolve("@earendil-works/pi-coding-agent")).resolve("@earendil-works/pi-ai/compat");
-    const { cleanupSessionResources } = await import(pathToFileURL(kept).href) as { cleanupSessionResources?: (session: string) => void };
+    const { cleanupSessionResources } = await import(pathToFileURL(inPisAi("./compat")).href) as { cleanupSessionResources?: (session: string) => void };
     for (const session of sessions) cleanupSessionResources?.(session);
   } catch { /* what cannot be let go of is left: it is bounded where it is kept */ }
 }

@@ -2,6 +2,22 @@
 
 All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`) are released together under one version.
 
+## Unreleased
+
+### Changed
+
+- **pi is 1.6.0** (`@earendil-works/pi-coding-agent`, was 1.5.2). Nothing of trama's had to change for it. What an agent call has of it, of what pi's own changelog says:
+  - The agent's `find` tool reads a pattern with a `/` in it from the directory it searches, as its `grep` reads a `glob`: `src/*.ts` finds `src/a.ts` and no longer `pkg/src/a.ts` — `**/src/*.ts` does. A pattern without a `/` still matches a file's name at any depth.
+  - More of what goes wrong on the way to a provider is asked again by pi before the call fails: a reply that ends in `Connection closed.`, and an error that is a socket's code and nothing else (`read ECONNRESET`, `write EPIPE`, `connect ETIMEDOUT`).
+  - A provider that speaks OpenAI's chat API and is not OpenAI is sent the system prompt as `system`, where it was sent as `developer`, which some refused.
+  - pi's own default for the `openai`, `azure` and `openai-codex` providers is `gpt-6.2-sol` (was `gpt-6.1-sol`): it is what pi may fall back to where a project names a model pi does not know. trama's own default is as it was.
+  - With extensions: a handler of `pi.events` that throws is said as any extension's failure is (`[trama] an extension failed (…)`), where it was printed by pi; and pi's llama.cpp extension looks for a server on port 9931, where it looked on 8080.
+  - `undici` 8.12.4, for the security advisories pi's changelog names.
+
+### Fixed
+
+- **A relay that is closed has pi let go of what it kept for the sessions it asked for.** Where a model is asked by a call's runner (0.6.0), pi keeps things for the session in the process that asks — for `openai-codex` an open WebSocket — and the relay was to have them let go of when its run is over. It never did: pi's way to do that was looked for as a package to be required, pi-ai is one to be imported and nothing else, and the error was passed over as "nothing to let go of". Such a socket stayed open in the runner until pi's own idle time closed it (five minutes). It is looked for where pi looks, by what the package exports to an `import`; a test has a relay asked for two sessions and closed.
+
 ## 0.6.1 — 2026-11-19
 
 ### Changed

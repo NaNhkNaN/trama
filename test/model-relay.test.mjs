@@ -620,6 +620,37 @@ test("a relay asks by the ways pi has of asking a model, and by nothing else its
   });
 });
 
+test("a relay that is closed has pi let go of what it kept for the sessions it asked for", async (t) => {
+  const it = await user(t, ofAllKinds());
+  withAllKinds(it);
+  await withEnv({ ...it.env, TRAMA_TEST_KEY: "a key" }, async () => {
+    // What pi keeps for a session where its model is asked (a provider's open socket, for one) is let go of by
+    // whatever is registered with pi for that: the test registers one of its own, to be told as pi's are.
+    const { registerSessionResourceCleanup } = await import("@earendil-works/pi-ai");
+    const letGo = [];
+    t.after(registerSessionResourceCleanup((session) => { letGo.push(session); }));
+    const relay = createModelRelay();
+    t.after(() => relay.close());
+    const { ModelRuntime } = await import("@earendil-works/pi-coding-agent");
+    const chat = (await ModelRuntime.create()).getModel("fake", "plain");
+    const context = { messages: [{ role: "user", content: [{ type: "text", text: "asked by a relay" }], timestamp: 1 }] };
+    const through = async (events) => { for await (const _event of events); };
+    await through(await relay.ask({ model: chat, context, options: { sessionId: "one session" } }));
+    await through(await relay.ask({ model: chat, context, options: { sessionId: "one session" } }));
+    await through(await relay.ask({ model: chat, context, options: { sessionId: "another" } }));
+    await through(await relay.ask({ model: chat, context, options: {} }));
+    assert.equal(it.requests.length, 4);
+    // Not while the relay may still be asked for them...
+    assert.deepEqual(letGo, []);
+    // ...and each once, when it is closed. (pi-ai is a package to be imported and nothing else: looked for as
+    // one to be required it is not found, and nothing was let go of — with no word of it.)
+    await relay.close();
+    assert.deepEqual(letGo, ["one session", "another"]);
+    await relay.close();
+    assert.deepEqual(letGo, ["one session", "another"]);
+  });
+});
+
 test("a reply that was asked for elsewhere is handed to its session as pi makes a reply: with the whole of it so far, as each part comes", async (t) => {
   const it = await user(t, (_request, stream) => {
     for (const words of ["hello ", "from ", "the fake"]) stream.says({ role: "assistant", content: words });
