@@ -2,11 +2,13 @@
 // A thin wrapper that forwards every call to the runner's IPC server
 // (ipc-server.ts), which does the real work.
 
-import type { Ctx, Agent, AgentOptions, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace } from "./types.js";
+import { randomUUID } from "crypto";
+import type { Ctx, Agent, AgentOptions, AgentTool, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace } from "./types.js";
 import { openBridge, remoteWorkspace, withOptions } from "./bridge-client.js";
+import { messageOf } from "./errors.js";
 import { assertSerializable, toLogData } from "./serializable.js";
 
-export type { Ctx, Agent, AgentOptions, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace };
+export type { Ctx, Agent, AgentOptions, AgentTool, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace };
 
 const PORT = process.env.TRAMA_PORT;
 if (!PORT) {
@@ -60,9 +62,87 @@ export const ctx: Ctx = {
   },
 };
 
+/** What a tool's result is to a model: a string as it is, anything else as JSON says it. */
+function said(result: unknown): string {
+  if (typeof result === "string") return result;
+  if (result === undefined) return "Done.";
+  const json = JSON.stringify(result);
+  if (json === undefined) throw new TypeError(`the tool returned a ${typeof result}, which cannot be said as JSON`);
+  return json;
+}
+
+/**
+ * Make an agent call. The tools of the program's own that it has are
+ * functions, and stay here: the runner is sent what each declares, and where
+ * this process waits to be asked for them — a call of its own beside the
+ * agent call, held by the runner until a tool is called, or one that is
+ * running is to stop, and made again for as long as the agent call lasts.
+ */
+async function agentCall(endpoint: string, body: unknown): Promise<any> {
+  // (What is no call at all is the runner's to refuse, or the bridge's, as it is made.)
+  const tools = typeof body === "object" && body !== null ? (body as { tools?: unknown }).tools : undefined;
+  if (!Array.isArray(tools) || tools.every(tool => typeof tool !== "object" || tool === null)) return call(endpoint, body);
+
+  const own = new Map<string, AgentTool["run"]>();
+  const declared = tools.map((tool: unknown) => {
+    if (typeof tool !== "object" || tool === null) return tool;
+    const { run, ...rest } = tool as Partial<AgentTool>;
+    if (typeof run !== "function") {
+      throw new TypeError(`the tool ${JSON.stringify(rest.name)} has no run: a tool of the program's own is a function of the program's`);
+    }
+    // (Of two by one name the runner refuses the call, before either is asked.)
+    own.set(String(rest.name), run);
+    return rest;
+  });
+
+  const toolsId = randomUUID();
+  const over = new AbortController();
+  /** The tools that are running, each by the key its use was told under. */
+  const running = new Map<string, AbortController>();
+
+  const use = async (key: string, name: string, args: unknown) => {
+    const stop = new AbortController();
+    running.set(key, stop);
+    let answer: { text: string } | { error: string };
+    try {
+      answer = { text: said(await own.get(name)!(args, { signal: stop.signal })) };
+    } catch (err) {
+      answer = { error: messageOf(err) };
+    }
+    running.delete(key);
+    // (What a tool says after it was told to stop, or after its call is over, is said to nobody: the runner has no use for it.)
+    await call("/agent/tool/answered", { of: toolsId, key, ...answer }).catch(() => {});
+  };
+
+  const waiting = (async () => {
+    while (!over.signal.aborted) {
+      let event: { key: string; name: string; args: unknown } | { stop: string } | null;
+      try {
+        event = await call("/agent/tool/asked", { of: toolsId }, over.signal);
+      } catch {
+        // Given up, the agent call being over. (Or not answered — which the agent call will say for itself: asked again meanwhile.)
+        if (over.signal.aborted) return;
+        await new Promise(resolve => setTimeout(resolve, 50));
+        continue;
+      }
+      if (event === null) return;
+      if ("stop" in event) running.get(event.stop)?.abort();
+      else void use(event.key, event.name, event.args);
+    }
+  })();
+
+  try {
+    return await call(endpoint, { ...(body as object), tools: declared, toolsId });
+  } finally {
+    over.abort();
+    for (const stop of running.values()) stop.abort();
+    await waiting;
+  }
+}
+
 export const agent: Agent = {
-  instruct: async (prompt, opts) => call("/agent/instruct", withOptions({ prompt }, opts)),
-  generate: (input) => call("/agent/generate", input),
+  instruct: async (prompt, opts) => agentCall("/agent/instruct", withOptions({ prompt }, opts)),
+  generate: async (input) => agentCall("/agent/generate", input),
 };
 
 export const tools: Tools = {

@@ -69,6 +69,41 @@ export interface Ctx {
 export type Thinking = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 /**
+ * A tool of the program's own, for the agent of one call: a function of the
+ * program's, which the model can call by name. It is run where the program
+ * runs — it has the program's variables, and can do what the program can.
+ */
+export interface AgentTool {
+  /** As the model calls it: letters, digits, "_" and "-". Not the name of another tool the agent has. */
+  name: string;
+  /** What it is for. This, and what its parameters are called, is all the model is told of it. */
+  description: string;
+  /**
+   * What it is called with, written as the shape of a typed answer is (see
+   * `Schema`): `{ id: "string: the order's id", lines: ["number"] }`. The
+   * model's call is held to it before `run` is called: every field there,
+   * each of its kind, and no other. Without it, the tool is called with `{}`.
+   */
+  parameters?: Schema;
+  /**
+   * It may run while another tool does. Without it, the tools a model calls
+   * in one reply are run one after the other, in the order it called them —
+   * the agent's own among them, where one of the program's is called beside.
+   */
+  parallel?: boolean;
+  /**
+   * Called each time the model calls the tool, with its arguments. What it
+   * returns is the model's to read: a string as it is, anything else as
+   * JSON says it (nothing at all as "Done."). What it throws is the model's
+   * to read too, as the tool's failure — and not the failure of the call,
+   * which goes on. `signal` says when the call it is run for is to go no
+   * further (it was cancelled, or its budget is spent): what it returns
+   * after that is nobody's.
+   */
+  run(args: any, context: { signal: AbortSignal }): unknown;
+}
+
+/**
  * What a call may say about how it is served. Each is honoured or the call
  * fails: nothing asked for here is quietly left out. (But by an extension
  * the call asked for itself: what one does to a session is its to do.)
@@ -85,9 +120,12 @@ export interface AgentOptions {
    * the answer is then made from the prompt alone, and nothing is read, run
    * or written. Without it the agent has its own choice of them (read, bash,
    * edit, write); pi has more than it chooses (grep, find, ls). A name the
-   * agent has no tool for is an error.
+   * agent has no tool for is an error. A tool of the program's own is given
+   * as itself (see `AgentTool`), beside the names — and is then the agent's
+   * like any: a call that names tools of its own and nothing else has those
+   * and no other.
    */
-  tools?: string[];
+  tools?: Array<string | AgentTool>;
   /**
    * The skills the agent has for this call: `true` for all that pi finds
    * for the user and for the project (its `.pi/skills` among them; of two

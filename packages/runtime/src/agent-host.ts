@@ -13,14 +13,21 @@
 // where no extension is.
 
 import { PiAdapter } from "./pi-adapter.js";
-import { CutOff, type AgentCall, type AgentUsage } from "./agent-backend.js";
+import { CutOff, type AgentCall, type AgentUsage, type OwnTool, type ToolAnswer } from "./agent-backend.js";
 import type { ModelConfig } from "./runner-types.js";
 import { messageOf } from "./errors.js";
 import { createModelRelay, relayClient, relayServer, withRepliesWhole, type RelayAnswered, type RelayAsked } from "./model-relay.js";
 import { groupsUnder, signalGroup } from "./stopping.js";
 
-/** What a call is made of that can be sent: all of it but where to say what it used, and what cancels it. */
-export type SentCall = Omit<AgentCall, "signal" | "used" | "sofar" | "had" | "relay">;
+/**
+ * What a call is made of that can be sent: all of it but where to say what
+ * it used, and what cancels it — and, of the tools of its caller's own, what
+ * each declares: to have one run, a host asks its runner (below).
+ */
+export type SentCall = Omit<AgentCall, "signal" | "used" | "sofar" | "had" | "relay" | "ownTools"> & { ownTools?: Array<Omit<OwnTool, "run">> };
+
+/** A use of a tool of the caller's own, as a host asks its runner for it: `key` is how the two speak of it. */
+export interface ToolAsked { key: string; name: string; id: string; args: unknown }
 
 /**
  * What a runner says to a host: a call to serve; that the call it is serving
@@ -28,9 +35,16 @@ export type SentCall = Omit<AgentCall, "signal" | "used" | "sofar" | "had" | "re
  * what a model answers that the call had asked by its runner (see
  * model-relay.ts). And to a host that serves no call, but asks models for
  * the calls of others — the runner's own, where the run was given variables,
- * which a process is to be started with to ask by them: what to ask.
+ * which a process is to be started with to ask by them: what to ask. And
+ * what a tool of the caller's own answered, that the call's model had called.
  */
-export type ToHost = { ask: { config: ModelConfig; prompt: string; call: SentCall } } | { go: boolean } | { abort: true } | RelayAnswered | RelayAsked;
+export type ToHost =
+  | { ask: { config: ModelConfig; prompt: string; call: SentCall } }
+  | { go: boolean }
+  | { abort: true }
+  | { tooled: { key: string; answer: ToolAnswer } }
+  | RelayAnswered
+  | RelayAsked;
 
 /**
  * What a host says to its runner: that it is there; what the call has used
@@ -40,7 +54,10 @@ export type ToHost = { ask: { config: ModelConfig; prompt: string; call: SentCal
  * process has to be ended); what it used in the end; how the call ended —
  * its answer, an answer cut off at the output limit (with what there was of
  * it), or its failure; and what the call would have a model asked (or, of a
- * host that asks for others: what the model answered).
+ * host that asks for others: what the model answered). And that the call's
+ * model has called a tool of the caller's own — which is the runner's to
+ * have run. (That such a use is to go no further is not said: it is when the
+ * call is cancelled, or over, and the runner knows of both.)
  */
 export type FromHost =
   | { ready: true }
@@ -50,6 +67,7 @@ export type FromHost =
   | { answer: string }
   | { cutOff: string }
   | { error: string }
+  | { tool: ToolAsked }
   | RelayAsked
   | RelayAnswered;
 
@@ -74,6 +92,24 @@ const answered = (go: boolean) => {
 const asks = relayClient(say);
 /** The end that answers, where this process is one that asks models for the calls of others: with its own pi, and the keys it was started with. */
 let answers: ReturnType<typeof relayServer> | undefined;
+/** The uses of the caller's own tools that the call being served waits for, each by its key. */
+const uses = new Map<string, (answer: ToolAnswer) => void>();
+let used = 0;
+/**
+ * A tool of the caller's own, as this process has it: each use is asked of
+ * the runner, which has the tool. (A use whose call is cancelled meanwhile
+ * is not waited for by whoever asked it here — see asPisTool — and its
+ * answer, should one come, is nobody's.)
+ */
+const askedOfRunner = (tool: Omit<OwnTool, "run">): OwnTool => ({
+  ...tool,
+  run: (args, id) => new Promise<ToolAnswer>((resolve) => {
+    const key = String(++used);
+    uses.set(key, resolve);
+    say({ tool: { key, name: tool.name, id, args } });
+  }),
+});
+
 /** Whether this process has been told to end. What it was serving is then stopped, and how that ended is not said: its runner hears that the process did. */
 let leaving = false;
 
@@ -83,14 +119,21 @@ process.on("message", (message: ToHost) => {
     cancel?.abort();
     return answered(false);
   }
+  if ("tooled" in message) {
+    uses.get(message.tooled.key)?.(message.tooled.answer);
+    uses.delete(message.tooled.key);
+    return;
+  }
   if ("relayed" in message) return asks.heard(message.relayed);
   if ("relay" in message || "relayAbort" in message) return (answers ??= relayServer(createModelRelay(), say)).heard(message);
   // (A process that has been told to end serves nothing more: whoever asked hears that it ended.)
   if (leaving) return;
   const { config, prompt, call } = message.ask;
   const serving = cancel = new AbortController();
+  uses.clear();
   new PiAdapter(config).serve(prompt, {
     ...call,
+    ownTools: call.ownTools?.map(askedOfRunner),
     signal: serving.signal,
     used: (usage) => say({ used: usage }),
     had: (usage) => say({ had: usage }),

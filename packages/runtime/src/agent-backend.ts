@@ -63,6 +63,33 @@ export function atLeast(usage: AgentUsage | undefined, seen?: Tally): AgentUsage
 export const declaredUsage = ({ model, input, output, cacheRead, cacheWrite, cost }: AgentUsage): AgentUsage =>
   ({ model, input, output, cacheRead, cacheWrite, cost });
 
+/** What a tool that was asked says: what the model is to read — and whether that is how it failed. */
+export interface ToolAnswer {
+  text: string;
+  failed?: boolean;
+}
+
+/**
+ * A tool that is not the backend's: whoever makes the call has it, and is
+ * asked by `run` each time the model calls it.
+ */
+export interface OwnTool {
+  /** As the model calls it. Nobody else's name: not a tool of the backend's, nor of anything the backend loads. */
+  name: string;
+  /** What it is for, as the model is told. */
+  description: string;
+  /** What it is called with: the JSON Schema of an object. A backend holds a call's arguments to it before it asks. */
+  parameters: Record<string, unknown>;
+  /** It may be run while another tool is. Without it, of the tools a model calls in one reply, one is run after the other. */
+  parallel?: boolean;
+  /**
+   * Have it run: `id` is the model's call of it. It does not reject — a
+   * tool's failure is an answer, for the model to read — and where `signal`
+   * says the call is to go no further it is not waited for.
+   */
+  run(args: unknown, id: string, signal?: AbortSignal): Promise<ToolAnswer>;
+}
+
 export interface AgentCall {
   /** The directory the agent works in: what its tools read is here, and what they write lands here. */
   cwd: string;
@@ -74,6 +101,12 @@ export interface AgentCall {
   thinking?: string;
   /** The agent's tools for this call, by name: these and no others. Without it, the agent's own choice. */
   tools?: string[];
+  /**
+   * Tools of the caller's own, which the agent has beside those: each to be
+   * the agent's as it is written, or the call rejects — a name that is
+   * another tool's is not taken over, and not passed over.
+   */
+  ownTools?: OwnTool[];
   /**
    * The skills the agent has for this call, of those the backend finds for
    * the user and where it works: all of them, or the ones named. Without it,

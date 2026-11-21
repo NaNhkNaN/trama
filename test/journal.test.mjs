@@ -890,8 +890,8 @@ await ctx.done({ first, second, third, fourth, fifth, sixth, seventh, eighth, ni
     first: "answer to first",
     second: { a: "x" },
     third: "Error: trama runtime error: Error: the model is away",
-    fourth: "Error: trama runtime error: Invalid field: tools (expected strings or undefined)",
-    fifth: "Error: trama runtime error: Invalid field: tools (expected strings or undefined)",
+    fourth: "Error: trama runtime error: Invalid field: tools (expected strings or tools or undefined)",
+    fifth: "Error: trama runtime error: Invalid field: tools (expected strings or tools or undefined)",
     sixth: "Error: trama runtime error: Invalid field: thinking (expected string or undefined)",
     seventh: "answer to seventh",
     // An option that is none — misspelt, or not this call's — is not passed over: the program would think it had been taken.
@@ -922,7 +922,7 @@ await ctx.done({ first, second, third, fourth, fifth, sixth, seventh, eighth, ni
   assert.match(shown, /#1 +agent\/instruct +first +ok +\d+ms  18 tokens  \$0\.2500$/m);
   assert.match(shown, /#2 +agent\/generate +second +ok +\d+ms  36 tokens  \$0\.5000$/m);
   assert.match(shown, /#3 +agent\/instruct +third +failed +\d+ms +Error: the model is away  18 tokens  \$0\.2500$/m);
-  assert.match(shown, /#4 +agent\/instruct +fourth +failed +\d+ms +Invalid field: tools \(expected strings or undefined\)$/m);
+  assert.match(shown, /#4 +agent\/instruct +fourth +failed +\d+ms +Invalid field: tools \(expected strings or tools or undefine…$/m);
   assert.match(shown, /end: done  \(90 tokens  \$1\.2500 in all\)$/m);
   assert.doesNotMatch(shown, /asking for the fix/, "what a call used is said with the call, and only there");
   const listed = await captureConsole("log", async () => printJournals(projectDir, "it", { list: true }));

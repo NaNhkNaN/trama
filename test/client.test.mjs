@@ -155,7 +155,7 @@ test("the types of the program-facing API can be imported from where the API is"
   const { readFileSync } = await import("fs");
   const declarations = readFileSync(join(REPO_ROOT, "packages", "runtime", "dist", "client.d.ts"), "utf-8");
   const exported = /export type \{([^}]*)\}/.exec(declarations)?.[1].split(",").map(name => name.trim()).sort();
-  assert.deepEqual(exported, ["Agent", "AgentOptions", "Ctx", "ObserveResult", "Schema", "SchemaField", "ShellResult", "Thinking", "Tools", "Workspace"]);
+  assert.deepEqual(exported, ["Agent", "AgentOptions", "AgentTool", "Ctx", "ObserveResult", "Schema", "SchemaField", "ShellResult", "Thinking", "Tools", "Workspace"]);
 });
 
 test("a schema and the options of a call type-check as a program would write them — inline, or held in a variable first", async (t) => {

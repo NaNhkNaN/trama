@@ -20,7 +20,7 @@ import { guardPath, identityIn, identityOf, makeDirsIn, realRootOf } from "./pat
 import { stagedNameFor } from "./replace-file.js";
 import { isJsonObject } from "./serializable.js";
 import { messageOf } from "./errors.js";
-import { declaredUsage, type AgentUsage } from "./agent-backend.js";
+import { declaredUsage, type AgentUsage, type ToolAnswer } from "./agent-backend.js";
 
 /** The format of the records. Bump it when a reader of older journals would be misled. */
 export const JOURNAL_VERSION = 1;
@@ -301,6 +301,13 @@ export interface RecordedCall {
   end(outcome: CallOutcome): void;
   /** What the agent behind it used — each time it was asked, and whether or not the call is answered. */
   used(usage: AgentUsage): void;
+  /**
+   * That the agent behind it called a tool of the program's (`id`: as the
+   * model called it) — what the program was asked. Returns what writes down
+   * what the program answered: a use of a tool that was not waited for has
+   * no answer on record, as a call nobody was left to answer has no result.
+   */
+  tool(id: string, name: string, args: unknown): (answer: ToolAnswer) => void;
 }
 
 export interface Journal {
@@ -325,9 +332,15 @@ export interface Journal {
 }
 
 /** A journal that records nothing. Calls are still numbered, so the rest of the runner need not care. */
+/** What is written down of a call that is not on record: nothing. */
+const UNRECORDED: Omit<RecordedCall, "seq"> = { end() {}, used() {}, tool: () => () => {} };
+
+/** A call that is nobody's to look up: what carries other calls rather than being one (see ipc-server). */
+export const OFF_THE_RECORD: RecordedCall = { seq: 0, ...UNRECORDED };
+
 function noJournal(): Journal {
   let seq = 0;
-  return { run: "", path: "", note() {}, used() {}, call: () => ({ seq: ++seq, end() {}, used() {} }), close() {} };
+  return { run: "", path: "", note() {}, used() {}, call: () => ({ seq: ++seq, ...UNRECORDED }), close() {} };
 }
 
 /**
@@ -469,8 +482,10 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
     used: (what, usage) => write("usage", () => ({ for: what, ...declaredUsage(usage) })),
     call(endpoint, request) {
       const position = ++seq;
-      if (!roomForCalls()) return { seq: position, end() {}, used() {} };
+      if (!roomForCalls()) return { seq: position, ...UNRECORDED };
       const arrived = performance.now();
+      // How many times the agent behind it has called a tool of the program's.
+      let uses = 0;
       write("call", () => ({ seq: position, endpoint, request: recordable(endpoint, request) }));
       return {
         seq: position,
@@ -483,6 +498,17 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
         },
         used(usage) {
           write("usage", () => ({ seq: position, ...declaredUsage(usage) }));
+        },
+        tool(id, name, args) {
+          const use = ++uses;
+          const asked = performance.now();
+          write("tool-call", () => ({ seq: position, tool: use, id, name, args }));
+          return (answer) => write("tool-result", () => ({
+            seq: position,
+            tool: use,
+            ms: Math.round(performance.now() - asked),
+            ...(answer.failed ? { ok: false, error: answer.text } : { ok: true, result: answer.text }),
+          }));
         },
       };
     },

@@ -4,13 +4,18 @@
 import { readFileSync } from "fs";
 import { Agent, request } from "http";
 import type { Workspace } from "./types.js";
+import { onAbort } from "./abort.js";
 import { messageOf } from "./errors.js";
 
 export interface Bridge {
   /** What the runner handed the program when it started it — the bridge secret among it. */
   init: Record<string, any>;
-  /** POST one call to the runner and return its result. */
-  call(endpoint: string, body: unknown): Promise<any>;
+  /**
+   * POST one call to the runner and return its result. With `signal`, the
+   * call can be given up: its connection is closed — which is how the runner
+   * hears of it — and it rejects.
+   */
+  call(endpoint: string, body: unknown, signal?: AbortSignal): Promise<any>;
 }
 
 let cached: { port: string; initPath: string; bridge: Bridge | null } | undefined;
@@ -67,9 +72,10 @@ export function openBridge(port: string, initPath: string): Bridge {
   // A call lasts as long as the work behind it — an agent run, or the whole
   // run of another program — so this uses node:http, which sets no deadline
   // for the response. (fetch gives up after five minutes without response headers.)
-  const call = (endpoint: string, body: unknown): Promise<any> =>
+  const call = (endpoint: string, body: unknown, signal?: AbortSignal): Promise<any> =>
     new Promise((resolve, reject) => {
       const payload = encode(endpoint, body);
+      if (signal?.aborted) return reject(new Error(`${endpoint} was given up`));
       const req = request({
         host: "127.0.0.1",
         port,
@@ -98,6 +104,8 @@ export function openBridge(port: string, initPath: string): Bridge {
         });
       });
       req.on("error", reject);
+      const off = onAbort(signal, () => req.destroy(new Error(`${endpoint} was given up`)));
+      req.on("close", off);
       req.end(payload);
     });
 

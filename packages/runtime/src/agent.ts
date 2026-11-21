@@ -1,5 +1,5 @@
-import type { Agent } from "./types.js";
-import { CutOff, type AgentBackend, type AgentCall } from "./agent-backend.js";
+import type { AgentOptions, Schema } from "./types.js";
+import { CutOff, type AgentBackend, type AgentCall, type OwnTool } from "./agent-backend.js";
 import { isJsonObject } from "./serializable.js";
 
 /** A line of a reply that could be the edge of a fenced block: three or more backticks. */
@@ -134,6 +134,42 @@ function shapeOf(declared: unknown, where: Where): Shape {
   return named as SchemaPrimitive;
 }
 
+/** A schema as JSON Schema says it: every field there, and no other; what follows a ":" in a field's word describes it. */
+function asJsonSchema(declared: unknown): Record<string, unknown> {
+  if (Array.isArray(declared)) return { type: "array", items: asJsonSchema(declared[0]) };
+  if (isJsonObject(declared)) {
+    return {
+      type: "object",
+      properties: Object.fromEntries(Object.entries(declared).map(([key, value]) => [key, asJsonSchema(value)])),
+      required: Object.keys(declared),
+      additionalProperties: false,
+    };
+  }
+  const [type, ...words] = String(declared).split(":");
+  const description = words.join(":").trim();
+  return { type: type.trim(), ...(description && { description }) };
+}
+
+/**
+ * What a tool is called with, declared as a typed answer's shape is: the
+ * fields of an object. `schema` says it as JSON Schema, which is how a model
+ * is told; `held` holds what a tool is about to be called with to it, as a
+ * typed answer is held to its shape — returning the declared fields and no
+ * others, or throwing what is wrong. (A schema that is not one is an error,
+ * as it is of an answer.)
+ */
+export function argumentsOf(declared: unknown): { schema: Record<string, unknown>; held(args: unknown): unknown } {
+  if (!isJsonObject(declared)) throw new Error("Schema validation failed: a tool's parameters are an object of the fields it is called with");
+  const shape = shapeOf(declared, null);
+  return {
+    schema: asJsonSchema(declared),
+    held(args) {
+      if (!isJsonObject(args)) throw new Error("Schema validation failed: the arguments are not an object");
+      return conform(args, shape, null);
+    },
+  };
+}
+
 const hasList = (shape: Shape): boolean =>
   typeof shape !== "string" && ("items" in shape || shape.fields.some(([, field]) => hasList(field)));
 
@@ -167,14 +203,21 @@ function conform(value: unknown, shape: Shape, where: Where): unknown {
 /** Hears what a call used — each time its backend was asked: a `generate` that had to ask again is heard twice. */
 type Used = AgentCall["used"];
 
-/** The runner's side of a program's `agent`: its calls, and for each a place to say what it used. */
+/** How a call is served, as its runner has it: the agent's tools by name — the program's own are given beside (`ownTools`). */
+type Served = Omit<AgentOptions, "tools"> & { tools?: string[] };
+
+/**
+ * The runner's side of a program's `agent`: its calls, and for each a place
+ * to say what it used — and the tools of the program's that the agent has
+ * for it, each a way to ask the program.
+ */
 export interface RunnerAgent {
-  instruct(prompt: string, options?: Parameters<Agent["instruct"]>[1], used?: Used): Promise<string>;
-  generate<T>(input: Parameters<Agent["generate"]>[0], used?: Used): Promise<T>;
+  instruct(prompt: string, options?: Served, used?: Used, ownTools?: OwnTool[]): Promise<string>;
+  generate<T>(input: Omit<Served, "templates"> & { prompt: string; schema: Schema }, used?: Used, ownTools?: OwnTool[]): Promise<T>;
 }
 
 /** Of what a call may ask for, what it did ask for: a backend is not handed a thing nobody named. */
-const asked = (options: Pick<AgentCall, "model" | "thinking" | "tools" | "skills" | "templates" | "extensions" | "asText" | "used">) =>
+const asked = (options: Pick<AgentCall, "model" | "thinking" | "tools" | "ownTools" | "skills" | "templates" | "extensions" | "asText" | "used">) =>
   Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined));
 
 /**
@@ -200,12 +243,12 @@ export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSi
   };
 
   return {
-    async instruct(prompt, options, used) {
+    async instruct(prompt, options, used, ownTools) {
       const { system, model, thinking, tools, skills, templates, extensions, cutOff } = options ?? {};
-      return ask(prompt, { cwd, system, signal, ...asked({ model, thinking, tools, skills, templates, extensions, used }) }, cutOff);
+      return ask(prompt, { cwd, system, signal, ...asked({ model, thinking, tools, ownTools, skills, templates, extensions, used }) }, cutOff);
     },
 
-    async generate(input, used) {
+    async generate(input, used, ownTools) {
       if (!isJsonObject(input.schema)) throw new Error("Schema validation failed: a schema is an object of the fields the answer is to have");
       const shape = shapeOf(input.schema, null);
       const schemaInstruction = `Respond with ONLY a JSON object matching this shape:\n${
@@ -219,7 +262,7 @@ export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSi
       // The prompt of a typed answer is text, whatever it begins with: what says how to answer follows it, and a
       // skill called up by name, or a command, would take that for its own — and would not be there at a second asking.
       const asText = skills !== undefined || extensions !== undefined ? true : undefined;
-      const call = { cwd, system, signal, ...asked({ model, thinking, tools, skills, extensions, asText, used }) };
+      const call = { cwd, system, signal, ...asked({ model, thinking, tools, ownTools, skills, extensions, asText, used }) };
 
       const parseAndValidate = (response: string): Record<string, unknown> => {
         const trimmed = response.trim();

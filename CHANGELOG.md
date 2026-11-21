@@ -4,7 +4,21 @@ All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`
 
 ## Unreleased
 
+### Added
+
+- **A program's own functions can be an agent's tools.** `agent.instruct(prompt, { tools: ["read", { name, description, parameters, run }] })`, and `generate` likewise: a tool of the program's is given as itself beside the names of pi's, the model calls it by its name, and the program runs it — where it has its own variables, and can do what it can (a call on `tools`, another agent call). Until now a program could say which of pi's tools an agent had, and nothing else of what the agent could do.
+  - `parameters` is written as the shape of a typed answer is (`{ id: "string: the order's id", lines: ["number"] }`), and a model's call is held to it before `run` is called: what is not of that shape goes back to the model with what was wrong, and the tool is not run.
+  - What `run` returns is the model's to read — a string as it is, anything else as JSON, nothing as `Done.` — and so is what it throws: a tool's failure is not the call's, which goes on.
+  - **A name that is another tool's is an error before the model is asked**: one of pi's own (pi would have the program's take its place, and say nothing), one of an extension's or an MCP server's, a name that begins `mcp__`, two of the program's by one name. A name is letters, digits, `_` and `-`, 64 at most.
+  - **The tools a model calls in one reply are run one after the other**, pi's own among them where one of the program's is called beside — unless every tool called says `parallel: true` (pi's own way is to run them together). So what a run's tools were asked is on record in the order it happened.
+  - `run` is given a `signal` that says when its call is to go no further — cancelled, stopped, out of budget, or over. The call does not wait for a tool that goes on after that.
+  - **In the journal**, under the agent call: a `tool-call` record for each use (the name, what it was called with) and a `tool-result` for what the program answered, or how it failed; `trama journal` shows them. A use that was not waited for has no `tool-result`.
+  - It works where a call is served by pi in a process of its own (a call with extensions, a run that was given variables): the tool is still run in the program. There the program's tool is asked with what its parameters allow whoever asks — the runner holds a use to them again, and does not take the serving process's word.
+  - `create`, `update` and a repair have no such tools. A tool cannot end the agent's run, and returns no images.
+
 ### Changed
+
+- **Backends hear `ownTools` in a call** (`AgentCall`, internal): tools of the caller's, each with a `run` that asks the caller — to be the agent's as written, or the call rejects.
 
 - **pi is 1.6.0** (`@earendil-works/pi-coding-agent`, was 1.5.2). Nothing of trama's had to change for it. What an agent call has of it, of what pi's own changelog says:
   - The agent's `find` tool reads a pattern with a `/` in it from the directory it searches, as its `grep` reads a `glob`: `src/*.ts` finds `src/a.ts` and no longer `pkg/src/a.ts` — `**/src/*.ts` does. A pattern without a `/` still matches a file's name at any depth.

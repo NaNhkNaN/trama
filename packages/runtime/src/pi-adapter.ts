@@ -1,8 +1,8 @@
-import type { AgentSession, ExtensionFactory, InlineExtension, ModelRuntime as Models, ResourceLoader, SettingsManager as Settings } from "@earendil-works/pi-coding-agent";
+import type { AgentSession, ExtensionFactory, InlineExtension, ModelRuntime as Models, ResourceLoader, SettingsManager as Settings, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { onAbort, rejectOnAbort, throwIfAborted } from "./abort.js";
 import { messageOf } from "./errors.js";
 import { createAgentHosts } from "./agent-hosts.js";
-import { CutOff, addReply, atLeast, nothingYet, type AgentBackend, type AgentCall, type AgentUsage, type Tally } from "./agent-backend.js";
+import { CutOff, addReply, atLeast, nothingYet, type AgentBackend, type AgentCall, type AgentUsage, type OwnTool, type Tally, type ToolAnswer } from "./agent-backend.js";
 import * as http from "http";
 import * as https from "https";
 import { dataOf, isData, notAsked, usageAtEnd, wholeOf, type RelayEvent, type RelayModel, type RelayWay } from "./model-relay.js";
@@ -36,11 +36,57 @@ async function builtInExtensions(): Promise<InlineExtension[]> {
   }
 }
 
+/**
+ * The names of pi's own tools — those it gives an agent unasked, and those it
+ * has besides. pi takes a tool it is handed by the name of one of them for
+ * that tool, with no word of it; so a caller's own tool is held against them
+ * here. Read from where pi keeps them, as its extensions are: the package
+ * does not export the list, and a pi that keeps it elsewhere is one a call
+ * with tools of its own cannot be served by as it asked — the call fails.
+ */
+async function pisOwnTools(): Promise<Set<string>> {
+  const kept = new URL("./core/tools/index.js", import.meta.resolve("@earendil-works/pi-coding-agent"));
+  try {
+    const found: unknown = (await import(kept.href)).allToolNames;
+    if (!(found instanceof Set)) throw new Error("the file exports none");
+    return found as Set<string>;
+  } catch (err) {
+    throw new Error(`The names of pi's own tools cannot be had: trama reads them from pi's own files, at ${kept.pathname} (${messageOf(err)}).`);
+  }
+}
+
+/** What a tool is taken to have said where its call was cancelled before it answered. (Nobody reads it: the call is over.) */
+const NOT_WAITED_FOR: ToolAnswer = { text: "The call was stopped before the tool had answered.", failed: true };
+
+/**
+ * A caller's own tool, as pi has a tool. Run one at a time unless it says
+ * it may be run beside another (pi's own way is to run together all that a
+ * model calls in one reply). And over as soon as its signal says the call
+ * is cancelled, whatever becomes of the asking: pi waits for a tool for as
+ * long as the tool takes, and a cancelled call would be held by it.
+ */
+function asPisTool(own: OwnTool): ToolDefinition {
+  return {
+    name: own.name,
+    label: own.name,
+    description: own.description,
+    parameters: own.parameters as ToolDefinition["parameters"],
+    executionMode: own.parallel ? "parallel" : "sequential",
+    async execute(id, args, signal) {
+      let off = () => {};
+      const cancelled = new Promise<ToolAnswer>((resolve) => { off = onAbort(signal, () => resolve(NOT_WAITED_FOR)); });
+      const asked = own.run(args, id, signal).catch((err): ToolAnswer => ({ text: messageOf(err), failed: true }));
+      const { text, failed } = await Promise.race([asked, cancelled]).finally(off);
+      return { content: [{ type: "text", text }], details: undefined, ...(failed && { isError: true }) };
+    },
+  };
+}
+
 /** provider/model pairs already warned about, so a loop of agent calls warns once per process. */
 const warnedUnknownModels = new Set<string>();
 
 /** What a call may ask of its session, beyond where it works and what it is told. */
-type Asked = Pick<AgentCall, "model" | "thinking" | "tools" | "skills" | "templates" | "extensions" | "asText" | "sofar" | "had" | "used" | "relay">;
+type Asked = Pick<AgentCall, "model" | "thinking" | "tools" | "ownTools" | "skills" | "templates" | "extensions" | "asText" | "sofar" | "had" | "used" | "relay">;
 
 const nameOf = (model: { provider: string; id: string }): string => `${model.provider}/${model.id}`;
 
@@ -123,7 +169,7 @@ function whyNotAsAsked(session: AgentSession, asked: Asked, serving: string | nu
       `Its levels: ${session.getAvailableThinkingLevels().join(", ")}.`;
   }
   // (With extensions, an agent's tools are not all there yet: see whyNotTheTools.)
-  const tools = asked.extensions ? undefined : whyNotTheTools(session, asked.tools);
+  const tools = asked.extensions ? undefined : whyNotTheTools(session, asked);
   if (tools) return tools;
   const lacking = (kind: string, choice: Choice, had: string[]): string | undefined => {
     const missing = named(choice)?.find(name => !had.includes(name));
@@ -152,12 +198,20 @@ function whyNotAsAsked(session: AgentSession, asked: Asked, serving: string | nu
  * extension may add tools as the run begins (pi's own connects the user's MCP
  * servers then, and their tools are the agent's from there on).
  */
-function whyNotTheTools(session: AgentSession, tools: string[] | undefined): string | undefined {
-  if (tools === undefined) return undefined;
+function whyNotTheTools(session: AgentSession, { tools, ownTools }: Pick<AgentCall, "tools" | "ownTools">): string | undefined {
+  const own = (ownTools ?? []).map(tool => tool.name);
+  // (A tool of the caller's own by the name of an extension's is the tool from then on, to pi, and nothing is said of it.)
+  for (const extension of session.resourceLoader.getExtensions().extensions) {
+    const taken = own.find(name => extension.tools.has(name));
+    if (taken !== undefined) return `The tool "${taken}" cannot be the call's own: the extension ${extension.path} has a tool of that name.`;
+  }
+  // The caller's own are named to pi with pi's (see createSession), and are the agent's as those are.
+  const named = tools ? [...tools, ...own] : own.length > 0 ? own : undefined;
+  if (named === undefined) return undefined;
   const given = session.getActiveToolNames();
   // (pi gives no tool that was not named. What it does not know by the name it was given, it leaves out.)
-  return tools.every(name => given.includes(name)) ? undefined
-    : `The agent cannot be given the tools ${JSON.stringify(tools)}: pi would give it ${JSON.stringify(given)}.`;
+  return named.every(name => given.includes(name)) ? undefined
+    : `The agent cannot be given the tools ${JSON.stringify(named)}: pi would give it ${JSON.stringify(given)}.`;
 }
 
 /** What is kept of a session that has extensions, beside the session. */
@@ -840,6 +894,19 @@ export class PiAdapter implements AgentBackend {
       throw new Error(`Unknown model "${asked.model}". A model is named "provider/model", as pi's model catalog has it.`);
     }
 
+    // The caller's own tools are handed to pi as tools of pi's embedder — and named to it with the tools the
+    // call named, where it named any: with a list of names, pi has a tool it is handed only where it is on the
+    // list. A name pi would take for something else is refused first: pi's own tool by that name would be gone.
+    const ownTools = asked.ownTools ?? [];
+    if (ownTools.length > 0) {
+      const pis = await raceAbort(pisOwnTools());
+      for (const [at, { name }] of ownTools.entries()) {
+        if (pis.has(name)) throw new Error(`The tool "${name}" cannot be the call's own: pi has a tool of that name.`);
+        if (name.startsWith("mcp__")) throw new Error(`The tool "${name}" cannot be the call's own: a name that begins "mcp__" is a tool of an MCP server's.`);
+        if (ownTools.findIndex(other => other.name === name) !== at) throw new Error(`Two of the call's own tools are named "${name}".`);
+      }
+    }
+
     // Keep a reference to the raw promise so we can clean up a late-arriving session
     const sessionPromise = createAgentSession({
       cwd,
@@ -850,7 +917,8 @@ export class PiAdapter implements AgentBackend {
       resourceLoader,
       ...(wary && { settingsManager: wary }),
       ...(asked.thinking !== undefined && { thinkingLevel: asked.thinking as AgentSession["thinkingLevel"] }),
-      ...(asked.tools && { tools: asked.tools }),
+      ...(asked.tools && { tools: [...asked.tools, ...ownTools.map(tool => tool.name)] }),
+      ...(ownTools.length > 0 && { customTools: ownTools.map(asPisTool) }),
     });
 
     let session: AgentSession | undefined;
@@ -1033,7 +1101,7 @@ export class PiAdapter implements AgentBackend {
       // createSession), and the call is stopped as one that was cancelled is.
       if (extended && call.extensions) {
         extended.look = () => {
-          refused = whyNotTheTools(session, call.tools);
+          refused = whyNotTheTools(session, call);
           if (refused === undefined) return;
           // (The session is stopped where it hears next that a turn begins — just after this: see createSession.)
           extended.over = true;

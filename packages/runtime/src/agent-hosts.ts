@@ -14,7 +14,7 @@
 import { fork, type ChildProcess } from "child_process";
 import { fileURLToPath } from "url";
 import { onAbort, throwIfAborted } from "./abort.js";
-import { CutOff, addReply, atLeast, nothingYet, type AgentCall, type AgentUsage } from "./agent-backend.js";
+import { CutOff, addReply, atLeast, nothingYet, type AgentCall, type AgentUsage, type ToolAnswer } from "./agent-backend.js";
 import { createModelRelay, relayClient, relayServer, type ModelRelay } from "./model-relay.js";
 import type { FromHost, SentCall, ToHost } from "./agent-host.js";
 import { messageOf } from "./errors.js";
@@ -42,8 +42,13 @@ function saidBy(message: unknown): FromHost | undefined {
   if (typeof said.answer === "string") return { answer: said.answer };
   if (typeof said.cutOff === "string") return { cutOff: said.cutOff };
   if (typeof said.error === "string") return { error: said.error };
-  // What a call would have a model asked, and what a model answered (see model-relay.ts).
   const held = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
+  // That a tool of the caller's own is called.
+  const { tool } = said;
+  if (held(tool) && typeof tool.key === "string" && typeof tool.name === "string" && typeof tool.id === "string") {
+    return { tool: { key: tool.key, name: tool.name, id: tool.id, args: tool.args } };
+  }
+  // What a call would have a model asked, and what a model answered (see model-relay.ts).
   const { relay, relayAbort, relayed } = said;
   if (held(relay) && typeof relay.id === "number" && held(relay.request)) {
     const { model, options } = relay.request;
@@ -74,7 +79,8 @@ export interface AgentHosts {
 }
 
 /** Of a call, what can be sent to another process. */
-const sendable = ({ signal: _signal, used: _used, sofar: _sofar, had: _had, relay: _relay, ...call }: AgentCall): SentCall => call;
+const sendable = ({ signal: _signal, used: _used, sofar: _sofar, had: _had, relay: _relay, ownTools, ...call }: AgentCall): SentCall =>
+  ({ ...call, ...(ownTools && { ownTools: ownTools.map(({ name, description, parameters, parallel }) => ({ name, description, parameters, ...(parallel && { parallel }) })) }) });
 
 /**
  * The hosts of one runner's calls. `env`: variables the hosts are started
@@ -216,6 +222,9 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
           let replies = 0, told = 0, noMore = false;
           let asksHere: ReturnType<typeof createModelRelay> | undefined;
           let asked: ReturnType<typeof relayServer> | undefined;
+          // What says to the caller's own tools, run from here for the host, that they are to go no further: the
+          // call is over — answered, failed, or cancelled and let go of.
+          const tooling = new AbortController();
           const asking = () => asked ??= relayServer(
             env ? apart : asksHere = createModelRelay(),
             (answer) => { if (child.connected) child.send(answer satisfies ToHost, () => {}); },
@@ -246,6 +255,8 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
           const over = (settle: () => void, hostIsWell: boolean) => {
             if (isOver) return;
             isOver = true;
+            // (A tool of the caller's own that is still running is told that its call is over.)
+            tooling.abort();
             offAbort();
             clearTimeout(giveUp);
             child.off("message", heard);
@@ -267,6 +278,18 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
             const message = saidBy(word);
             if (!message) return;
             if ("relay" in message || "relayAbort" in message) return asking().heard(message);
+            // The call's model has called a tool of the caller's own: it is run from here, where the caller's
+            // tools are, and the host is told what it answered. (One the call has not got is not run. Whoever
+            // has the tool holds what it is called with to what it declared: a host's word is not taken for it.)
+            if ("tool" in message) {
+              const { key, name, id, args } = message.tool;
+              const tool = call.ownTools?.find(own => own.name === name);
+              const answering = tool ? tool.run(args, id, tooling.signal) : Promise.resolve<ToolAnswer>({ text: `Tool ${name} not found`, failed: true });
+              void answering.catch((err): ToolAnswer => ({ text: messageOf(err), failed: true })).then((answer) => {
+                if (!tooling.signal.aborted && child.connected) child.send({ tooled: { key, answer } } satisfies ToHost, () => {});
+              });
+              return;
+            }
             if ("sofar" in message) {
               const sofar = atLeast(last = message.sofar, seen);
               told = replies;

@@ -83,6 +83,9 @@ function printJournal(path: string, records: JournalRecord[]): void {
 
   const results = new Map<number, JournalRecord>();
   for (const record of records) if (record.kind === "result") results.set(record.seq, record);
+  // What a tool of the program's answered, by the call it was used for and which use of a tool that was.
+  const answers = new Map<string, JournalRecord>();
+  for (const record of records) if (record.kind === "tool-result") answers.set(`${record.seq}/${record.tool}`, record);
   const usage = usageIn(records);
   const total = spentInAll(records, " in all");
 
@@ -99,6 +102,14 @@ function printJournal(path: string, records: JournalRecord[]): void {
           : `failed  ${result.ms}ms  ${oneLine(result.error, 60)}`;
         const used = spent(usage.filter(item => item.seq === record.seq));
         console.log(`${at}  #${String(record.seq).padEnd(3)} ${record.endpoint.slice(1).padEnd(18)} ${gist(record.request).padEnd(60)}  ${how}${used && `  ${used}`}`);
+        break;
+      }
+      case "tool-call": {
+        const answer = answers.get(`${record.seq}/${record.tool}`);
+        const how = !answer ? "never answered"
+          : answer.ok ? `ok  ${answer.ms}ms`
+          : `failed  ${answer.ms}ms  ${oneLine(answer.error, 60)}`;
+        console.log(`${at}  #${String(record.seq).padEnd(3)} ${`  tool ${record.name}`.padEnd(18)} ${oneLine(record.args, 60).padEnd(60)}  ${how}`);
         break;
       }
       case "usage":

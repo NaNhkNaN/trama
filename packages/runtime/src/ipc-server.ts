@@ -10,7 +10,9 @@ import type { RunnerAgent } from "./agent.js";
 import type { RunContext } from "./context.js";
 import type { ProgramResult, RunRequest } from "./runner-types.js";
 import type { MakeRequest } from "./runner.js";
-import type { Journal, RecordedCall } from "./journal.js";
+import { OFF_THE_RECORD, type Journal, type RecordedCall } from "./journal.js";
+import type { OwnTool } from "./agent-backend.js";
+import { createToolAsks, toolsOf } from "./own-tools.js";
 import { describeJson, isJsonObject } from "./serializable.js";
 import { checkedEnv, variableName } from "./child-process.js";
 import { checkedBudget, type Budget } from "./budget.js";
@@ -30,6 +32,8 @@ interface FieldKinds {
   object: Record<string, unknown>;
   /** A list of strings. */
   strings: string[];
+  /** A list of tools: each by its name, or — one of the program's own — as an object that declares it. */
+  "strings or tools": unknown[];
   /** All or none of something, or some of it by name. */
   "boolean or strings": boolean | string[];
   /** All or none of something, or which of it in a word. */
@@ -46,7 +50,16 @@ type Args<F extends Fields> = {
     : F[K] extends Kind ? FieldKinds[F[K]] : never;
 };
 
+/** Fields that are the client's own way of carrying a call, and nothing a program says: not among what a call is said to take. */
+const CARRIES = new Set(["toolsId"]);
+
 interface Route {
+  /**
+   * It is no call of the program's, but part of how one is carried — the
+   * program's client waiting to be asked for a tool, or saying what one
+   * answered: what it carries is on record with the call it is for.
+   */
+  offTheRecord?: boolean;
   /**
    * Carry a call out, given the body of its request. `connectionClosed`
    * resolves when the caller's connection ends, answered or not. `call` is
@@ -62,6 +75,7 @@ const isOfKind = (value: unknown, kind: Kind): boolean =>
   kind === "any" ? value !== undefined
     : kind === "object" ? isJsonObject(value)
     : kind === "strings" ? isStrings(value)
+    : kind === "strings or tools" ? Array.isArray(value) && value.every(item => typeof item === "string" || isJsonObject(item))
     : kind === "boolean or strings" ? typeof value === "boolean" || isStrings(value)
     : kind === "boolean or string" ? typeof value === "boolean" || typeof value === "string"
     : typeof value === kind;
@@ -85,7 +99,9 @@ function read<F extends Fields>(body: unknown, fields: F): Args<F> {
   }
   // What a call does not declare it cannot do anything with: to pass it over would be to let its sender think it had.
   const unknown = Object.keys(body).find(name => !Object.hasOwn(fields, name));
-  if (unknown !== undefined) throw new BadRequest(`Unknown field: ${unknown} (this call takes: ${Object.keys(fields).join(", ")})`);
+  if (unknown !== undefined) {
+    throw new BadRequest(`Unknown field: ${unknown} (this call takes: ${Object.keys(fields).filter(name => !CARRIES.has(name)).join(", ")})`);
+  }
   return args as Args<F>;
 }
 
@@ -98,8 +114,9 @@ function read<F extends Fields>(body: unknown, fields: F): Args<F> {
 function route<F extends Fields>(
   fields: F,
   handle: (args: Args<F>, connectionClosed: Promise<void>, call: RecordedCall) => unknown,
+  how: Pick<Route, "offTheRecord"> = {},
 ): Route {
-  return { handle: (body, connectionClosed, call) => handle(read(body, fields), connectionClosed, call) };
+  return { ...how, handle: (body, connectionClosed, call) => handle(read(body, fields), connectionClosed, call) };
 }
 
 /** The variables a call gives, held to what variables are (see checkedEnv): what is none is the request's fault. */
@@ -137,8 +154,10 @@ const asRecorded = (body: unknown): unknown =>
  * not, for what says how to answer follows it.)
  */
 const HOW_SERVED = {
-  system: "optional string", model: "optional string", thinking: "optional string", tools: "optional strings",
+  system: "optional string", model: "optional string", thinking: "optional string", tools: "optional strings or tools",
   skills: "optional boolean or strings", extensions: "optional boolean or string", cutOff: "optional string",
+  // Where the program waits to be asked for the tools of its own that the call has (see own-tools.ts).
+  toolsId: "optional string",
 } as const satisfies Fields;
 
 export interface IpcBackends {
@@ -207,6 +226,47 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
     }
   };
 
+  /** The tools of the program's own that its agent calls have, and how the program is asked for each. */
+  const asks = createToolAsks();
+
+  /**
+   * Have an agent call served with the tools it named: the agent's by name,
+   * and the program's own — each made a way to ask the program, open for as
+   * long as the call lasts. (A list of names and nothing else is the
+   * backend's to read, as it always was.)
+   */
+  const withTools = async <T>(
+    tools: unknown[] | undefined,
+    toolsId: string | undefined,
+    call: RecordedCall,
+    serve: (names: string[] | undefined, own: OwnTool[] | undefined) => Promise<T>,
+  ): Promise<T> => {
+    const ofTheProgram = tools?.some(tool => typeof tool !== "string") ?? false;
+    if (!ofTheProgram) {
+      if (toolsId !== undefined) throw new BadRequest("Invalid field: toolsId (the call has no tools of the program's own)");
+      return serve(tools as string[] | undefined, undefined);
+    }
+    if (toolsId === undefined) throw new BadRequest("Missing field: toolsId (expected string, for a call with tools of the program's own)");
+    // (What is wrong with a tool as it was written, or with where its program waits, is the request's fault: found before anything is asked.)
+    let read: ReturnType<typeof toolsOf>;
+    try {
+      read = toolsOf(tools!);
+    } catch (err) {
+      throw new BadRequest(`Invalid field: tools (${messageOf(err)})`);
+    }
+    let way: ReturnType<typeof asks.open>;
+    try {
+      way = asks.open(toolsId, read.declared, call.tool);
+    } catch (err) {
+      throw new BadRequest(messageOf(err));
+    }
+    try {
+      return await serve(read.names, way.tools);
+    } finally {
+      way.close();
+    }
+  };
+
   /** The workspace a call is about: the directory it names, or else the one this run was started with. */
   const workspaceOf = (dir: string | undefined): Workspace => {
     if (dir !== undefined) {
@@ -220,11 +280,25 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
   return {
     "/agent/instruct": route(
       { prompt: "string", ...HOW_SERVED, templates: "optional boolean or strings" },
-      ({ prompt, ...options }, _closed, call) => agent.instruct(prompt, options as Parameters<RunnerAgent["instruct"]>[1], call.used),
+      ({ prompt, tools, toolsId, ...options }, _closed, call) => withTools(tools, toolsId, call, (names, own) =>
+        agent.instruct(prompt, { ...options, tools: names } as Parameters<RunnerAgent["instruct"]>[1], call.used, own)),
     ),
     "/agent/generate": route(
       { prompt: "string", schema: "object", ...HOW_SERVED },
-      (input, _closed, call) => agent.generate(input as Parameters<RunnerAgent["generate"]>[0], call.used),
+      ({ tools, toolsId, ...input }, _closed, call) => withTools(tools, toolsId, call, (names, own) =>
+        agent.generate({ ...input, tools: names } as Parameters<RunnerAgent["generate"]>[0], call.used, own)),
+    ),
+    // How a program's own tools are asked (see own-tools.ts): its client waits here to be told that one is
+    // called, or is to stop — held until there is something to tell, or the agent call is over — and says
+    // here what one answered.
+    "/agent/tool/asked": route({ of: "string" }, (b, closed) => asks.next(b.of, closed), { offTheRecord: true }),
+    "/agent/tool/answered": route(
+      { of: "string", key: "string", text: "optional string", error: "optional string" },
+      (b) => {
+        if ((b.text === undefined) === (b.error === undefined)) throw new BadRequest("A tool's answer is its text, or the error it failed with: one of the two");
+        asks.answered(b.of, b.key, b.error !== undefined ? { text: b.error, failed: true } : { text: b.text! });
+      },
+      { offTheRecord: true },
     ),
 
     "/tools/read": route({ path: "string" }, b => tools.read(b.path)),
@@ -347,7 +421,7 @@ export function createIPCServer(backends: IpcBackends): Server {
         }
         const route = req.url && Object.hasOwn(routes, req.url) ? routes[req.url] : undefined;
         if (!route) return reply(404, "Not found");
-        call = backends.journal.call(req.url!, asRecorded(body));
+        call = route.offTheRecord ? OFF_THE_RECORD : backends.journal.call(req.url!, asRecorded(body));
         const result = (await route.handle(body, connectionClosed, call)) ?? null;
         const payload = JSON.stringify({ result });
         if (answerable()) call.end({ ok: true, result });
