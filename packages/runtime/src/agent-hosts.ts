@@ -80,7 +80,7 @@ export interface AgentHosts {
 
 /** Of a call, what can be sent to another process. */
 const sendable = ({ signal: _signal, used: _used, sofar: _sofar, had: _had, relay: _relay, ownTools, ...call }: AgentCall): SentCall =>
-  ({ ...call, ...(ownTools && { ownTools: ownTools.map(({ name, description, parameters, parallel }) => ({ name, description, parameters, ...(parallel && { parallel }) })) }) });
+  ({ ...call, ...(ownTools && { ownTools: ownTools.map(({ name, description, parameters, parallel, ends }) => ({ name, description, parameters, ...(parallel && { parallel }), ...(ends && { ends }) })) }) });
 
 /**
  * The hosts of one runner's calls. `env`: variables the hosts are started

@@ -14,7 +14,9 @@ All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`
   - `run` is given a `signal` that says when its call is to go no further — cancelled, stopped, out of budget, or over. The call does not wait for a tool that goes on after that.
   - **In the journal**, under the agent call: a `tool-call` record for each use (the name, what it was called with) and a `tool-result` for what the program answered, or how it failed; `trama journal` shows them. A use that was not waited for has no `tool-result`.
   - It works where a call is served by pi in a process of its own (a call with extensions, a run that was given variables): the tool is still run in the program. There the program's tool is asked with what its parameters allow whoever asks — the runner holds a use to them again, and does not take the serving process's word.
-  - `create`, `update` and a repair have no such tools. A tool cannot end the agent's run, and returns no images.
+  - **Bytes a tool returns are an image for the model to see**: a `Buffer` or `Uint8Array` that is a PNG, a JPEG, a GIF or a WebP (told by how it begins), by itself or in a list with words. What is none of those is the tool's failure; pi itself would hand a model anything by the name of an image. A model that takes no images is told there was one. The journal has what kind an image was and how large, and not the image.
+  - **`ends: true` on a tool makes what it returns the call's answer**: the agent's work ends there and the model is not asked again — an answer handed over and held to a shape, rather than last words to be parsed. A tool that throws has ended nothing, and the model may call it again.
+  - `create`, `update` and a repair have no such tools: they are a running program's, and those three are not programs.
 
 ### Changed
 

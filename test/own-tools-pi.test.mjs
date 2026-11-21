@@ -20,6 +20,7 @@ const saying = (stream, words) => { stream.says({ role: "assistant", content: wo
 const scripted = (...replies) => (_request, stream) => (replies.length > 0 ? calling(stream, ...replies.shift()) : saying(stream, "the answer"));
 const toolResults = (request) => request.messages.filter((message) => message.role === "tool").map((message) => message.content);
 
+const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 const PARAMETERS = { type: "object", properties: { n: { type: "number", description: "how many" } }, required: ["n"], additionalProperties: false };
 /** A tool of the caller's own, which writes down each time it is asked. */
 const own = (asked, name, more = {}) => ({
@@ -156,7 +157,10 @@ test("a call served in a process of its own is cancelled as any: a tool of the c
 test("a program's tools are its agent's by the real pi, where the call is served here and where it is served by a host — and are called with what they declared, whoever asks", async (t) => {
   const it = await user(t, (request, stream) => {
     const results = toolResults(request);
-    if (results.length === 0 && (request.tools ?? []).some((tool) => tool.function.name === "count")) return calling(stream, ["count", { n: 1 }]);
+    const has = (name) => (request.tools ?? []).some((tool) => tool.function.name === name);
+    if (results.length === 0 && has("count")) return calling(stream, ["count", { n: 1 }]);
+    if (results.length === 0 && has("verdict")) return calling(stream, ["verdict", { ok: true, why: "it holds" }]);
+    if (results.length === 0 && has("draw")) return calling(stream, ["draw", {}]);
     return saying(stream, `the model read: ${results.at(-1)}`);
   });
   // An extension that would have the program's tool called for itself, with what the tool does not take — by the
@@ -174,7 +178,12 @@ const here = await agent.instruct("count to one", { tools: [count] });
 const hosted = await agent.instruct("count to one", { tools: [count], extensions: true });
 const taken = await agent.instruct("p", { tools: [{ ...count, name: "ext_tool" }], extensions: true }).catch(told);
 const pis = await agent.instruct("p", { tools: ["bash", { ...count, name: "read" }] }).catch(told);
-await ctx.done({ here, hosted, taken, pis, got, pid: process.pid });
+const verdict = { name: "verdict", description: "Hand over the verdict", ends: true, parameters: { ok: "boolean", why: "string" }, run: (said: object) => said };
+const typed = await agent.generate({ prompt: "judge it", schema: { ok: "boolean", why: "string" }, tools: [verdict] });
+const typedHosted = await agent.generate({ prompt: "judge it", schema: { ok: "boolean", why: "string" }, tools: [verdict], extensions: true });
+const png = Buffer.from("${PNG}", "base64");
+const drawn = await agent.instruct("draw it", { extensions: true, tools: [{ name: "draw", description: "Draws", ends: true, run: () => ["drawn by the program", png] }] });
+await ctx.done({ here, hosted, taken, pis, got, typed, typedHosted, drawn, pid: process.pid });
 `,
   });
   const meta = JSON.parse(readFileSync(join(projectDir, "meta.json"), "utf-8"));
@@ -183,6 +192,9 @@ await ctx.done({ here, hosted, taken, pis, got, pid: process.pid });
   const { result, status } = await withEnv(it.env, () => runProgram({ projectDir, maxRepairAttempts: 0, timeout: 60_000 }));
   assert.equal(status, "done");
   const { pid } = result;
+  // A typed answer handed over by a tool that ends the agent's work is held to its shape as any is — here, and by a host.
+  assert.deepEqual([result.typed, result.typedHosted], [{ ok: true, why: "it holds" }, { ok: true, why: "it holds" }]);
+  assert.equal(result.drawn, "drawn by the program");
   assert.equal(result.here, `the model read: counted 1 in ${pid}`);
   assert.equal(result.hosted, `the model read: counted 1 in ${pid}`);
   assert.match(result.taken, /^trama runtime error: Error: The tool "ext_tool" cannot be the call's own: the extension .*ext\.ts has a tool of that name\.$/);
@@ -193,8 +205,9 @@ await ctx.done({ here, hosted, taken, pis, got, pid: process.pid });
 
   const dir = join(projectDir, "logs", "journal");
   const records = readdirSync(dir).flatMap((file) => readFileSync(join(dir, file), "utf-8").trim().split("\n").map((line) => JSON.parse(line)));
-  assert.deepEqual(records.filter((record) => record.kind === "tool-call").map(({ seq, name, args }) => [seq, name, args]), [[1, "count", { n: 1 }], [2, "count", { n: 1 }]]);
-  assert.deepEqual(records.filter((record) => record.kind === "tool-result").map(({ seq, ok, result: said }) => [seq, ok, said]), [[1, true, `counted 1 in ${pid}`], [2, true, `counted 1 in ${pid}`]]);
+  assert.deepEqual(records.filter((record) => record.kind === "tool-call" && record.name === "count").map(({ seq, name, args }) => [seq, name, args]), [[1, "count", { n: 1 }], [2, "count", { n: 1 }]]);
+  assert.deepEqual(records.filter((record) => record.kind === "tool-result" && record.seq <= 2).map(({ seq, ok, result: said }) => [seq, ok, said]), [[1, true, `counted 1 in ${pid}`], [2, true, `counted 1 in ${pid}`]]);
+  assert.deepEqual(records.filter((record) => record.kind === "tool-result").at(-1).images, [{ mimeType: "image/png", bytes: 70 }]);
 });
 
 test("a process that serves a call and ends with a tool of the caller's running fails that call, and the tool is told", async (t) => {
@@ -209,4 +222,64 @@ test("a process that serves a call and ends with a tool of the caller's running 
   await assert.rejects(() => it.ask("p", { extensions: true, ownTools: [deaf] }), /exit|ended|code 3/);
   await waitFor(() => heard.length === 2, "the tool to hear that its call is over");
   assert.deepEqual(heard, ["began", "told to stop"]);
+});
+
+test("a tool that ends the agent's work has what it said be the call's answer: the model is not asked again — unless the tool failed, or another was called beside it that ends nothing", async (t) => {
+  const asked = [];
+  let tries = 0;
+  const verdict = own(asked, "verdict", { ends: true });
+  // The agent works, and then hands its answer over.
+  const it = await user(t, scripted([["look", { n: 1 }]], [["verdict", { n: 7 }]]));
+  assert.equal(await it.ask("p", { ownTools: [own(asked, "look"), verdict] }), "verdict says 7");
+  assert.equal(it.requests.length, 2);
+  assert.deepEqual(asked.map(([name]) => name), ["look", "verdict"]);
+
+  // One that fails has ended nothing: the model reads why, and calls it again.
+  const failing = await user(t, scripted([["verdict", { n: 1 }]], [["verdict", { n: 2 }]]));
+  const picky = own(asked, "verdict", { ends: true, run: async ({ n }) => ((tries += 1) === 1 ? { text: "not yet", failed: true } : { text: `accepted ${n}` }) });
+  assert.equal(await failing.ask("p", { ownTools: [picky] }), "accepted 2");
+  assert.deepEqual(toolResults(failing.requests[1]), ["not yet"]);
+  assert.equal(failing.requests.length, 2);
+
+  // Called beside a tool that ends nothing, it has not ended the agent's work either: the model is asked again, and its reply is the answer.
+  const beside = await user(t, scripted([["verdict", { n: 1 }], ["look", { n: 2 }]]));
+  assert.equal(await beside.ask("p", { ownTools: [own(asked, "look"), verdict] }), "the answer");
+  assert.deepEqual(toolResults(beside.requests[1]), ["verdict says 1", "look says 2"]);
+  // ...and two that end it, in one reply, have: the answer is what the last of them said.
+  const twice = await user(t, scripted([["verdict", { n: 1 }], ["verdict", { n: 2 }]]));
+  assert.equal(await twice.ask("p", { ownTools: [verdict] }), "verdict says 2");
+  assert.equal(twice.requests.length, 1);
+});
+
+test("an image a tool answers with is shown to a model that takes images, and a model that takes none is told there was one", async (t) => {
+  const it = await user(t, (request, stream) => (toolResults(request).length > 0 ? saying(stream, "the answer") : calling(stream, ["draw", { n: 1 }])));
+  it.put(it.agentDir, "models.json", JSON.stringify({ providers: { fake: { baseUrl: `http://127.0.0.1:${it.port}/v1`, api: "openai-completions", apiKey: "none", models: [
+    { id: "plain", cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } },
+    { id: "sees", input: ["text", "image"], cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } },
+  ] } } }));
+  const draws = (answer) => ({ name: "draw", description: "Draws", parameters: PARAMETERS, run: async () => answer });
+  const image = { mimeType: "image/png", data: PNG };
+  const tail = (request) => request.messages.slice(-2).map((message) => [message.role, message.content]);
+
+  await it.ask("p", { model: "fake/sees", ownTools: [draws({ text: "the chart", images: [image] })] });
+  assert.deepEqual(tail(it.requests.at(-1)), [
+    ["tool", "the chart"],
+    ["user", [{ type: "text", text: "Attached image(s) from tool result:" }, { type: "image_url", image_url: { url: `data:image/png;base64,${PNG}` } }]],
+  ]);
+  // An image and no words: pi says for itself that there is something to see.
+  await it.ask("p", { model: "fake/sees", ownTools: [draws({ text: "", images: [image, image] })] });
+  assert.equal(tail(it.requests.at(-1))[0][1], "(see attached image)");
+  assert.equal(tail(it.requests.at(-1))[1][1].length, 3);
+  // A model that takes no images is told by pi that there was one.
+  await it.ask("p", { model: "fake/plain", ownTools: [draws({ text: "the chart", images: [image] })] });
+  assert.deepEqual(tail(it.requests.at(-1))[1], ["tool", "the chart\n(tool image omitted: model does not support images)"]);
+});
+
+test("a run that another's tool ended has no answer of the call's own tool: only what its own tool said is its answer", async (t) => {
+  // An extension with a tool that ends the agent's run, as pi lets a tool do.
+  const it = await user(t, scripted([["quits", {}]]));
+  it.put(it.agentDir, "extensions/ext.ts", EXTENSION("ext", `pi.registerTool({ name: "quits", label: "quits", description: "Ends the run", parameters: { type: "object", properties: {} }, async execute() { return { content: [{ type: "text", text: "the extension's last word" }], details: undefined, terminate: true }; } });`));
+  const asked = [];
+  await assert.rejects(() => it.ask("p", { extensions: true, ownTools: [own(asked, "verdict", { ends: true })] }), { message: "Empty response from LLM" });
+  assert.deepEqual(asked, []);
 });

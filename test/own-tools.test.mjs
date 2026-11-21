@@ -113,6 +113,7 @@ await ctx.done({
   blank: await said([tool({ description: "  " })]),
   field: await said([tool({ params: { n: "number" } })]),
   parallel: await said([tool({ parallel: "yes" })]),
+  ends: await said([tool({ ends: 1 })]),
   parameters: await said([tool({ parameters: "string" })]),
   kind: await said([tool({ parameters: { n: "integer" } })]),
   twice: await said([tool(), tool()]),
@@ -138,8 +139,9 @@ await ctx.done({
     noName: refused(`A tool's name is letters, digits, "_" and "-", 64 of them at most: not undefined`),
     noDescription: refused(`The tool "mine" has no description: it is all a model is told of what the tool is for`),
     blank: refused(`The tool "mine" has no description: it is all a model is told of what the tool is for`),
-    field: refused(`The tool "mine" has a field a tool does not take: params (a tool takes: name, description, parameters, parallel, run)`),
+    field: refused(`The tool "mine" has a field a tool does not take: params (a tool takes: name, description, parameters, parallel, ends, run)`),
     parallel: refused(`The tool "mine": parallel is true or false, not string`),
+    ends: refused(`The tool "mine": ends is true or false, not number`),
     parameters: refused(`The tool "mine": Schema validation failed: a tool's parameters are an object of the fields it is called with`),
     kind: refused(`The tool "mine": Schema validation failed: unsupported schema type "integer" for key "n" (a list is written as the shape of its items, in brackets: ["string"]; an object as its fields: { name: "string" })`),
     twice: refused(`Two tools are named "mine": a tool is called by its name`),
@@ -245,4 +247,90 @@ await ctx.done({ answer });`);
   const [records] = journalsOf(projectDir);
   assert.deepEqual(records.filter((record) => record.kind === "call").map((record) => [record.seq, record.endpoint]),
     [[1, "/agent/instruct"], [2, "/agent/instruct"], [3, "/tools/shell"], [4, "/ctx/done"]]);
+});
+
+const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+test("bytes a tool returns are an image for the model to see, told by how they begin — and a tool says where its answer is the call's", async (t) => {
+  const projectDir = project(t, `import { ctx, agent } from "@trama-dev/runtime";
+const png = Buffer.from(${JSON.stringify(PNG)}, "base64");
+const jpeg = new Uint8Array([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]);
+const tool = (name, run, more = {}) => ({ name, description: "Returns " + name, run, ...more });
+const answer = await agent.instruct("p", { tools: [
+  tool("picture", () => png),
+  tool("both", () => ["the chart", png, { n: 1 }, jpeg]),
+  tool("words", () => ["only", "words"]),
+  tool("bytes", () => Buffer.from("these are no image")),
+  tool("last", () => "the last word", { ends: true }),
+] });
+await ctx.done({ answer: JSON.parse(answer) });`);
+  const seen = {};
+  standIn(t, async (_prompt, call) => {
+    seen.ends = call.ownTools.map((tool) => [tool.name, tool.ends]);
+    const answers = [];
+    for (const tool of call.ownTools) answers.push(await tool.run({}, `c-${tool.name}`, call.signal));
+    return JSON.stringify(answers);
+  });
+  const { result, status } = await run(projectDir);
+  assert.equal(status, "done");
+  assert.deepEqual(result.answer, [
+    { text: "", images: [{ mimeType: "image/png", data: PNG }] },
+    { text: 'the chart\n{"n":1}', images: [{ mimeType: "image/png", data: PNG }, { mimeType: "image/jpeg", data: "/9j/4AAQ" }] },
+    // (A list with no bytes in it is a list, as JSON says one.)
+    { text: '["only","words"]' },
+    { text: "the tool returned bytes that are no image a model is shown: not a PNG, a JPEG, a GIF or a WebP", failed: true },
+    { text: "the last word" },
+  ]);
+  assert.deepEqual(seen.ends, [["picture", undefined], ["both", undefined], ["words", undefined], ["bytes", undefined], ["last", true]]);
+  // On record: what kind of image, and how large. Not the image.
+  const [records] = journalsOf(projectDir);
+  assert.deepEqual(records.filter((record) => record.kind === "tool-result").map(({ tool, ok, result: said, images }) => [tool, ok, said, images]), [
+    [1, true, "", [{ mimeType: "image/png", bytes: 70 }]],
+    [2, true, 'the chart\n{"n":1}', [{ mimeType: "image/png", bytes: 70 }, { mimeType: "image/jpeg", bytes: 6 }]],
+    [3, true, '["only","words"]', undefined],
+    [4, false, undefined, undefined],
+    [5, true, "the last word", undefined],
+  ]);
+  assert.ok(!JSON.stringify(records.filter((record) => record.kind.startsWith("tool-"))).includes(PNG));
+});
+
+test("what a program says a tool answered is held to what an answer is, whoever says it — and how a tool's use is carried is no call on record", async (t) => {
+  const projectDir = project(t, `import { ctx } from "@trama-dev/runtime";
+import { readFileSync } from "fs";
+const { token } = JSON.parse(readFileSync(process.env.TRAMA_INIT, "utf-8"));
+const post = (endpoint, body) => fetch("http://127.0.0.1:" + process.env.TRAMA_PORT + endpoint, {
+  method: "POST", headers: { Authorization: "Bearer " + token }, body: JSON.stringify(body),
+}).then(async (res) => res.status + " " + (await res.text()));
+const image = { mimeType: "image/png", data: ${JSON.stringify(PNG)} };
+const answers = [];
+for (const body of [
+  { text: "words", error: "and an error" },
+  {},
+  { text: "", images: "one" },
+  { text: "", images: [{ ...image, mimeType: "text/html" }] },
+  { text: "", images: [{ ...image, data: "<not base64>" }] },
+  { text: "", images: [{ ...image, data: "" }] },
+  { text: "", images: [{ ...image, more: true }] },
+  { text: "", images: [image.data] },
+  { error: "it failed", images: [image] },
+  { text: "", extra: 1 },
+  // What is an answer is taken — and, being of no use of a tool that anybody waits for, said to nobody.
+  { text: "words", images: [image] },
+  { text: "words", images: [] },
+  { error: "it failed" },
+]) answers.push(await post("/agent/tool/answered", { of: "no call", key: "1", ...body }));
+await ctx.done({ answers });`);
+  const { result, status } = await run(projectDir);
+  assert.equal(status, "done");
+  const images = "400 Invalid field: images (expected a list of images, each its mimeType — image/png, image/jpeg, image/gif, image/webp — and its data, in base64)";
+  assert.deepEqual(result.answers, [
+    "400 A tool's answer is its text, or the error it failed with: one of the two",
+    "400 A tool's answer is its text, or the error it failed with: one of the two",
+    images, images, images, images, images, images,
+    "400 Invalid field: images (a tool that failed has its error, and no images)",
+    "400 Unknown field: extra (this call takes: of, key, text, images, error)",
+    '200 {"result":null}', '200 {"result":null}', '200 {"result":null}',
+  ]);
+  const [records] = journalsOf(projectDir);
+  assert.deepEqual(records.filter((record) => record.kind === "call").map((record) => record.endpoint), ["/ctx/done"]);
 });

@@ -62,13 +62,41 @@ export const ctx: Ctx = {
   },
 };
 
-/** What a tool's result is to a model: a string as it is, anything else as JSON says it. */
-function said(result: unknown): string {
-  if (typeof result === "string") return result;
-  if (result === undefined) return "Done.";
-  const json = JSON.stringify(result);
-  if (json === undefined) throw new TypeError(`the tool returned a ${typeof result}, which cannot be said as JSON`);
-  return json;
+/** What kind of image bytes are, told by how they begin: of the kinds a model is shown. */
+function imageKind(bytes: Uint8Array): string | undefined {
+  const begins = (at: number, ...with_: number[]) => with_.every((byte, index) => bytes[at + index] === byte);
+  if (begins(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return "image/png";
+  if (begins(0, 0xff, 0xd8, 0xff)) return "image/jpeg";
+  if (begins(0, 0x47, 0x49, 0x46, 0x38) && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) return "image/gif";
+  if (begins(0, 0x52, 0x49, 0x46, 0x46) && begins(8, 0x57, 0x45, 0x42, 0x50)) return "image/webp";
+  return undefined;
+}
+
+/**
+ * What a tool's result is to a model. Words: a string as it is, anything
+ * else as JSON says it. And bytes are an image to be seen — by themselves,
+ * or in a list, where what is not bytes is words.
+ */
+function said(result: unknown): { text: string; images?: Array<{ mimeType: string; data: string }> } {
+  const words = (value: unknown): string => {
+    if (typeof value === "string") return value;
+    const json = JSON.stringify(value);
+    if (json === undefined) throw new TypeError(`the tool returned a ${typeof value}, which cannot be said as JSON`);
+    return json;
+  };
+  const parts = result instanceof Uint8Array ? [result] : Array.isArray(result) && result.some(part => part instanceof Uint8Array) ? result : undefined;
+  if (!parts) return { text: result === undefined ? "Done." : words(result) };
+  const text: string[] = [], images: Array<{ mimeType: string; data: string }> = [];
+  for (const part of parts) {
+    if (!(part instanceof Uint8Array)) {
+      text.push(words(part));
+      continue;
+    }
+    const mimeType = imageKind(part);
+    if (!mimeType) throw new TypeError("the tool returned bytes that are no image a model is shown: not a PNG, a JPEG, a GIF or a WebP");
+    images.push({ mimeType, data: Buffer.from(part.buffer, part.byteOffset, part.byteLength).toString("base64") });
+  }
+  return { text: text.join("\n"), images };
 }
 
 /**
@@ -103,9 +131,9 @@ async function agentCall(endpoint: string, body: unknown): Promise<any> {
   const use = async (key: string, name: string, args: unknown) => {
     const stop = new AbortController();
     running.set(key, stop);
-    let answer: { text: string } | { error: string };
+    let answer: ReturnType<typeof said> | { error: string };
     try {
-      answer = { text: said(await own.get(name)!(args, { signal: stop.signal })) };
+      answer = said(await own.get(name)!(args, { signal: stop.signal }));
     } catch (err) {
       answer = { error: messageOf(err) };
     }

@@ -10,7 +10,7 @@
 // Nothing listens in the program, and what a tool was asked and answered is
 // seen where everything a program is told is seen.
 
-import type { OwnTool, ToolAnswer } from "./agent-backend.js";
+import type { OwnTool, ToolAnswer, ToolImage } from "./agent-backend.js";
 import { argumentsOf } from "./agent.js";
 import { onAbort } from "./abort.js";
 import { messageOf } from "./errors.js";
@@ -25,7 +25,26 @@ export type DeclaredTool = Omit<OwnTool, "run"> & { held(args: unknown): unknown
 
 /** What a tool's name may be: what every provider takes for one. */
 const NAME = /^[A-Za-z0-9_-]{1,64}$/;
-const DECLARED = ["name", "description", "parameters", "parallel"];
+const DECLARED = ["name", "description", "parameters", "parallel", "ends"];
+
+/** The kinds of image a model is shown. */
+const IMAGES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+
+/**
+ * The images a tool answered with, as its program's client sent them: each
+ * its kind and its bytes in base64, and nothing else. (pi hands a model
+ * whatever it is given by that name; what is no image is refused here.)
+ */
+export function imagesOf(given: unknown): ToolImage[] | undefined {
+  if (given == null) return undefined;
+  const isImage = (image: unknown) => isJsonObject(image) && Object.keys(image).length === 2
+    && typeof image.mimeType === "string" && IMAGES.has(image.mimeType)
+    && typeof image.data === "string" && image.data !== "" && /^[A-Za-z0-9+/]*={0,2}$/.test(image.data);
+  if (!Array.isArray(given) || !given.every(isImage)) {
+    throw new Error(`Invalid field: images (expected a list of images, each its mimeType — ${[...IMAGES].join(", ")} — and its data, in base64)`);
+  }
+  return given.length > 0 ? given.map(({ mimeType, data }) => ({ mimeType, data })) : undefined;
+}
 
 /**
  * A call's `tools` as its program wrote them: the agent's own by name, and
@@ -46,7 +65,7 @@ export function toolsOf(tools: unknown[]): { names: string[]; declared: Declared
       continue;
     }
     if (!isJsonObject(tool)) throw new Error(`A tool is a name, or an object with a name, a description and a run: not ${describeJson(tool)}`);
-    const { name, description, parameters, parallel } = tool;
+    const { name, description, parameters, parallel, ends } = tool;
     if (typeof name !== "string" || !NAME.test(name)) {
       throw new Error(`A tool's name is letters, digits, "_" and "-", 64 of them at most: not ${typeof name === "string" ? JSON.stringify(name) : describeJson(name)}`);
     }
@@ -55,7 +74,9 @@ export function toolsOf(tools: unknown[]): { names: string[]; declared: Declared
     if (typeof description !== "string" || description.trim() === "") {
       throw new Error(`The tool ${JSON.stringify(name)} has no description: it is all a model is told of what the tool is for`);
     }
-    if (parallel != null && typeof parallel !== "boolean") throw new Error(`The tool ${JSON.stringify(name)}: parallel is true or false, not ${describeJson(parallel)}`);
+    for (const [option, value] of Object.entries({ parallel, ends })) {
+      if (value != null && typeof value !== "boolean") throw new Error(`The tool ${JSON.stringify(name)}: ${option} is true or false, not ${describeJson(value)}`);
+    }
     let called: ReturnType<typeof argumentsOf>;
     try {
       called = argumentsOf(parameters ?? {});
@@ -63,7 +84,7 @@ export function toolsOf(tools: unknown[]): { names: string[]; declared: Declared
       throw new Error(`The tool ${JSON.stringify(name)}: ${messageOf(err)}`);
     }
     take(name);
-    declared.push({ name, description, parameters: called.schema, ...(parallel === true && { parallel }), held: called.held });
+    declared.push({ name, description, parameters: called.schema, ...(parallel === true && { parallel }), ...(ends === true && { ends }), held: called.held });
   }
   return { names, declared };
 }

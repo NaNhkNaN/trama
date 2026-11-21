@@ -92,9 +92,22 @@ export interface AgentTool {
    */
   parallel?: boolean;
   /**
+   * What it returns is the end of the agent's work, and the answer of the
+   * call: the model is not asked again. For a call whose answer is to be
+   * something the model hands over, held to a shape, rather than its last
+   * words — `{ name: "verdict", ends: true, parameters: { ok: "boolean" }, … }`.
+   * Not where it throws: the model then reads why, and may call it again.
+   * (And not where the model called, in the same reply, a tool that ends
+   * nothing: it is then asked again, as after any tool.)
+   */
+  ends?: boolean;
+  /**
    * Called each time the model calls the tool, with its arguments. What it
    * returns is the model's to read: a string as it is, anything else as
-   * JSON says it (nothing at all as "Done."). What it throws is the model's
+   * JSON says it (nothing at all as "Done."). Bytes — a Buffer, a
+   * Uint8Array — are an image for the model to see: PNG, JPEG, GIF or WebP,
+   * told by how they begin; a list with bytes in it is each of those as an
+   * image, and the rest as words. What it throws is the model's
    * to read too, as the tool's failure — and not the failure of the call,
    * which goes on. `signal` says when the call it is run for is to go no
    * further (it was cancelled, or its budget is spent): what it returns

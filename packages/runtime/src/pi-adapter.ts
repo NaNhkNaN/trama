@@ -59,6 +59,23 @@ async function pisOwnTools(): Promise<Set<string>> {
 const NOT_WAITED_FOR: ToolAnswer = { text: "The call was stopped before the tool had answered.", failed: true };
 
 /**
+ * What a call's own tool said that ended the agent's work — the answer of
+ * such a call. A run that a tool ended has that tool's result as the last
+ * thing on its record: the model was not asked again. (Where the model was —
+ * it had called, in the same reply, a tool that ends nothing — the last
+ * thing is its reply, and that is the answer, as of any call.)
+ */
+function endedWith(session: AgentSession, ownTools: OwnTool[] | undefined): string | undefined {
+  const ending = new Set((ownTools ?? []).filter(tool => tool.ends).map(tool => tool.name));
+  if (ending.size === 0) return undefined;
+  const last = session.sessionManager.getEntries().flatMap(entry => (entry.type === "message" ? [entry.message] : [])).at(-1);
+  // (Of the call's own that end it: a run may be ended by another's tool — an extension's — which is no answer of this call's.
+  // And not one that failed: such a tool has ended nothing — see asPisTool — and the model was asked again.)
+  if (last?.role !== "toolResult" || !ending.has(last.toolName)) return undefined;
+  return last.content.map(block => (block.type === "text" ? block.text : "")).join("");
+}
+
+/**
  * A caller's own tool, as pi has a tool. Run one at a time unless it says
  * it may be run beside another (pi's own way is to run together all that a
  * model calls in one reply). And over as soon as its signal says the call
@@ -76,8 +93,16 @@ function asPisTool(own: OwnTool): ToolDefinition {
       let off = () => {};
       const cancelled = new Promise<ToolAnswer>((resolve) => { off = onAbort(signal, () => resolve(NOT_WAITED_FOR)); });
       const asked = own.run(args, id, signal).catch((err): ToolAnswer => ({ text: messageOf(err), failed: true }));
-      const { text, failed } = await Promise.race([asked, cancelled]).finally(off);
-      return { content: [{ type: "text", text }], details: undefined, ...(failed && { isError: true }) };
+      const { text, images = [], failed } = await Promise.race([asked, cancelled]).finally(off);
+      return {
+        // (Where a tool has images and no words, there is no text at all: pi then says for itself that there is
+        // something to see — and a text of no words, beside an image, is one some providers refuse.)
+        content: [...(text !== "" || images.length === 0 ? [{ type: "text" as const, text }] : []), ...images.map(image => ({ type: "image" as const, ...image }))],
+        details: undefined,
+        ...(failed && { isError: true }),
+        // (pi ends an agent's run on a result that says so, failed or not: a tool that failed has ended nothing.)
+        ...(own.ends && !failed && { terminate: true }),
+      };
     },
   };
 }
@@ -1137,7 +1162,7 @@ export class PiAdapter implements AgentBackend {
       // An aborted prompt resolves with no usable answer — report it as an abort,
       // not as an empty LLM response.
       throwIfAborted(signal);
-      return answerOf(session, taken);
+      return endedWith(session, call.ownTools) ?? answerOf(session, taken);
     } finally {
       offAbort();
       its.over = true;

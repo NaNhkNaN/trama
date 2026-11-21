@@ -508,6 +508,8 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
             tool: use,
             ms: Math.round(performance.now() - asked),
             ...(answer.failed ? { ok: false, error: answer.text } : { ok: true, result: answer.text }),
+            // (Of an image: what kind it is and how large — it is the model's to see, and no record's to keep.)
+            ...(answer.images && { images: answer.images.map(({ mimeType, data }) => ({ mimeType, bytes: Buffer.byteLength(data, "base64") })) }),
           }));
         },
       };

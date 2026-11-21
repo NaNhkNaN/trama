@@ -12,7 +12,7 @@ import type { ProgramResult, RunRequest } from "./runner-types.js";
 import type { MakeRequest } from "./runner.js";
 import { OFF_THE_RECORD, type Journal, type RecordedCall } from "./journal.js";
 import type { OwnTool } from "./agent-backend.js";
-import { createToolAsks, toolsOf } from "./own-tools.js";
+import { createToolAsks, imagesOf, toolsOf } from "./own-tools.js";
 import { describeJson, isJsonObject } from "./serializable.js";
 import { checkedEnv, variableName } from "./child-process.js";
 import { checkedBudget, type Budget } from "./budget.js";
@@ -293,10 +293,17 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
     // here what one answered.
     "/agent/tool/asked": route({ of: "string" }, (b, closed) => asks.next(b.of, closed), { offTheRecord: true }),
     "/agent/tool/answered": route(
-      { of: "string", key: "string", text: "optional string", error: "optional string" },
+      { of: "string", key: "string", text: "optional string", images: "optional any", error: "optional string" },
       (b) => {
         if ((b.text === undefined) === (b.error === undefined)) throw new BadRequest("A tool's answer is its text, or the error it failed with: one of the two");
-        asks.answered(b.of, b.key, b.error !== undefined ? { text: b.error, failed: true } : { text: b.text! });
+        let images: ReturnType<typeof imagesOf>;
+        try {
+          images = imagesOf(b.images);
+        } catch (err) {
+          throw new BadRequest(messageOf(err));
+        }
+        if (images && b.error !== undefined) throw new BadRequest("Invalid field: images (a tool that failed has its error, and no images)");
+        asks.answered(b.of, b.key, b.error !== undefined ? { text: b.error, failed: true } : { text: b.text!, ...(images && { images }) });
       },
       { offTheRecord: true },
     ),

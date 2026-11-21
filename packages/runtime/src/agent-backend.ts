@@ -63,9 +63,19 @@ export function atLeast(usage: AgentUsage | undefined, seen?: Tally): AgentUsage
 export const declaredUsage = ({ model, input, output, cacheRead, cacheWrite, cost }: AgentUsage): AgentUsage =>
   ({ model, input, output, cacheRead, cacheWrite, cost });
 
-/** What a tool that was asked says: what the model is to read — and whether that is how it failed. */
+/** An image, as it is handed about: what kind it is, and its bytes in base64. */
+export interface ToolImage {
+  mimeType: string;
+  data: string;
+}
+
+/**
+ * What a tool that was asked says: what the model is to read — and to be
+ * shown, where the tool has images for it — and whether that is how it failed.
+ */
 export interface ToolAnswer {
   text: string;
+  images?: ToolImage[];
   failed?: boolean;
 }
 
@@ -82,6 +92,12 @@ export interface OwnTool {
   parameters: Record<string, unknown>;
   /** It may be run while another tool is. Without it, of the tools a model calls in one reply, one is run after the other. */
   parallel?: boolean;
+  /**
+   * What it answers, where it does not fail, is the end of the agent's work
+   * and the answer of the call: the model is not asked again. (Unless the
+   * model called, in the same reply, a tool that does not end it.)
+   */
+  ends?: boolean;
   /**
    * Have it run: `id` is the model's call of it. It does not reject — a
    * tool's failure is an answer, for the model to read — and where `signal`
