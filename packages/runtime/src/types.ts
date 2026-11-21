@@ -218,6 +218,117 @@ export interface Agent {
     prompt: string;
     schema: Schema;
   }): Promise<T>;
+
+  /**
+   * Ask the model once, and have its one reply: no agent is at work, no
+   * tool is run, and nothing is asked again. For a program that is its own
+   * harness — it keeps the conversation, runs the tools the model calls,
+   * and decides when to ask again and when to stop:
+   *
+   *   const messages: ModelMessage[] = [{ role: "user", content: "…" }];
+   *   for (;;) {
+   *     const reply = await agent.complete({ system, messages, tools });
+   *     messages.push(reply);                      // a reply goes back as it came
+   *     if (reply.stopReason !== "toolUse") break; // read why it stopped: see ModelReply
+   *     for (const part of reply.content) {
+   *       if (part.type !== "toolCall") continue;
+   *       messages.push({ role: "toolResult", toolCallId: part.id, toolName: part.name, content: await mine(part) });
+   *     }
+   *   }
+   *
+   * Each is a call to a run's budget, counted for what its reply used: a
+   * loop is better held by a cap on tokens or cost than on calls.
+   */
+  complete(request: ModelRequest): Promise<ModelReply>;
+}
+
+/** A part of a message that is text. */
+export interface TextPart {
+  type: "text";
+  text: string;
+}
+
+/** An image in a message: its kind — image/png, image/jpeg, image/gif or image/webp — and its bytes in base64. */
+export interface ImagePart {
+  type: "image";
+  mimeType: string;
+  data: string;
+}
+
+/** What a model thought before it answered, where it shows that. */
+export interface ThinkingPart {
+  type: "thinking";
+  thinking: string;
+}
+
+/**
+ * A model's call of a tool it was told of: to be answered by a message of
+ * role "toolResult" with its `id`, before the model is asked again. Its
+ * arguments are as the model wrote them — held to nothing: where they were
+ * no JSON at all, `argumentsError` says so, and they are `{}`.
+ */
+export interface ToolCallPart {
+  type: "toolCall";
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+  argumentsError?: string;
+}
+
+/**
+ * A model's reply to one request. What is declared here is what a program
+ * may read. There is more on it — what its provider wants to see again when
+ * the conversation goes on: so a reply goes back into `messages` as it came,
+ * all of it. (It is plain data, and can be kept in state.)
+ */
+export interface ModelReply {
+  role: "assistant";
+  content: Array<TextPart | ThinkingPart | ToolCallPart>;
+  /**
+   * Why the model stopped. "stop": it has answered. "toolUse": it called
+   * tools, and waits for what they say. "length": it was cut off at its
+   * output limit — what there is of the reply is here. "error": the
+   * provider failed, and `errorMessage` says how; whether to ask again is
+   * the program's to decide.
+   */
+  stopReason: "stop" | "toolUse" | "length" | "error";
+  errorMessage?: string;
+  /** The model that answered, as its provider names it. */
+  model: string;
+  /** What the reply used: tokens read and written, from a cache and to one, and what pi's price list makes of them in US dollars. */
+  usage: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: { total: number } };
+  [carried: string]: unknown;
+}
+
+/** A message of the conversation a model is sent: the user's, a reply as it came, or what a tool the model called said. */
+export type ModelMessage =
+  | { role: "user"; content: string | Array<TextPart | ImagePart> }
+  | ModelReply
+  | { role: "toolResult"; toolCallId: string; toolName: string; content: string | Array<TextPart | ImagePart>; isError?: boolean };
+
+export interface ModelRequest {
+  /** The conversation so far, oldest first. It is the program's to keep: nothing of it is remembered between requests. */
+  messages: ModelMessage[];
+  /** What the model is told to be, before the conversation. */
+  system?: string;
+  /**
+   * The tools the model may call, each declared as a tool of the program's
+   * is to an agent (see `AgentTool`): its name, description and parameters.
+   * Nothing runs one — the model's call comes back in the reply, and the
+   * program does with it what it will; so a tool's `run` may be left out.
+   */
+  tools?: Array<Pick<AgentTool, "name" | "description" | "parameters"> & Partial<AgentTool>>;
+  /** The model, as "provider/model". Without it, the project's — which is then one pi has, or the call fails. */
+  model?: string;
+  /** How much the model is to think. A level the model has not got is an error. */
+  thinking?: Thinking;
+  /** The most the reply may come to, in tokens. */
+  maxTokens?: number;
+  temperature?: number;
+  /** "none": the model answers without calling a tool, though it is told of them. */
+  toolChoice?: "auto" | "none";
+  /** How long the provider is waited for, in milliseconds: five minutes without it. */
+  timeout?: number;
 }
 
 export interface ShellResult {

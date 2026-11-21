@@ -32,19 +32,43 @@ export function createBackend(config: TramaConfig, meter: Meter = createMeter(),
     refused ??= why;
     return new Error(why);
   };
+  /** Take a call on, in the run's count — or refuse it, with why, where nothing more may be asked. */
+  const admitted = (): ReturnType<Meter["admit"]> => {
+    try {
+      return meter.admit();
+    } catch (err) {
+      throw overBudget(messageOf(err));
+    }
+  };
   return {
     spent: () => meter.spent(),
     refused: () => refused,
     counts: () => meter.capped(),
+    // One request to a model is a call too: taken on or refused as an agent's is, and counted for what its
+    // reply used. There is nothing in it to stop half-way — it is asked once, and a reply that is coming is
+    // let come, as an agent's is.
+    async complete(request, call) {
+      const account = admitted();
+      const work = backend.complete(request, {
+        ...call,
+        used(usage) {
+          account.sofar(usage);
+          call.used?.(usage);
+        },
+      });
+      const off = onAbort(call.signal, () => { cutOff.add(work); });
+      const settled = () => {
+        off();
+        account.close();
+        cutOff.delete(work);
+      };
+      work.then(settled, settled);
+      return rejectOnAbort(work, call.signal);
+    },
     // The interface promises that a cancelled call rejects, and a run's end
     // waits on that. Every backend is held to it here, rather than trusted with it.
     async ask(prompt, call) {
-      let account: ReturnType<Meter["admit"]>;
-      try {
-        account = meter.admit();
-      } catch (err) {
-        throw overBudget(messageOf(err));
-      }
+      const account = admitted();
       // Stops the call where the budget is reached while it is under way.
       const over = new AbortController();
       let why: string | undefined;

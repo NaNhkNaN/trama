@@ -210,6 +210,39 @@ export class CutOff extends Error {
   }
 }
 
+/**
+ * One request to a model: what it is to be sent — the conversation so far,
+ * and beside it what the model is told to be and the tools it may call, each
+ * declared — and how it is asked. Plain data, all of it, held to its shape by
+ * whoever made it (see model-request.ts): a backend sends it as it is.
+ */
+export interface ModelAsk {
+  context: {
+    systemPrompt?: string;
+    messages: Array<Record<string, unknown>>;
+    tools?: Array<{ name: string; description: string; parameters: Record<string, unknown> }>;
+  };
+  /** The model that is to answer, as the backend names its models — in place of the one it would ask. */
+  model?: string;
+  /** How much the model is to think, as the backend names its levels. */
+  thinking?: string;
+  /** The most the reply may come to, in tokens. */
+  maxTokens?: number;
+  temperature?: number;
+  /** Whether the model may call the tools it is told of ("auto", as it is without this) or is to answer without ("none"). */
+  toolChoice?: "auto" | "none";
+  /** How long the provider is waited for, in milliseconds. */
+  timeout?: number;
+}
+
+/** What goes with one request to a model, and is no part of it. */
+export interface ModelCall {
+  /** Cancels the request. A cancelled request rejects. */
+  signal?: AbortSignal;
+  /** Told what the request used, at most once and before it settles — however it ended. (It does not throw.) */
+  used?: (usage: AgentUsage) => void;
+}
+
 export interface AgentBackend {
   /**
    * Run one prompt to completion and return the agent's final text. A final
@@ -220,4 +253,19 @@ export interface AgentBackend {
    * honour something in `call` must reject, never silently ignore it.
    */
   ask(prompt: string, call: AgentCall): Promise<string>;
+
+  /**
+   * Ask the backend's model once, and return its one reply: no agent, no
+   * tool run, nothing asked again — whoever asks is the harness. The reply
+   * is the model's as the backend has replies: plain data, to be sent back
+   * as it came where the conversation goes on. What is the model's doing is
+   * a reply, and is read in it: one that was cut off at its limit, and one
+   * the provider failed (its `stopReason` is "error", and `errorMessage`
+   * says how). What is not rejects: a model the backend has not got, or
+   * cannot ask; a level it does not think at; a request that was cancelled.
+   *
+   * As of `ask`: each stands alone, and what a backend cannot honour of a
+   * request it rejects.
+   */
+  complete(request: ModelAsk, call: ModelCall): Promise<Record<string, unknown>>;
 }

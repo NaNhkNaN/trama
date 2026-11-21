@@ -56,6 +56,15 @@ export interface RelayRequest {
   by?: RelayWay;
   /** The model, as the session that asks has it. */
   model: RelayModel;
+  /**
+   * The model by name, "provider/model", where no session asks that has it:
+   * it is then the relay's own by that name — and where the relay has none
+   * such, has no key for it, or the model does not think as the request
+   * would have it, the reply says so, as one that was not asked for (see
+   * `unasked`). Such a request is never one for whoever sent it to ask
+   * itself: it has nothing to ask by.
+   */
+  named?: string;
   /** What the model is to be sent: as pi hands it to a provider. */
   context: unknown;
   /** The options of the request that are data (see `dataOf`). */
@@ -221,6 +230,37 @@ export function notAsked(model: RelayModel, why: string, as: "aborted" | "error"
   };
 }
 
+/** Why a model that was asked for by name was not asked: which of the things a request by name is refused for. */
+export type Unasked = "model" | "key" | "thinking";
+
+/** The reply of a request by name that was not made (see RelayRequest.named): one event, that says why — and of which kind the reason is. */
+async function* unasked(model: RelayModel, kind: Unasked, why: string): AsyncIterable<RelayEvent> {
+  yield { ...notAsked(model, why, "error"), unasked: kind };
+}
+
+/**
+ * A model by the name a call gives it, "provider/model", among those `models`
+ * has: the provider's name ends at a stroke, and either name may have more of
+ * them — so each stroke is tried, the first first.
+ */
+export function modelNamed<M>(models: { getModel(provider: string, id: string): M | undefined }, name: string): M | undefined {
+  for (const { index } of name.matchAll(/\//g)) {
+    const model = models.getModel(name.slice(0, index), name.slice(index + 1));
+    if (model) return model;
+  }
+  return undefined;
+}
+
+/** The levels a model thinks at, as pi-ai has them of it. (pi-ai's own, had by its file: pi hands it to nobody.) */
+async function levelsOf(model: unknown): Promise<string[] | undefined> {
+  try {
+    const { getSupportedThinkingLevels } = await import(pathToFileURL(inPisAi("./models")).href) as { getSupportedThinkingLevels?: (model: unknown) => string[] };
+    return getSupportedThinkingLevels?.(model);
+  } catch {
+    return undefined;
+  }
+}
+
 // --- An event without the reply so far, and with it again ---
 
 // Every event of a reply but the last carries `partial`: the whole reply so
@@ -348,12 +388,32 @@ export function createModelRelay(): ModelRelay & { close(): Promise<void> } {
         // (A way that is none of these is not one to ask by, whatever pi's models have by that name.)
         const way = WAYS.get(by);
         if (!way) return undefined;
-        const own: unknown = way.of === "chat" ? found.getModel(provider, id) : found.getModelOfType(way.of, provider, id);
-        // The same model, to the letter, with a key to ask it by — and a provider nobody has had a hand in.
-        if (!own || JSON.stringify(own) !== JSON.stringify(request.model) || !found.hasConfiguredAuth(provider)) return undefined;
         // (What goes with a request is held to here as where it was sent from: whoever sent it may not be who should have.)
         const options = dataOf(request.options);
         if (!options) return undefined;
+        let own: unknown;
+        if (request.named !== undefined) {
+          // By name: this relay's own model of that name, or none — and what stands against asking it is said.
+          const name = request.named;
+          const mine = way.of === "chat" ? modelNamed(found, name) : undefined;
+          if (!mine) return unasked(request.model, "model", `Unknown model "${name}". A model is named "provider/model", as pi's model catalog has it.`);
+          if (!found.hasConfiguredAuth(mine.provider)) return unasked(request.model, "key", `The model ${name} cannot be asked: pi has no key for the provider "${mine.provider}".`);
+          if (options.reasoning !== undefined) {
+            // (pi gives the level it has that is nearest, without a word: a request is to have what it asked for, or fail.)
+            const levels = await levelsOf(mine);
+            if (!levels) return unasked(request.model, "thinking", `Whether the model ${name} thinks at level "${String(options.reasoning)}" cannot be told: pi's list of a model's levels was not found.`);
+            if (!levels.includes(String(options.reasoning))) {
+              return unasked(request.model, "thinking", `The model ${name} does not think at level "${String(options.reasoning)}". Its levels: ${levels.join(", ")}.`);
+            }
+            // (Not at all is how a model is asked without a word of it.)
+            if (options.reasoning === "off") delete options.reasoning;
+          }
+          own = mine;
+        } else {
+          own = way.of === "chat" ? found.getModel(provider, id) : found.getModelOfType(way.of, provider, id);
+          // The same model, to the letter, with a key to ask it by — and a provider nobody has had a hand in.
+          if (!own || JSON.stringify(own) !== JSON.stringify(request.model) || !found.hasConfiguredAuth(provider)) return undefined;
+        }
         if (typeof options.sessionId === "string") sessions.add(options.sessionId);
         // (pi's models, asked by the name of the way: each takes the model, what it is to be sent, and the options.)
         const ask = (found as unknown as Record<RelayWay, (model: unknown, context: unknown, options: Record<string, unknown>) => unknown>)[by].bind(found);

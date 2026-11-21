@@ -2,10 +2,10 @@ import type { AgentSession, ExtensionFactory, InlineExtension, ModelRuntime as M
 import { onAbort, rejectOnAbort, throwIfAborted } from "./abort.js";
 import { messageOf } from "./errors.js";
 import { createAgentHosts } from "./agent-hosts.js";
-import { CutOff, NOT_WAITED_FOR, addReply, atLeast, nothingYet, type AgentBackend, type AgentCall, type AgentUsage, type OwnTool, type Tally, type ToolAnswer } from "./agent-backend.js";
+import { CutOff, NOT_WAITED_FOR, addReply, atLeast, nothingYet, type AgentBackend, type AgentCall, type AgentUsage, type ModelAsk, type ModelCall, type OwnTool, type Tally, type ToolAnswer } from "./agent-backend.js";
 import * as http from "http";
 import * as https from "https";
-import { dataOf, isData, notAsked, usageAtEnd, wholeOf, type RelayEvent, type RelayModel, type RelayWay } from "./model-relay.js";
+import { createModelRelay, dataOf, isData, modelNamed, notAsked, usageAtEnd, wholeOf, type RelayEvent, type RelayModel, type RelayWay, type Unasked } from "./model-relay.js";
 import type { ModelConfig } from "./runner-types.js";
 
 /**
@@ -798,12 +798,17 @@ function answerOf(session: AgentSession, taken = false): string {
  * commands it runs are given, are a process's — and this process is the
  * runner's, whose own are not a run's to change.
  */
+/** How long a provider is waited for, for one request to a model that does not say: as pi's agent waits for one. */
+const MODEL_TIMEOUT_MS = 300_000;
+
 export class PiAdapter implements AgentBackend {
   private config: ModelConfig;
   /** Whether every call is served in a process of its own: where those processes are given variables this one has not. */
   private apart: boolean;
   /** The processes that serve this adapter's calls. */
   private hosts: ReturnType<typeof createAgentHosts>;
+  /** Who asks a model for a request that is no call of an agent's, where that is this process: made when one first comes. */
+  private asks?: ReturnType<typeof createModelRelay>;
 
   constructor(config: ModelConfig, env?: Record<string, string>) {
     this.config = config;
@@ -817,9 +822,51 @@ export class PiAdapter implements AgentBackend {
     return call.extensions || this.apart ? this.hosts.ask(this.config, prompt, call) : this.serve(prompt, call);
   }
 
+  /**
+   * Ask a model once (see AgentBackend.complete): by pi's own models, as pi
+   * hands a request to a provider — no session of pi's, and so none of what
+   * a session does: no tool is run, nothing is asked again, nothing summed
+   * up. Asked where this adapter's calls have their models asked for them:
+   * here — or, for an adapter that was given variables, by the process
+   * that was started with them, where a key that is among them is the key.
+   */
+  async complete(request: ModelAsk, call: ModelCall): Promise<Record<string, unknown>> {
+    throwIfAborted(call.signal);
+    const { context, model, thinking, timeout, ...sampled } = request;
+    // (Without a name of its own, the project's model — by name too: which of pi's that is, is for whoever asks it to say.)
+    const named = model ?? `${this.config.provider}/${this.config.model}`;
+    const stroke = named.indexOf("/");
+    const relay = this.apart ? this.hosts.asks : this.asks ??= createModelRelay();
+    const events = await relay.ask({
+      named, model: { provider: named.slice(0, stroke), id: named.slice(stroke + 1) }, context,
+      // (As pi's agent has a provider waited for, where the request does not say.)
+      options: { ...sampled, ...(thinking !== undefined && { reasoning: thinking }), timeoutMs: timeout ?? MODEL_TIMEOUT_MS },
+    }, call.signal);
+    if (!events) throw new Error("The model could not be asked: pi was not to be had to ask it by.");
+    let last: RelayEvent | undefined;
+    for await (const event of events) last = event;
+    const reply = last?.type === "done" ? last.message : last?.type === "error" ? last.error : undefined;
+    if (!last || !isData(reply) || typeof reply !== "object" || reply === null || Array.isArray(reply)) throw new Error("The model could not be asked: nothing came of asking it.");
+    const said = reply as Record<string, unknown>;
+    // What it used, however it ended — where it used anything: a reply that failed half-way was paid for as far as it came.
+    const usage = usageAtEnd(last);
+    if (usage && usage.input + usage.output + usage.cacheRead + usage.cacheWrite > 0) {
+      call.used?.({ model: `${String(said.provider)}/${String(said.model)}`, input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, cost: usage.cost.total });
+    }
+    throwIfAborted(call.signal);
+    const kind = last.unasked as Unasked | undefined;
+    if (kind !== undefined) {
+      throw new Error(kind === "model" && model === undefined
+        ? `The project's model, ${named}, is not one pi has. A request to a model is answered by the model it names, or by the project's: there is no agent here whose own choice it could fall back on.`
+        : String(said.errorMessage));
+    }
+    return said;
+  }
+
   /** End the processes that served calls: what this adapter was for is over. (It can be asked again: it starts them anew.) */
   async close(): Promise<void> {
-    await this.hosts.close();
+    await Promise.all([this.hosts.close(), this.asks?.close()]);
+    this.asks = undefined;
   }
 
   private async createSession(cwd: string, systemPrompt?: string, signal?: AbortSignal, asked: Asked = {}): Promise<AgentSession> {
@@ -932,11 +979,9 @@ export class PiAdapter implements AgentBackend {
     const modelRuntime = await raceAbort(ModelRuntime.create({ signal }));
     const asking: Asking = { models: modelRuntime, seen: nothingYet(), answering: 0, readying: 0, cut: new AbortController(), over: false, gone: false, refusal: new AbortController() };
     watch(modelRuntime, asking);
-    // (A call names it "provider/model": the provider's name ends at a stroke, and either name may have more of them.)
-    const strokes = [...(asked.model ?? "").matchAll(/\//g)].map(stroke => stroke.index);
     const model = asked.model === undefined
       ? modelRuntime.getModel(this.config.provider, this.config.model)
-      : strokes.map(at => modelRuntime.getModel(asked.model!.slice(0, at), asked.model!.slice(at + 1))).find(Boolean);
+      : modelNamed(modelRuntime, asked.model);
     if (asked.model !== undefined && !model) {
       throw new Error(`Unknown model "${asked.model}". A model is named "provider/model", as pi's model catalog has it.`);
     }

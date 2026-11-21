@@ -93,6 +93,13 @@ interface Host {
 export interface AgentHosts {
   /** Have a host serve one call, as the adapter would (see AgentBackend.ask). */
   ask(config: ModelConfig, prompt: string, call: AgentCall): Promise<string>;
+  /**
+   * Who asks the models of the calls these hosts serve, where the hosts were
+   * started with variables: a process started with the same, that serves no
+   * call. To be asked by for what is no call of an agent's — one request to
+   * a model — and is to be asked with a run's variables all the same.
+   */
+  readonly asks: ModelRelay;
   /** End every host: what they were for is over. Resolves when none is left. (A call made after this starts one anew.) */
   close(): Promise<void>;
 }
@@ -215,6 +222,7 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
   };
 
   return {
+    asks: apart,
     async ask(config, prompt, call) {
       throwIfAborted(call.signal);
       const host = free.pop() ?? start();

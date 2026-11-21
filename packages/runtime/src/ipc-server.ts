@@ -12,6 +12,7 @@ import type { MakeRequest, ProgramResult, RunRequest } from "./runner-types.js";
 import { OFF_THE_RECORD, type Journal, type RecordedCall } from "./journal.js";
 import type { OwnTool } from "./agent-backend.js";
 import { createToolAsks, imagesOf, toolsOf } from "./own-tools.js";
+import { REQUEST_FIELDS, requestOf } from "./model-request.js";
 import { describeJson, isJsonObject } from "./serializable.js";
 import { checkedEnv, variableName } from "./child-process.js";
 import { checkedBudget, type Budget } from "./budget.js";
@@ -292,6 +293,12 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
       { prompt: "string", schema: "object", ...HOW_SERVED },
       ({ tools, toolsId, ...input }, _closed, call) => withTools(tools, toolsId, call, (names, own) =>
         agent.generate({ ...input, tools: names } as Parameters<RunnerAgent["generate"]>[0], call.used, own)),
+    ),
+    // One request to a model (see model-request.ts): what it holds is read there, all of it, before anything is
+    // asked or counted — a conversation is no list of fields, and what is wrong with one is said by where it is.
+    "/agent/complete": route(
+      Object.fromEntries(REQUEST_FIELDS.map(field => [field, "optional any"])) as Record<(typeof REQUEST_FIELDS)[number], "optional any">,
+      (request, _closed, call) => agent.complete(asGiven(() => requestOf(request), ofAField), call.used),
     ),
     // How a program's own tools are asked (see own-tools.ts): its client waits here to be told that one is
     // called, or is to stop — held until there is something to tell, or the agent call is over — and says

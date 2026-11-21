@@ -3,14 +3,14 @@
 // (ipc-server.ts), which does the real work.
 
 import { randomUUID } from "crypto";
-import type { Ctx, Agent, AgentOptions, AgentTool, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace } from "./types.js";
+import type { Ctx, Agent, AgentOptions, AgentTool, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace, ModelRequest, ModelReply, ModelMessage, TextPart, ImagePart, ThinkingPart, ToolCallPart } from "./types.js";
 import type { ImageKind, ToolImage } from "./agent-backend.js";
 import type { ToolEvent } from "./own-tools.js";
 import { openBridge, remoteWorkspace, withOptions } from "./bridge-client.js";
 import { messageOf } from "./errors.js";
 import { assertSerializable, toLogData } from "./serializable.js";
 
-export type { Ctx, Agent, AgentOptions, AgentTool, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace };
+export type { Ctx, Agent, AgentOptions, AgentTool, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace, ModelRequest, ModelReply, ModelMessage, TextPart, ImagePart, ThinkingPart, ToolCallPart };
 
 const PORT = process.env.TRAMA_PORT;
 if (!PORT) {
@@ -177,9 +177,27 @@ async function agentCall(endpoint: string, body: unknown): Promise<any> {
   }
 }
 
+/**
+ * A request to a model as it is sent: of each tool, what it declares. Its
+ * function stays here, and waits for nobody: no agent is asked that would
+ * call it — the program reads the model's calls in the reply, and runs what
+ * it will.
+ */
+function asSent(request: unknown): unknown {
+  const tools = isOwn(request) ? (request as { tools?: unknown }).tools : undefined;
+  if (!Array.isArray(tools)) return request;
+  const declared = tools.map((tool: unknown) => {
+    if (!isOwn(tool)) return tool;
+    const { run: _run, ...rest } = tool as Partial<AgentTool>;
+    return rest;
+  });
+  return { ...(request as object), tools: declared };
+}
+
 export const agent: Agent = {
   instruct: async (prompt, opts) => agentCall("/agent/instruct", withOptions({ prompt }, opts)),
   generate: async (input) => agentCall("/agent/generate", input),
+  complete: async (request) => call("/agent/complete", asSent(request)),
 };
 
 export const tools: Tools = {

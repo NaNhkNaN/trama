@@ -3,7 +3,7 @@
 // else, the program in it.
 
 import type { AgentOptions, Schema } from "./types.js";
-import { CutOff, type AgentBackend, type AgentCall, type OwnTool } from "./agent-backend.js";
+import { CutOff, type AgentBackend, type AgentCall, type ModelAsk, type OwnTool } from "./agent-backend.js";
 import { conform, hasList, shapeOf } from "./schema.js";
 import { isJsonObject } from "./serializable.js";
 
@@ -116,6 +116,8 @@ type Served = Omit<AgentOptions, "tools"> & { tools?: string[] };
 export interface RunnerAgent {
   instruct(prompt: string, options?: Served, used?: Used, ownTools?: OwnTool[]): Promise<string>;
   generate<T>(input: Omit<Served, "templates"> & { prompt: string; schema: Schema }, used?: Used, ownTools?: OwnTool[]): Promise<T>;
+  /** One request to the model, held to its shape already (see model-request.ts), and its one reply. */
+  complete(request: ModelAsk, used?: Used): Promise<Record<string, unknown>>;
 }
 
 /** Of what a call may ask for, what it did ask for: a backend is not handed a thing nobody named. */
@@ -149,6 +151,8 @@ export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSi
       const { system, model, thinking, tools, skills, templates, extensions, cutOff } = options ?? {};
       return ask(prompt, { cwd, system, signal, ...asked({ model, thinking, tools, ownTools, skills, templates, extensions, used }) }, cutOff);
     },
+
+    complete: (request, used) => backend.complete(request, { signal, ...(used && { used }) }),
 
     async generate(input, used, ownTools) {
       if (!isJsonObject(input.schema)) throw new Error("Schema validation failed: a schema is an object of the fields the answer is to have");

@@ -2,6 +2,20 @@
 
 All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`) are released together under one version.
 
+## Unreleased
+
+### Added
+
+- **A program can ask a model itself, one reply at a time: `agent.complete({ messages, system, tools, … })`.** No agent is at work behind it — no tool is run, nothing is asked again, nothing is remembered. The program keeps the conversation, reads in each reply why the model stopped, runs the tools the model calls and sends back what they said: it is the harness. `agent.instruct` and `agent.generate` are as they were, with pi's agent as theirs.
+  - **A message** is the user's (`{ role: "user", content }`: text, or parts of text and images), a reply as `complete` returned it, or a tool's result (`{ role: "toolResult", toolCallId, toolName, content, isError? }`). A request is held to that before anything is asked or counted, and what is wrong with it is said by where it is (`messages[2].toolCallId is the id of the call it answers…`): pi holds a conversation to nothing.
+  - **A reply** is plain data — it can be kept in `ctx.state` — and goes back into `messages` as it came: it holds what its provider wants to see again. What a program may read of it is declared (`ModelReply`): `content` (parts of text, of thinking, and tool calls with their `id`, `name` and `arguments`), `stopReason`, `usage`, `model`.
+  - **`stopReason` is the program's to read**: `stop`, `toolUse`, `length` — a reply cut off at its limit is a reply, with what there was of it — and `error`: a provider's failure, or one that did not answer in time, comes back as a reply with `errorMessage`, asked once. Whether to ask again is what a harness decides. What is not the model's doing fails the call: a request that is none, a model pi has not got or has no key for, a level the model does not think at, a budget that is spent, a run that was stopped.
+  - **Tools are declared and not run.** The same object `instruct` takes (`name`, `description`, `parameters`); its `run` may be there or not, and nobody calls it. The model's arguments come back as it wrote them.
+  - **What goes with a request is a short list**: `model` (`"provider/model"`; without it the project's, which is then one pi has or the call fails — there is no agent whose own choice to fall back on), `thinking`, `maxTokens`, `temperature`, `toolChoice` (`"auto"`, `"none"`), `timeout` (five minutes without it). No headers, no keys, none of a provider's own options.
+  - **It is a call to a run's budget**, admitted or refused as an agent's is and counted for what its reply used, by pi's price list. A loop makes one for each turn, so it is better held by `tokens` or `cost` than by `calls`.
+  - **In the journal**: the request, the reply, and a `usage` record, as of any call; `trama journal` shows each by the last that was said in its conversation.
+  - **A run that was given variables has its requests asked with them** — by the process that asks the models of such a run's agents already — so a key that is among them is the key used.
+
 ## 0.7.0 — 2026-11-21
 
 ### Added

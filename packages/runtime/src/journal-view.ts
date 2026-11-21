@@ -34,11 +34,22 @@ const oneLine = (value: unknown, max: number): string => {
 };
 
 /** The one field of a request that says most about it. */
+/** The words of a conversation's last message — or, where it has none, what it has instead. */
+function lastSaid(messages: unknown[]): string {
+  const content = (messages.at(-1) as { content?: unknown } | undefined)?.content;
+  if (typeof content === "string") return content;
+  const parts = Array.isArray(content) ? content as Array<Record<string, unknown>> : [];
+  const text = parts.find(part => typeof part?.text === "string");
+  return text ? String(text.text) : parts.length > 0 ? `(${String(parts[0]?.type)})` : "";
+}
+
 function gist(request: Record<string, unknown> | undefined): string {
   // A run that was asked for is best known by the name it was given.
   if (typeof request?.label === "string") return oneLine(`${request.label}  (${request.projectDir})`, 60);
   // ...and a project that was asked for by its own.
   if (typeof request?.name === "string") return oneLine(`${request.name}: ${typeof request.prompt === "string" ? request.prompt : ""}`, 60);
+  // ...and a request to a model by the last that was said in the conversation it carries.
+  if (Array.isArray(request?.messages)) return oneLine(lastSaid(request.messages), 60);
   for (const field of ["prompt", "command", "path", "pattern", "url", "message", "projectDir", "reason"]) {
     if (request?.[field] !== undefined) return oneLine(request[field], 60);
   }
