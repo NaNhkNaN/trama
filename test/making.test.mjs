@@ -4,7 +4,8 @@ import { existsSync, readdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import { createProject, runProgram, updateProject } from "../packages/runtime/dist/index.js";
-import { createBackend, runProgram as runWithoutMaking, validateProgram } from "../packages/runtime/dist/runner.js";
+import { runProgram as runWithoutMaking, validateProgram } from "../packages/runtime/dist/runner.js";
+import { createBackend } from "../packages/runtime/dist/runner-backend.js";
 import { printJournals } from "../packages/runtime/dist/journal-view.js";
 import { captureConsole, cleanupTempDir, createProjectFixture, makeTempDir, waitFor, withEnv, writeJson } from "./helpers.mjs";
 

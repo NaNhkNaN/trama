@@ -51,7 +51,12 @@ export function spentIn(usage: object[]): string {
   const sum = (field: string) => usage.reduce((total, record) => total + (Number((record as Record<string, unknown>)[field]) || 0), 0);
   return `${sum("input") + sum("output") + sum("cacheRead") + sum("cacheWrite")} tokens  $${sum("cost").toFixed(4)}`;
 }
-const spent = spentIn;
+
+/** How a call, or a use of a tool, was answered — as its record of that says, where it has one. */
+const howAnswered = (answer: JournalRecord | undefined): string =>
+  !answer ? "never answered"
+    : answer.ok ? `ok  ${answer.ms}ms`
+    : `failed  ${answer.ms}ms  ${oneLine(answer.error, 60)}`;
 
 const usageIn = (records: JournalRecord[]) => records.filter(record => record.kind === "usage");
 
@@ -61,7 +66,7 @@ const usageIn = (records: JournalRecord[]) => records.filter(record => record.ki
  * that nothing, and is said to be.
  */
 function spentInAll(records: JournalRecord[], inAll = ""): string {
-  const counted = spent(usageIn(records));
+  const counted = spentIn(usageIn(records));
   if (!records.some(record => record.kind === "full")) return counted && counted + inAll;
   return `${counted || "no usage"} on record — the journal was full`;
 }
@@ -96,26 +101,20 @@ function printJournal(path: string, records: JournalRecord[]): void {
         console.log(`${at}  attempt ${record.attempt}  program ${record.program?.sha256?.slice(0, 8) ?? "missing"}`);
         break;
       case "call": {
-        const result = results.get(record.seq);
-        const how = !result ? "never answered"
-          : result.ok ? `ok  ${result.ms}ms`
-          : `failed  ${result.ms}ms  ${oneLine(result.error, 60)}`;
-        const used = spent(usage.filter(item => item.seq === record.seq));
+        const how = howAnswered(results.get(record.seq));
+        const used = spentIn(usage.filter(item => item.seq === record.seq));
         console.log(`${at}  #${String(record.seq).padEnd(3)} ${record.endpoint.slice(1).padEnd(18)} ${gist(record.request).padEnd(60)}  ${how}${used && `  ${used}`}`);
         break;
       }
       case "tool-call": {
-        const answer = answers.get(`${record.seq}/${record.tool}`);
-        const how = !answer ? "never answered"
-          : answer.ok ? `ok  ${answer.ms}ms`
-          : `failed  ${answer.ms}ms  ${oneLine(answer.error, 60)}`;
+        const how = howAnswered(answers.get(`${record.seq}/${record.tool}`));
         console.log(`${at}  #${String(record.seq).padEnd(3)} ${`  tool ${record.name}`.padEnd(18)} ${oneLine(record.args, 60).padEnd(60)}  ${how}`);
         break;
       }
       case "usage":
         // (What a call used is shown with the call.)
-        if (record.for === "fix") console.log(`${at}  asking for the fix used ${spent([record])}`);
-        if (record.for === "generate") console.log(`${at}  writing the program used ${spent([record])}`);
+        if (record.for === "fix") console.log(`${at}  asking for the fix used ${spentIn([record])}`);
+        if (record.for === "generate") console.log(`${at}  writing the program used ${spentIn([record])}`);
         break;
       case "budget":
         console.log(`${at}  ${oneLine(record.spent, 100)}`);

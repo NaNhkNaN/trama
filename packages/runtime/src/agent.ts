@@ -1,5 +1,10 @@
+// What a program's `agent` is to its runner: its calls, each made a request
+// of the backend — and, of a reply that was to be a program and nothing
+// else, the program in it.
+
 import type { AgentOptions, Schema } from "./types.js";
 import { CutOff, type AgentBackend, type AgentCall, type OwnTool } from "./agent-backend.js";
+import { conform, hasList, shapeOf } from "./schema.js";
 import { isJsonObject } from "./serializable.js";
 
 /** A line of a reply that could be the edge of a fenced block: three or more backticks. */
@@ -97,109 +102,6 @@ export function stripCodeFences(text: string): string {
   return last ?? reply;
 }
 
-const SCHEMA_PRIMITIVES = new Set(["string", "number", "boolean"]);
-type SchemaPrimitive = "string" | "number" | "boolean";
-
-/** What a schema says a value is to be: a primitive by its name, an object by its fields, a list by the one shape all its items have. */
-type Shape = SchemaPrimitive | { fields: Array<[string, Shape]> } | { items: Shape };
-
-/** How the two shapes that are not named in a word are written, for whoever named them in one. */
-const HOW_WRITTEN = `a list is written as the shape of its items, in brackets: ["string"]; an object as its fields: { name: "string" }`;
-
-/** Where a value is in an answer, in words: null for the answer itself, and under that each field by its name. */
-type Where = string | null;
-const fieldOf = (where: Where, key: string): string => (where === null ? key : `${where}.${key}`);
-
-/**
- * Read the caller's schema declaration, up front: what the value at `where`
- * is to be. In words — "string", "number", "boolean", where what follows a
- * ":" describes the value to the model and is not read here — or an object
- * of such, or a list of one element: the shape of every item.
- */
-function shapeOf(declared: unknown, where: Where): Shape {
-  if (Array.isArray(declared)) {
-    if (declared.length !== 1) {
-      throw new Error(`Schema validation failed: the list at "${where}" is written with ${declared.length} elements — it takes one, the shape of every item`);
-    }
-    return { items: shapeOf(declared[0], `${where}[]`) };
-  }
-  if (isJsonObject(declared)) {
-    return { fields: Object.entries(declared).map(([key, value]) => [key, shapeOf(value, fieldOf(where, key))]) };
-  }
-  // (Anything else says nothing that is supported — and is said back as JSON would write it, which is no word for a kind.)
-  const named = typeof declared === "string" ? declared.split(":")[0].trim() : JSON.stringify(declared);
-  if (!SCHEMA_PRIMITIVES.has(named)) {
-    throw new Error(`Schema validation failed: unsupported schema type "${named}" for key "${where}" (${HOW_WRITTEN})`);
-  }
-  return named as SchemaPrimitive;
-}
-
-/** A schema as JSON Schema says it: every field there, and no other; what follows a ":" in a field's word describes it. */
-function asJsonSchema(declared: unknown): Record<string, unknown> {
-  if (Array.isArray(declared)) return { type: "array", items: asJsonSchema(declared[0]) };
-  if (isJsonObject(declared)) {
-    return {
-      type: "object",
-      properties: Object.fromEntries(Object.entries(declared).map(([key, value]) => [key, asJsonSchema(value)])),
-      required: Object.keys(declared),
-      additionalProperties: false,
-    };
-  }
-  const [type, ...words] = String(declared).split(":");
-  const description = words.join(":").trim();
-  return { type: type.trim(), ...(description && { description }) };
-}
-
-/**
- * What a tool is called with, declared as a typed answer's shape is: the
- * fields of an object. `schema` says it as JSON Schema, which is how a model
- * is told; `held` holds what a tool is about to be called with to it, as a
- * typed answer is held to its shape — returning the declared fields and no
- * others, or throwing what is wrong. (A schema that is not one is an error,
- * as it is of an answer.)
- */
-export function argumentsOf(declared: unknown): { schema: Record<string, unknown>; held(args: unknown): unknown } {
-  if (!isJsonObject(declared)) throw new Error("Schema validation failed: a tool's parameters are an object of the fields it is called with");
-  const shape = shapeOf(declared, null);
-  return {
-    schema: asJsonSchema(declared),
-    held(args) {
-      if (!isJsonObject(args)) throw new Error("Schema validation failed: the arguments are not an object");
-      return conform(args, shape, null);
-    },
-  };
-}
-
-const hasList = (shape: Shape): boolean =>
-  typeof shape !== "string" && ("items" in shape || shape.fields.some(([, field]) => hasList(field)));
-
-/** What a value is, said as a reply is told of it. */
-const said = (value: unknown): string =>
-  value === null ? "null" : Array.isArray(value) ? "a list" : typeof value === "number" ? String(value) : typeof value;
-
-/**
- * Shape validation and projection: verifies that the value at `where` is of
- * the shape declared — every field there, every item of a list — and returns
- * it holding the declared fields and no others.
- */
-function conform(value: unknown, shape: Shape, where: Where): unknown {
-  const mismatch = (expected: string) => new Error(`Schema validation failed: ${where}: expected ${expected}, got ${said(value)}`);
-  if (typeof shape === "string") {
-    if (typeof value !== shape || (shape === "number" && !Number.isFinite(value))) throw mismatch(shape);
-    return value;
-  }
-  if ("items" in shape) {
-    if (!Array.isArray(value)) throw mismatch("a list");
-    return value.map((item, index) => conform(item, shape.items, `${where}[${index}]`));
-  }
-  if (!isJsonObject(value)) throw where === null ? new Error("Schema validation failed: response is not an object") : mismatch("an object");
-  return Object.fromEntries(shape.fields.map(([key, field]) => {
-    // (A field is the reply's own: what every object has by birth is not something a reply said.)
-    if (!Object.hasOwn(value, key)) throw new Error(`Schema validation failed: missing key: ${fieldOf(where, key)}`);
-    return [key, conform(value[key], field, fieldOf(where, key))];
-  }));
-}
-
 /** Hears what a call used — each time its backend was asked: a `generate` that had to ask again is heard twice. */
 type Used = AgentCall["used"];
 
@@ -250,7 +152,7 @@ export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSi
 
     async generate(input, used, ownTools) {
       if (!isJsonObject(input.schema)) throw new Error("Schema validation failed: a schema is an object of the fields the answer is to have");
-      const shape = shapeOf(input.schema, null);
+      const shape = shapeOf(input.schema);
       const schemaInstruction = `Respond with ONLY a JSON object matching this shape:\n${
         JSON.stringify(input.schema, null, 2)
       }\n${
@@ -272,10 +174,18 @@ export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSi
         try {
           parsed = JSON.parse(trimmed);
         } catch {
-          const fenceMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
-          parsed = JSON.parse(fenceMatch ? fenceMatch[1].trim() : trimmed);
+          // Fenced: what stands between the first fence and the last — an answer may hold fences of its own,
+          // in what it says — or, where that is not JSON (more blocks than one), what the first block holds.
+          const whole = trimmed.match(/```(?:json)?\s*\n?([\s\S]*)\n?\s*```/);
+          try {
+            if (!whole) throw new SyntaxError("not fenced");
+            parsed = JSON.parse(whole[1].trim());
+          } catch {
+            const first = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
+            parsed = JSON.parse(first ? first[1].trim() : trimmed);
+          }
         }
-        return conform(parsed, shape, null) as Record<string, unknown>;
+        return conform(parsed, shape) as Record<string, unknown>;
       };
 
       // First attempt — backend errors (network/auth) propagate immediately.

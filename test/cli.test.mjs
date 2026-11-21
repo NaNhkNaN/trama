@@ -251,3 +251,42 @@ PiAdapter.prototype.ask = async function ask(_prompt, options) {
   assert.equal(existsSync(join(fakeHome, ".trama", "projects", "half-made")), false);
 });
 
+
+test("CLI --arg is a name and what it is given: a name that is none, or given twice, is refused — and any name reaches the program as it was written", async (t) => {
+  const fakeHome = makeTempDir("trama-cli-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+  const projectDir = join(fakeHome, ".trama", "projects", "says");
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+await tools.write("args.json", JSON.stringify(Object.entries(ctx.input.args)));
+await ctx.done();`,
+  });
+  const run = (...args) => runNodeCommand([CLI_ENTRY, "run", "says", ...args], { cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome } });
+
+  for (const [args, said] of [
+    [["--arg", "=nameless"], /Invalid --arg format: "=nameless"\. Expected key=value\./],
+    [["--arg", "mode=fast", "--arg", "mode=slow"], /--arg mode is given twice\./],
+  ]) {
+    const refused = await run(...args);
+    assert.equal(refused.exitCode, 1, args.join(" "));
+    assert.match(refused.stderr, said);
+    assert.equal(existsSync(join(projectDir, "args.json")), false, "and nothing was run");
+  }
+
+  // (A name every object has from birth is a name like any other.)
+  const ran = await run("--arg", "__proto__=x", "--arg", "mode=fast", "--arg", "note=a=b");
+  assert.equal(ran.exitCode, 0, ran.stderr);
+  assert.deepEqual(JSON.parse(readFileSync(join(projectDir, "args.json"), "utf-8")), [["__proto__", "x"], ["mode", "fast"], ["note", "a=b"]]);
+});
+
+test("CLI run says once that a program failed, whatever the reason says of itself", async (t) => {
+  const fakeHome = makeTempDir("trama-cli-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+  writeJson(join(fakeHome, ".trama", "config.json"), { maxRepairAttempts: 0 });
+  createProjectFixture(join(fakeHome, ".trama", "projects", "fails"), { scaffold: false, programSource: `throw new Error("it breaks");` });
+  const result = await runNodeCommand([CLI_ENTRY, "run", "fails"], { cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome } });
+  assert.equal(result.exitCode, 1);
+  assert.match(result.stderr, /Program failed \(repair disabled\)/);
+  assert.equal(result.stderr.match(/Program failed/g).length, 1, result.stderr);
+});

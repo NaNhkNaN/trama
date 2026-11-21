@@ -10,6 +10,7 @@ import {
   showLogs,
   showJournal,
   resolveProject,
+  failureOf,
 } from "@trama-dev/runtime/runner";
 
 // The trama command is always a runner of its own, even when a program starts
@@ -61,15 +62,19 @@ function collectArg(value: string, previous: string[]) {
 /** Turn repeated `--arg key=value` options into an args object (undefined if none were given). */
 function parseArgs(args: string[]): Record<string, unknown> | undefined {
   if (args.length === 0) return undefined;
-  const result: Record<string, unknown> = {};
+  const given: Array<[string, string]> = [];
   for (const arg of args) {
     const eq = arg.indexOf("=");
-    if (eq === -1) {
+    // (A name, then what it is given: what begins with the "=" names nothing.)
+    if (eq < 1) {
       throw new Error(`Invalid --arg format: "${arg}". Expected key=value.`);
     }
-    result[arg.slice(0, eq)] = arg.slice(eq + 1);
+    const name = arg.slice(0, eq);
+    if (given.some(([had]) => had === name)) throw new Error(`--arg ${name} is given twice.`);
+    given.push([name, arg.slice(eq + 1)]);
   }
-  return result;
+  // (Made of its pairs, as a budget is below: a name every object has from birth is then a name like any other.)
+  return Object.fromEntries(given);
 }
 
 /** Turn repeated `--budget cap=number` options into a budget (undefined if none were given). What a cap may be is the runner's to say. */
@@ -144,7 +149,7 @@ cli
     const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, signal }));
     // (A run that a signal stopped has failed, and is not reported as that: see `command`.)
     if (result.status === "failed") {
-      throw new Error(`Program failed: ${result.reason}`);
+      throw new Error(failureOf(result.reason));
     }
   }));
 

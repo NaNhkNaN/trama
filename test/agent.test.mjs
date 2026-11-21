@@ -770,7 +770,7 @@ test("a call stopped while the model answers has used what that request had take
 });
 
 test("whoever cancels a call is answered at once, whatever its backend still has to do about it", async (t) => {
-  const { createBackend } = await import("../packages/runtime/dist/runner.js");
+  const { createBackend } = await import("../packages/runtime/dist/runner-backend.js");
   const { PiAdapter } = await import("../packages/runtime/dist/pi-adapter.js");
   const realAsk = PiAdapter.prototype.ask;
   t.after(() => { PiAdapter.prototype.ask = realAsk; });
@@ -1561,4 +1561,65 @@ test("what an extension sets going as its call ends neither reaches the model no
     await later(400);
     assert.equal(fake.requests.length, 1, `${what}: the model was asked the call's own question, and no other`);
   }
+});
+
+test("a kind is its word: what stands around the word in a schema is not part of it", async () => {
+  const { shapeOf, argumentsOf } = await import("../packages/runtime/dist/schema.js");
+  // Written with room around the word, and around what describes it: the same kinds.
+  const spaced = { title: " string ", count: "number : how many", done: "\tboolean:  whether it is  ", tags: [" string: one tag "] };
+  assert.deepEqual(shapeOf(spaced), shapeOf({ title: "string", count: "number", done: "boolean", tags: ["string"] }));
+  assert.deepEqual(argumentsOf(spaced).schema.properties, {
+    title: { type: "string" }, count: { type: "number", description: "how many" }, done: { type: "boolean", description: "whether it is" },
+    tags: { type: "array", items: { type: "string", description: "one tag" } },
+  });
+  assert.throws(() => shapeOf({ n: "num ber" }), /unsupported schema type "num ber" for key "n"/);
+});
+
+test("the names of pi's that trama goes by are the names pi has: a pi that sets its loop up by another is found out here", async () => {
+  const { HANDS_IN, HOOKS, LOOPS } = await import("../packages/runtime/dist/pi-adapter.js");
+  const { existsSync, readFileSync } = await import("node:fs");
+  const { createRequire } = await import("node:module");
+  const { dirname, join } = await import("node:path");
+  const { fileURLToPath } = await import("node:url");
+  const pi = dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")));
+  // (The agent's own package, where pi's would find it: it names no file for a `require` to be answered with.)
+  const core = createRequire(join(pi, "index.js")).resolve.paths("@earendil-works/pi-agent-core")
+    .map((dir) => join(dir, "@earendil-works", "pi-agent-core", "dist")).find((dir) => existsSync(join(dir, "agent.js")));
+  assert.ok(core, "pi's agent is where pi would find it");
+
+  // What pi's agent sets a loop up by, as pi's own source says it: each thing is one trama knows for what it is.
+  const agent = readFileSync(join(core, "agent.js"), "utf-8");
+  const config = agent.slice(agent.indexOf("createLoopConfig(options = {}) {"), agent.indexOf("async runWithLifecycle("));
+  const setUpBy = [...config.matchAll(/^ {12}(\w+):/gm)].map(([, name]) => name);
+  // (Data, which goes with a request as any data does; and the key a request is made by, which is its asker's to give
+  // and is never left out: a pi that sets one has its agent's requests asked where the call is served.)
+  const data = ["model", "reasoning", "sessionId", "transport", "thinkingBudgets", "maxRetryDelayMs", "identity", "toolExecution"];
+  const known = [...data, ...HOOKS, ...LOOPS, "getApiKey"];
+  assert.ok(setUpBy.length >= known.length, `read from pi's source: ${setUpBy}`);
+  assert.deepEqual(setUpBy.filter((name) => !known.includes(name)), [], "pi sets its loop up by something trama does not know");
+  assert.deepEqual([...HOOKS, ...LOOPS].filter((name) => !setUpBy.includes(name)), [], "trama goes by a name pi's loop no longer has");
+
+  // And where an extension may have a hand in a request to a provider: the handlers pi asks after there.
+  const sdk = readFileSync(join(pi, "core", "sdk.js"), "utf-8");
+  const askedAfter = [...new Set([...sdk.matchAll(/hasHandlers\("([a-z_]*provider[a-z_]*)"\)/g)].map(([, event]) => event))];
+  assert.deepEqual(askedAfter.sort(), [...HANDS_IN].sort());
+});
+
+test("a typed answer that is fenced, and holds fences of its own in what it says, is read whole: the model is not asked again", async () => {
+  const F = "```";
+  const answers = [
+    `${F}json\n${JSON.stringify({ code: `${F}js\nrun();\n${F}`, note: "as asked" })}\n${F}`,
+    `Here it is:\n\n${F}\n${JSON.stringify({ code: `before ${F} after`, note: "as asked" }, null, 2)}\n${F}\n`,
+  ];
+  for (const reply of answers) {
+    let asked = 0;
+    const agent = createAgent({ async ask() { asked += 1; return reply; } }, "/work");
+    const answer = await agent.generate({ prompt: "p", schema: { code: "string", note: "string" } });
+    assert.equal(answer.note, "as asked");
+    assert.ok(answer.code.includes(F));
+    assert.equal(asked, 1, reply);
+  }
+  // (Two blocks, of which the first is the answer: read as it was.)
+  const agent = createAgent({ async ask() { return `${F}json\n{"n": 1}\n${F}\n\nand an example of something else:\n\n${F}\nnot json\n${F}`; } }, "/work");
+  assert.deepEqual(await agent.generate({ prompt: "p", schema: { n: "number" } }), { n: 1 });
 });

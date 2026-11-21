@@ -34,29 +34,48 @@ const HOST = fileURLToPath(new URL("./agent-host.js", import.meta.url));
 function saidBy(message: unknown): FromHost | undefined {
   if (typeof message !== "object" || message === null) return undefined;
   const said = message as Record<string, unknown>;
-  const counted = (usage: unknown): usage is AgentUsage => typeof usage === "object" && usage !== null;
-  if (said.ready === true) return { ready: true };
-  if (counted(said.sofar)) return { sofar: said.sofar, ...(said.answered === true && { answered: true }) };
-  if (counted(said.had)) return { had: said.had };
-  if (counted(said.used)) return { used: said.used };
-  if (typeof said.answer === "string") return { answer: said.answer };
-  if (typeof said.cutOff === "string") return { cutOff: said.cutOff };
-  if (typeof said.error === "string") return { error: said.error };
   const held = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
-  // That a tool of the caller's own is called.
-  const { tool } = said;
-  if (held(tool) && typeof tool.key === "string" && typeof tool.name === "string" && typeof tool.id === "string") {
-    return { tool: { key: tool.key, name: tool.name, id: tool.id, args: tool.args } };
+  if (said.ready === true) return { ready: true };
+  // What is said of a call: by the call's number.
+  const { of } = said;
+  if (typeof of === "number") {
+    const sofar = countOf(said.sofar), had = countOf(said.had), used = countOf(said.used);
+    if (sofar) return { of, sofar, ...(said.answered === true && { answered: true }) };
+    if (had) return { of, had };
+    if (used) return { of, used };
+    if (typeof said.answer === "string") return { of, answer: said.answer };
+    if (typeof said.cutOff === "string") return { of, cutOff: said.cutOff };
+    if (typeof said.error === "string") return { of, error: said.error };
+    // That a tool of the caller's own is called.
+    const { tool } = said;
+    if (held(tool) && typeof tool.key === "string" && typeof tool.name === "string" && typeof tool.id === "string") {
+      return { of, tool: { key: tool.key, name: tool.name, id: tool.id, args: tool.args } };
+    }
   }
   // What a call would have a model asked, and what a model answered (see model-relay.ts).
   const { relay, relayAbort, relayed } = said;
   if (held(relay) && typeof relay.id === "number" && held(relay.request)) {
     const { model, options } = relay.request;
-    if (held(model) && typeof model.provider === "string" && typeof model.id === "string" && held(options)) return { relay } as FromHost;
+    if (held(model) && typeof model.provider === "string" && typeof model.id === "string" && held(options)) return { relay, ...(typeof of === "number" && { of }) } as FromHost;
   }
-  if (typeof relayAbort === "number") return { relayAbort };
+  if (typeof relayAbort === "number") return { relayAbort, ...(typeof of === "number" && { of }) };
   if (held(relayed) && typeof relayed.id === "number" && (relayed.not === true || (held(relayed.event) && typeof relayed.event.type === "string"))) return { relayed } as FromHost;
   return undefined;
+}
+
+/**
+ * A count a host said, if it is one: every figure of it a number, and none
+ * less than nothing. What is anything else is no count — and is not to be
+ * reckoned with as one: a figure that is no number would make no number of
+ * what the runner itself saw the call use.
+ */
+function countOf(said: unknown): AgentUsage | undefined {
+  if (typeof said !== "object" || said === null) return undefined;
+  const { model, input, output, cacheRead, cacheWrite, cost } = said as Record<string, unknown>;
+  const figures = [input, output, cacheRead, cacheWrite, cost];
+  if (!figures.every((figure): figure is number => typeof figure === "number" && Number.isFinite(figure) && figure >= 0)) return undefined;
+  if (model !== undefined && typeof model !== "string") return undefined;
+  return { ...(model !== undefined && { model }), input: figures[0], output: figures[1], cacheRead: figures[2], cacheWrite: figures[3], cost: figures[4] };
 }
 
 interface Host {
@@ -78,9 +97,9 @@ export interface AgentHosts {
   close(): Promise<void>;
 }
 
-/** Of a call, what can be sent to another process. */
+/** Of a call, what can be sent to another process: of a tool of its caller's own, all it declares — the function stays here. */
 const sendable = ({ signal: _signal, used: _used, sofar: _sofar, had: _had, relay: _relay, ownTools, ...call }: AgentCall): SentCall =>
-  ({ ...call, ...(ownTools && { ownTools: ownTools.map(({ name, description, parameters, parallel, ends }) => ({ name, description, parameters, ...(parallel && { parallel }), ...(ends && { ends }) })) }) });
+  ({ ...call, ...(ownTools && { ownTools: ownTools.map(({ run: _run, ...declared }) => declared) }) });
 
 /**
  * The hosts of one runner's calls. `env`: variables the hosts are started
@@ -90,6 +109,13 @@ const sendable = ({ signal: _signal, used: _used, sofar: _sofar, had: _had, rela
 export function createAgentHosts(env?: Record<string, string>): AgentHosts {
   /** The hosts that are there: those serving a call, and those free to serve one. */
   const all = new Set<Host>(), free: Host[] = [];
+  /** How many calls were handed to a host: each is known to its host, and in what the host says of it, by its number. */
+  let calls = 0;
+  /** A host that is ending, or has ended, is no longer one to hand a call. */
+  const notFree = (host: Host) => {
+    const at = free.indexOf(host);
+    if (at !== -1) free.splice(at, 1);
+  };
 
   /** Put an end to a host, and to what it has under it. Resolves when they are gone. */
   const end = async (host: Host): Promise<void> => {
@@ -100,8 +126,7 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
     host.process.ref();
     if (!host.gone) {
       host.gone = true;
-      const at = free.indexOf(host);
-      if (at !== -1) free.splice(at, 1);
+      notFree(host);
       // (Its process leads a group of its own; what it started in groups of their own is looked for first, while it is there to be asked of.)
       const { pid } = host.process;
       if (pid !== undefined) host.stopped = groupsUnder(pid).then(groups => stopGroups([pid, ...groups]));
@@ -138,8 +163,7 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
         const over = () => {
           host.gone = true;
           all.delete(host);
-          const at = free.indexOf(host);
-          if (at !== -1) free.splice(at, 1);
+          notFree(host);
           watched();
           resolve();
         };
@@ -195,9 +219,11 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
       throwIfAborted(call.signal);
       const host = free.pop() ?? start();
       const child = host.process;
+      const id = ++calls;
       // (While it serves a call it is this process's to wait for; free, it keeps nobody waiting.)
       child.ref();
       child.channel?.ref();
+      let kept = false;
       /** The host goes back among the free ones: it has answered, or was never asked. */
       const release = () => {
         kept = true;
@@ -205,7 +231,6 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
         child.channel?.unref();
         free.push(host);
       };
-      let kept = false;
       try {
         await host.ready;
         return await new Promise<string>((resolve, reject) => {
@@ -225,6 +250,27 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
           // What says to the caller's own tools, run from here for the host, that they are to go no further: the
           // call is over — answered, failed, or cancelled and let go of.
           const tooling = new AbortController();
+          /**
+           * Tell the call what it has used by now, and hear what it says to that — which, of a call that is
+           * over (`answered`), is whether anything more may be asked on its account: a no is one from then on.
+           */
+          const tell = (answered: boolean): Promise<unknown> => {
+            told = replies;
+            const sofar = atLeast(last, seen);
+            return Promise.resolve(sofar && call.sofar?.(sofar, answered)).then((go) => {
+              if (go === false && answered) noMore = true;
+              return go;
+            });
+          };
+          /** Say what the call has used, to whoever counts: as a reply came, and — once — in the end. */
+          const sayHad = () => {
+            const had = atLeast(last, seen);
+            if (had) call.had?.(had);
+          };
+          const sayUsed = (said: AgentUsage | undefined) => {
+            const used = atLeast(said, seen);
+            if (used) call.used?.(used);
+          };
           const asking = () => asked ??= relayServer(
             env ? apart : asksHere = createModelRelay(),
             (answer) => { if (child.connected) child.send(answer satisfies ToHost, () => {}); },
@@ -236,18 +282,13 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
               // after and whatever it says of itself. And a call that is cancelled, or done with, has its model
               // asked no more, whatever in its host would have it asked.
               async refuse(request) {
-                if (!noMore && replies !== told) {
-                  told = replies;
-                  const sofar = atLeast(last, seen), answered = request.answered === true;
-                  if (sofar && await call.sofar?.(sofar, answered) === false && answered) noMore = true;
-                }
+                if (!noMore && replies !== told) await tell(request.answered === true);
                 return noMore || isOver || call.signal?.aborted === true;
               },
               replied(used) {
                 addReply(seen, used);
                 replies += 1;
-                const had = atLeast(last, seen);
-                if (had) call.had?.(had);
+                sayHad();
               },
             },
           );
@@ -268,15 +309,14 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
             // it last said the call had used — and what was seen of it here — is then all that is
             // known of it, and what the call is taken to have used. (And a host that is well and
             // says nothing, of a call whose model was asked from here, is not taken at its silence.)
-            if (!usedSaid) {
-              const used = atLeast(last, seen);
-              if (used) call.used?.(used);
-            }
+            if (!usedSaid) sayUsed(last);
             settle();
           };
           const heard = (word: unknown) => {
             const message = saidBy(word);
             if (!message) return;
+            // (Of another call than this: a word that waited on the channel since, or was never the host's.)
+            if (!("of" in message) || message.of !== id) return;
             if ("relay" in message || "relayAbort" in message) return asking().heard(message);
             // The call's model has called a tool of the caller's own: it is run from here, where the caller's
             // tools are, and the host is told what it answered. (One the call has not got is not run. Whoever
@@ -291,22 +331,19 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
               return;
             }
             if ("sofar" in message) {
-              const sofar = atLeast(last = message.sofar, seen);
-              told = replies;
+              last = message.sofar;
               // The host waits to hear whether the call is to go on — or, of a call that has its answer, whether
               // what would be asked beside it may be. (Where hearing what it used cancelled the call, the host
               // has been told that first, below: this then tells it nothing.)
-              void Promise.resolve(sofar && call.sofar?.(sofar, message.answered === true)).then((go) => {
-                if (go === false && message.answered === true) noMore = true;
-                if (!isOver && child.connected) child.send({ go: go !== false } satisfies ToHost, () => {});
+              void tell(message.answered === true).then((go) => {
+                if (!isOver && child.connected) child.send({ go: go !== false, of: id } satisfies ToHost, () => {});
               });
             } else if ("had" in message) {
-              const had = atLeast(last = message.had, seen);
-              if (had) call.had?.(had);
+              last = message.had;
+              sayHad();
             } else if ("used" in message) {
               usedSaid = true;
-              const used = atLeast(message.used, seen);
-              if (used) call.used?.(used);
+              sayUsed(message.used);
             }
             else if ("answer" in message) over(() => resolve(message.answer), true);
             else if ("cutOff" in message) over(() => reject(new CutOff(message.cutOff)), true);
@@ -316,14 +353,18 @@ export function createAgentHosts(env?: Record<string, string>): AgentHosts {
             over(() => reject(new Error(`The agent's process ended before it had answered (${signal ?? `exit code ${code}`}): the call was not finished.`)), false);
           child.on("message", heard);
           child.once("exit", exited);
-          child.send({ ask: { config, prompt, call: sendable(call) } } satisfies ToHost, (err) => {
-            if (err) over(() => reject(new Error(`The agent's process could not be asked: ${err.message}`)), false);
-          });
+          const notAsked = (err: Error) => over(() => reject(new Error(`The agent's process could not be asked: ${err.message}`)), false);
+          // (What cannot be sent at all — a call that holds what no channel carries — is refused as it is handed over, and not later.)
+          try {
+            child.send({ ask: { id, config, prompt, call: sendable(call) } } satisfies ToHost, (err) => { if (err) notAsked(err); });
+          } catch (err) {
+            notAsked(err instanceof Error ? err : new Error(String(err)));
+          }
           // A cancelled call is asked to stop where it is, and waited for no longer than anything asked to stop is.
           offAbort = onAbort(call.signal, () => {
             // (What its model is being asked from here is asked no further, whether or not its host hears.)
             asked?.close();
-            if (child.connected) child.send({ abort: true } satisfies ToHost, () => {});
+            if (child.connected) child.send({ abort: true, of: id } satisfies ToHost, () => {});
             giveUp = setTimeout(() => over(() => reject(new Error("Aborted")), false), KILL_GRACE_MS);
           });
         });

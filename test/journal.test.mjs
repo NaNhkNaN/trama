@@ -7,7 +7,9 @@ import { join } from "path";
 import { execFileSync } from "child_process";
 import { runsIn } from "../packages/runtime/dist/journal.js";
 import { llm } from "./fake-llm.mjs";
-import { createBackend, loadConfig, runProgram, validateProgram } from "../packages/runtime/dist/runner.js";
+import { runProgram, validateProgram } from "../packages/runtime/dist/runner.js";
+import { createBackend } from "../packages/runtime/dist/runner-backend.js";
+import { loadConfig } from "../packages/runtime/dist/project.js";
 import {
   REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, runNodeCommand,
   startRunnerProcess, waitFor, withEnv, writeJson, writeText,

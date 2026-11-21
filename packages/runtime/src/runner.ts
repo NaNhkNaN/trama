@@ -1,40 +1,35 @@
 import { spawn } from "child_process";
 import {
-  readFileSync, writeFileSync, appendFileSync,
+  readFileSync, writeFileSync,
   readdirSync, mkdirSync, existsSync, statSync,
-  symlinkSync, rmSync, lstatSync, readlinkSync,
+  symlinkSync, rmSync, readlinkSync,
   mkdtempSync, openSync, closeSync, chmodSync,
-  accessSync, constants, truncateSync,
+  accessSync, constants,
 } from "fs";
 import { basename, join, dirname, relative } from "path";
-import { homedir, tmpdir } from "os";
-import { fileURLToPath } from "url";
+import { tmpdir } from "os";
 import { createHash, randomBytes } from "crypto";
 import type { ShellResult, Workspace } from "./types.js";
-import type { RunOptions, TramaConfig, ProgramResult } from "./runner-types.js";
+import type { MakeRequest, RunOptions, ProgramResult } from "./runner-types.js";
 import { onAbort, rejectOnAbort } from "./abort.js";
-import type { AgentBackend, AgentUsage } from "./agent-backend.js";
+import type { AgentUsage } from "./agent-backend.js";
 import { checkedBudget, createMeter, type Budget, type Meter } from "./budget.js";
-import { PiAdapter } from "./pi-adapter.js";
 import { LATEST_LOG_PATH, appendLogEntry, createContext } from "./context.js";
 import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace } from "./workspace.js";
 import { guardPath, identityOf, projectAt, realRootOf, sameProjectAs, wayTo } from "./path-guard.js";
-import { copyTree, differences, entryAt, mergeTree, pathAsListed, readTree, type Tree, type Unmerged } from "./tree.js";
-import { stageFile, type StagedFile } from "./replace-file.js";
-import { readProjectMeta } from "./meta.js";
-import { describeJson, isJsonObject } from "./serializable.js";
+import { ITSELF, copyTree, differences, entryAt, pathAsListed, readTree, type Tree } from "./tree.js";
+import { mergeTree, type Unmerged } from "./merge.js";
+import { stageFile, stageFileInProject, type StagedFile } from "./replace-file.js";
 import { checkedEnv, createAllowance, superviseChild, type ChildExit } from "./child-process.js";
-import { KILL_GRACE_MS, removeTempDir, removeWithThisProcess, requireWatchdog, stopGroups, stopWithThisProcess } from "./stopping.js";
+import { removeTempDir, removeWithThisProcess, requireWatchdog, stopGroups, stopWithThisProcess } from "./stopping.js";
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
 import { journalEntriesOf, openJournal, type Journal } from "./journal.js";
 import { messageOf } from "./errors.js";
-
-// --- Locating the runtime itself ---
-
-/** The installed @trama-dev/runtime package — this file lives in its dist/. */
-const RUNTIME_PACKAGE_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
+import { checkedRepairAttempts, checkedTimeout, ensureProjectScaffold, loadProjectConfig, loadState, saveState } from "./project.js";
+import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
+import { copyToHistory, recordVersion } from "./history.js";
 
 /**
  * tsx lets node run program.ts. Resolved through the module system, so any
@@ -44,106 +39,6 @@ const RUNTIME_PACKAGE_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
  * it has not acted on, and reports its death by signal as an exit code.
  */
 const TSX_LOADER = import.meta.resolve("tsx");
-
-/**
- * The @trama-dev packages a program.ts can import, and where they are installed.
- * The runtime always; the session layer when it is installed alongside (as it
- * is with the CLI). The runtime never imports the session layer itself — it
- * only makes it reachable from projects.
- */
-const IMPORTABLE_PACKAGES: Record<string, string> = { runtime: RUNTIME_PACKAGE_DIR };
-try {
-  // Resolves to <package>/dist/index.js
-  IMPORTABLE_PACKAGES.session = dirname(dirname(fileURLToPath(import.meta.resolve("@trama-dev/session"))));
-} catch { /* not installed — programs simply cannot import it */ }
-
-// --- Project scaffolding ---
-
-/**
- * Point the project's node_modules/@trama-dev/<name> at an installed package,
- * so program.ts can import it. Replaces any existing symlink whose target
- * differs (including user-managed ones). Only refuses to touch a real
- * directory/file to avoid destroying user content.
- *
- * The link points outside the project, and is meant to. Where it is put is
- * inside it, like everything else the runtime writes: a project whose
- * node_modules leads somewhere else is refused, not followed there.
- */
-function linkPackage(projectDir: string, name: string, target: string): void {
-  const linkDir = guardPath(projectDir, join("node_modules", "@trama-dev"));
-  // Not through the guard: it is the link itself that is looked at and replaced, not what it points at.
-  const linkPath = join(linkDir, name);
-
-  try {
-    if (!lstatSync(linkPath).isSymbolicLink()) {
-      throw new Error(
-        `${linkPath} exists and is not a symlink. ` +
-        `trama needs this path for module resolution. ` +
-        `Remove it manually or rename it to proceed.`
-      );
-    }
-    if (readlinkSync(linkPath) === target) return;
-    rmSync(linkPath);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-  }
-
-  mkdirSync(linkDir, { recursive: true });
-  symlinkSync(target, linkPath, "dir");
-}
-
-/** Make sure package.json exists and declares an ES module (program.ts uses top-level await). */
-function ensureModulePackageJson(projectDir: string): void {
-  const pkgPath = guardPath(projectDir, "package.json");
-  if (!existsSync(pkgPath)) {
-    writeFileSync(pkgPath, JSON.stringify({ type: "module" }, null, 2));
-    return;
-  }
-  const advice = "trama will not overwrite it automatically; fix or remove it and try again.";
-  let pkg: unknown;
-  try {
-    pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
-  } catch (err) {
-    throw new Error(
-      `Malformed package.json at ${pkgPath}. ${advice}\n` +
-      `Parse error: ${messageOf(err)}`
-    );
-  }
-  if (!isJsonObject(pkg)) {
-    throw new Error(`Malformed package.json at ${pkgPath} — expected a JSON object but got ${describeJson(pkg)}. ${advice}`);
-  }
-  if (pkg.type !== "module") {
-    pkg.type = "module";
-    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
-  }
-}
-
-/** Make sure .gitignore excludes what trama generates, without disturbing existing entries. */
-function ensureGitignore(projectDir: string): void {
-  const giPath = guardPath(projectDir, ".gitignore");
-  const required = ["node_modules/", "state.json", "logs/", "history/"];
-  const existing = existsSync(giPath) ? readFileSync(giPath, "utf-8") : "";
-  const present = new Set(existing.split("\n").map(line => line.trim()));
-  const missing = required.filter(entry => !present.has(entry));
-  if (missing.length === 0) return;
-  const separator = existing === "" || existing.endsWith("\n") ? "" : "\n";
-  writeFileSync(giPath, existing + separator + missing.join("\n") + "\n");
-}
-
-/**
- * Everything a project directory needs around program.ts before it can run:
- * history/ and logs/, an ESM package.json, .gitignore entries, and links to the
- * @trama-dev packages it can import.
- * Idempotent — called before every run, so a freshly cloned project just works.
- */
-export function ensureProjectScaffold(projectDir: string): void {
-  projectAt(projectDir);
-  mkdirSync(guardPath(projectDir, "history"), { recursive: true });
-  mkdirSync(guardPath(projectDir, "logs"), { recursive: true });
-  ensureModulePackageJson(projectDir);
-  ensureGitignore(projectDir);
-  for (const [name, target] of Object.entries(IMPORTABLE_PACKAGES)) linkPackage(projectDir, name, target);
-}
 
 // --- The API reference shown to the LLM ---
 
@@ -162,320 +57,6 @@ export const RUNTIME_TYPES = [
     "export declare const workspace: Workspace;",
   ].join("\n"),
 ].join("\n\n");
-
-// --- Config & state loaders ---
-
-export function loadConfig(): TramaConfig {
-  const configPath = join(homedir(), ".trama", "config.json");
-  const defaults: TramaConfig = {
-    provider: "anthropic",
-    model: "claude-opus-5-5",
-    maxRepairAttempts: 3,
-    defaultTimeout: 300_000,
-    defaultMaxIterations: 100,
-    journalRuns: 20,
-    agentChanges: "keep",
-  };
-  let raw: string;
-  try {
-    raw = readFileSync(configPath, "utf-8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return defaults;
-    throw err;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    throw new Error(
-      `Malformed config at ${configPath} — fix or delete it.\n` +
-      `Parse error: ${messageOf(err)}`
-    );
-  }
-  if (!isJsonObject(parsed)) {
-    throw new Error(
-      `Malformed config at ${configPath} — expected a JSON object but got ${describeJson(parsed)}. Fix or delete it to proceed.`
-    );
-  }
-  // null is how JSON says a field is not there.
-  const given = Object.fromEntries(Object.entries(parsed).filter(([, value]) => value !== null));
-  return checkedConfig({ ...defaults, ...given }, "config");
-}
-
-/** A config that holds what the runtime can work with — or an error naming what does not, and where it came from. */
-function checkedConfig(merged: TramaConfig, source: string): TramaConfig {
-  const s = (v: unknown) => typeof v === "string" && v.length > 0;
-  const pint = (v: unknown) => Number.isInteger(v) && (v as number) > 0;
-  const checks: Array<[boolean, string]> = [
-    [s(merged.provider), `"provider" must be a non-empty string (got ${JSON.stringify(merged.provider)})`],
-    [s(merged.model), `"model" must be a non-empty string (got ${JSON.stringify(merged.model)})`],
-    [Number.isInteger(merged.maxRepairAttempts) && merged.maxRepairAttempts >= 0, `"maxRepairAttempts" must be a non-negative integer (got ${merged.maxRepairAttempts})`],
-    [Number.isFinite(merged.defaultTimeout) && merged.defaultTimeout > 0, `"defaultTimeout" must be a positive number (got ${merged.defaultTimeout})`],
-    [pint(merged.defaultMaxIterations), `"defaultMaxIterations" must be a positive integer (got ${merged.defaultMaxIterations})`],
-    [Number.isInteger(merged.journalRuns) && merged.journalRuns >= 0, `"journalRuns" must be a non-negative integer (got ${merged.journalRuns})`],
-    [merged.agentChanges === "keep" || merged.agentChanges === "discard", `"agentChanges" must be "keep" or "discard" (got ${JSON.stringify(merged.agentChanges)})`],
-  ];
-  for (const [ok, msg] of checks) {
-    if (!ok) throw new Error(`Invalid ${source}: ${msg}`);
-  }
-  if (merged.budget === undefined) return merged;
-  try {
-    return { ...merged, budget: checkedBudget(merged.budget, `"budget"`) };
-  } catch (err) {
-    throw new Error(`Invalid ${source}: ${messageOf(err)}`);
-  }
-}
-
-/** The global config, with the model/provider a project was created with taking precedence. */
-export function loadProjectConfig(projectDir: string, meta = readProjectMeta(projectDir)): TramaConfig {
-  const config = loadConfig();
-  // null is how JSON says a field is not there. Anything else a project says
-  // is taken, and held to what the global config is held to — an empty or
-  // mistyped name is an error here, not a quiet return to another model.
-  if (meta.model != null) config.model = meta.model;
-  if (meta.provider != null) config.provider = meta.provider;
-  return checkedConfig(config, `meta.json in ${projectDir}`);
-}
-
-/**
- * What does the LLM work for a project. The only place that picks a backend:
- * everything else is handed one and does not know which it is.
- *
- * It is also where what is asked of a model is counted, and held to a
- * budget (`meter`): every call passes here, whoever makes it. A call that
- * comes when the budget is spent is refused; one under way is stopped where
- * its agent would ask the model again — what the model was asked before
- * that is used, and what it was answering is let finish. `spent` is told
- * why, the first time either happens.
- */
-export function createBackend(config: TramaConfig, meter: Meter = createMeter(), spent: (why: string) => void = () => {}, env?: Record<string, string>): Backend {
-  // (`env`: the variables of the run whose calls these are — its agents' too, as they are its program's and its commands'.)
-  const backend = new PiAdapter(config, env);
-  // The calls that were cancelled.
-  const cutOff = new Set<Promise<unknown>>();
-  // Why a call was first refused, or stopped, for the budget.
-  let refused: string | undefined;
-  const overBudget = (why: string): Error => {
-    if (refused === undefined) spent(why);
-    refused ??= why;
-    return new Error(why);
-  };
-  return {
-    spent: () => meter.spent(),
-    refused: () => refused,
-    counts: () => meter.capped(),
-    // The interface promises that a cancelled call rejects, and a run's end
-    // waits on that. Every backend is held to it here, rather than trusted with it.
-    async ask(prompt, call) {
-      let account: ReturnType<Meter["admit"]>;
-      try {
-        account = meter.admit();
-      } catch (err) {
-        throw overBudget(messageOf(err));
-      }
-      // Stops the call where the budget is reached while it is under way.
-      const over = new AbortController();
-      let why: string | undefined;
-      const signal = call.signal ? AbortSignal.any([call.signal, over.signal]) : over.signal;
-      const work = backend.ask(prompt, {
-        ...call,
-        signal,
-        sofar(usage, answered) {
-          const reached = account.sofar(usage);
-          call.sofar?.(usage, answered);
-          // A call that is over keeps what it ended with — its answer, or its own failure: what would be
-          // asked beside it is not asked, and that is all. (It is a request refused for the budget all the
-          // same, and said as one.)
-          if (answered) {
-            const spent = why ?? reached;
-            if (spent === undefined) return true;
-            overBudget(spent);
-            return false;
-          }
-          // (Once it is to stop, it is to stop — whatever is said of it after.)
-          why ??= reached;
-          if (why === undefined) return true;
-          over.abort();
-          return false;
-        },
-        // (What the call has used is counted from when it is known: nothing is stopped for it here — a reply that
-        // has come is not taken back — but whatever is asked next, by this call or another, is asked against it.)
-        had(usage) {
-          account.sofar(usage);
-          call.had?.(usage);
-        },
-        used(usage) {
-          account.sofar(usage);
-          call.used?.(usage);
-        },
-      });
-      const off = onAbort(signal, () => { cutOff.add(work); });
-      // What the call used is counted as its own until the backend has let go of it — which
-      // is when it has said the last of it — however long ago whoever asked was answered.
-      const settled = () => {
-        off();
-        account.close();
-      };
-      work.then(settled, settled);
-      try {
-        return await rejectOnAbort(work, signal);
-      } catch (err) {
-        // (Stopped by whoever asked, it was stopped by them, whatever the budget had come to.)
-        throw why !== undefined && !call.signal?.aborted ? overBudget(why) : err;
-      }
-    },
-    close: () => backend.close(),
-    async letGo() {
-      let giveUp: NodeJS.Timeout | undefined;
-      await Promise.race([
-        Promise.allSettled(cutOff),
-        new Promise(resolve => { giveUp = setTimeout(resolve, KILL_GRACE_MS); }),
-      ]);
-      clearTimeout(giveUp);
-    },
-  };
-}
-
-/** The budgets of which it has been said that they are spent. */
-const saidSpent = new WeakSet<Meter>();
-
-/**
- * Say that a budget is spent, once for the budget — whoever comes up against
- * it first: the run's own backend, or the backend of a project being made
- * for the run's program, of which there may be many.
- */
-export const saysOnce = (meter: Meter, say: (why: string) => void) => (why: string): void => {
-  if (saidSpent.has(meter)) return;
-  saidSpent.add(meter);
-  say(why);
-};
-
-/** A backend as the runner holds it: one whose cancelled calls are answered at once, and can be waited for apart. */
-export interface Backend extends AgentBackend {
-  /** Why nothing more may be asked of it — the budget it counts in is spent — or nothing, while something may. */
-  spent?(): string | undefined;
-  /** Why a call of it was first refused or stopped for the budget, if one was — whatever the count has come to since. */
-  refused?(): string | undefined;
-  /** Whether what its calls use is held to anything: then what a call it cut off used is to be waited for, recorded or not. */
-  counts?(): boolean;
-  /**
-   * End what the backend kept to serve calls with — a process of its own for
-   * those that have extensions. Whatever it served is over: a run, a
-   * validation. (Asked again after this, it starts anew.)
-   */
-  close?(): Promise<void>;
-  /**
-   * Resolves when the backend has let go of the calls that were cancelled so
-   * far: whoever cancelled one went on at once, and the backend still had to
-   * stop what it was doing, and to say what the call had used. They are
-   * waited for no longer than anything asked to stop is.
-   */
-  letGo(): Promise<void>;
-}
-
-export function loadState(projectDir: string): Record<string, unknown> {
-  const statePath = guardPath(projectDir, "state.json");
-  let raw: string;
-  try {
-    raw = readFileSync(statePath, "utf-8");
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
-    throw err;
-  }
-  function fail(reason: string): never {
-    throw new Error(
-      `Corrupt state.json in ${projectDir} — cannot safely continue.\n${reason}\n` +
-      `Back up or delete state.json to reset state.`
-    );
-  }
-  let parsed: unknown;
-  try { parsed = JSON.parse(raw); } catch (err) {
-    fail(`Parse error: ${messageOf(err)}`);
-  }
-  if (!isJsonObject(parsed)) {
-    fail(`Expected a JSON object but got ${describeJson(parsed)}.`);
-  }
-  return parsed;
-}
-
-// --- History management ---
-
-/** The index.jsonl field that carries the detail for each kind of versioned change. */
-const HISTORY_DETAIL_FIELD: Record<string, string> = { create: "prompt", update: "prompt", repair: "error" };
-
-/**
- * Add a version to a project's history: its text as history/NNNN.ts, and a
- * line in index.jsonl saying why (after `notes`, lines that belong with it).
- * Either all of it is written or none of it. Returns how to take it back, for
- * a caller whose own next step may still fail.
- */
-function recordVersion(
-  projectDir: string,
-  source: string | Buffer,
-  reason: string,
-  detail?: string,
-  notes: Array<Record<string, unknown>> = [],
-): () => void {
-  const historyDir = guardPath(projectDir, "history");
-  const indexPath = guardPath(projectDir, join("history", "index.jsonl"));
-  const versions = readdirSync(historyDir)
-    .filter(f => /^\d+\.ts$/.test(f))
-    .map(f => parseInt(f, 10))
-    .filter(n => Number.isSafeInteger(n) && n < Number.MAX_SAFE_INTEGER);
-  const version = versions.reduce((a, b) => Math.max(a, b), 0) + 1;
-  const snapshot = guardPath(projectDir, join("history", `${String(version).padStart(4, "0")}.ts`));
-
-  const entry: Record<string, unknown> = { version, reason, timestamp: new Date().toISOString() };
-  const detailField = HISTORY_DETAIL_FIELD[reason];
-  if (detailField && detail) entry[detailField] = detail;
-
-  const lines = Buffer.from([...notes, entry].map(line => JSON.stringify(line) + "\n").join(""));
-  const sizeBefore = statSync(indexPath, { throwIfNoEntry: false })?.size;
-  let wroteSnapshot = false;
-  let appended = false;
-
-  // Takes back what was written here and nothing else. Another run of the
-  // project may be recording a version of its own at the same moment: if the
-  // index no longer ends with these lines alone, they are left in it, and the
-  // version file with them — a version on record that was never installed,
-  // rather than someone else's record cut out of the history.
-  const undo = () => {
-    try {
-      const index = readFileSync(indexPath);
-      const start = sizeBefore ?? 0;
-      const sinceThen = index.subarray(Math.min(start, index.length));
-      // What was appended is the end of the index — whole, or as far as a failed write got.
-      const cutTo = index.subarray(-lines.length).equals(lines) ? index.length - lines.length
-        : lines.subarray(0, sinceThen.length).equals(sinceThen) ? start
-        : null;
-      if (cutTo === null) return;
-      if (cutTo === 0 && sizeBefore === undefined) rmSync(indexPath, { force: true });
-      else if (cutTo < index.length) truncateSync(indexPath, cutTo);
-    } catch (err) {
-      // The index cannot be looked at. If the lines went into it, they stay,
-      // and the version file with them; if they never did, there is only the file.
-      if (appended && (err as NodeJS.ErrnoException).code !== "ENOENT") return;
-    }
-    if (wroteSnapshot) try { rmSync(snapshot, { force: true }); } catch { /* best-effort */ }
-  };
-  try {
-    // Never over a version file that is already there: that one is someone else's.
-    const fd = openSync(snapshot, "wx");
-    wroteSnapshot = true;
-    try { writeFileSync(fd, source); } finally { closeSync(fd); }
-    appendFileSync(indexPath, lines);
-    appended = true;
-  } catch (err) {
-    undo();
-    throw err;
-  }
-  return undo;
-}
-
-/** Save the current program.ts as the next version of the project, and record why. */
-export function copyToHistory(projectDir: string, reason: string, detail?: string): void {
-  recordVersion(projectDir, readFileSync(guardPath(projectDir, "program.ts")), reason, detail);
-}
 
 // --- Staging: run against a copy, merge back what worked (see tree.ts) ---
 
@@ -645,7 +226,7 @@ function strandedBeside(copy: string, beside: Beside): Unmerged[] {
  * whyNotReplaceable). A project with a directory where its program should be
  * has no place for one, and is not copied to try one in.
  */
-export function copyProjectWith(projectDir: string, privateDir: string, program?: string, among = projectDir): { copy: string; held: Tree; beside: Beside } {
+function copyProjectWith(projectDir: string, privateDir: string, program?: string, among = projectDir): { copy: string; held: Tree; beside: Beside } {
   const root = projectAt(projectDir);
   const itsOwn = realRootOf(privateDir);
   const copyDir = join(itsOwn, basename(root) || "project");
@@ -717,6 +298,13 @@ interface RunOnceResult {
 function tail(text: string, max = 20_000): string {
   return text.length <= max ? text : `[… ${text.length - max} earlier characters omitted]\n${text.slice(-max)}`;
 }
+
+/**
+ * How a run that failed is said to whoever asked for it: as a program's
+ * failure — which the reasons that begin so say for themselves, and is not
+ * said of them twice.
+ */
+export const failureOf = (reason: string | undefined): string => (reason?.startsWith("Program failed") ? reason : `Program failed: ${reason}`);
 
 /** A line as it is shown for a run: under the run's name, if it has one. */
 export const tagged = (label: string | undefined, line: string) => label ? `[${label}] ${line}` : line;
@@ -804,7 +392,7 @@ function settle(projectDir: string, child: ShellResult, ended: ProgramResult | n
   // the next run look resumed.
   if (state.__trama_yield != null) {
     delete state.__trama_yield;
-    writeFileSync(guardPath(projectDir, "state.json"), JSON.stringify(state, null, 2));
+    saveState(projectDir, state);
   }
   return { status: "done" };
 }
@@ -858,6 +446,25 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   let handedOff: false | "starts another program" | "has a project made or changed" = false;
   // Runs the program has asked for and that are still going. They belong to this run.
   const nestedRuns = new Set<Promise<unknown>>();
+  /** What the program asked for is waited for as the run ends: the run is not over before it is. */
+  const notOverBefore = <T>(asked: Promise<T>): Promise<T> => {
+    const going = asked.finally(() => { nestedRuns.delete(going); });
+    nestedRuns.add(going);
+    return going;
+  };
+  /**
+   * What a program asks its runner for — a run, a project made — is this
+   * run's own: stopped when this run ends, or when the program no longer
+   * wants it (`stop`); counted in this run's budget; and on record both
+   * ways — this run's journal says what the call `seq` started, and what
+   * was started says which call started it.
+   */
+  const itsOwn = (seq: number, stop: AbortSignal, purpose?: string) => ({
+    signal: AbortSignal.any([runEnded.signal, stop]),
+    above: options.meter,
+    parent: { run: journal.run, journal: journal.path, seq },
+    started: (run: string, path: string) => { if (run) journal.note("child", { seq, run, journal: path, ...(purpose && { purpose }) }); },
+  });
   const workspaces = new Map<string, Workspace>();
   const workspaceAt = (dir: string): Workspace => {
     let workspace = workspaces.get(dir);
@@ -896,17 +503,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       // The run's own, as a run it asks for is: under its budget, with its variables, stopped when it
       // ends or when the program no longer wants it, and not over before this is. (But the program's
       // clock goes on: what it has made is its own work, with no timeout but the program's.)
-      const made = options.making(request, {
-        signal: AbortSignal.any([runEnded.signal, stop]),
-        above: options.meter,
-        label,
-        env: options.env,
-        parent: { run: journal.run, journal: journal.path, seq },
-        // (What it starts is a validation: of the program the project is made with.)
-        started: (run, path) => { if (run) journal.note("child", { seq, run, journal: path, purpose: "validate" }); },
-      }).finally(() => { nestedRuns.delete(made); });
-      nestedRuns.add(made);
-      return made;
+      // (What it starts is a validation: of the program the project is made with.)
+      return notOverBefore(options.making(request, { ...itsOwn(seq, stop, "validate"), label, env: options.env }));
     },
     run: (request, stop, seq) => {
       if (validating) return handOff("starts another program", stop);
@@ -916,19 +514,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       const release = allowance.hold();
       // What this run was started with, the run it asks for has too — and what it is given besides.
       const env = options.env || request.env ? { ...options.env, ...request.env } : undefined;
-      const nested = runProgram({ ...request, env, signal: AbortSignal.any([runEnded.signal, stop]) }, {
-        depth: options.depth + 1,
-        // The two journals point at each other: this one says which run the call started…
-        started: (run, path) => { if (run) journal.note("child", { seq, run, journal: path }); },
-        // …and that run's journal says which call started it.
-        parent: { run: journal.run, journal: journal.path, seq },
-        above: options.meter,
-      }, options.making).finally(() => {
-        release();
-        nestedRuns.delete(nested);
-      });
-      nestedRuns.add(nested);
-      return nested;
+      const { signal, ...asked } = itsOwn(seq, stop);
+      return notOverBefore(runProgram({ ...request, env, signal }, { depth: options.depth + 1, ...asked }, options.making).finally(release));
     },
   });
 
@@ -1082,7 +669,7 @@ const repairPrompt = (input: { programSource: string; error: string; journal: st
  * the copy, not in what a link leads to, nor in a directory made anew.
  */
 const sameCopyAs = (copy: string, was: Tree) => (): void => {
-  const there = entryAt(copy), itself = was.get(".");
+  const there = entryAt(copy), itself = was.get(ITSELF);
   if (!(there?.kind === "dir" && itself?.kind === "dir" && there.id === itself.id)) {
     throw new Error("the copy that was worked in is no longer where it was made: it was moved away, or something else put in its place");
   }
@@ -1293,7 +880,7 @@ async function tryFix(options: ExecuteOptions, staged: Staged, fixed: string, at
   // project is the directory that was copied, which the copy knows by what
   // it is.
   const projectRoot = realRootOf(projectDir);
-  const copied = held.get("."), there = entryAt(projectRoot);
+  const copied = held.get(ITSELF), there = entryAt(projectRoot);
   if (there && copied?.kind === "dir" && !(there.kind === "dir" && there.id === copied.id)) {
     throw new Error(`The program cannot be replaced: what is at ${projectRoot} is not the project the fix was tried on.`);
   }
@@ -1366,7 +953,7 @@ async function executeProgram(options: ExecuteOptions): Promise<Execution> {
   for (let attempt = 1; attempt <= maxRepairAttempts; attempt++) {
     stillTheProject();
     // A fix is asked of a model: where no more may be, none is asked for, and nothing is got ready for one.
-    const spent = options.backend.spent?.();
+    const spent = options.backend.spent();
     if (spent !== undefined) {
       return failed(`${attempt === 1 ? "Program failed, and no repair was tried" : `Failed after ${attempt - 1} repair attempt(s), and no further repair was tried`}. ${spent}\n${lastError}`);
     }
@@ -1421,13 +1008,13 @@ async function journalled<T extends Execution>(journal: Journal, backend: Backen
     end = { error: messageOf(err) };
     throw err;
   } finally {
-    if (journal.run || backend.counts?.()) await backend.letGo();
-    const spent = backend.spent?.() ?? backend.refused?.();
+    if (journal.run || backend.counts()) await backend.letGo();
+    const spent = backend.spent() ?? backend.refused();
     if (spent !== undefined) journal.note("budget", { spent });
     journal.note("end", end);
     journal.close();
     // Nothing a run started outlives it: nor what served its agent calls.
-    await backend.close?.();
+    await backend.close();
   }
 }
 
@@ -1523,7 +1110,7 @@ export async function validateProgram(
     }
   });
   const { result, repair, left } = await journalled(journal, backend, async () => (await validatedIn(as)) ?? (await validatedIn(projectDir))!);
-  if (result.status === "failed") throw new Error(`Program failed: ${result.reason}`);
+  if (result.status === "failed") throw new Error(failureOf(result.reason));
   return { source: left, repairedError: repair?.error, ...(alone === undefined ? {} : { alone }) };
 }
 
@@ -1672,7 +1259,7 @@ export function whyNotReplaceable(projectDir: string): string | null {
 function stageProgram(projectDir: string, source: string): StagedFile {
   const refusal = whyNotReplaceable(projectDir);
   if (refusal) throw Object.assign(new Error(refusal), { code: "EACCES" });
-  return stageFile(projectDir, "program.ts", source);
+  return stageFileInProject(projectDir, "program.ts", source);
 }
 
 /**
@@ -1711,15 +1298,6 @@ export function installValidatedProgram(
 const MAX_RUN_DEPTH = 16;
 const MAX_RUNS_IN_FLIGHT = 128;
 let runsInFlight = 0;
-
-/** A project a program asks its runner to make, or to change (see createProject and updateProject). */
-export interface MakeRequest {
-  kind: "create" | "update";
-  name: string;
-  prompt: string;
-  model?: string;
-  args?: Record<string, unknown>;
-}
 
 /**
  * What a project is made or changed under where a run's program asked for
@@ -1789,19 +1367,17 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   }
 
   const config = loadProjectConfig(projectDir);
-  const maxRepairAttempts = options.maxRepairAttempts ?? config.maxRepairAttempts;
-  const timeout = options.timeout ?? config.defaultTimeout;
-
-  if (!Number.isFinite(timeout) || timeout <= 0) {
-    throw new Error(`Invalid timeout: ${timeout}. Must be a positive number.`);
-  }
-  if (!Number.isInteger(maxRepairAttempts) || maxRepairAttempts < 0) {
-    throw new Error(`Invalid maxRepairAttempts: ${maxRepairAttempts}. Must be a non-negative integer.`);
-  }
+  const timeout = checkedTimeout(options.timeout ?? config.defaultTimeout);
+  const maxRepairAttempts = checkedRepairAttempts(options.maxRepairAttempts ?? config.maxRepairAttempts);
   const env = options.env == null ? undefined : checkedEnv(options.env);
   // Its own budget — the config's, for a run nobody's program asked for and that was given none — under the budgets above it.
   const budget = options.budget != null ? checkedBudget(options.budget) : askedFor ? undefined : config.budget;
   const meter = createMeter(budget, askedFor?.above);
+  const outOfBudget = (why: string) => console.warn(tagged(options.label, `[trama] ${why}`));
+  // (Before the journal is opened: once it is, nothing stands between that and the run that ends it — a
+  // journal with a beginning and no end is a run that died, and is not to be one that never began.)
+  const stillTheProject = sameProjectAs(projectDir);
+  const backend = createBackend(config, meter, saysOnce(meter, outOfBudget), env);
 
   const journal = openJournal(projectDir, config.journalRuns, {
     purpose: "run",
@@ -1817,10 +1393,8 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
     args: options.args, // last: it is the one field of unknown size
   });
   askedFor?.started(journal.run, journal.path);
-  const stillTheProject = sameProjectAs(projectDir);
 
-  const outOfBudget = (why: string) => console.warn(tagged(options.label, `[trama] ${why}`));
-  const { result, repair } = await journalled(journal, createBackend(config, meter, saysOnce(meter, outOfBudget), env), (backend) => executeProgram({
+  const { result, repair } = await journalled(journal, backend, (backend) => executeProgram({
     projectDir,
     backend,
     meter,

@@ -2,7 +2,7 @@ import type { AgentSession, ExtensionFactory, InlineExtension, ModelRuntime as M
 import { onAbort, rejectOnAbort, throwIfAborted } from "./abort.js";
 import { messageOf } from "./errors.js";
 import { createAgentHosts } from "./agent-hosts.js";
-import { CutOff, addReply, atLeast, nothingYet, type AgentBackend, type AgentCall, type AgentUsage, type OwnTool, type Tally, type ToolAnswer } from "./agent-backend.js";
+import { CutOff, NOT_WAITED_FOR, addReply, atLeast, nothingYet, type AgentBackend, type AgentCall, type AgentUsage, type OwnTool, type Tally, type ToolAnswer } from "./agent-backend.js";
 import * as http from "http";
 import * as https from "https";
 import { dataOf, isData, notAsked, usageAtEnd, wholeOf, type RelayEvent, type RelayModel, type RelayWay } from "./model-relay.js";
@@ -55,8 +55,13 @@ async function pisOwnTools(): Promise<Set<string>> {
   }
 }
 
-/** What a tool is taken to have said where its call was cancelled before it answered. (Nobody reads it: the call is over.) */
-const NOT_WAITED_FOR: ToolAnswer = { text: "The call was stopped before the tool had answered.", failed: true };
+/** What a session has on record of what was said in it, in order: pi's messages, whoever's each is. */
+const messagesOf = (session: AgentSession) =>
+  session.sessionManager.getEntries().flatMap(entry => (entry.type === "message" ? [entry.message] : []));
+
+/** The words of what a message holds. */
+const wordsOf = (content: ReadonlyArray<{ type: string; text?: string }>): string =>
+  content.map(block => (block.type === "text" ? block.text ?? "" : "")).join("");
 
 /**
  * What a call's own tool said that ended the agent's work — the answer of
@@ -68,11 +73,11 @@ const NOT_WAITED_FOR: ToolAnswer = { text: "The call was stopped before the tool
 function endedWith(session: AgentSession, ownTools: OwnTool[] | undefined): string | undefined {
   const ending = new Set((ownTools ?? []).filter(tool => tool.ends).map(tool => tool.name));
   if (ending.size === 0) return undefined;
-  const last = session.sessionManager.getEntries().flatMap(entry => (entry.type === "message" ? [entry.message] : [])).at(-1);
+  const last = messagesOf(session).at(-1);
   // (Of the call's own that end it: a run may be ended by another's tool — an extension's — which is no answer of this call's.
   // And not one that failed: such a tool has ended nothing — see asPisTool — and the model was asked again.)
   if (last?.role !== "toolResult" || !ending.has(last.toolName)) return undefined;
-  return last.content.map(block => (block.type === "text" ? block.text : "")).join("");
+  return wordsOf(last.content);
 }
 
 /**
@@ -231,12 +236,25 @@ function whyNotTheTools(session: AgentSession, { tools, ownTools }: Pick<AgentCa
     if (taken !== undefined) return `The tool "${taken}" cannot be the call's own: the extension ${extension.path} has a tool of that name.`;
   }
   // The caller's own are named to pi with pi's (see createSession), and are the agent's as those are.
-  const named = tools ? [...tools, ...own] : own.length > 0 ? own : undefined;
-  if (named === undefined) return undefined;
+  const wanted = tools ? [...tools, ...own] : own.length > 0 ? own : undefined;
+  if (wanted === undefined) return undefined;
   const given = session.getActiveToolNames();
   // (pi gives no tool that was not named. What it does not know by the name it was given, it leaves out.)
-  return named.every(name => given.includes(name)) ? undefined
-    : `The agent cannot be given the tools ${JSON.stringify(named)}: pi would give it ${JSON.stringify(given)}.`;
+  return wanted.every(name => given.includes(name)) ? undefined
+    : `The agent cannot be given the tools ${JSON.stringify(wanted)}: pi would give it ${JSON.stringify(given)}.`;
+}
+
+/**
+ * Have a session that is set going again once its call is over, or stopped
+ * (`done` says which it is by now), stopped as it begins to: a command of an
+ * extension that asks the model once more, or what an extension starts
+ * while it is being told that the call is over.
+ */
+function stoppedAsItBegins(session: AgentSession, done: () => boolean): void {
+  session.subscribe((event) => {
+    if (event.type !== "turn_start" && event.type !== "compaction_start") return;
+    if (done()) void session.abort().catch(() => {});
+  });
 }
 
 /** What is kept of a session that has extensions, beside the session. */
@@ -332,7 +350,7 @@ function either(own: unknown, cut: AbortSignal): { signal: AbortSignal; release:
 }
 
 /** What an extension may have a hand in, of a request to a provider: a session where one does asks its model itself. */
-const HANDS_IN = ["before_provider_request", "before_provider_headers", "after_provider_response", "provider_stream_event"];
+export const HANDS_IN = ["before_provider_request", "before_provider_headers", "after_provider_response", "provider_stream_event"];
 
 /**
  * What pi's agent has every request of its own go with, to be told of what
@@ -341,7 +359,7 @@ const HANDS_IN = ["before_provider_request", "before_provider_headers", "after_p
  * by the way the agent asks, is one the agent makes for itself — or one made
  * with all the agent's was made with, which is the same to a provider.
  */
-const HOOKS = ["onPayload", "onResponse", "onProviderStreamEvent"];
+export const HOOKS = ["onPayload", "onResponse", "onProviderStreamEvent"];
 
 /**
  * What else goes with a request the agent makes for itself, and is nothing
@@ -354,7 +372,7 @@ const HOOKS = ["onPayload", "onResponse", "onProviderStreamEvent"];
  * is set up by a function more has its agent's requests asked where the call
  * is served, until it is named here.
  */
-const LOOPS = ["beforeToolCall", "afterToolCall", "finishTurn", "prepareRequest", "prepareNextTurn", "convertToLlm", "transformContext", "getSteeringMessages", "getFollowUpMessages"];
+export const LOOPS = ["beforeToolCall", "afterToolCall", "finishTurn", "prepareRequest", "prepareNextTurn", "convertToLlm", "transformContext", "getSteeringMessages", "getFollowUpMessages"];
 
 /**
  * What a provider is asked by, of what it has: whether what comes of it comes
@@ -572,13 +590,19 @@ function account(asking: Asking, call: Asked, signal: AbortSignal | undefined, s
   const atWork = AbortSignal.any([stopped, asking.cut.signal]);
   asking.before = () => heard = heard.then(async () => {
     const usage = sofar && !asking.gone && !noMore && !halted() && counted();
-    if (usage && await rejectOnAbort(Promise.resolve(sofar(usage, asking.over)), asking.over ? asking.cut.signal : atWork).catch(() => {}) === false && asking.over) noMore = true;
+    // (Whoever hears is not to throw. One that does has said nothing: it is not for a count to fail the call it is of.)
+    const said = usage ? new Promise((resolve) => resolve(sofar(usage, asking.over))) : undefined;
+    if (said && await rejectOnAbort(said, asking.over ? asking.cut.signal : atWork).catch(() => {}) === false && asking.over) noMore = true;
   });
   // (As soon as a reply has come, what the call has used is said to whoever would not otherwise know
   // it, were this process to be ended: before the reply is anybody else's to hear of.)
   asking.replied = () => {
     const usage = had && !asking.gone && counted();
-    if (usage) had(usage);
+    try {
+      if (usage) had(usage);
+    } catch {
+      // (As above: a hearer that throws has said nothing.)
+    }
   };
   // Where the call has extensions and somebody to ask its model by, its model is asked by them: what
   // a reply used is then read where no extension is. Not where an extension has made the model's
@@ -752,10 +776,8 @@ function usageOf(session: AgentSession, seen?: Tally): AgentUsage | undefined {
  * middle of a tool call is never the last: pi has the model make the call again.
  */
 function answerOf(session: AgentSession, taken = false): string {
-  const replies = session.sessionManager.getEntries()
-    .flatMap(entry => (entry.type === "message" && entry.message.role === "assistant" ? [entry.message] : []));
-  const reply = replies.at(-1);
-  const text = reply?.content.map(block => (block.type === "text" ? block.text : "")).join("") ?? "";
+  const reply = messagesOf(session).flatMap(message => (message.role === "assistant" ? [message] : [])).at(-1);
+  const text = reply ? wordsOf(reply.content) : "";
   if (reply?.stopReason === "error") throw new Error(`The model did not answer: ${reply.errorMessage ?? "no reason given"}`);
   if (reply?.stopReason === "length") throw new CutOff(text);
   if (!text) {
@@ -957,16 +979,7 @@ export class PiAdapter implements AgentBackend {
     try {
       ({ session } = await raceAbort(sessionPromise));
       this.asking.set(session, asking);
-      // A session that is set going again once its call is over, or stopped, is stopped as it begins to: a
-      // command of an extension that asks the model once more, or what an extension starts while it is being
-      // told that the call is over.
-      if (asked.sofar || asked.extensions) {
-        const here = session;
-        here.subscribe((event) => {
-          if (event.type !== "turn_start" && event.type !== "compaction_start") return;
-          if (asking.over || stopped.aborted) void here.abort().catch(() => {});
-        });
-      }
+      if (asked.sofar || asked.extensions) stoppedAsItBegins(session, () => asking.over || stopped.aborted);
       // An extension is told that its session has begun, as pi tells it where pi runs by itself:
       // that is when it sets itself up. What goes wrong in one later is said, and is not the call's failure.
       // A command of one can wait for the model it asked, as it can there; the session is one call's, and
@@ -1042,7 +1055,7 @@ export class PiAdapter implements AgentBackend {
         asking.gone = true;
         offCut();
         const usage = session && asked.used && usageOf(session, asking.seen);
-        if (usage) asked.used!(usage);
+        if (usage) asked.used?.(usage);
       }
       throw err;
     }
@@ -1102,10 +1115,6 @@ export class PiAdapter implements AgentBackend {
     throwIfAborted(signal);
 
     const session = await this.createSession(cwd, system, signal, call);
-    // (A call that is cancelled asks no more — and what is being asked for it then is asked no further, whoever
-    // asked: while it is at its work, and while its extensions are told that it is over.)
-    const offCut = onAbort(signal, () => this.asking.get(session)?.cut.abort());
-    let offAbort = () => {};
     // What is kept of the call where its model is asked (see `account`): whether it has come to its end, and
     // whether its session is gone. (A session that was not made here has nothing asked on its account that
     // is seen: what is kept of its call is then kept here alone.)
@@ -1113,6 +1122,10 @@ export class PiAdapter implements AgentBackend {
     const its: Pick<Asking, "over" | "gone" | "refusal"> = asking ?? { over: false, gone: false, refusal: new AbortController() };
     // What is kept of the session beside it, where it has extensions.
     const extended = this.extended.get(session);
+    // (A call that is cancelled asks no more — and what is being asked for it then is asked no further, whoever
+    // asked: while it is at its work, and while its extensions are told that it is over.)
+    const offCut = onAbort(signal, () => asking?.cut.abort());
+    let offAbort = () => {};
     // Why the call cannot have the tools it named, where that was found as its run began. It is
     // then stopped as a cancelled call is — it asks nothing, and what would hold it is not waited
     // for long — and fails with that.
@@ -1133,12 +1146,7 @@ export class PiAdapter implements AgentBackend {
           its.refusal.abort();
         };
       }
-      if (!asking && (sofar || call.extensions)) {
-        session.subscribe((event) => {
-          if (event.type !== "turn_start" && event.type !== "compaction_start") return;
-          if (its.over || stopped.aborted) void session.abort().catch(() => {});
-        });
-      }
+      if (!asking && (sofar || call.extensions)) stoppedAsItBegins(session, () => its.over || stopped.aborted);
 
       // The prompt is a program's text, whatever it begins with — but where the call has the user's skills,
       // templates or extensions, and does not say its prompt is text all the same: each of those has a line of
@@ -1152,7 +1160,7 @@ export class PiAdapter implements AgentBackend {
         });
         // A command that asked the model has the model's answer be the call's: what it put to the model is
         // waited for — also where the command itself did not wait, or pi had not yet set the run going.
-        const puts = this.extended.get(session)?.puts;
+        const puts = extended?.puts;
         while (puts && puts.size > 0) await Promise.allSettled([...puts]);
         if (taken) await session.waitForIdle();
       };
@@ -1174,7 +1182,7 @@ export class PiAdapter implements AgentBackend {
         // ended. (Whoever counts has not waited for this: they were told as each reply came.)
         its.gone = true;
         offCut();
-        const usage = used && usageOf(session, this.asking.get(session)?.seen);
+        const usage = used && usageOf(session, asking?.seen);
         if (usage) used(usage);
       }
     }

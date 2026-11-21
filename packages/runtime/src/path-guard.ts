@@ -21,6 +21,11 @@ import { dirname, isAbsolute, join, parse, resolve, sep } from "path";
  */
 const MAX_LINKS = 32;
 const tooManyLinks = (path: string) => new Error(`Too many levels of symbolic links: ${path}`);
+/** Nothing lies beyond what is not a directory: the system refuses to go on from one, in these words. */
+const notADirectory = (at: string, path: string) =>
+  Object.assign(new Error(`ENOTDIR: not a directory, ${at} (on the way to ${path})`), { code: "ENOTDIR" });
+const saysNothing = (link: string) =>
+  new Error(`Path cannot be followed: ${link} (it links to nothing, or to what is not readable as text)`);
 
 /**
  * A step that is not a name: what the walk has come to must be a directory.
@@ -139,7 +144,7 @@ function follow(path: string, from: Place, watch: Watch = {}): Place {
       // Nothing lies beyond a file — not a name, and not "." or ".." either.
       // The system refuses to go on, and so does this.
       if (!stat.isDirectory() && steps.length > 0) {
-        throw Object.assign(new Error(`ENOTDIR: not a directory, ${next} (on the way to ${path})`), { code: "ENOTDIR" });
+        throw notADirectory(next, path);
       }
       at = next;
       continue;
@@ -150,15 +155,13 @@ function follow(path: string, from: Place, watch: Watch = {}): Place {
       ({ at, missing } = instead);
       // As where a file is come to by a step: nothing lies beyond one.
       if (steps.length > 0 && !missing && !lstatSync(at).isDirectory()) {
-        throw Object.assign(new Error(`ENOTDIR: not a directory, ${at} (on the way to ${path})`), { code: "ENOTDIR" });
+        throw notADirectory(at, path);
       }
       continue;
     }
     if (++links > MAX_LINKS) throw tooManyLinks(path);
     const target = linkText(next);
-    if (target === undefined) {
-      throw new Error(`Path cannot be followed: ${next} (it links to nothing, or to what is not readable as text)`);
-    }
+    if (target === undefined) throw saysNothing(next);
     if (isAbsolute(target)) at = parse(target).root;
     steps = [...stepsOf(target), ...steps];
   }
@@ -288,7 +291,7 @@ export function linksOf(root: string): {
     depth += 1;
     try {
       const text = linkText(link);
-      if (text === undefined) throw new Error(`Path cannot be followed: ${link} (it links to nothing, or to what is not readable as text)`);
+      if (text === undefined) throw saysNothing(link);
       const { place } = lead(dirname(link), text);
       named.set(link, place);
       return place;

@@ -1,4 +1,5 @@
 import { spawn } from "child_process";
+import type { Writable } from "stream";
 import { accessSync, constants, readFileSync, statSync, writeFileSync } from "fs";
 import { delimiter, resolve, dirname } from "path";
 import type { Tools, ShellResult } from "./types.js";
@@ -10,6 +11,23 @@ import { signalGroup, stopGroups, stopWithThisProcess } from "./stopping.js";
 const MAX_FETCH_BODY = 10 * 1024 * 1024; // 10 MB
 const DEFAULT_SHELL_TIMEOUT = 30_000;
 const GROUP_SWEEP_MS = 250;
+
+/**
+ * What a command's shell is started with, in place of the command: it waits
+ * to be told that it may go — on a channel of its own, which is closed
+ * before anything of the command's runs — and then becomes the shell the
+ * command is run by, as that shell would have been started: the same
+ * process, with the command and nothing else.
+ *
+ * A command is in a group of its own, which is stopped with its run — by
+ * the runner, or, should the runner die, by whoever watches for that. Both
+ * know of the group once it is listed, and it can only be listed once it is
+ * there: a command that was at its work before that would, in a runner that
+ * died in between, be nobody's to stop. So it is held until it is listed.
+ * Where its runner is gone before that, the channel ends with nothing said,
+ * and nothing of the command is run.
+ */
+const HELD = 'read -r go <&3 || exit 1; exec 3<&-; exec "$1" -c "$2" "$0"';
 
 /**
  * The shell a command is run by: the `sh` that `path` — the runner's own
@@ -127,12 +145,13 @@ export function createTools(projectDir: string, signal?: AbortSignal, env?: Reco
       const notStarted = (why: unknown): ShellResult => ({ exitCode: 1, stdout: "", stderr: messageOf(why).replace(`spawn ${shell} `, "spawn sh ") });
       let child;
       try {
-        child = spawn(shell, ["-c", command], {
+        child = spawn(shell, ["-c", HELD, "sh", shell, command], {
           cwd,
           env,
           argv0: "sh",
           // Nothing is ever sent to a command: one that reads its input finds it at an end, rather than waiting.
-          stdio: ["ignore", "pipe", "pipe"],
+          // (The fourth is how it is told that it may go: see HELD.)
+          stdio: ["ignore", "pipe", "pipe", "pipe"],
           detached: true,
         });
       } catch (spawnError) {
@@ -143,6 +162,10 @@ export function createTools(projectDir: string, signal?: AbortSignal, env?: Reco
       if (pgid) {
         groups.set(pgid, { shellExited: false, forget: stopWithThisProcess(pgid) });
       }
+      // Listed: now it may go. (A shell that could not be started has nobody to be told.)
+      const go = child.stdio[3] as Writable | null | undefined;
+      go?.on("error", () => {});
+      go?.end("\n");
 
       try {
         const exit = await superviseChild(child, { timeout: options.timeout ?? DEFAULT_SHELL_TIMEOUT });
@@ -171,25 +194,28 @@ export function createTools(projectDir: string, signal?: AbortSignal, env?: Reco
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let text = "";
+        // How much may still be taken, of what was sent: the limit is on that, and not on how many characters it comes to.
+        let room = MAX_FETCH_BODY;
         let truncated = false;
         try {
           for (;;) {
             const { done, value } = await reader.read();
             if (done) break;
-            text += decoder.decode(value, { stream: true });
-            if (text.length > MAX_FETCH_BODY) {
+            if (value.byteLength > room) {
+              // (What a character is cut in the middle of is left out with the rest: the decoder keeps it for what never comes.)
+              text += decoder.decode(value.subarray(0, room), { stream: true });
               truncated = true;
               await reader.cancel();
               break;
             }
+            text += decoder.decode(value, { stream: true });
+            room -= value.byteLength;
           }
           if (!truncated) text += decoder.decode();
         } finally {
           reader.releaseLock();
         }
-        body = truncated
-          ? text.slice(0, MAX_FETCH_BODY) + "\n[trama] response body truncated at 10MB"
-          : text;
+        body = truncated ? text + "\n[trama] response body truncated at 10MB" : text;
       } else {
         body = ""; // (an answer that has no body: to a HEAD, say)
       }

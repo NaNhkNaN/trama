@@ -8,14 +8,14 @@ import { timingSafeEqual } from "crypto";
 import type { Tools, Workspace } from "./types.js";
 import type { RunnerAgent } from "./agent.js";
 import type { RunContext } from "./context.js";
-import type { ProgramResult, RunRequest } from "./runner-types.js";
-import type { MakeRequest } from "./runner.js";
+import type { MakeRequest, ProgramResult, RunRequest } from "./runner-types.js";
 import { OFF_THE_RECORD, type Journal, type RecordedCall } from "./journal.js";
 import type { OwnTool } from "./agent-backend.js";
 import { createToolAsks, imagesOf, toolsOf } from "./own-tools.js";
 import { describeJson, isJsonObject } from "./serializable.js";
 import { checkedEnv, variableName } from "./child-process.js";
 import { checkedBudget, type Budget } from "./budget.js";
+import { checkedRepairAttempts, checkedTimeout } from "./project.js";
 import { messageOf } from "./errors.js";
 
 const MAX_IPC_BODY = 50 * 1024 * 1024; // 50 MB
@@ -30,8 +30,6 @@ interface FieldKinds {
   number: number;
   boolean: boolean;
   object: Record<string, unknown>;
-  /** A list of strings. */
-  strings: string[];
   /** A list of tools: each by its name, or — one of the program's own — as an object that declares it. */
   "strings or tools": unknown[];
   /** All or none of something, or some of it by name. */
@@ -74,7 +72,6 @@ const isStrings = (value: unknown): boolean => Array.isArray(value) && value.eve
 const isOfKind = (value: unknown, kind: Kind): boolean =>
   kind === "any" ? value !== undefined
     : kind === "object" ? isJsonObject(value)
-    : kind === "strings" ? isStrings(value)
     : kind === "strings or tools" ? Array.isArray(value) && value.every(item => typeof item === "string" || isJsonObject(item))
     : kind === "boolean or strings" ? typeof value === "boolean" || isStrings(value)
     : kind === "boolean or string" ? typeof value === "boolean" || typeof value === "string"
@@ -119,24 +116,45 @@ function route<F extends Fields>(
   return { ...how, handle: (body, connectionClosed, call) => handle(read(body, fields), connectionClosed, call) };
 }
 
-/** The variables a call gives, held to what variables are (see checkedEnv): what is none is the request's fault. */
-function envOf(env: Record<string, unknown> | undefined): Record<string, string> | undefined {
-  if (env === undefined) return undefined;
+/**
+ * Read what a request gave by whoever knows what it is to be: what that
+ * finds wrong with it is the request's fault, said in its words (`as` has
+ * them say which field it was).
+ */
+function asGiven<T>(read: () => T, as: (why: string) => string = why => why): T {
   try {
-    return checkedEnv(env);
+    return read();
   } catch (err) {
-    throw new BadRequest(`Invalid field: ${messageOf(err)}`);
+    throw new BadRequest(as(messageOf(err)));
   }
 }
 
+/** A field that names itself in what is wrong with it. */
+const ofAField = (why: string) => `Invalid field: ${why}`;
+
+/** The variables a call gives, held to what variables are (see checkedEnv). */
+const envOf = (env: Record<string, unknown> | undefined): Record<string, string> | undefined =>
+  env === undefined ? undefined : asGiven(() => checkedEnv(env), ofAField);
+
 /** The budget a call gives a run, held to what a budget is (see checkedBudget). */
-function budgetOf(budget: Record<string, unknown> | undefined): Budget | undefined {
-  if (budget === undefined) return undefined;
-  try {
-    return checkedBudget(budget);
-  } catch (err) {
-    throw new BadRequest(`Invalid field: ${messageOf(err)}`);
-  }
+const budgetOf = (budget: Record<string, unknown> | undefined): Budget | undefined =>
+  budget === undefined ? undefined : asGiven(() => checkedBudget(budget), ofAField);
+
+/** A run's time and its count of attempts, where a call gives them: held to what each is before the run is looked for. */
+const timeoutOf = (timeout: number | undefined): number | undefined => (timeout === undefined ? undefined : asGiven(() => checkedTimeout(timeout)));
+const attemptsOf = (attempts: number | undefined): number | undefined => (attempts === undefined ? undefined : asGiven(() => checkedRepairAttempts(attempts)));
+
+/** The headers a request is to go with: names and their text. */
+function headersOf(headers: Record<string, unknown> | undefined): Record<string, string> | undefined {
+  const [name, value] = Object.entries(headers ?? {}).find(([, value]) => typeof value !== "string") ?? [];
+  if (name !== undefined) throw new BadRequest(`Invalid field: headers (${name}: expected string, got ${describeJson(value)})`);
+  return headers as Record<string, string> | undefined;
+}
+
+/** The id a program gives to what it may want stopped: a name, so not an empty one. */
+function namedBy(id: string): string {
+  if (id === "") throw new BadRequest("Invalid field: id (expected a non-empty string)");
+  return id;
 }
 
 /**
@@ -209,10 +227,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
    * or is gone — its process died, or it gave up — and no longer wants it.
    */
   const lasting = async <T>(id: string | undefined, connectionClosed: Promise<void>, work: (stop: AbortSignal) => Promise<T>): Promise<T> => {
-    if (id !== undefined) {
-      if (id === "") throw new BadRequest("Invalid field: id (expected a non-empty string)");
-      if (runsAskedFor.has(id)) throw new BadRequest(`Duplicate run id: ${id}`);
-    }
+    if (id !== undefined && runsAskedFor.has(namedBy(id))) throw new BadRequest(`Duplicate run id: ${id}`);
     const stop = new AbortController();
     void connectionClosed.then(() => stop.abort());
     if (id !== undefined) {
@@ -248,18 +263,8 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
     }
     if (toolsId === undefined) throw new BadRequest("Missing field: toolsId (expected string, for a call with tools of the program's own)");
     // (What is wrong with a tool as it was written, or with where its program waits, is the request's fault: found before anything is asked.)
-    let read: ReturnType<typeof toolsOf>;
-    try {
-      read = toolsOf(tools!);
-    } catch (err) {
-      throw new BadRequest(`Invalid field: tools (${messageOf(err)})`);
-    }
-    let way: ReturnType<typeof asks.open>;
-    try {
-      way = asks.open(toolsId, read.declared, call.tool);
-    } catch (err) {
-      throw new BadRequest(messageOf(err));
-    }
+    const read = asGiven(() => toolsOf(tools!), why => `Invalid field: tools (${why})`);
+    const way = asGiven(() => asks.open(toolsId, read.declared, call.tool));
     try {
       return await serve(read.names, way.tools);
     } finally {
@@ -296,12 +301,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
       { of: "string", key: "string", text: "optional string", images: "optional any", error: "optional string" },
       (b) => {
         if ((b.text === undefined) === (b.error === undefined)) throw new BadRequest("A tool's answer is its text, or the error it failed with: one of the two");
-        let images: ReturnType<typeof imagesOf>;
-        try {
-          images = imagesOf(b.images);
-        } catch (err) {
-          throw new BadRequest(messageOf(err));
-        }
+        const images = asGiven(() => imagesOf(b.images));
         if (images && b.error !== undefined) throw new BadRequest("Invalid field: images (a tool that failed has its error, and no images)");
         asks.answered(b.of, b.key, b.error !== undefined ? { text: b.error, failed: true } : { text: b.text!, ...(images && { images }) });
       },
@@ -316,7 +316,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
     ),
     "/tools/fetch": route(
       { url: "string", method: "optional string", headers: "optional object", body: "optional string" },
-      b => tools.fetch(b.url, { method: b.method, headers: b.headers as Record<string, string> | undefined, body: b.body }),
+      b => tools.fetch(b.url, { method: b.method, headers: headersOf(b.headers), body: b.body }),
     ),
 
     "/ctx/log": route({ message: "string", data: "optional any" }, b => ctx.log(b.message, b.data)),
@@ -336,8 +336,8 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
         id: "optional string", label: "optional string", workspaceDir: "optional string", env: "optional object",
         budget: "optional object",
       },
-      async ({ id, env, budget, ...asked }, connectionClosed, { seq }) => {
-        const request: RunRequest = { ...asked, env: envOf(env), budget: budgetOf(budget) };
+      async ({ id, env, budget, timeout, maxRepairAttempts, ...asked }, connectionClosed, { seq }) => {
+        const request: RunRequest = { ...asked, timeout: timeoutOf(timeout), maxRepairAttempts: attemptsOf(maxRepairAttempts), env: envOf(env), budget: budgetOf(budget) };
         return lasting(id, connectionClosed, stop => run(request, stop, seq));
       },
     ),
@@ -354,8 +354,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
     // Stop a run asked for above, or a project being made. The call that asked
     // for it still gets its answer — a failed run, an error — once it is over.
     "/run/stop": route({ id: "string" }, b => {
-      if (b.id === "") throw new BadRequest("Invalid field: id (expected a non-empty string)");
-      const asked = runsAskedFor.get(b.id);
+      const asked = runsAskedFor.get(namedBy(b.id));
       if (asked) asked.abort();
       else {
         if (stoppedAhead.size >= MAX_STOPPED_AHEAD && !stoppedAhead.has(b.id)) {
@@ -391,7 +390,10 @@ export function createIPCServer(backends: IpcBackends): Server {
       res.end(body);
     };
 
-    if (req.method !== "POST") return reply(405, "Method not allowed");
+    if (req.method !== "POST") {
+      req.resume(); // discard the body
+      return reply(405, "Method not allowed");
+    }
     if (!isAuthorized(req.headers.authorization, backends.token)) {
       req.resume(); // discard the body
       return reply(401, "Missing or invalid IPC token");

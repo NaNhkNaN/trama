@@ -835,6 +835,40 @@ test("createProject rejects duplicate project names", async (t) => {
   }
 });
 
+test("a project's name is one line of text: what would break a line is no name", () => {
+  for (const name of ["two\nlines", "tab\there", "bell\x07", "gone\x7f", "nul\0"]) assert.throws(() => validateProjectName(name), /Invalid project name/, JSON.stringify(name));
+  for (const name of ["plain", "with space", "dotted.name", "-dashed", "ünïcödé"]) validateProjectName(name);
+});
+
+test("a project is what can be run by its name: listed where it is reached through a link, and not found where the name is a file's", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const elsewhere = makeTempDir("trama-elsewhere-");
+  t.after(() => { cleanupTempDir(fakeHome); cleanupTempDir(elsewhere); });
+  const projects = join(fakeHome, ".trama", "projects");
+  mkdirSync(projects, { recursive: true });
+  createProjectFixture(join(elsewhere, "kept-elsewhere"), { scaffold: false });
+  symlinkSync(join(elsewhere, "kept-elsewhere"), join(projects, "linked"));
+  writeText(join(projects, "a-file"), "no project");
+
+  const { messages } = await withEnv({ HOME: fakeHome }, () => captureConsole("log", () => listProjects()));
+  assert.equal(messages.filter((line) => line.includes("linked")).length, 1, messages.join("\n"));
+  assert.equal(messages.some((line) => line.includes("a-file")), false);
+  await withEnv({ HOME: fakeHome }, async () => {
+    await assert.rejects(() => updateProject("a-file", "change it"), /Project "a-file" not found/);
+  });
+});
+
+test("createProject takes a model by its name: what is no text is refused before a project is made", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+  await withEnv({ HOME: fakeHome }, async () => {
+    for (const model of [7, { id: "m" }, ["m"], true]) {
+      await assert.rejects(() => createProject("typed", "p", { model }), /Invalid model: .*\. A model is named in text\./, JSON.stringify(model));
+      assert.equal(existsSync(join(fakeHome, ".trama", "projects", "typed")), false);
+    }
+  });
+});
+
 test("validateProjectName rejects empty, dot, and slash names", () => {
   assert.throws(() => validateProjectName(""), /Invalid project name/);
   assert.throws(() => validateProjectName("."), /Invalid project name/);

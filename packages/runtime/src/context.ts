@@ -1,10 +1,11 @@
-import { writeFileSync, appendFileSync } from "fs";
+import { appendFileSync } from "fs";
 import { join } from "path";
 import type { Ctx } from "./types.js";
 import type { ProgramResult } from "./runner-types.js";
 import { assertSerializable, isJsonObject } from "./serializable.js";
 import { guardPath } from "./path-guard.js";
 import { readProjectMeta } from "./meta.js";
+import { saveState } from "./project.js";
 
 /** Where a project's structured run log lives, relative to the project root. */
 export const LATEST_LOG_PATH = join("logs", "latest.jsonl");
@@ -112,7 +113,7 @@ export function createContext(
     const record: Record<string, unknown> = { ...state, __trama_iteration: iteration + 1 };
     if (ending?.status === "yielded") record.__trama_yield = { reason: ending.reason };
     else delete record.__trama_yield; // the program has moved on from its last yield
-    writeFileSync(statePath(), JSON.stringify(record, null, 2));
+    saveState(projectDir, record);
     // Settled only once persisted: a call that failed leaves every call open.
     iteration += 1;
     ended = ending ?? null;

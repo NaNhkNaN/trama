@@ -10,8 +10,8 @@
 // Nothing listens in the program, and what a tool was asked and answered is
 // seen where everything a program is told is seen.
 
-import type { OwnTool, ToolAnswer, ToolImage } from "./agent-backend.js";
-import { argumentsOf } from "./agent.js";
+import { IMAGE_KINDS, NOT_WAITED_FOR, type OwnTool, type ToolAnswer, type ToolImage } from "./agent-backend.js";
+import { argumentsOf } from "./schema.js";
 import { onAbort } from "./abort.js";
 import { messageOf } from "./errors.js";
 import { describeJson, isJsonObject } from "./serializable.js";
@@ -27,8 +27,7 @@ export type DeclaredTool = Omit<OwnTool, "run"> & { held(args: unknown): unknown
 const NAME = /^[A-Za-z0-9_-]{1,64}$/;
 const DECLARED = ["name", "description", "parameters", "parallel", "ends"];
 
-/** The kinds of image a model is shown. */
-const IMAGES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const IMAGES = new Set<string>(IMAGE_KINDS);
 
 /**
  * The images a tool answered with, as its program's client sent them: each
@@ -53,14 +52,17 @@ export function imagesOf(given: unknown): ToolImage[] | undefined {
  */
 export function toolsOf(tools: unknown[]): { names: string[]; declared: DeclaredTool[] } {
   const names: string[] = [], declared: DeclaredTool[] = [];
-  const taken = new Set<string>();
+  // A tool of the program's is nobody else's by its name: not another of the program's, and not one of the
+  // agent's that the call names. (A name of the agent's said twice is the agent's tool twice named, which is
+  // the backend's to read — as a list of names and nothing else is.)
+  const own = new Set<string>();
   const take = (name: string) => {
-    if (taken.has(name)) throw new Error(`Two tools are named ${JSON.stringify(name)}: a tool is called by its name`);
-    taken.add(name);
+    if (own.has(name) || names.includes(name)) throw new Error(`Two tools are named ${JSON.stringify(name)}: a tool is called by its name`);
+    own.add(name);
   };
   for (const tool of tools) {
     if (typeof tool === "string") {
-      take(tool);
+      if (own.has(tool)) throw new Error(`Two tools are named ${JSON.stringify(tool)}: a tool is called by its name`);
       names.push(tool);
       continue;
     }
@@ -116,8 +118,8 @@ export interface ToolAsks {
   answered(of: string, key: string, answer: ToolAnswer): void;
 }
 
-/** What a tool is taken to have said where it was not waited for: its call was to go no further. */
-const STOPPED: ToolAnswer = { text: "The call was stopped before the tool had answered.", failed: true };
+/** How many calls that are over are remembered as that. */
+const MAX_CLOSED = 1024;
 
 interface Way {
   /** What the program has not been told yet, and whoever of it is waiting to be told. */
@@ -132,6 +134,11 @@ interface Way {
 /** The tools of one program's agent calls: how each is asked, and how the program comes to hear of it. */
 export function createToolAsks(): ToolAsks {
   const ways = new Map<string, Way>();
+  /**
+   * The calls that are over, by their ids — the latest of them: whoever asks what is next of one is told
+   * that nothing is, and is not taken for one who asks ahead of a call to come.
+   */
+  const closed = new Set<string>();
   /** Whoever asked of a call that is not here yet: it and the asking were sent together, and either may be first. */
   const early = new Map<string, Set<() => void>>();
 
@@ -144,7 +151,7 @@ export function createToolAsks(): ToolAsks {
   return {
     open(of, declared, record) {
       if (of === "") throw new Error("Invalid field: toolsId (expected a non-empty string)");
-      if (ways.has(of)) throw new Error(`Duplicate toolsId: ${of}`);
+      if (ways.has(of) || closed.has(of)) throw new Error(`Duplicate toolsId: ${of}`);
       const way: Way = { events: [], waiting: [], pending: new Map(), uses: 0, closed: false };
       ways.set(of, way);
       for (const wake of early.get(of) ?? []) wake();
@@ -153,7 +160,7 @@ export function createToolAsks(): ToolAsks {
       const tools = declared.map(({ held, ...tool }): OwnTool => ({
         ...tool,
         run: (given, id, signal) => new Promise<ToolAnswer>((resolve) => {
-          if (way.closed || signal?.aborted) return resolve(STOPPED);
+          if (way.closed || signal?.aborted) return resolve(NOT_WAITED_FOR);
           // A backend holds a model's call to the tool's parameters before it asks; what asks here may be
           // somebody else's word of what a backend said (a process that serves the call, with other code in it).
           // The program is asked with what its tool declared, or not at all.
@@ -171,11 +178,12 @@ export function createToolAsks(): ToolAsks {
             way.pending.delete(key);
             off();
             if (answer) answered(answer);
-            resolve(answer ?? STOPPED);
+            resolve(answer ?? NOT_WAITED_FOR);
           });
           off = onAbort(signal, () => {
-            if (!way.pending.has(key)) return;
-            way.pending.get(key)!(null);
+            const waiting = way.pending.get(key);
+            if (!waiting) return;
+            waiting(null);
             tell(way, { stop: key });
           });
           tell(way, { key, name: tool.name, args });
@@ -185,15 +193,20 @@ export function createToolAsks(): ToolAsks {
       return {
         tools,
         close() {
-          // (A use that is still waiting for the program is waited for by nobody: its call is over.)
+          // (A use that is still waiting for the program is waited for by nobody: its call is over. It has
+          // the answer of one that was not waited for, and none on record.)
           way.closed = true;
           ways.delete(of);
+          if (closed.size >= MAX_CLOSED) closed.delete(closed.values().next().value!);
+          closed.add(of);
+          for (const settle of [...way.pending.values()]) settle(null);
           for (const waiting of way.waiting.splice(0)) waiting(null);
         },
       };
     },
 
     async next(of, gone) {
+      if (closed.has(of)) return null;
       if (!ways.has(of)) {
         const opened = await new Promise<boolean>((resolve) => {
           const wake = () => resolve(true);

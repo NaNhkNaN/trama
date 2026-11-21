@@ -26,7 +26,7 @@ import { declaredUsage, type AgentUsage, type ToolAnswer } from "./agent-backend
 export const JOURNAL_VERSION = 1;
 
 /** Where a project keeps its journals, relative to the project — under logs/, which trama keeps out of version control. */
-export const JOURNAL_DIR = join("logs", "journal");
+const JOURNAL_DIR = join("logs", "journal");
 
 /** The shape of a run's id: ISO timestamp (with dashes) followed by 6 hex digits. */
 const RUN_ID = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{6}$/;
@@ -45,7 +45,10 @@ export function journalDirOf(projectDir: string): string {
 }
 
 /** The journal of a run, in a journal directory. */
-export const journalIn = (dir: string, run: string) => join(dir, `${run}.jsonl`);
+const EXT = ".jsonl";
+export const journalIn = (dir: string, run: string) => join(dir, `${run}${EXT}`);
+/** The run a file of a journal directory is named for: none, where it is not named as a journal is. */
+const runNamed = (name: string): string => (name.endsWith(EXT) ? name.slice(0, -EXT.length) : "");
 
 /** How a journal begins: the record of its run, which names the run and the process that writes it. */
 const FIRST_RECORD = /^\{"at":\d+,"kind":"run","v":\d+,"run":"([^"]+)","pid":(\d+)[,}]/;
@@ -104,7 +107,7 @@ function inJournal<T>(path: string, run: string | undefined, look: (journal: { w
  * at its name: it can be listed and removed in its turn, and cannot be copied.
  */
 function isJournal(dir: string, name: string): boolean {
-  const run = name.endsWith(".jsonl") ? name.slice(0, -".jsonl".length) : "";
+  const run = runNamed(name);
   if (!RUN_ID.test(run)) return false;
   try {
     return inJournal(join(dir, name), run, () => true) === true;
@@ -126,7 +129,7 @@ export function runsIn(dir: string): string[] {
   // A journal is a file. Anything else that bears a journal's name — a directory, a link, a pipe,
   // which would hold up whoever opened it — is not one; nor is a file somebody else put there.
   return entries.filter((entry) => entry.isFile() && isJournal(dir, entry.name))
-    .map((entry) => entry.name.slice(0, -".jsonl".length)).sort();
+    .map((entry) => runNamed(entry.name)).sort();
 }
 
 /**
@@ -331,13 +334,13 @@ export interface Journal {
   close(): void;
 }
 
-/** A journal that records nothing. Calls are still numbered, so the rest of the runner need not care. */
 /** What is written down of a call that is not on record: nothing. */
 const UNRECORDED: Omit<RecordedCall, "seq"> = { end() {}, used() {}, tool: () => () => {} };
 
 /** A call that is nobody's to look up: what carries other calls rather than being one (see ipc-server). */
 export const OFF_THE_RECORD: RecordedCall = { seq: 0, ...UNRECORDED };
 
+/** A journal that records nothing. Calls are still numbered, so the rest of the runner need not care. */
 function noJournal(): Journal {
   let seq = 0;
   return { run: "", path: "", note() {}, used() {}, call: () => ({ seq: ++seq, ...UNRECORDED }), close() {} };

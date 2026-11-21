@@ -11,10 +11,12 @@ import type { AgentUsage } from "./agent-backend.js";
 import { createMeter } from "./budget.js";
 import { LATEST_LOG_PATH } from "./context.js";
 import { readProjectMeta } from "./meta.js";
+import { ensureProjectScaffold, loadConfig, loadProjectConfig, loadState } from "./project.js";
+import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import {
-  loadConfig, loadProjectConfig, loadState, createBackend, validateProgram, installValidatedProgram,
-  withTempDir, prepareProject, shownPaths, type Prepared, ensureProjectScaffold, RUNTIME_TYPES, runProgram as runHere, whyNotReplaceable,
-  tagged, saysOnce, type AskedToMake, type Making,
+  validateProgram, installValidatedProgram,
+  withTempDir, prepareProject, shownPaths, type Prepared, RUNTIME_TYPES, runProgram as runHere, whyNotReplaceable,
+  tagged, type AskedToMake, type Making,
 } from "./runner.js";
 import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspace.js";
 import { parentBridge, remoteWorkspace, withOptions, type Bridge } from "./bridge-client.js";
@@ -23,6 +25,7 @@ import { printJournals, spentIn } from "./journal-view.js";
 import { messageOf } from "./errors.js";
 
 export type { Budget, ProgramResult, RunOptions } from "./runner-types.js";
+export { failureOf } from "./runner.js";
 import type { ProgramResult, RunOptions, TramaConfig } from "./runner-types.js";
 export type { Workspace, ObserveResult } from "./types.js";
 import type { Workspace } from "./types.js";
@@ -187,15 +190,19 @@ function projectsDir(): string {
 }
 
 export function validateProjectName(name: string): void {
-  if (!name || /[\/\\]/.test(name) || name === "." || name === "..") {
-    throw new Error(`Invalid project name: "${name}". Must be a simple directory name without path separators.`);
+  // (One line of text, too: a name is shown, in a line of its own making, wherever its project is spoken of.)
+  if (!name || /[\/\\\x00-\x1f\x7f]/.test(name) || name === "." || name === "..") {
+    throw new Error(`Invalid project name: ${JSON.stringify(name)}. Must be a simple directory name without path separators.`);
   }
 }
+
+/** Whether a project is at a path: a directory, reached however the path reaches it. */
+const isProject = (dir: string): boolean => statSync(dir, { throwIfNoEntry: false })?.isDirectory() === true;
 
 export function resolveProject(name: string): string {
   validateProjectName(name);
   const dir = join(projectsDir(), name);
-  if (!existsSync(dir)) {
+  if (!isProject(dir)) {
     throw new Error(`Project "${name}" not found. Run \`trama list\` to see available projects.`);
   }
   return dir;
@@ -211,7 +218,7 @@ export function resolveProject(name: string): string {
  * program that does nothing.
  */
 async function generateProgram(
-  backend: ReturnType<typeof createBackend>, prepared: Prepared, prompt: string, system: string, wrote: AgentUsage[], signal?: AbortSignal,
+  backend: Backend, prepared: Prepared, prompt: string, system: string, wrote: AgentUsage[], signal?: AbortSignal,
   label?: string,
 ): Promise<string> {
   let reply: string;
@@ -257,22 +264,22 @@ function backendFor(config: TramaConfig, asked: Asked) {
 
 /** Carry what the agent made beside a program into the project the program is now in, and say what that was. */
 function keepPrepared(prepared: Prepared, label?: string): void {
-  const console = shownUnder(label);
+  const say = shownUnder(label);
   let kept: ReturnType<Prepared["keep"]>;
   try {
     kept = prepared.keep();
   } catch (err) {
     // The program is in the project. That what was made beside it cannot be carried over is said, and does not undo that.
-    console.warn(`[trama] what was made beside the program, while it was written, could not be carried into the project: ${messageOf(err)}`);
+    say.warn(`[trama] what was made beside the program, while it was written, could not be carried into the project: ${messageOf(err)}`);
     return;
   }
   const { changed, unmerged } = kept;
   if (changed.length > 0) {
-    console.log(`[trama] ${changed.length} path(s) made or changed beside the program, while it was written: ${shownPaths(changed)}`);
+    say.log(`[trama] ${changed.length} path(s) made or changed beside the program, while it was written: ${shownPaths(changed)}`);
   }
   if (unmerged.length > 0) {
-    console.warn(`[trama] ${unmerged.length} thing(s) done while the program was written did not reach the project:`);
-    for (const { path, why } of unmerged) console.warn(`[trama]   ${path} — ${why}`);
+    say.warn(`[trama] ${unmerged.length} thing(s) done while the program was written did not reach the project:`);
+    for (const { path, why } of unmerged) say.warn(`[trama]   ${path} — ${why}`);
   }
 }
 
@@ -286,7 +293,7 @@ function keepPrepared(prepared: Prepared, label?: string): void {
  * (see validateProgram).
  */
 async function validateCandidate(
-  projectDir: string, backend: ReturnType<typeof createBackend>, candidate: string, config: TramaConfig, prepared: Prepared,
+  projectDir: string, backend: Backend, candidate: string, config: TramaConfig, prepared: Prepared,
   wrote: AgentUsage[], signal: AbortSignal | undefined, asked: Asked,
 ): Promise<{ validated: Awaited<ReturnType<typeof validateProgram>>; kept: boolean }> {
   let as: string | undefined, alone: string | undefined;
@@ -321,6 +328,47 @@ const shownUnder = (label: string | undefined) => ({
   warn: (line: string) => console.warn(tagged(label, line)),
 });
 
+/**
+ * How a project comes by a program that was asked for — a new project's
+ * first, or one in the place of another: written off to the side, in a copy
+ * of the project; validated; and only then made the project's, with what
+ * the agent made beside it where that is kept. The project is written to
+ * once there is a program that works. (`written`: told of the candidate
+ * before it is validated, for whoever has a use for one that may yet fail.)
+ */
+async function writeValidateInstall(projectDir: string, how: {
+  reason: "create" | "update";
+  /** What was asked for, as it is kept on record with the version. */
+  prompt: string;
+  /** What the agent is asked, and what it is told beside. */
+  ask: string;
+  system: string;
+  /** What is said as the validation begins. */
+  validating: string;
+  config: TramaConfig;
+  backend: Backend;
+  /** Throws where the project is no longer the directory it was (see sameProjectAs). */
+  stillTheProject: () => void;
+  signal?: AbortSignal;
+  asked: Asked;
+  written?: (candidate: string) => void;
+}): Promise<void> {
+  const { config, backend, stillTheProject, signal, asked } = how;
+  const wrote: AgentUsage[] = [];
+  await withTempDir("trama-gen-", async (privateDir) => {
+    const prepared = prepareProject(projectDir, privateDir);
+    const candidate = await generateProgram(backend, prepared, how.ask, how.system, wrote, signal, asked.label);
+    stillTheProject();
+    how.written?.(candidate);
+
+    shownUnder(asked.label).log(how.validating);
+    const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, signal, asked);
+    stillTheProject();
+    installValidatedProgram(projectDir, validated, how.reason, how.prompt);
+    if (kept) keepPrepared(prepared, asked.label);
+  });
+}
+
 // --- Public API ---
 
 /** Generate a program for a new project from a prompt, validate it, and make it the project's. */
@@ -353,8 +401,12 @@ async function createHere(
   options?: { model?: string; args?: Record<string, unknown>; signal?: AbortSignal },
   asked: Asked = {},
 ): Promise<void> {
-  const console = shownUnder(asked.label);
+  const say = shownUnder(asked.label);
   validateProjectName(name);
+  // (Asked before a project is made: what is no name of a model would be written down as the project's, and no run of it could read that.)
+  if (options?.model !== undefined && typeof options.model !== "string") {
+    throw new Error(`Invalid model: ${JSON.stringify(options.model)}. A model is named in text.`);
+  }
   throwIfAborted(options?.signal);
   const projectDir = join(projectsDir(), name);
   let keepProjectOnFailure = false;
@@ -384,38 +436,29 @@ async function createHere(
       model: config.model,
       provider: config.provider,
     };
-    writeFileSync(join(projectDir, "meta.json"), JSON.stringify(meta, null, 2));
+    writeFileSync(guardPath(projectDir, "meta.json"), JSON.stringify(meta, null, 2));
 
     const backend = backendFor(config, asked);
-    const wrote: AgentUsage[] = [];
 
-    console.log(`Generating program for "${name}"...`);
+    say.log(`Generating program for "${name}"...`);
     // (What the agent is given to look at is the project made here, and no other directory that is at its path by now.)
     stillTheProject();
-    await withTempDir("trama-gen-", async (privateDir) => {
-      const prepared = prepareProject(projectDir, privateDir);
-      const candidate = await generateProgram(backend, prepared,
-        `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation.`,
-        getSystemPrompt(config.agentChanges === "keep"),
-        wrote,
-        options?.signal,
-        asked.label,
-      );
-      stillTheProject();
-
+    await writeValidateInstall(projectDir, {
+      reason: "create",
+      prompt,
+      ask: `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation.`,
+      system: getSystemPrompt(config.agentChanges === "keep"),
+      validating: "Validating program...",
+      config, backend, stillTheProject, signal: options?.signal, asked,
       // From here on the project is kept even if validation fails, so the
       // generated program can be inspected and fixed by hand.
-      writeFileSync(guardPath(projectDir, "program.ts"), candidate);
-      keepProjectOnFailure = true;
-
-      console.log("Validating program...");
-      const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, options?.signal, asked);
-      stillTheProject();
-      installValidatedProgram(projectDir, validated, "create", prompt);
-      if (kept) keepPrepared(prepared, asked.label);
+      written: (candidate) => {
+        writeFileSync(guardPath(projectDir, "program.ts"), candidate);
+        keepProjectOnFailure = true;
+      },
     });
 
-    console.log(`Created ${name}. Run with: trama run ${name}`);
+    say.log(`Created ${name}. Run with: trama run ${name}`);
   } catch (err) {
     if (!keepProjectOnFailure && identityOf(projectDir) === made) {
       rmSync(projectDir, { recursive: true, force: true });
@@ -430,7 +473,7 @@ async function updateHere(
   options?: { signal?: AbortSignal },
   asked: Asked = {},
 ): Promise<void> {
-  const console = shownUnder(asked.label);
+  const say = shownUnder(asked.label);
   const projectDir = resolveProject(name);
   const unchanged = (why: unknown) =>
     new Error(`Update failed — the program is unchanged.\n${messageOf(why)}`);
@@ -453,7 +496,6 @@ async function updateHere(
     const meta = readProjectMeta(projectDir);
     const config = loadProjectConfig(projectDir, meta);
     const backend = backendFor(config, asked);
-    const wrote: AgentUsage[] = [];
 
     const systemPrompt =
       getSystemPrompt(config.agentChanges === "keep") +
@@ -461,29 +503,20 @@ async function updateHere(
       `\n\nCurrent program.ts:\n${originalSource}` +
       (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : "");
 
-    console.log(`Updating "${name}"...`);
-    await withTempDir("trama-gen-", async (privateDir) => {
-      const prepared = prepareProject(projectDir, privateDir);
-      const candidate = await generateProgram(backend, prepared,
-        `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
-        systemPrompt,
-        wrote,
-        options?.signal,
-        asked.label,
-      );
-      stillTheProject();
-
-      console.log("Validating updated program...");
-      const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, options?.signal, asked);
-      stillTheProject();
-      installValidatedProgram(projectDir, validated, "update", prompt);
-      if (kept) keepPrepared(prepared, asked.label);
+    say.log(`Updating "${name}"...`);
+    await writeValidateInstall(projectDir, {
+      reason: "update",
+      prompt,
+      ask: `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
+      system: systemPrompt,
+      validating: "Validating updated program...",
+      config, backend, stillTheProject, signal: options?.signal, asked,
     });
   } catch (err) {
     throw unchanged(err);
   }
 
-  console.log(`Updated ${name}. Run with: trama run ${name}`);
+  say.log(`Updated ${name}. Run with: trama run ${name}`);
 }
 
 export async function listProjects(): Promise<void> {
@@ -493,8 +526,9 @@ export async function listProjects(): Promise<void> {
     return;
   }
 
+  // (What can be run by its name is listed by it: a project reached through a link among them.)
   const entries = readdirSync(dir, { withFileTypes: true })
-    .filter(e => e.isDirectory());
+    .filter(e => isProject(join(dir, e.name)));
 
   if (entries.length === 0) {
     console.log("No projects found.");

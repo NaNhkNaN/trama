@@ -8,20 +8,70 @@ import { isStagedName, stageFile } from "./replace-file.js";
 const OBSERVE_POLL_MS = 250;
 
 /**
- * Compile a simple glob pattern for matching relative paths: `*` is any run
- * of characters within a segment, `?` one of them, `**` any run of characters
+ * Read a simple glob pattern for matching relative paths: `*` is any run of
+ * characters within a segment, `?` one of them, `**` any run of characters
  * at all, and `**` with its slash any number of whole segments, none included
  * (so `**` + `/*.md` matches at the root too). Every other character is itself.
  *
- * The pattern is taken apart at its operators and each piece between them
- * escaped whole — nothing is put into the pattern on the way, so there is no
- * text a pattern could hold that is mistaken for an operator.
+ * The pattern is taken apart at its operators, and each piece between them
+ * is itself, character for character — there is no text a pattern could
+ * hold that is mistaken for an operator.
+ *
+ * A path is held against it step by step, and no step is taken twice: where
+ * the pattern is at a given place and the path at a given place, whether the
+ * rest matches is found once. (A pattern handed to the system's own matcher
+ * of expressions is tried every way round instead, and one that says "any
+ * segments" a dozen times is not done with a path of some depth in any time
+ * a caller would wait — which, here, is everyone the runner serves.)
  */
-function compileGlob(pattern: string): RegExp {
-  const literal = (text: string) => text.replace(/[.+^${}()|[\]\\]/g, "\\$&");
-  const within = (segment: string) => segment.split("?").map((part) => part.split("*").map(literal).join("[^/]*")).join("[^/]");
-  const regex = pattern.split("**/").map((part) => part.split("**").map(within).join(".*")).join("(?:.+/)?");
-  return new RegExp(`^${regex}$`);
+export function compileGlob(pattern: string): { test(path: string): boolean } {
+  type Step = { one: string } | "one of a segment" | "some of a segment" | "anything" | "whole segments";
+  const steps: Step[] = [];
+  pattern.split("**/").forEach((part, whole) => {
+    if (whole > 0) steps.push("whole segments");
+    part.split("**").forEach((within, any) => {
+      if (any > 0) steps.push("anything");
+      within.split("?").forEach((run, one) => {
+        if (one > 0) steps.push("one of a segment");
+        run.split("*").forEach((text, some) => {
+          if (some > 0) steps.push("some of a segment");
+          // (Unit by unit, as text is counted: one `?` is one of them, as it was to the matcher before this.)
+          for (let at = 0; at < text.length; at += 1) steps.push({ one: text[at] });
+        });
+      });
+    });
+  });
+  return {
+    test(characters) {
+      /** Whether the rest matches, from a step of the pattern and a place in the path: found once. */
+      const found = new Map<number, boolean>();
+      const rest = (step: number, at: number): boolean => {
+        if (step === steps.length) return at === characters.length;
+        const key = step * (characters.length + 1) + at;
+        const known = found.get(key);
+        if (known !== undefined) return known;
+        const is = steps[step];
+        let matches = false;
+        if (typeof is === "object") matches = characters[at] === is.one && rest(step + 1, at + 1);
+        else if (is === "one of a segment") matches = at < characters.length && characters[at] !== "/" && rest(step + 1, at + 1);
+        else if (is === "some of a segment") {
+          for (let to = at; !matches; to += 1) {
+            matches = rest(step + 1, to);
+            if (to >= characters.length || characters[to] === "/") break;
+          }
+        } else if (is === "anything") {
+          for (let to = at; to <= characters.length && !matches; to += 1) matches = rest(step + 1, to);
+        } else {
+          // None — or what ends in a slash and has something before it.
+          matches = rest(step + 1, at);
+          for (let to = at + 2; to <= characters.length && !matches; to += 1) matches = characters[to - 1] === "/" && rest(step + 1, to);
+        }
+        found.set(key, matches);
+        return matches;
+      };
+      return rest(0, 0);
+    },
+  };
 }
 
 /**
@@ -77,6 +127,8 @@ function listFiles(dir: string, root: string, found: string[], byLink = false): 
   }
 }
 
+const observeAborted = () => new Error("workspace.observe() aborted");
+
 /** Resolve after `ms`, or reject as soon as `signal` aborts. */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise<void>((resolve, reject) => {
@@ -86,7 +138,7 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     }, ms);
     const offAbort = onAbort(signal, () => {
       clearTimeout(timer);
-      reject(new Error("workspace.observe() aborted"));
+      reject(observeAborted());
     });
   });
 }
@@ -178,7 +230,7 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
       // Level-triggered: artifacts that already exist count immediately.
       const startTime = performance.now();
       while (true) {
-        if (signal?.aborted) throw new Error("workspace.observe() aborted");
+        if (signal?.aborted) throw observeAborted();
         if (single && isDirectory()) {
           throw Object.assign(new Error(`EISDIR: illegal operation on a directory, read '${pattern}'`), { code: "EISDIR" });
         }

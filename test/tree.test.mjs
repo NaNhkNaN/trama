@@ -17,11 +17,12 @@ import { execFileSync } from "child_process";
 import { tmpdir } from "os";
 import { basename, dirname, join, resolve } from "path";
 import * as tree from "../packages/runtime/dist/tree.js";
+import { mergeTree } from "../packages/runtime/dist/merge.js";
 import { identityOf } from "../packages/runtime/dist/path-guard.js";
 
 const asRoot = process.getuid?.() === 0; // root may do what permissions forbid: nothing below would be refused
 
-const { entryAt, mergeTree } = tree;
+const { entryAt } = tree;
 /**
  * A change is told from none by the time the system records for it, and that
  * is as fine as the system's clock for it: Linux before 6.13 moves it once a

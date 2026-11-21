@@ -17,7 +17,7 @@ import { CutOff, type AgentCall, type AgentUsage, type OwnTool, type ToolAnswer 
 import type { ModelConfig } from "./runner-types.js";
 import { messageOf } from "./errors.js";
 import { createModelRelay, relayClient, relayServer, withRepliesWhole, type RelayAnswered, type RelayAsked } from "./model-relay.js";
-import { groupsUnder, signalGroup } from "./stopping.js";
+import { groupsUnder, stopGroups } from "./stopping.js";
 
 /**
  * What a call is made of that can be sent: all of it but where to say what
@@ -39,9 +39,9 @@ export interface ToolAsked { key: string; name: string; id: string; args: unknow
  * what a tool of the caller's own answered, that the call's model had called.
  */
 export type ToHost =
-  | { ask: { config: ModelConfig; prompt: string; call: SentCall } }
-  | { go: boolean }
-  | { abort: true }
+  | { ask: { id: number; config: ModelConfig; prompt: string; call: SentCall } }
+  | { go: boolean; of: number }
+  | { abort: true; of: number }
   | { tooled: { key: string; answer: ToolAnswer } }
   | RelayAnswered
   | RelayAsked;
@@ -58,9 +58,21 @@ export type ToHost =
  * model has called a tool of the caller's own — which is the runner's to
  * have run. (That such a use is to go no further is not said: it is when the
  * call is cancelled, or over, and the runner knows of both.)
+ *
+ * What is said of a call is said with the call's number (`of`), as the
+ * runner gave it — what the call would have a model asked too. A host
+ * serves one call after another, and what it says while nobody listens
+ * waits on the channel for whoever listens next: a word that comes late, or
+ * was not the host's at all, is not to be the next call's.
  */
 export type FromHost =
   | { ready: true }
+  | OfCall
+  | (RelayAsked & { of?: number })
+  | RelayAnswered;
+
+/** What a host says of the call it is serving. */
+export type OfCall = { of: number } & (
   | { sofar: AgentUsage; answered?: true }
   | { had: AgentUsage }
   | { used: AgentUsage }
@@ -68,14 +80,15 @@ export type FromHost =
   | { cutOff: string }
   | { error: string }
   | { tool: ToolAsked }
-  | RelayAsked
-  | RelayAnswered;
+);
 
 const say = (message: FromHost): void => {
   // (A runner that is gone is told nothing: this process is on its way out with it.)
   if (process.connected) process.send?.(message);
 };
 
+/** The call being served, by the number its runner gave it — none, while this process is free. */
+let serving: number | undefined;
 /** Cancels the call being served. */
 let cancel: AbortController | undefined;
 /**
@@ -88,8 +101,8 @@ const answered = (go: boolean) => {
   goOn?.(go);
   goOn = undefined;
 };
-/** The end that asks, of what the call being served has its model asked by: this process's runner. */
-const asks = relayClient(say);
+/** The end that asks, of what the call being served has its model asked by: this process's runner — told which call it is for. */
+const asks = relayClient((asked) => say(serving === undefined ? asked : { ...asked, of: serving }));
 /** The end that answers, where this process is one that asks models for the calls of others: with its own pi, and the keys it was started with. */
 let answers: ReturnType<typeof relayServer> | undefined;
 /** The uses of the caller's own tools that the call being served waits for, each by its key. */
@@ -101,12 +114,12 @@ let used = 0;
  * is not waited for by whoever asked it here — see asPisTool — and its
  * answer, should one come, is nobody's.)
  */
-const askedOfRunner = (tool: Omit<OwnTool, "run">): OwnTool => ({
+const askedOfRunner = (of: number) => (tool: Omit<OwnTool, "run">): OwnTool => ({
   ...tool,
   run: (args, id) => new Promise<ToolAnswer>((resolve) => {
     const key = String(++used);
     uses.set(key, resolve);
-    say({ tool: { key, name: tool.name, id, args } });
+    say({ of, tool: { key, name: tool.name, id, args } });
   }),
 });
 
@@ -114,8 +127,10 @@ const askedOfRunner = (tool: Omit<OwnTool, "run">): OwnTool => ({
 let leaving = false;
 
 process.on("message", (message: ToHost) => {
-  if ("go" in message) return answered(message.go);
+  // (What is said of a call that is not the one being served — it is over here, and its runner had not heard — is said of nothing.)
+  if ("go" in message) return message.of === serving ? answered(message.go) : undefined;
   if ("abort" in message) {
+    if (message.of !== serving) return;
     cancel?.abort();
     return answered(false);
   }
@@ -128,46 +143,58 @@ process.on("message", (message: ToHost) => {
   if ("relay" in message || "relayAbort" in message) return (answers ??= relayServer(createModelRelay(), say)).heard(message);
   // (A process that has been told to end serves nothing more: whoever asked hears that it ended.)
   if (leaving) return;
-  const { config, prompt, call } = message.ask;
-  const serving = cancel = new AbortController();
+  // A runner asks a host that is free, and a host is free when it has said how its call ended. Asked while it is
+  // at a call's work still, something else in this process said that for it — an extension, which has the same
+  // channel: this is no process to serve a call by, and it ends. (Whoever asked hears that it did.)
+  if (serving !== undefined) return leave();
+  const { id: of, config, prompt, call } = message.ask;
+  const stop = cancel = new AbortController();
+  serving = of;
+  goOn = undefined;
   uses.clear();
+  /** The call is over here: how it ended is said, and this process is free. */
+  const over = (how: { answer: string } | { cutOff: string } | { error: string }) => {
+    serving = undefined;
+    if (!leaving) say({ of, ...how });
+  };
   new PiAdapter(config).serve(prompt, {
     ...call,
-    ownTools: call.ownTools?.map(askedOfRunner),
-    signal: serving.signal,
-    used: (usage) => say({ used: usage }),
-    had: (usage) => say({ had: usage }),
+    ownTools: call.ownTools?.map(askedOfRunner(of)),
+    signal: stop.signal,
+    used: (usage) => say({ of, used: usage }),
+    had: (usage) => say({ of, had: usage }),
     relay: withRepliesWhole(asks.relay),
     sofar: (usage, has) => new Promise<boolean>((resolve) => {
       goOn = resolve;
-      say({ sofar: usage, ...(has && { answered: true }) });
+      say({ of, sofar: usage, ...(has && { answered: true }) });
     }),
   }).then(
-    (answer) => { if (!leaving) say({ answer }); },
-    (err) => { if (!leaving) say(err instanceof CutOff ? { cutOff: err.text } : { error: messageOf(err) }); },
+    (answer) => over({ answer }),
+    (err) => over(err instanceof CutOff ? { cutOff: err.text } : { error: messageOf(err) }),
   );
 });
 
 // The runner is gone, or has no more use for this process — it says so, or its watchdog does, by asking
 // this process to end: there is nothing left to serve. What this process has under it in groups of their
 // own — an MCP server, what an agent was running — goes first: nobody else knows of it, once this process
-// is gone. (This process's own group is its runner's to end, or the watchdog's; and a process that cannot
+// is gone. It is stopped as anything is: asked, given its time, and only then ended. (Whoever asked this
+// process to end may have asked those groups too, having looked for them first: such a group is asked twice.)
+// (This process's own group is its runner's to end, or the watchdog's; and a process that cannot
 // hear either is ended without being asked again, when the time anything asked to stop is given is up.)
 // And the call it is serving is stopped first, where it is: the system takes a moment to say what is
 // under this process, and in that moment the call is not to go on — to ask its model again, or to answer.
-const leave = (asked?: NodeJS.Signals) => {
+function leave(asked?: NodeJS.Signals): void {
   if (leaving) return;
   leaving = true;
   cancel?.abort();
   answered(false);
-  void groupsUnder(process.pid).then((groups) => {
-    for (const group of groups) signalGroup(group, "SIGKILL");
+  void groupsUnder(process.pid).then(stopGroups).then(() => {
     // (Asked to end, it ends as what was asked to: whoever waits for it is told how it went.)
     if (!asked) process.exit(0);
     process.removeAllListeners(asked);
     process.kill(process.pid, asked);
   });
-};
+}
 process.on("disconnect", () => leave());
 process.on("SIGTERM", leave);
 

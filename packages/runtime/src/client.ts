@@ -4,6 +4,8 @@
 
 import { randomUUID } from "crypto";
 import type { Ctx, Agent, AgentOptions, AgentTool, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace } from "./types.js";
+import type { ImageKind, ToolImage } from "./agent-backend.js";
+import type { ToolEvent } from "./own-tools.js";
 import { openBridge, remoteWorkspace, withOptions } from "./bridge-client.js";
 import { messageOf } from "./errors.js";
 import { assertSerializable, toLogData } from "./serializable.js";
@@ -63,7 +65,7 @@ export const ctx: Ctx = {
 };
 
 /** What kind of image bytes are, told by how they begin: of the kinds a model is shown. */
-function imageKind(bytes: Uint8Array): string | undefined {
+function imageKind(bytes: Uint8Array): ImageKind | undefined {
   const begins = (at: number, ...with_: number[]) => with_.every((byte, index) => bytes[at + index] === byte);
   if (begins(0, 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return "image/png";
   if (begins(0, 0xff, 0xd8, 0xff)) return "image/jpeg";
@@ -77,7 +79,7 @@ function imageKind(bytes: Uint8Array): string | undefined {
  * else as JSON says it. And bytes are an image to be seen — by themselves,
  * or in a list, where what is not bytes is words.
  */
-function said(result: unknown): { text: string; images?: Array<{ mimeType: string; data: string }> } {
+function said(result: unknown): { text: string; images?: ToolImage[] } {
   const words = (value: unknown): string => {
     if (typeof value === "string") return value;
     const json = JSON.stringify(value);
@@ -86,7 +88,7 @@ function said(result: unknown): { text: string; images?: Array<{ mimeType: strin
   };
   const parts = result instanceof Uint8Array ? [result] : Array.isArray(result) && result.some(part => part instanceof Uint8Array) ? result : undefined;
   if (!parts) return { text: result === undefined ? "Done." : words(result) };
-  const text: string[] = [], images: Array<{ mimeType: string; data: string }> = [];
+  const text: string[] = [], images: ToolImage[] = [];
   for (const part of parts) {
     if (!(part instanceof Uint8Array)) {
       text.push(words(part));
@@ -99,6 +101,9 @@ function said(result: unknown): { text: string; images?: Array<{ mimeType: strin
   return { text: text.join("\n"), images };
 }
 
+/** Whether a tool a call names is one of the program's own: written out, where the agent's are named. */
+const isOwn = (tool: unknown): tool is object => typeof tool === "object" && tool !== null;
+
 /**
  * Make an agent call. The tools of the program's own that it has are
  * functions, and stay here: the runner is sent what each declares, and where
@@ -108,12 +113,12 @@ function said(result: unknown): { text: string; images?: Array<{ mimeType: strin
  */
 async function agentCall(endpoint: string, body: unknown): Promise<any> {
   // (What is no call at all is the runner's to refuse, or the bridge's, as it is made.)
-  const tools = typeof body === "object" && body !== null ? (body as { tools?: unknown }).tools : undefined;
-  if (!Array.isArray(tools) || tools.every(tool => typeof tool !== "object" || tool === null)) return call(endpoint, body);
+  const tools = isOwn(body) ? (body as { tools?: unknown }).tools : undefined;
+  if (!Array.isArray(tools) || !tools.some(isOwn)) return call(endpoint, body);
 
   const own = new Map<string, AgentTool["run"]>();
   const declared = tools.map((tool: unknown) => {
-    if (typeof tool !== "object" || tool === null) return tool;
+    if (!isOwn(tool)) return tool;
     const { run, ...rest } = tool as Partial<AgentTool>;
     if (typeof run !== "function") {
       throw new TypeError(`the tool ${JSON.stringify(rest.name)} has no run: a tool of the program's own is a function of the program's`);
@@ -143,14 +148,18 @@ async function agentCall(endpoint: string, body: unknown): Promise<any> {
   };
 
   const waiting = (async () => {
+    // How long is waited before it is asked again where the asking failed: longer each time it fails again, and never long.
+    let pause = 50;
     while (!over.signal.aborted) {
-      let event: { key: string; name: string; args: unknown } | { stop: string } | null;
+      let event: ToolEvent | null;
       try {
         event = await call("/agent/tool/asked", { of: toolsId }, over.signal);
+        pause = 50;
       } catch {
         // Given up, the agent call being over. (Or not answered — which the agent call will say for itself: asked again meanwhile.)
         if (over.signal.aborted) return;
-        await new Promise(resolve => setTimeout(resolve, 50));
+        await new Promise(resolve => setTimeout(resolve, pause));
+        pause = Math.min(pause * 2, 1000);
         continue;
       }
       if (event === null) return;

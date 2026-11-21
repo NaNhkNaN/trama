@@ -6,7 +6,7 @@ import { execFileSync } from "child_process";
 import { guardPath } from "../packages/runtime/dist/path-guard.js";
 import { createTools } from "../packages/runtime/dist/tools.js";
 import { createWorkspace } from "../packages/runtime/dist/workspace.js";
-import { loadState, ensureProjectScaffold } from "../packages/runtime/dist/runner.js";
+import { loadState, ensureProjectScaffold } from "../packages/runtime/dist/project.js";
 import { createContext } from "../packages/runtime/dist/context.js";
 import { makeTempDir, cleanupTempDir, writeJson, writeText, createProjectFixture, REPO_ROOT } from "./helpers.mjs";
 

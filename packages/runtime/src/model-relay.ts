@@ -339,6 +339,8 @@ export function createModelRelay(): ModelRelay & { close(): Promise<void> } {
     async ask(request, signal) {
       let reply: AsyncIterable<unknown>;
       const stop = new AbortController();
+      // (Cancelled before it was asked: nothing is asked.)
+      if (signal?.aborted) return (async function* () { yield notAsked(request.model, "Aborted"); })();
       try {
         const found = await (models ??= loadPi().then(pi => pi.ModelRuntime.create()));
         const { provider, id } = request.model;
@@ -434,10 +436,11 @@ export function relayClient(send: (message: RelayAsked) => void): { relay: Model
         waiting.set(id, {
           heard(answer) {
             if ("event" in answer) return add(answer.event);
-            // (Not one the other end can serve: nothing was asked.)
+            // (Not one the other end can serve: nothing was asked. Said of a reply that had begun, it is the reply's end.)
+            if (begun) return add(notAsked(request.model, "The process that was asking the model ended the reply before it was whole.", "error"));
             off();
             waiting.delete(id);
-            if (!begun) resolve(undefined);
+            resolve(undefined);
           },
           end: () => add(notAsked(request.model, "The process that was asking the model ended before the reply had come.", "error")),
         });

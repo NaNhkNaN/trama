@@ -118,9 +118,12 @@ await ctx.done({
   kind: await said([tool({ parameters: { n: "integer" } })]),
   twice: await said([tool(), tool()]),
   named: await said(["mine", tool()]),
+  namedAfter: await said([tool(), "mine"]),
   neither: await said(["read", 7]),
   // A list of names and nothing else is as it always was: the backend's to read.
   names: await said(["read", "read"]),
+  // ...and so it is beside a tool of the program's: a name of the agent's said twice is no tool of the program's by another's name.
+  namesBeside: await said(["read", "read", tool()]),
   none: await said([]),
   // Where the program waits to be asked is the client's to say, and no option of a call.
   toolsId: await said(["read"], { toolsId: "x" }),
@@ -146,13 +149,45 @@ await ctx.done({
     kind: refused(`The tool "mine": Schema validation failed: unsupported schema type "integer" for key "n" (a list is written as the shape of its items, in brackets: ["string"]; an object as its fields: { name: "string" })`),
     twice: refused(`Two tools are named "mine": a tool is called by its name`),
     named: refused(`Two tools are named "mine": a tool is called by its name`),
+    namedAfter: refused(`Two tools are named "mine": a tool is called by its name`),
     neither: "trama runtime error: Invalid field: tools (expected strings or tools or undefined)",
     names: 'answered: [["read","read"],0]',
+    namesBeside: 'answered: [["read","read"],1]',
     none: "answered: [[],0]",
     toolsId: "trama runtime error: Invalid field: toolsId (the call has no tools of the program's own)",
     misspelt: "trama runtime error: Unknown field: tool (this call takes: prompt, system, model, thinking, tools, skills, extensions, cutOff, templates)",
   });
-  assert.equal(asked, 2);
+  assert.equal(asked, 3);
+});
+
+test("a use of a tool that is still waited for when its call is over has its answer, and whoever asks for more of that call is told there is none", async () => {
+  const { createToolAsks, toolsOf } = await import("../packages/runtime/dist/own-tools.js");
+  const asks = createToolAsks();
+  const never = new Promise(() => {});
+  const within = (what, ms = 300) => Promise.race([what, new Promise((resolve) => setTimeout(() => resolve("still waiting"), ms))]);
+  const recorded = [];
+  const way = asks.open("one", toolsOf([{ name: "slow", description: "Takes its time" }]).declared, (id, name) => { recorded.push(["asked", id, name]); return (answer) => recorded.push(["answered", id, answer.text]); });
+  const stop = new AbortController();
+  const using = way.tools[0].run({}, "use-1", stop.signal);
+  assert.deepEqual(await asks.next("one", never), { key: "1", name: "slow", args: {} });
+
+  // The call is over, the program not having said what the tool answered: the use is waited for by nobody.
+  way.close();
+  assert.deepEqual(await within(using), { text: "The call was stopped before the tool had answered.", failed: true });
+  // (It has no answer on record: none was given. And what stops it later — its call's signal — finds nothing to stop.)
+  assert.deepEqual(recorded, [["asked", "use-1", "slow"]]);
+  stop.abort();
+  // What the program says of it after is said to nobody, and whoever asks what is next of that call is told: nothing.
+  asks.answered("one", "1", { text: "late" });
+  assert.equal(await within(asks.next("one", never)), null);
+  // (A call that is not there yet is another matter: its asking may come first, and waits for it.)
+  const early = asks.next("two", never);
+  assert.equal(await within(early, 100), "still waiting");
+  const second = asks.open("two", [], () => () => {});
+  second.close();
+  assert.equal(await within(early), null);
+  // An id is one call's: it is not another's after.
+  assert.throws(() => asks.open("one", [], () => () => {}), /Duplicate toolsId: one/);
 });
 
 test("tools the model calls together are each the program's to answer, and a typed answer's call has them as any call has", async (t) => {

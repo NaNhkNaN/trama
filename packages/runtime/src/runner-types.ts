@@ -62,6 +62,15 @@ export interface RunOptions {
 /** A run as one program asks its runner for it: everything in RunOptions that can cross the bridge. */
 export type RunRequest = Omit<RunOptions, "signal">;
 
+/** A project a program asks its runner to make, or to change (see createProject and updateProject). */
+export interface MakeRequest {
+  kind: "create" | "update";
+  name: string;
+  prompt: string;
+  model?: string;
+  args?: Record<string, unknown>;
+}
+
 export interface TramaConfig extends ModelConfig {
   maxRepairAttempts: number;
   defaultTimeout: number;

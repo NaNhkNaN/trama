@@ -41,7 +41,7 @@ trama create research "break topic into sub-questions, create a trama sub-progra
 
 ```bash
 trama create <name> <prompt> [--model <model>] [--arg key=value ...]
-trama run <name> [--timeout <ms>] [--arg key=value ...]
+trama run <name> [--timeout <ms>] [--budget cap=number ...] [--arg key=value ...]
 trama update <name> <prompt>
 trama list
 trama logs <name>

@@ -63,6 +63,10 @@ export function atLeast(usage: AgentUsage | undefined, seen?: Tally): AgentUsage
 export const declaredUsage = ({ model, input, output, cacheRead, cacheWrite, cost }: AgentUsage): AgentUsage =>
   ({ model, input, output, cacheRead, cacheWrite, cost });
 
+/** The kinds of image a model is shown. */
+export const IMAGE_KINDS = ["image/png", "image/jpeg", "image/gif", "image/webp"] as const;
+export type ImageKind = (typeof IMAGE_KINDS)[number];
+
 /** An image, as it is handed about: what kind it is, and its bytes in base64. */
 export interface ToolImage {
   mimeType: string;
@@ -78,6 +82,9 @@ export interface ToolAnswer {
   images?: ToolImage[];
   failed?: boolean;
 }
+
+/** What a tool is taken to have said where it was not waited for: its call was to go no further. (Nobody reads it: the call is over.) */
+export const NOT_WAITED_FOR: ToolAnswer = { text: "The call was stopped before the tool had answered.", failed: true };
 
 /**
  * A tool that is not the backend's: whoever makes the call has it, and is

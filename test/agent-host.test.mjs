@@ -8,7 +8,8 @@ import { pathToFileURL } from "node:url";
 import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
 import { CutOff } from "../packages/runtime/dist/agent-backend.js";
 import { createMeter } from "../packages/runtime/dist/budget.js";
-import { createBackend, runProgram } from "../packages/runtime/dist/runner.js";
+import { runProgram } from "../packages/runtime/dist/runner.js";
+import { createBackend } from "../packages/runtime/dist/runner-backend.js";
 import { groupsUnder, processesOnFile } from "../packages/runtime/dist/stopping.js";
 import { EXTENSION, hostsHere, user } from "./pi-user.mjs";
 import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, waitFor, withEnv } from "./helpers.mjs";
@@ -705,4 +706,100 @@ process.exitCode = 7;
     assert.equal(said, "hello from the fake\nclosed\n");
     assert.equal(code, 7);
   }
+});
+
+test("a count on a host's channel that is no count is no word of a host's: what was seen of the call stands", async (t) => {
+  const it = await user(t);
+  // (A word is a call's by the call's number: the extension says its piece of every call there could be.)
+  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `pi.on("session_start", async () => {
+    const figures = (each) => ({ input: each, output: each, cacheRead: each, cacheWrite: each, cost: each });
+    const none = [figures("x"), figures(-1), figures([]), { ...figures(0), cost: "free" }, { ...figures(0), model: 7 }, { input: 1 }, {}];
+    for (let call = 1; call <= 50; call += 1) for (const usage of none) for (const kind of ["had", "sofar", "used"]) process.send?.({ of: call, [kind]: usage });
+    note("said its piece");
+  });`));
+  const said = [];
+  const hears = (kind) => (usage) => { said.push([kind, usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.cost]); };
+  assert.equal(await it.ask("say hello", { extensions: true, had: hears("had"), sofar: hears("sofar"), used: hears("used") }), "hello from the fake");
+  assert.equal(it.seen().at(-1)[1], "said its piece");
+  // Nothing that is no number, or less than nothing, was taken for what the call used — and what it used was said once, as it is.
+  assert.ok(said.length > 0 && said.every(([, ...figures]) => figures.every((figure) => Number.isFinite(figure) && figure >= 0)), JSON.stringify(said));
+  assert.deepEqual(said.filter(([kind]) => kind === "used").map(([, input, output]) => input + output), [1200]);
+});
+
+test("a word on a host's channel is a call's by the call's number — and a host that was answered for while at its work serves no call after", async (t) => {
+  const it = await user(t);
+  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `
+  const told = () => { try { return readFileSync(process.env.TRAMA_TEST_SEEN + ".mode", "utf-8"); } catch { return ""; } };
+  // An extension is in its host's process: it hears what the host is told, the number of its call with the rest.
+  // (It is loaded anew for every session: what it heard is kept where the next loading finds it.)
+  process.on("message", (word) => { if (word && word.ask) globalThis.callHeardOf = word.ask.id; });
+  pi.on("session_start", async () => {
+    // Of no call, and of calls there are none of.
+    for (const word of [{ answer: "of no call" }, { of: -1, answer: "of a call there is none of" }, { of: "1", answer: "of no number" }, { of: -1, error: "of a call there is none of" }, { cutOff: "of no call" }]) process.send?.(word);
+    // Of calls to come: said while nobody listens for them, it waits on the channel for whoever listens next.
+    for (let call = 2; call <= 9; call += 1) process.send?.({ of: call + 100, answer: "said before its call was made" });
+    if (told() === "answer for it") process.send?.({ of: globalThis.callHeardOf, answer: "an extension's answer" });
+  });`));
+  const tell = (how) => writeFileSync(join(it.agentDir, "seen.log.mode"), how);
+
+  // What names no call, or one there is none of, is nobody's: the call has its host's answer.
+  assert.equal(await it.ask("say hello", { extensions: true }), "hello from the fake");
+  const [host] = it.pids();
+
+  // An extension that answers for its host, by the call's own number, cannot be told from the host: it is in the
+  // host's process. Its answer is the call's — and the host is at the call's work still (the model it would ask
+  // by its runner is asked for no call that is over).
+  tell("answer for it");
+  const asked = it.requests.length;
+  assert.equal(await it.ask("say hello", { extensions: true }), "an extension's answer");
+  assert.deepEqual(it.pids(), [host]);
+  tell("");
+  // The next call finds it there: it is no host to be served by, and ends. That is one call's failure —
+  await assert.rejects(() => it.ask("say hello", { extensions: true }), /The agent's process ended before it had answered/);
+  await waitFor(() => !isAlive(host), "the host that was answered for to be gone");
+  assert.equal(it.requests.length, asked, "and what the call that was answered for would have asked its model was asked for no call");
+  // — and the call after has a host of its own.
+  assert.equal(await it.ask("say hello", { extensions: true }), "hello from the fake");
+  assert.notEqual(it.pids().at(-1), host);
+});
+
+test("what a host started in a group of its own is asked to stop, and given its time, when the host is ended", async (t) => {
+  const it = await user(t);
+  const words = join(it.agentDir, "last-words");
+  // Something that takes a moment over being asked to stop: it has things to put away.
+  const slow = `process.on("SIGTERM", () => setTimeout(() => { require("fs").writeFileSync(process.argv[1], "put away"); process.exit(0); }, 400)); setInterval(() => {}, 1000); require("fs").writeFileSync(process.argv[1] + ".up", "");`;
+  it.put(it.agentDir, "extensions/mine.ts", EXTENSION("mine", `pi.on("session_start", async () => {
+    const { spawn } = await import("node:child_process");
+    note("started " + spawn(process.execPath, ["-e", ${JSON.stringify(slow)}, ${JSON.stringify(words)}], { detached: true, stdio: "ignore" }).pid);
+  });`));
+  assert.equal(await it.ask("say hello", { extensions: true }), "hello from the fake");
+  const started = Number(it.seen().find(([, what]) => what.startsWith("started "))[1].slice(8));
+  await waitFor(() => existsSync(`${words}.up`), "what the extension started to be up");
+  await it.adapter.close();
+  assert.equal(isAlive(started), false, "it is gone when its host's backend says it is done with");
+  assert.equal(readFileSync(words, "utf-8"), "put away");
+});
+
+test("a call that cannot be sent to a host has failed as it is handed over, with that — and nothing is said of it after", async (t) => {
+  const it = await user(t);
+  const said = [];
+  // (A number no channel between processes carries.)
+  await assert.rejects(() => it.ask("say hello", { extensions: true, system: 10n, used: (usage) => said.push(usage) }), /^Error: The agent's process could not be asked: .*BigInt/);
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.deepEqual(said, []);
+  assert.equal(await it.ask("say hello", { extensions: true }), "hello from the fake");
+});
+
+test("whoever hears what a call used and throws has said nothing: it is not for a count to fail the call it is of", async (t) => {
+  const it = await user(t, (request, stream) => {
+    // A model that has the agent read a file before it answers: it is asked twice.
+    if (!request.messages.some((message) => message.role === "tool")) stream.calls("read", { path: "a.txt" });
+    else { stream.says({ role: "assistant", content: "hello from the fake" }); stream.says({}, "stop"); }
+    stream.done();
+  });
+  const heard = [];
+  const breaks = (kind) => (usage) => { heard.push([kind, usage.input + usage.output]); throw new Error(`the ${kind} count is broken`); };
+  assert.equal(await it.ask("read a.txt", { tools: ["read"], sofar: breaks("sofar"), had: breaks("had") }), "hello from the fake");
+  assert.deepEqual(heard, [["had", 1200], ["sofar", 1200], ["had", 2400]]);
+  assert.equal(it.requests.length, 2);
 });

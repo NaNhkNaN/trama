@@ -184,7 +184,6 @@ const processes = () => {
   }
 };
 const alive = (pgid) => signalGroup(pgid, 0);
-const signal = signalGroup;
 
 let unread = "";
 process.stdin.setEncoding("utf8");
@@ -211,7 +210,7 @@ const takeOver = () => {
   const rows = led.length > 0 ? processes() : [];
   const below = led.flatMap((pid) => groupsAmong(rows, pid, process.pid));
   let left = [...new Set([...lists.g, ...below])].filter(alive);
-  for (const pgid of left) { if (!lists.asked.has(pgid)) signal(pgid, "SIGTERM"); }
+  for (const pgid of left) { if (!lists.asked.has(pgid)) signalGroup(pgid, "SIGTERM"); }
   let deadline = performance.now() + grace;
   let killed = false;
   const check = () => {
@@ -220,7 +219,7 @@ const takeOver = () => {
     if (left.length === 0) return finish();
     if (performance.now() < deadline) return;
     if (killed) return finish();
-    for (const pgid of left) signal(pgid, "SIGKILL");
+    for (const pgid of left) signalGroup(pgid, "SIGKILL");
     killed = true;
     deadline = performance.now() + settle;
   };

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync, mkdirSync, symlinkSync } from "fs";
+import { existsSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync, symlinkSync } from "fs";
+import { spawn } from "child_process";
 import { join } from "path";
 import { createWorkspace } from "../packages/runtime/dist/workspace.js";
 import { cleanupTempDir, makeTempDir, writeText } from "./helpers.mjs";
@@ -664,4 +665,83 @@ test("workspace.observe waits out what comes to be in the way of a path that cou
   setTimeout(() => writeFileSync(join(wsDir, "out"), "in the way"), 50);
   setTimeout(() => { rmSync(join(wsDir, "out")); mkdirSync(join(wsDir, "out")); writeFileSync(join(wsDir, "out", "result.txt"), "there now"); }, 700);
   assert.equal(await pending, "there now");
+});
+
+test("what is to take an artifact's place is closed to others while it is written, where the artifact is", { skip: process.platform === "win32" }, async (t) => {
+  const wsDir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(wsDir));
+  const workspace = createWorkspace(wsDir);
+  writeFileSync(join(wsDir, "key.txt"), "old", { mode: 0o600 });
+
+  // Somebody who looks, all the while, at what stands beside the artifact, and writes down what each such file allows.
+  const seen = join(wsDir, "..", `seen-${process.pid}.txt`);
+  t.after(() => rmSync(seen, { force: true }));
+  const looks = `const fs = require("fs"); const [dir, seen] = process.argv.slice(1); const modes = new Set(); fs.writeFileSync(seen, "");
+    const until = Date.now() + 20000;
+    while (Date.now() < until && !fs.existsSync(dir + "/enough")) {
+      for (const name of fs.readdirSync(dir)) if (name.startsWith(".trama-tmp-")) { try { modes.add((fs.statSync(dir + "/" + name).mode & 0o777).toString(8)); } catch {} }
+    }
+    fs.writeFileSync(seen, [...modes].join(" "));`;
+  const looker = spawn(process.execPath, ["-e", looks, wsDir, seen], { stdio: "ignore" });
+  const done = new Promise((resolve) => looker.once("exit", resolve));
+  while (!existsSync(seen)) await new Promise((resolve) => setTimeout(resolve, 10));
+
+  // Much to write: it stands there half-written for a while.
+  for (let n = 0; n < 4; n += 1) await workspace.write("key.txt", "k".repeat(48 * 1024 * 1024));
+  writeFileSync(join(wsDir, "enough"), "");
+  await done;
+  const modes = readFileSync(seen, "utf-8").split(" ").filter(Boolean);
+  assert.ok(modes.length > 0, "it was seen while it was written");
+  assert.deepEqual(modes, ["600"], "and never allowed more than the artifact it was to replace");
+  assert.equal(statSync(join(wsDir, "key.txt")).mode & 0o777, 0o600);
+});
+
+test("a pattern that says \"any directories\" many times over is read as quickly as one that says it once", async (t) => {
+  const wsDir = makeTempDir("trama-ws-");
+  t.after(() => cleanupTempDir(wsDir));
+  const workspace = createWorkspace(wsDir);
+  const deep = Array.from({ length: 28 }, (_, at) => `d${at}`).join("/");
+  await workspace.write(`${deep}/found.md`, "there");
+
+  const started = performance.now();
+  // (Each of them could be any number of the directories on the way: tried every way round, that is millions of ways to find nothing.)
+  assert.deepEqual(await workspace.list(`${"**/".repeat(14)}nothing.md`), []);
+  assert.deepEqual(await workspace.list(`${"**/".repeat(14)}found.md`), [`${deep}/found.md`]);
+  assert.deepEqual(await workspace.list(`d0/**/d5/**/**/d20/**/*.md`), [`${deep}/found.md`]);
+  assert.deepEqual(await workspace.list(`**/d5/**/d4/**/*.md`), [], "directories are found in the order they are in");
+  assert.ok(performance.now() - started < 2000, `it took ${Math.round(performance.now() - started)}ms`);
+});
+
+test("a pattern matches what it matched when it was handed to the system's matcher of expressions: thousands of them, made up", async () => {
+  const { compileGlob } = await import("../packages/runtime/dist/workspace.js");
+  // As a pattern was read before: an expression, tried every way round. (For patterns short enough to be done with.)
+  const before = (pattern) => {
+    const literal = (text) => text.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+    const within = (segment) => segment.split("?").map((part) => part.split("*").map(literal).join("[^/]*")).join("[^/]");
+    return new RegExp(`^${pattern.split("**/").map((part) => part.split("**").map(within).join(".*")).join("(?:.+/)?")}$`);
+  };
+  // Made up the same way each time: what fails once fails again.
+  let seed = 20261120;
+  const next = (below) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % below; };
+  const made = (from, longest) => Array.from({ length: next(longest + 1) }, () => from[next(from.length)]).join("");
+  const differing = [];
+  let matched = 0;
+  for (let n = 0; n < 12000; n += 1) {
+    // (Half of them of few letters, so that a pattern and a path are often nearly each other.)
+    const few = n % 2 === 0;
+    const pattern = made(few ? ["a", "/", "*", "**/", "**/", "**", "?"] : ["a", "b", "/", "*", "*", "**/", "**", "?", ".", "("], few ? 5 : 7);
+    const was = before(pattern), is = compileGlob(pattern);
+    for (let m = 0; m < 12; m += 1) {
+      const path = made(few ? ["a", "a", "/"] : ["a", "b", "/", ".", "(", "é"], few ? 6 : 9);
+      if (was.test(path)) matched += 1;
+      if (was.test(path) !== is.test(path)) differing.push([pattern, path, was.test(path)]);
+    }
+  }
+  assert.deepEqual(differing.slice(0, 5), []);
+  assert.ok(matched > 10000, `enough of them matched for that to mean something: ${matched}`);
+  // "Whole segments" are none, or what ends in a slash and has something before it: a slash alone is neither.
+  for (const [pattern, path, matches] of [["a**/b", "a/b", false], ["a**/b", "ab", true], ["a**/b", "a/x/b", true], ["**/b", "/b", false], ["**/b", "x/b", true], ["a/**/b", "a/b", true], ["a/**/b", "a//b", false]]) {
+    assert.equal(compileGlob(pattern).test(path), matches, `${pattern} against ${path}`);
+    assert.equal(before(pattern).test(path), matches, `${pattern} against ${path}, as it was`);
+  }
 });

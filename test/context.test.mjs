@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, mkdirSync, rmSync } from "fs";
+import { chmodSync, existsSync, linkSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { createContext } from "../packages/runtime/dist/context.js";
 import { toLogData } from "../packages/runtime/dist/serializable.js";
@@ -324,4 +324,32 @@ test("createContext takes a run for a resumption only where the state holds a yi
     const ctx = createContext(projectDir, { __trama_yield: marker }, { print() {} });
     assert.deepEqual([ctx.resumed, ctx.yieldReason], [false, null], JSON.stringify(marker));
   }
+});
+
+test("createContext: a state is put in the place of the last, whole — it is not written into it", { skip: process.getuid?.() === 0 }, (t) => {
+  const projectDir = makeTempDir("trama-ctx-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+  const ctx = createContext(projectDir, {}, { print() {} });
+  ctx.checkpoint({ n: 1 });
+  // The state as it is on file, under a second name: what is written into the file is seen under both, what
+  // takes its place is not. (A program stopped in the middle of the first leaves half a state, and no run
+  // of the project starts from that; stopped in the middle of the second, it leaves the state before.)
+  linkSync(join(projectDir, "state.json"), join(projectDir, "as-it-was.json"));
+  ctx.checkpoint({ n: 2 });
+  assert.deepEqual(readJson(join(projectDir, "as-it-was.json")), { n: 1, __trama_iteration: 1 });
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { n: 2, __trama_iteration: 2 });
+  assert.deepEqual(readdirSync(projectDir).filter((name) => name.includes("trama-tmp")), [], "and nothing is left beside it");
+
+  // A state file its owner made read-only is not replaced, as it was not written into: its owner's say.
+  chmodSync(join(projectDir, "state.json"), 0o444);
+  assert.throws(() => ctx.checkpoint({ n: 3 }), { code: "EACCES" });
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { n: 2, __trama_iteration: 2 });
+  assert.deepEqual(readdirSync(projectDir).filter((name) => name.includes("trama-tmp")), []);
+  chmodSync(join(projectDir, "state.json"), 0o644);
+
+  // A project that is gone is not made anew for the sake of a state to put in it.
+  rmSync(projectDir, { recursive: true });
+  assert.throws(() => ctx.checkpoint({ n: 3 }));
+  assert.equal(existsSync(projectDir), false);
 });

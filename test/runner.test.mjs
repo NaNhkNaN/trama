@@ -6,10 +6,10 @@ import { tmpdir } from "os";
 import { execFileSync } from "child_process";
 import { createServer } from "net";
 import { llm } from "./fake-llm.mjs";
-import {
-  copyToHistory, createBackend, ensureProjectScaffold, installValidatedProgram, loadConfig, loadState, runProgram, RUNTIME_TYPES,
-  validateProgram,
-} from "../packages/runtime/dist/runner.js";
+import { installValidatedProgram, runProgram, RUNTIME_TYPES, validateProgram } from "../packages/runtime/dist/runner.js";
+import { createBackend } from "../packages/runtime/dist/runner-backend.js";
+import { ensureProjectScaffold, loadConfig, loadState } from "../packages/runtime/dist/project.js";
+import { copyToHistory } from "../packages/runtime/dist/history.js";
 import { printJournals } from "../packages/runtime/dist/journal-view.js";
 import { createTools } from "../packages/runtime/dist/tools.js";
 import { openJournal } from "../packages/runtime/dist/journal.js";
@@ -83,6 +83,27 @@ test("copyToHistory creates 0001.ts as the first entry when history is empty", (
   // "create" without detail should not have error or prompt keys
   assert.equal("error" in entries.at(-1), false);
   assert.equal("prompt" in entries.at(-1), false);
+});
+
+test("versions recorded by several at once are all on record, each under a number of its own", async (t) => {
+  const projectDir = makeTempDir("trama-history-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, { programSource: "A PROGRAM" });
+  // Runs of one project, each recording versions of it: the number one of them read as the next may be another's by the time it takes it.
+  const records = `import { copyToHistory } from ${JSON.stringify(new URL("../packages/runtime/dist/history.js", import.meta.url).href)};
+for (let n = 0; n < 60; n += 1) copyToHistory(process.argv[1], "update", "by " + process.pid);`;
+  const { spawn } = await import("child_process");
+  const ended = await Promise.all([1, 2, 3, 4].map(() => new Promise((resolve) => {
+    let said = "";
+    const child = spawn(process.execPath, ["--input-type=module", "-e", records, projectDir], { stdio: ["ignore", "ignore", "pipe"] });
+    child.stderr.on("data", (chunk) => { said += chunk; });
+    child.once("exit", (code) => resolve({ code, said: said.split("\n").find((line) => /Error/.test(line)) ?? "" }));
+  })));
+  assert.deepEqual(ended, [1, 2, 3, 4].map(() => ({ code: 0, said: "" })));
+  const files = readdirSync(join(projectDir, "history")).filter((name) => name.endsWith(".ts")).sort();
+  assert.equal(files.length, 240);
+  const index = readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+  assert.deepEqual(index.map((entry) => entry.version).sort((a, b) => a - b), Array.from({ length: 240 }, (_, at) => at + 1));
 });
 
 test("copyToHistory records error detail for repair entries", (t) => {
@@ -1549,7 +1570,7 @@ test("a version is never recorded over a version file that is already there", (t
   const projectDir = makeTempDir("trama-install-");
   t.after(() => cleanupTempDir(projectDir));
   createProjectFixture(projectDir, { programSource: "OLD" });
-  // Two runs that pick the same number: the file of the first must survive the second.
+  // Two runs that pick the same number: the file of the first must survive the second — which takes the next.
   const fsPromise = import("node:fs");
   return fsPromise.then(async ({ default: fs }) => {
     const { syncBuiltinESMExports } = await import("node:module");
@@ -1558,14 +1579,15 @@ test("a version is never recorded over a version file that is already there", (t
     fs.readdirSync = (path, ...rest) => String(path).endsWith("history") ? [] : realReaddir(path, ...rest);
     syncBuiltinESMExports();
     try {
-      assert.throws(() => installValidatedProgram(projectDir, { source: "NEW" }, "update", "p"), { code: "EEXIST" });
+      installValidatedProgram(projectDir, { source: "NEW" }, "update", "p");
     } finally {
       fs.readdirSync = realReaddir;
       syncBuiltinESMExports();
     }
     assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), "THEIRS");
-    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), "OLD");
-    assert.equal(existsSync(join(projectDir, "history", "index.jsonl")), false);
+    assert.equal(readFileSync(join(projectDir, "history", "0002.ts"), "utf-8"), "NEW");
+    assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), "NEW");
+    assert.deepEqual(readFileSync(join(projectDir, "history", "index.jsonl"), "utf-8").trim().split("\n").map((line) => JSON.parse(line).version), [2]);
   });
 });
 
@@ -1810,6 +1832,44 @@ test("a repair of a program that is a link inside the project goes through the l
 });
 
 // --- What crosses the bridge ---
+
+test("what a call gives that is of its kind, and still no such thing, is the request's fault — said before anything is done", async (t) => {
+  const projectDir = makeTempDir("trama-runner-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir, {
+    scaffold: false,
+    programSource: `import { ctx, tools } from "@trama-dev/runtime";
+import { readFileSync } from "fs";
+const { token } = JSON.parse(readFileSync(process.env.TRAMA_INIT, "utf-8"));
+const post = (endpoint, body) => fetch("http://127.0.0.1:" + process.env.TRAMA_PORT + endpoint, {
+  method: "POST", headers: { Authorization: "Bearer " + token }, body: JSON.stringify(body),
+}).then(async res => res.status + " " + (await res.text()));
+const answers = [];
+for (const [endpoint, body] of [
+  // A number that is no time, and none that is a count of attempts: the run is not looked for.
+  ["/run/program", { projectDir: "/nowhere", timeout: 0 }],
+  ["/run/program", { projectDir: "/nowhere", timeout: -1 }],
+  ["/run/program", { projectDir: "/nowhere", maxRepairAttempts: 1.5 }],
+  ["/run/program", { projectDir: "/nowhere", maxRepairAttempts: -1 }],
+  // Headers are names and their text: nothing is asked for.
+  ["/tools/fetch", { url: "http://127.0.0.1:1/", headers: { "X-Count": 7 } }],
+  ["/tools/fetch", { url: "http://127.0.0.1:1/", headers: { Accept: "text/plain", "X-List": ["a"] } }],
+]) answers.push(await post(endpoint, body));
+await tools.write("answers.json", JSON.stringify(answers));
+await ctx.done();`,
+  });
+
+  const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
+  assert.equal(result.status, "done");
+  assert.deepEqual(readJson(join(projectDir, "answers.json")), [
+    "400 Invalid timeout: 0. Must be a positive number.",
+    "400 Invalid timeout: -1. Must be a positive number.",
+    "400 Invalid maxRepairAttempts: 1.5. Must be a non-negative integer.",
+    "400 Invalid maxRepairAttempts: -1. Must be a non-negative integer.",
+    "400 Invalid field: headers (X-Count: expected string, got number)",
+    "400 Invalid field: headers (X-List: expected string, got an array)",
+  ]);
+});
 
 test("the bridge holds every field of a call to the kind it is declared as", async (t) => {
   const projectDir = makeTempDir("trama-runner-");

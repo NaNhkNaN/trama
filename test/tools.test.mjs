@@ -584,3 +584,62 @@ test("a directory called sh on the runner's PATH is no shell: the next is taken"
   const result = await withEnv({ PATH: `${join(projectDir, "bin")}:${process.env.PATH}` }, () => createTools(projectDir).shell("printf ran"));
   assert.deepEqual(result, { exitCode: 0, stdout: "ran", stderr: "" });
 });
+
+test("a command does nothing before whoever watches for its runner knows of it: a runner that dies as it starts one leaves nothing behind", { skip: process.platform === "win32" }, async (t) => {
+  const { spawn } = await import("node:child_process");
+  const { pathToFileURL } = await import("node:url");
+  const { REPO_ROOT, isAlive, pidIn, waitFor } = await import("./helpers.mjs");
+  const projectDir = makeTempDir("trama-tools-gate-");
+  t.after(() => cleanupTempDir(projectDir));
+  // A runner that is slow between starting a command and saying that it did: the moment in which a command
+  // that was already at its work would be nobody's to stop, were its runner to die then.
+  const runner = `import cp from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+const started = cp.spawn;
+cp.spawn = (...args) => {
+  const child = started(...args);
+  if (args[1]?.[0] === "-c") { const until = Date.now() + 500; while (Date.now() < until); }
+  return child;
+};
+syncBuiltinESMExports();
+const { createTools } = await import(${JSON.stringify(pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "tools.js")).href)});
+await createTools(${JSON.stringify(projectDir)}).shell("echo $$ > shell.pid; sleep 60", { timeout: 60000 });`;
+  const running = spawn(process.execPath, ["--input-type=module", "-e", runner], { stdio: "ignore" });
+  t.after(() => { running.kill("SIGKILL"); });
+  const pidFile = join(projectDir, "shell.pid");
+  await waitFor(() => pidIn(pidFile), "the command to be at its work", 20_000);
+  const shell = pidIn(pidFile);
+  t.after(() => { try { process.kill(-shell, "SIGKILL"); } catch { /* gone, as it should be */ } });
+  // The runner dies the moment its command is seen to have begun.
+  running.kill("SIGKILL");
+  await waitFor(() => !isAlive(shell), "the command of a runner that was killed to be gone", 8_000);
+});
+
+test("what is fetched is cut at ten megabytes of what was sent, whatever it is text of", async (t) => {
+  const projectDir = makeTempDir("trama-tools-fetch-");
+  t.after(() => cleanupTempDir(projectDir));
+  // Text that takes three bytes a character: twelve megabytes of it sent, in four million characters.
+  const chunk = Buffer.from("語".repeat(64 * 1024));
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
+    let sent = 0;
+    const pump = () => {
+      while (!res.destroyed && sent < 64) {
+        sent += 1;
+        if (!res.write(chunk)) return void res.once("drain", pump);
+      }
+      if (!res.destroyed) res.end();
+    };
+    pump();
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+
+  const { body } = await createTools(projectDir).fetch(`http://127.0.0.1:${server.address().port}/`);
+  const note = "\n[trama] response body truncated at 10MB";
+  assert.equal(body.endsWith(note), true, `it was cut: ${body.length} characters`);
+  const kept = body.slice(0, -note.length);
+  // (Ten megabytes are 3,495,253 such characters and a third of one: what is kept is whole characters.)
+  assert.equal(kept.length, Math.floor(10 * 1024 * 1024 / 3));
+  assert.equal(/^語+$/.test(kept), true);
+});
