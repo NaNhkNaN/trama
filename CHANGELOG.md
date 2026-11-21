@@ -2,7 +2,7 @@
 
 All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`) are released together under one version.
 
-## Unreleased
+## 0.7.0 — 2026-11-21
 
 ### Added
 
