@@ -385,4 +385,15 @@ export interface Workspace {
    * Single-file pattern returns content string. Glob/expect>1 returns sorted array of {path, content}.
    */
   observe(pattern: string, options?: { expect?: number; timeout?: number }): Promise<ObserveResult>;
+  /**
+   * Execute a shell command in the workspace: as `tools.shell`, but it
+   * begins in the workspace's directory — or, with `cwd`, in a directory
+   * of it. For a program whose work is in a directory that is not its own:
+   * one that was handed another project to work on, say.
+   */
+  shell(command: string, options?: {
+    cwd?: string;
+    timeout?: number;
+    env?: Record<string, string | undefined>;
+  }): Promise<ShellResult>;
 }

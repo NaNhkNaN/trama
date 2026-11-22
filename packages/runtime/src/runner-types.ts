@@ -53,6 +53,22 @@ export interface RunOptions {
    */
   budget?: Budget;
   /**
+   * The project that is asked for a fix where the run's program fails, in
+   * place of pi's agent: by its name among the user's projects, or by a
+   * path. Its program is run with a copy of the failing project as its
+   * workspace, is handed as arguments `program` (the program that failed),
+   * `error`, `journal` (the path of the failed run's record), `kept`
+   * (whether what it changes in the copy beside the program reaches the
+   * project) and `types` (the API as a program's author is shown it) — and
+   * answers with `{ program }`: the whole of the fixed program. (Or with
+   * `{ unfixable }`, saying why there is no fix: the run then fails with
+   * that, and nobody is asked again.) It is a run
+   * of the failing run's own: counted in its budget, stopped with it, and
+   * not itself fixed where it fails. Without it, the config's `repairWith`,
+   * if that has one.
+   */
+  repairWith?: string;
+  /**
    * Stops the run: its program is stopped, no repair is attempted, and the
    * run ends as failed. A fix that was being tried leaves no trace.
    */
@@ -85,6 +101,8 @@ export interface TramaConfig extends ModelConfig {
    * is taken from the agent.
    */
   agentChanges: "keep" | "discard";
+  /** The project asked for a fix, in place of pi's agent, where a run is not given one of its own (see RunOptions). */
+  repairWith?: string;
   /**
    * What a run may use of a model (see RunOptions) where it is not given a
    * budget of its own — and what a `create` or an `update` may: writing the

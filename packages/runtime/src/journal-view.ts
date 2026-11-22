@@ -34,6 +34,27 @@ const oneLine = (value: unknown, max: number): string => {
 };
 
 /** The one field of a request that says most about it. */
+/**
+ * The requests to a model on a record, each whole, by the position of its
+ * call: a journal has of each what it adds to the one before (see
+ * `besideTheLast` in journal.ts), and this puts them together again. (As far
+ * as the record has them: what was cut from a record for its size is cut.)
+ */
+export function requestsWhole(records: Array<Record<string, any>>): Map<number, Record<string, unknown>> {
+  const whole = new Map<number, Record<string, unknown>>();
+  let last: Record<string, any> | undefined;
+  for (const record of records) {
+    if (record.kind !== "call" || record.endpoint !== "/agent/complete" || !Array.isArray(record.request?.messages)) continue;
+    const { messagesBefore = 0, unchanged = [], messages, ...others } = record.request;
+    const request: Record<string, any> = { ...others };
+    for (const name of unchanged) if (last?.[name] !== undefined) request[name] = last[name];
+    request.messages = [...(last?.messages ?? []).slice(0, messagesBefore), ...messages];
+    whole.set(record.seq, request);
+    last = request;
+  }
+  return whole;
+}
+
 /** The words of a conversation's last message — or, where it has none, what it has instead. */
 function lastSaid(messages: unknown[]): string {
   const content = (messages.at(-1) as { content?: unknown } | undefined)?.content;
@@ -49,7 +70,7 @@ function gist(request: Record<string, unknown> | undefined): string {
   // ...and a project that was asked for by its own.
   if (typeof request?.name === "string") return oneLine(`${request.name}: ${typeof request.prompt === "string" ? request.prompt : ""}`, 60);
   // ...and a request to a model by the last that was said in the conversation it carries.
-  if (Array.isArray(request?.messages)) return oneLine(lastSaid(request.messages), 60);
+  if (Array.isArray(request?.messages)) return oneLine(request.messages.length === 0 && request.messagesBefore ? "(asked again, as before)" : lastSaid(request.messages), 60);
   for (const field of ["prompt", "command", "path", "pattern", "url", "message", "projectDir", "reason"]) {
     if (request?.[field] !== undefined) return oneLine(request[field], 60);
   }
@@ -76,8 +97,12 @@ const usageIn = (records: JournalRecord[]) => records.filter(record => record.ki
  * says so) unless the journal filled up: then it is what is on record, be
  * that nothing, and is said to be.
  */
+/** What a project asked for a fix used (see the `fix` record), as a report of usage is added up: its tokens are not told apart there. */
+const asUsage = (used: { tokens?: number; cost?: number }) => ({ input: used.tokens ?? 0, cost: used.cost ?? 0 });
+
 function spentInAll(records: JournalRecord[], inAll = ""): string {
-  const counted = spentIn(usageIn(records));
+  // (A fix is part of the run it is for, whoever made it: what a project used for one is counted with the rest.)
+  const counted = spentIn([...usageIn(records), ...records.filter(record => record.kind === "fix" && record.used).map(record => asUsage(record.used))]);
   if (!records.some(record => record.kind === "full")) return counted && counted + inAll;
   return `${counted || "no usage"} on record — the journal was full`;
 }
@@ -131,13 +156,17 @@ function printJournal(path: string, records: JournalRecord[]): void {
         console.log(`${at}  ${oneLine(record.spent, 100)}`);
         break;
       case "child":
-        console.log(`${at}  #${String(record.seq).padEnd(3)} started ${record.purpose === "validate" ? "validation" : "run"} ${record.run}`);
+        // (A run a call of the program's started — or, for a fix, one the run itself started.)
+        console.log(record.purpose === "fix"
+          ? `${at}  the fix is asked of a project: run ${record.run}`
+          : `${at}  #${String(record.seq).padEnd(3)} started ${record.purpose === "validate" ? "validation" : "run"} ${record.run}`);
         break;
       case "fix-request":
         console.log(`${at}  fix asked for: ${oneLine(record.error, 80)}`);
         break;
       case "fix":
-        console.log(`${at}  fix ${record.ok ? "returned" : `not returned: ${oneLine(record.error, 80)}`}`);
+        // (What a project that was asked for it used is said with it: what pi's agent used is in the lines of `usage`.)
+        console.log(`${at}  fix ${record.ok ? "returned" : `not returned: ${oneLine(record.error, 80)}`}${record.used ? `  ${spentIn([asUsage(record.used)])}` : ""}`);
         break;
       case "exit": {
         const how = record.timedOut ? "timed out"

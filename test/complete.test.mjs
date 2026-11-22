@@ -10,7 +10,8 @@ import { createMeter } from "../packages/runtime/dist/budget.js";
 import { runProgram } from "../packages/runtime/dist/runner.js";
 import { createBackend } from "../packages/runtime/dist/runner-backend.js";
 import { createAgent } from "../packages/runtime/dist/agent.js";
-import { printJournals } from "../packages/runtime/dist/journal-view.js";
+import { printJournals, requestsWhole } from "../packages/runtime/dist/journal-view.js";
+import { openJournal } from "../packages/runtime/dist/journal.js";
 import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, makeTempDir } from "./helpers.mjs";
 
 // One request to a model, and one reply: what a program that is its own harness asks by. The request is held to
@@ -272,7 +273,14 @@ test("a program asks a model by the bridge: the conversation is the program's, a
     system: "You add.", messages: [{ role: "user", content: "What is 2 + 3?" }], maxTokens: 500,
     tools: [{ name: "add", description: "Adds two numbers.", parameters: { a: "number", b: "number" } }],
   });
-  assert.equal(asked[1].request.messages.length, 3);
+  // The second is written down beside the first: what it has that the first had is not written again — and is put back by whoever reads.
+  assert.deepEqual(asked[1].request, {
+    messagesBefore: 1, unchanged: ["system", "tools"], maxTokens: 500,
+    messages: [calls, { role: "toolResult", toolCallId: "c1", toolName: "add", content: "5" }],
+  });
+  const whole = requestsWhole(records);
+  assert.deepEqual(whole.get(1), asked[0].request);
+  assert.deepEqual(whole.get(2), { ...asked[0].request, messages: [...asked[0].request.messages, ...asked[1].request.messages] });
   assert.deepEqual(records.filter((record) => record.kind === "result" && record.seq <= 2).map((record) => [record.ok, record.result.stopReason]), [[true, "toolUse"], [true, "stop"]]);
   assert.deepEqual(records.filter((record) => record.kind === "usage").map(({ seq, model, input, cost }) => ({ seq, model, input, cost })), [
     { seq: 1, model: "p/m", input: 400, cost: 0.4 }, { seq: 2, model: "p/m", input: 400, cost: 0.4 },
@@ -282,6 +290,50 @@ test("a program asks a model by the bridge: the conversation is the program's, a
   // (Of a conversation, the last that was said in it is what the request is known by.)
   assert.match(shown, /#2 +agent\/complete +5 +ok +\d+ms +400 tokens +\$0\.4000$/m);
   assert.match(shown, /end: done +\(800 tokens +\$0\.8000 in all\)$/m);
+});
+
+test("a conversation is written down as what each request adds to the one before it, and read back whole", async (t) => {
+  const projectDir = makeTempDir("trama-complete-");
+  t.after(() => cleanupTempDir(projectDir));
+  createProjectFixture(projectDir);
+  const user = (content) => ({ role: "user", content });
+  const tools = [{ name: "add", description: "Adds." }];
+  const requests = [
+    { system: "S", tools, messages: [user("one")] },
+    { system: "S", tools, messages: [user("one"), user("two"), user("three")] },
+    // A message of before is other than it was (a harness that forgets does that): written again from there on.
+    { system: "S", tools, messages: [user("one"), user("TWO"), user("three"), user("four")] },
+    // Asked again, as it was.
+    { system: "S", tools, messages: [user("one"), user("TWO"), user("three"), user("four")] },
+    // What the model is told to be is other than it was: that is written, and what is the same is not.
+    { system: "S2", tools, maxTokens: 9, messages: [user("one"), user("TWO"), user("three"), user("four"), user("five")] },
+    // Another conversation altogether: whole, as the first.
+    { messages: [user("new")] },
+  ];
+  const journal = openJournal(projectDir, 5, { purpose: "run" });
+  // (Another call between two requests changes nothing of how they are written.)
+  for (const request of requests) {
+    journal.call("/agent/complete", request).end({ ok: true, result: {} });
+    journal.call("/tools/read", { path: "a.txt", messages: "not a conversation" }).end({ ok: true, result: "" });
+  }
+  journal.note("end", {});
+  journal.close();
+  const records = journalsOf(projectDir)[0];
+  const said = ["system", "tools"];
+  assert.deepEqual(records.filter((record) => record.kind === "call" && record.endpoint === "/agent/complete").map((record) => record.request), [
+    requests[0],
+    { messagesBefore: 1, unchanged: said, messages: [user("two"), user("three")] },
+    { messagesBefore: 1, unchanged: said, messages: [user("TWO"), user("three"), user("four")] },
+    { messagesBefore: 4, unchanged: said, messages: [] },
+    { messagesBefore: 4, unchanged: ["tools"], system: "S2", maxTokens: 9, messages: [user("five")] },
+    { messages: [user("new")] },
+  ]);
+  assert.deepEqual(records.filter((record) => record.endpoint === "/tools/read")[0].request, { path: "a.txt", messages: "not a conversation" });
+  assert.deepEqual([...requestsWhole(records).values()], requests);
+  assert.deepEqual([...requestsWhole(records).keys()], [1, 3, 5, 7, 9, 11]);
+  const shown = (await captureConsole("log", async () => printJournals(projectDir, "it", {}))).messages.join("\n");
+  assert.match(shown, /#3 +agent\/complete +three +ok/);
+  assert.match(shown, /#7 +agent\/complete +\(asked again, as before\) +ok/);
 });
 
 test("of what comes back, a program reads what is the model's doing — and is failed by what is not", async (t) => {

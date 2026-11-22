@@ -1,6 +1,7 @@
 import { readFileSync, mkdirSync, readdirSync, statSync } from "fs";
 import { resolve, relative, sep } from "path";
 import type { Workspace } from "./types.js";
+import { createTools, type ToolsWithCleanup } from "./tools.js";
 import { onAbort } from "./abort.js";
 import { guardPath, realRootOf } from "./path-guard.js";
 import { isStagedName, stageFile } from "./replace-file.js";
@@ -155,8 +156,15 @@ export function ensureWorkspaceDir(workspaceDir: string): string {
   return root;
 }
 
-export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Workspace {
+/**
+ * The workspace in a directory. `shellIn`: the shell its commands are run by
+ * — a run's own, so that they are the run's to stop, and have its variables.
+ * Without it the workspace has a shell of its own: commands it started end
+ * with this process.
+ */
+export function createWorkspace(workspaceDir: string, signal?: AbortSignal, shellIn?: ToolsWithCleanup["shellIn"]): Workspace {
   const root = ensureWorkspaceDir(workspaceDir);
+  let ownShell: ToolsWithCleanup | undefined;
 
   /** All artifact paths matching a glob, sorted. */
   const listMatching = (pattern: string): string[] => {
@@ -194,6 +202,10 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal): Wor
 
     async list(pattern) {
       return listMatching(pattern);
+    },
+
+    async shell(command, options) {
+      return (shellIn ?? (ownShell ??= createTools(root, signal)).shellIn)(root, command, options);
     },
 
     async observe(pattern, options = {}) {

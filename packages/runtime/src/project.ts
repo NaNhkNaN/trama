@@ -6,7 +6,7 @@ import {
   readFileSync, writeFileSync, mkdirSync, existsSync,
   symlinkSync, rmSync, lstatSync, readlinkSync, accessSync, constants,
 } from "fs";
-import { join, dirname } from "path";
+import { join, dirname, resolve, sep } from "path";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
 import type { TramaConfig } from "./runner-types.js";
@@ -174,6 +174,9 @@ function checkedConfig(merged: TramaConfig, source: string): TramaConfig {
     [Number.isInteger(merged.journalRuns) && merged.journalRuns >= 0, `"journalRuns" must be a non-negative integer (got ${merged.journalRuns})`],
     [merged.agentChanges === "keep" || merged.agentChanges === "discard", `"agentChanges" must be "keep" or "discard" (got ${JSON.stringify(merged.agentChanges)})`],
   ];
+  if (merged.repairWith !== undefined) {
+    checks.push([s(merged.repairWith), `"repairWith" must be a project — its name, or a path to it (got ${JSON.stringify(merged.repairWith)})`]);
+  }
   for (const [ok, msg] of checks) {
     if (!ok) throw new Error(`Invalid ${source}: ${msg}`);
   }
@@ -184,6 +187,21 @@ function checkedConfig(merged: TramaConfig, source: string): TramaConfig {
     throw new Error(`Invalid ${source}: ${messageOf(err)}`);
   }
 }
+
+/**
+ * Where a project is, that is named as `repairWith` names one: by a path —
+ * what has a stroke in it, or begins with a dot or with "~" for the user's
+ * home — or else by its name among the user's projects.
+ */
+export function projectNamed(given: string): string {
+  if (given === "~" || given.startsWith("~/")) return join(homedir(), given.slice(2));
+  if (namesAPath(given)) return resolve(given);
+  return join(homedir(), ".trama", "projects", given);
+}
+
+/** Whether what names a project names it by a path, and not by its name among the user's projects. */
+export const namesAPath = (given: string): boolean =>
+  given.includes("/") || given.includes(sep) || given.startsWith(".") || given.startsWith("~");
 
 /** The time a run is given, held to what a time is. */
 export function checkedTimeout(timeout: number): number {

@@ -214,3 +214,5 @@ export const workspace: Workspace = remoteWorkspace((endpoint, body) => {
   }
   return call(endpoint, body);
 });
+
+export { heldTo } from "./schema.js";

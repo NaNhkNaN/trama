@@ -341,7 +341,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
         projectDir: "string", args: "optional object",
         timeout: "optional number", maxRepairAttempts: "optional number",
         id: "optional string", label: "optional string", workspaceDir: "optional string", env: "optional object",
-        budget: "optional object",
+        budget: "optional object", repairWith: "optional string",
       },
       async ({ id, env, budget, timeout, maxRepairAttempts, ...asked }, connectionClosed, { seq }) => {
         const request: RunRequest = { ...asked, timeout: timeoutOf(timeout), maxRepairAttempts: attemptsOf(maxRepairAttempts), env: envOf(env), budget: budgetOf(budget) };
@@ -377,6 +377,10 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
       b => workspaceOf(b.dir).write(b.path, b.content),
     ),
     "/workspace/list": route({ pattern: "string", dir: "optional string" }, b => workspaceOf(b.dir).list(b.pattern)),
+    "/workspace/shell": route(
+      { command: "string", dir: "optional string", cwd: "optional string", timeout: "optional number", env: "optional object" },
+      b => workspaceOf(b.dir).shell(b.command, { cwd: b.cwd, timeout: b.timeout, env: envOf(b.env) }),
+    ),
     "/workspace/observe": route(
       { pattern: "string", dir: "optional string", expect: "optional number", timeout: "optional number" },
       b => workspaceOf(b.dir).observe(b.pattern, { expect: b.expect, timeout: b.timeout }),

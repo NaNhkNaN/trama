@@ -114,3 +114,13 @@ export function conform(value: unknown, shape: Shape, where: Where = null): unkn
     return [key, conform(value[key], field, fieldOf(where, key))];
   }));
 }
+
+/**
+ * What a model called a tool with, held to the parameters the tool declared:
+ * for a program that runs its own tools, as the runner holds them for an
+ * agent's (see argumentsOf). Returns the declared fields and no others, or
+ * throws what is wrong — in words a model can be handed, to try again by.
+ */
+export function heldTo(parameters: unknown, given: unknown): Record<string, unknown> {
+  return argumentsOf(parameters ?? {}).held(given) as Record<string, unknown>;
+}

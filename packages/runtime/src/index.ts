@@ -11,7 +11,7 @@ import type { AgentUsage } from "./agent-backend.js";
 import { createMeter } from "./budget.js";
 import { LATEST_LOG_PATH } from "./context.js";
 import { readProjectMeta } from "./meta.js";
-import { ensureProjectScaffold, loadConfig, loadProjectConfig, loadState } from "./project.js";
+import { ensureProjectScaffold, loadConfig, loadProjectConfig, loadState, namesAPath, projectNamed } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import {
   validateProgram, installValidatedProgram,
@@ -26,6 +26,7 @@ import { messageOf } from "./errors.js";
 
 export type { Budget, ProgramResult, RunOptions } from "./runner-types.js";
 export { failureOf } from "./runner.js";
+export { requestsWhole } from "./journal-view.js";
 import type { ProgramResult, RunOptions, TramaConfig } from "./runner-types.js";
 export type { Workspace, ObserveResult } from "./types.js";
 import type { Workspace } from "./types.js";
@@ -73,6 +74,8 @@ export async function runProgram(options: RunOptions): Promise<ProgramResult> {
     // The runner does not share this program's working directory.
     projectDir: resolve(request.projectDir),
     workspaceDir: request.workspaceDir && resolve(request.workspaceDir),
+    // (A path is this program's to say where it leads. A name is one of the user's projects, wherever it is said.)
+    repairWith: request.repairWith !== undefined && namesAPath(request.repairWith) ? projectNamed(request.repairWith) : request.repairWith,
   }, signal);
 }
 

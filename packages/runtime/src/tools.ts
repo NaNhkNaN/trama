@@ -51,6 +51,13 @@ function shellOn(path: string | undefined, cwd: string): string {
 }
 
 export interface ToolsWithCleanup extends Tools {
+  /**
+   * The shell, in another directory than the project: where a command begins
+   * is `root`, or a path within it. It is the same shell otherwise — its
+   * variables, what is kept of the commands it started, how they are stopped.
+   * (For a workspace: see Workspace.shell.)
+   */
+  shellIn(root: string, command: string, options?: Parameters<Tools["shell"]>[1]): Promise<ShellResult>;
   /** Stop every shell command still running, and anything they left in the background. Resolves when they are gone. */
   stopActiveShells(): Promise<void>;
 }
@@ -108,7 +115,7 @@ export function createTools(projectDir: string, signal?: AbortSignal, env?: Reco
     }
   };
 
-  return {
+  const made: ToolsWithCleanup = {
     async stopActiveShells() {
       const pgids = [...groups.keys()];
       await stopGroups(pgids);
@@ -135,8 +142,10 @@ export function createTools(projectDir: string, signal?: AbortSignal, env?: Reco
       writeFileSync(target, content);
     },
 
-    async shell(command, options = {}): Promise<ShellResult> {
-      const cwd = options.cwd ? guardPath(normalizedProjectDir, options.cwd) : normalizedProjectDir;
+    shell: (command, options) => made.shellIn(normalizedProjectDir, command, options),
+
+    async shellIn(root, command, options = {}): Promise<ShellResult> {
+      const cwd = options.cwd ? guardPath(root, options.cwd) : root;
       const env = options.env == null ? shellEnv : { ...shellEnv, ...checkedEnv(options.env) };
       // The shell is started from where the runner finds it, and is `sh` to itself and to whoever it tells of
       // itself, as it was when the system did the finding: in "$0", in what it says of a command it cannot find,
@@ -226,4 +235,5 @@ export function createTools(projectDir: string, signal?: AbortSignal, env?: Reco
       return { status: response.status, body, headers };
     }
   };
+  return made;
 }

@@ -295,6 +295,46 @@ function recordable(endpoint: string, value: unknown): unknown {
   return value;
 }
 
+/** Of a request to a model, a mark for each of its parts: by which a part is known to be what it was in the request before. */
+interface Asked {
+  messages: string[];
+  rest: Record<string, string>;
+}
+
+/** What a request to a model may have again that it had before, beside its conversation: left out of its record where it is the same (see `besideTheLast`). */
+const SAID_ONCE = ["system", "tools"];
+
+const markOf = (value: unknown): string => createHash("sha1").update(JSON.stringify(value) ?? "").digest("base64");
+
+/**
+ * A request to a model, as it is written down beside the one before it on
+ * the same record. A program that is its own harness sends the whole
+ * conversation with every request: written down whole each time, a record
+ * grows with the square of the turns. So of a conversation that begins as
+ * the last one did, what is written is what it adds: `messagesBefore` says
+ * how many of its messages are those the request before it began with, and
+ * `messages` has the rest. And `unchanged` names what else it has as that
+ * request had it (what the model is told to be, its tools), which is then
+ * left out. A request that shares nothing with the one before is written
+ * whole, as the first is. (Read back whole by `requestsWhole`.)
+ */
+function besideTheLast(request: unknown, last: Asked | undefined): { recorded: unknown; asked?: Asked } {
+  if (!isJsonObject(request) || !Array.isArray(request.messages)) return { recorded: request };
+  const asked: Asked = {
+    messages: request.messages.map(markOf),
+    rest: Object.fromEntries(SAID_ONCE.filter(name => request[name] !== undefined).map(name => [name, markOf(request[name])])),
+  };
+  if (!last) return { recorded: request, asked };
+  let same = 0;
+  while (same < asked.messages.length && same < last.messages.length && asked.messages[same] === last.messages[same]) same += 1;
+  const unchanged = SAID_ONCE.filter(name => asked.rest[name] !== undefined && asked.rest[name] === last.rest[name]);
+  if (same === 0 && unchanged.length === 0) return { recorded: request, asked };
+  const { messages, ...others } = request;
+  for (const name of unchanged) delete others[name];
+  // (The small fields first: a record's allowance is spent in order.)
+  return { recorded: { ...(same > 0 && { messagesBefore: same }), ...(unchanged.length > 0 && { unchanged }), ...others, messages: messages.slice(same) }, asked };
+}
+
 export type CallOutcome = { ok: true; result: unknown } | { ok: false; error: string };
 
 /** A bridge call on record: its position among the run's calls, and what is written down of it later. */
@@ -477,6 +517,8 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
   };
 
   let seq = 0;
+  // The last request to a model that was written down: the next is written beside it.
+  let lastAsked: Asked | undefined;
 
   return {
     run,
@@ -489,7 +531,13 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
       const arrived = performance.now();
       // How many times the agent behind it has called a tool of the program's.
       let uses = 0;
-      write("call", () => ({ seq: position, endpoint, request: recordable(endpoint, request) }));
+      let recorded = recordable(endpoint, request);
+      if (endpoint === "/agent/complete") {
+        const beside = besideTheLast(request, lastAsked);
+        recorded = beside.recorded;
+        lastAsked = beside.asked ?? lastAsked;
+      }
+      write("call", () => ({ seq: position, endpoint, request: recorded }));
       return {
         seq: position,
         end(outcome) {

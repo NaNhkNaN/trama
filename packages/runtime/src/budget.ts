@@ -106,6 +106,8 @@ export interface Meter {
   reached(): string | undefined;
   /** Add to the count, here and above: calls taken on, and what calls used — more than was said of them before, or less. */
   count(calls: number, cost: number, tokens: number): void;
+  /** What it has counted so far: the calls taken on, and what they have said they used. */
+  counted(): { calls: number; cost: number; tokens: number };
 }
 
 /**
@@ -142,6 +144,7 @@ export function createMeter(limit: Budget = {}, above?: Meter): Meter {
       tokens += read;
       above?.count(more, dollars, read);
     },
+    counted: () => ({ calls, cost, tokens }),
     admit() {
       const refusal = meter.spent();
       if (refusal !== undefined) throw new Error(refusal);
