@@ -26,6 +26,37 @@ test("guardPath rejects symlink pointing outside the project", (t) => {
   );
 });
 
+test("a directory beside the project is outside it, also where its name begins as the project's does", async (t) => {
+  const base = makeTempDir("trama-guard-");
+  t.after(() => cleanupTempDir(base));
+  // (Whether one path is under another is not whether its text begins with the other's: "proj-other" is not in "proj".)
+  const projectDir = join(base, "proj"), beside = join(base, "proj-other");
+  mkdirSync(projectDir);
+  mkdirSync(beside);
+  writeFileSync(join(beside, "secret.txt"), "sensitive data");
+  writeFileSync(join(projectDir, "mine.txt"), "the project's own");
+  symlinkSync(join(beside, "secret.txt"), join(projectDir, "by-link.txt"));
+  symlinkSync("../proj-other", join(projectDir, "by-dir"));
+
+  // By its name, said from the project or in full: outside, and no link had a part in it.
+  for (const path of ["../proj-other/secret.txt", join(beside, "secret.txt"), "../proj-other", "../proj-other/not-there-yet.txt"]) {
+    assert.throws(() => guardPath(projectDir, path), (err) => err.message === `Path escapes project directory: ${path}`, path);
+  }
+  // By a link of the project's: outside all the same.
+  for (const path of ["by-link.txt", "by-dir/secret.txt", "by-dir/not-there-yet.txt"]) {
+    assert.throws(() => guardPath(projectDir, path), (err) => err.message === `Path escapes project directory via symlink: ${path}`, path);
+  }
+  assert.equal(guardPath(projectDir, "mine.txt"), join(realpathSync(projectDir), "mine.txt"));
+  // And so to a program's tools: nothing beside the project is read, and nothing is written there.
+  const tools = createTools(projectDir);
+  await assert.rejects(tools.read("../proj-other/secret.txt"), /Path escapes project directory: /);
+  await assert.rejects(tools.read("by-link.txt"), /Path escapes project directory via symlink/);
+  await assert.rejects(tools.write("../proj-other/planted.txt", "x"), /Path escapes project directory: /);
+  await assert.rejects(tools.write("by-dir/planted.txt", "x"), /Path escapes project directory via symlink/);
+  assert.deepEqual(readdirSync(beside), ["secret.txt"]);
+  assert.equal(await tools.read("mine.txt"), "the project's own");
+});
+
 test("guardPath rejects directory symlink pointing outside the project", (t) => {
   const projectDir = makeTempDir("trama-guard-");
   const outsideDir = makeTempDir("trama-outside-");

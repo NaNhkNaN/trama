@@ -329,6 +329,48 @@ await ctx.done({ answer: JSON.parse(answer) });`);
   assert.ok(!JSON.stringify(records.filter((record) => record.kind.startsWith("tool-"))).includes(PNG));
 });
 
+test("each kind of image is told by its own beginning, and what only begins like one is none — and of what a tool returns, only nothing at all is \"Done.\"", async (t) => {
+  const projectDir = project(t, `import { ctx, agent } from "@trama-dev/runtime";
+const bytes = (...parts) => Buffer.concat(parts.map((part) => (typeof part === "string" ? Buffer.from(part, "latin1") : Buffer.from(part))));
+const tool = (name, run) => ({ name, description: "Returns " + name, run });
+const answer = await agent.instruct("p", { tools: [
+  // A GIF, of the older kind and of the newer; a WebP, which says what it is after it has said its size.
+  tool("gif87", () => bytes("GIF87a", [1, 0, 1, 0])),
+  tool("gif89", () => bytes("GIF89a", [1, 0, 1, 0])),
+  tool("webp", () => bytes("RIFF", [26, 0, 0, 0], "WEBPVP8 ")),
+  // What begins as one of those does, and is none: no such GIF, a sound, and a WebP's word where its size belongs.
+  tool("gif88", () => bytes("GIF88a", [1, 0, 1, 0])),
+  tool("gif89b", () => bytes("GIF89b", [1, 0, 1, 0])),
+  tool("wave", () => bytes("RIFF", [26, 0, 0, 0], "WAVEfmt ")),
+  tool("webp_early", () => bytes("RIFFWEBP", [26, 0, 0, 0], "VP8 ")),
+  // Nothing returned is "Done."; null, no and none are each something a tool said.
+  tool("nothing", () => undefined),
+  tool("null", () => null),
+  tool("no", () => false),
+  tool("none", () => 0),
+] });
+await ctx.done({ answer: JSON.parse(answer) });`);
+  standIn(t, async (_prompt, call) => {
+    const answers = [];
+    for (const tool of call.ownTools) answers.push(await tool.run({}, `c-${tool.name}`, call.signal));
+    return JSON.stringify(answers);
+  });
+  const { result, status } = await run(projectDir);
+  assert.equal(status, "done");
+  const image = (mimeType, ...parts) => ({ text: "", images: [{ mimeType, data: Buffer.concat(parts.map((part) => Buffer.from(part, "latin1"))).toString("base64") }] });
+  const noImage = { text: "the tool returned bytes that are no image a model is shown: not a PNG, a JPEG, a GIF or a WebP", failed: true };
+  assert.deepEqual(result.answer, [
+    image("image/gif", "GIF87a", "\x01\x00\x01\x00"),
+    image("image/gif", "GIF89a", "\x01\x00\x01\x00"),
+    image("image/webp", "RIFF", "\x1a\x00\x00\x00", "WEBPVP8 "),
+    noImage, noImage, noImage, noImage,
+    { text: "Done." },
+    { text: "null" },
+    { text: "false" },
+    { text: "0" },
+  ]);
+});
+
 test("what a program says a tool answered is held to what an answer is, whoever says it — and how a tool's use is carried is no call on record", async (t) => {
   const projectDir = project(t, `import { ctx } from "@trama-dev/runtime";
 import { readFileSync } from "fs";

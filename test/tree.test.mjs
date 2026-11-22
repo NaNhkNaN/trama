@@ -1684,6 +1684,33 @@ test("a way back into the directory under another of its names is a way back int
   assert.equal(readlinkSync(join(copy, "slashes")), `${copy}/sub`, "what is said beyond the directory is kept");
 });
 
+test("a link by full path to a place outside the directory says in a copy what it said: its words, not where they were found to lead", (t) => {
+  const base = scratch(t);
+  const real = join(base, "proj"), copy = join(base, "elsewhere", "copy"), out = join(base, "out");
+  for (const dir of [join(real, "d0"), copy, join(out, "first"), join(out, "second")]) mkdirSync(dir, { recursive: true });
+  writeFileSync(join(out, "first", "x.txt"), "FIRST");
+  writeFileSync(join(out, "second", "x.txt"), "SECOND");
+  symlinkSync("first", join(out, "now")); // outside, and a link of nobody's copy
+  symlinkSync(join(out, "now", "x.txt"), join(real, "k"));
+  symlinkSync(join(out, "now", "x.txt"), join(real, "d0", "deeper"));
+  symlinkSync(`${out}/./first/../now/`, join(real, "roundabout"));
+  copyTree(real, copy);
+  // The way never comes to the directory: the same words name the same place from anywhere, and are kept.
+  assert.equal(readlinkSync(join(copy, "k")), join(out, "now", "x.txt"));
+  assert.equal(readlinkSync(join(copy, "d0", "deeper")), join(out, "now", "x.txt"));
+  assert.equal(readlinkSync(join(copy, "roundabout")), `${out}/./first/../now/`);
+  assert.equal(readFileSync(join(copy, "k"), "utf-8"), "FIRST");
+  // Were the copy's link to say where the words led when it was made, it would not go where the directory's goes
+  // once the link outside is pointed elsewhere.
+  unlinkSync(join(out, "now"));
+  symlinkSync("second", join(out, "now"));
+  for (const dir of [real, copy]) {
+    assert.equal(readFileSync(join(dir, "k"), "utf-8"), "SECOND", dir);
+    assert.equal(readFileSync(join(dir, "d0", "deeper"), "utf-8"), "SECOND", dir);
+    assert.equal(realpathSync(join(dir, "roundabout")), join(out, "second"), dir);
+  }
+});
+
 test("a link by full path that goes through the directory on its way to a place outside does not go through it from a copy", (t) => {
   const base = scratch(t);
   const real = join(base, "proj"), copy = join(base, "elsewhere", "copy"), out = join(base, "out");

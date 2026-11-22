@@ -47,6 +47,8 @@ ${types}`;
 type Tool = Pick<AgentTool, "name" | "description" | "parameters"> & { run(given: any): unknown };
 
 let fixed: string | undefined, unfixable: string | undefined;
+/** The longest a command may be given, in seconds; and how the runtime ends the stderr of one it stopped at its time. */
+const LONGEST = 600, TIMED_OUT = "\ntimeout";
 const shown = (ran: { exitCode: number; stdout: string; stderr: string }) =>
   `exit code ${ran.exitCode}\n${ran.stdout}${ran.stderr ? `\n[stderr]\n${ran.stderr}` : ""}`;
 
@@ -67,9 +69,19 @@ const tools: Tool[] = [
     run: async ({ path, content }) => { await workspace.write(path, content); return "written"; },
   },
   {
-    name: "shell", description: "Run a shell command in the project's directory, and see what it printed.",
-    parameters: { command: "string" },
-    run: async ({ command }) => shown(await workspace.shell(command, { timeout: 120_000 })),
+    // A command has the time the model gives it. (With a time the model is not told of, a command that ran into it
+    // was only a command that failed, and was made again as it was.)
+    name: "shell",
+    description: `Run a shell command in the project's directory, and see what it printed. It has the seconds you give it, and is stopped when they are up: give it what it needs and some to spare, ${LONGEST} at most. What takes longer than that, start in the background, writing to a file (… > out.log 2>&1 &), and look in on it.`,
+    parameters: { command: "string", seconds: "number: how long it may take before it is stopped" },
+    run: async ({ command, seconds }) => {
+      if (!(seconds >= 1 && seconds <= LONGEST)) throw new Error(`seconds is to be from 1 to ${LONGEST}: how long the command may take.`);
+      const began = Date.now(), ran = await workspace.shell(command, { timeout: seconds * 1000 });
+      // (A command stopped at its time took that long, and the runtime ends what it wrote to stderr with the word.)
+      if (!ran.stderr.endsWith(TIMED_OUT) || Date.now() - began < seconds * 1000) return shown(ran);
+      const stderr = ran.stderr.slice(0, -TIMED_OUT.length);
+      return `It was stopped: it was not done after the ${seconds}s it was given. Give it longer (${LONGEST}s at most), run less at a time, or start it in the background and look in on it. What it had printed:\n${ran.stdout}${stderr ? `\n[stderr]\n${stderr}` : ""}`;
+    },
   },
   ...(journal ? [{
     name: "record", description: "Read the end of the failed run's record: each call the program made and what came back, a line of JSON for each.",

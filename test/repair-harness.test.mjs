@@ -91,7 +91,8 @@ test("the harness fixes a program as a run asks it to: it looks, mends what the 
     { name: "read", args: { file: "data.txt" } },                           // not what `read` declared: told what it takes
     { name: "read", args: { path: "data.txt" } },
     { name: "open", args: {} },                                             // no such tool: told which there are
-    { name: "shell", args: { command: "wc -w < data.txt | tr -d ' '" } },
+    { name: "shell", args: { command: "wc -w < data.txt | tr -d ' '", seconds: 30 } },
+    { name: "shell", args: { command: "echo begun; sleep 20", seconds: 1 } },   // not done in the time it gave it: told so
     { name: "record", args: {} },
     { name: "write", args: { path: "mended-by.txt", content: "the harness, at length" }, cut: true }, // cut off: not run
     { name: "write", args: { path: "mended-by.txt", content: "the harness" } },
@@ -116,27 +117,32 @@ test("the harness fixes a program as a run asks it to: it looks, mends what the 
 
   // What the tools said, in turn — as the last request has it.
   const said = saidByTools(it.requests.at(-1));
-  assert.equal(said.length, 8);
+  assert.equal(said.length, 9);
   // (The copy: the project, with the log of the run that failed and without its journals.)
   assert.equal(said[0], ".gitignore\ndata.txt\nlogs/latest.jsonl\nmeta.json\npackage.json\nprogram.ts");
   assert.match(said[1], /missing key: path/);
   assert.equal(said[2], "the heron waits at low tide");
   assert.equal(said[3], 'There is no tool "open". The tools: list, read, write, shell, record, hand_over, give_up.');
   assert.equal(said[4], "exit code 0\n6\n");
+  // A command has the time the model gives it, of which it is told; one not done in it is said to have been stopped.
+  const shell = it.requests[1].tools.find((tool) => tool.function.name === "shell").function;
+  assert.deepEqual(shell.parameters.required, ["command", "seconds"]);
+  assert.match(shell.description, /It has the seconds you give it, and is stopped when they are up[^]*600 at most/);
+  assert.match(said[5], /^It was stopped: it was not done after the 1s it was given\. [^]*600s at most[^]*What it had printed:\nbegun\n$/);
   // (The record of the run that failed: where the program read its file, and how it ended.)
-  assert.match(said[5], /"endpoint":"\/tools\/read"[^]*"kind":"attempt-end"|"kind":"call"[^]*tools\/read/);
-  assert.match(said[6], /^Your reply was cut off at its limit before this call was whole: it was not run\./);
-  assert.equal(said[7], "written");
+  assert.match(said[6], /"endpoint":"\/tools\/read"[^]*"kind":"attempt-end"|"kind":"call"[^]*tools\/read/);
+  assert.match(said[7], /^Your reply was cut off at its limit before this call was whole: it was not run\./);
+  assert.equal(said[8], "written");
   // And where it said words and called nothing, it was told to work.
   assert.ok(it.requests[2].messages.some((message) => message.role === "user" && /Work with the tools/.test(JSON.stringify(message.content))));
 
   // All of it is on record, in the harness's own journal: each request, and each thing done between them.
   const [records] = journalsOf(it.harness);
   const calls = records.filter((record) => record.kind === "call").map((record) => record.endpoint);
-  assert.deepEqual(calls.filter((endpoint) => endpoint !== "/agent/complete"), ["/workspace/list", "/workspace/read", "/workspace/shell", "/workspace/shell", "/workspace/write", "/ctx/done"]);
+  assert.deepEqual(calls.filter((endpoint) => endpoint !== "/agent/complete"), ["/workspace/list", "/workspace/read", "/workspace/shell", "/workspace/shell", "/workspace/shell", "/workspace/write", "/ctx/done"]);
   assert.equal(calls.filter((endpoint) => endpoint === "/agent/complete").length, script.length);
   const shown = (await captureConsole("log", async () => printJournals(it.harness, "it", {}))).messages.join("\n");
-  assert.match(shown, /end: done +\(12000 tokens +\$0\.0140 in all\)/);
+  assert.match(shown, /end: done +\(13200 tokens +\$0\.0154 in all\)/);
 });
 
 test("the harness gives up where it is to: a provider that goes on failing, and a model that never hands a program over", async (t) => {

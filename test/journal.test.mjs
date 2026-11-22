@@ -417,6 +417,43 @@ test("no shape of value gets a record past its size, and none can pass for a not
   assert.equal(lookalike.cuts, undefined, "nothing was cut, and the record says so by saying nothing");
 });
 
+test("a record goes twelve names into what it is given and no further: a list or an object that deep is left out, and said to be", async (t) => {
+  const { openJournal } = await import("../packages/runtime/dist/journal.js");
+  const projectDir = makeTempDir("trama-journal-");
+  t.after(() => cleanupTempDir(projectDir));
+  /** A value under so many names, the field's own being the first. */
+  const under = (names, value) => { for (let name = 1; name < names; name += 1) value = { in: value }; return value; };
+  const way = (field, names) => [field, ...Array(names - 1).fill("in")];
+
+  const journal = openJournal(projectDir, 5, { purpose: "test" });
+  journal.note("deep", {
+    // Under eleven names a list is a list, and what is in it is under twelve: text and numbers are kept there...
+    kept: under(11, ["text", 7, null]),
+    words: under(12, "the innermost"),
+    // ...and a list or an object is not, be it empty: the record says nothing was there, and beside it what was.
+    list: under(12, [1, 2]),
+    object: under(12, {}),
+    among: under(11, ["text", { lost: true }, 7]),
+    far: under(40, "far too deep"),
+  });
+  journal.close();
+
+  const [, record] = readFileSync(journal.path, "utf-8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+  const at = (value, names) => { for (let name = 1; name < names; name += 1) value = value.in; return value; };
+  assert.deepEqual(at(record.kept, 11), ["text", 7, null]);
+  assert.equal(at(record.words, 12), "the innermost");
+  assert.equal(at(record.list, 12), null);
+  assert.equal(at(record.object, 12), null);
+  assert.deepEqual(at(record.among, 11), ["text", null, 7]);
+  assert.equal(at(record.far, 12), null);
+  assert.deepEqual(record.cuts, [
+    { path: way("list", 12), cut: "depth" },
+    { path: way("object", 12), cut: "depth" },
+    { path: [...way("among", 11), 1], cut: "depth" },
+    { path: way("far", 12), cut: "depth" },
+  ]);
+});
+
 test("a journal that is still being written is never the one to make room", async (t) => {
   const fakeHome = makeTempDir("trama-journal-home-");
   const projectDir = makeTempDir("trama-journal-");

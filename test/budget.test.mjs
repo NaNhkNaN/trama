@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { after } from "node:test";
 import { readdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
@@ -14,6 +14,17 @@ import { Session } from "../packages/session/dist/index.js";
 import {
   REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, makeTempDir, readJson, runNodeCommand, withEnv, writeJson,
 } from "./helpers.mjs";
+
+// Whether a run has a budget where it is given none is configuration. These tests say what a run is held to,
+// so they run against the defaults — not against whatever the person running them has in their own
+// ~/.trama/config.json: a budget there would be the budget of every run here that is given none.
+const defaultsHome = makeTempDir("trama-budget-defaults-");
+const realHome = process.env.HOME;
+process.env.HOME = defaultsHome;
+after(() => {
+  process.env.HOME = realHome;
+  cleanupTempDir(defaultsHome);
+});
 
 /** A report of usage: so many tokens read, at a dollar a thousand. */
 const took = (tokens) => ({ model: "p/m", input: tokens, output: 0, cacheRead: 0, cacheWrite: 0, cost: tokens / 1000 });

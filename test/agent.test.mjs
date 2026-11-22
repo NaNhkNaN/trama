@@ -319,8 +319,14 @@ test("PiAdapter warns once when the configured model is not in pi's catalog", as
   // Isolated pi config dir: the result must not depend on the developer's own ~/.pi/agent.
   const agentDir = makeTempDir("trama-pi-agent-");
   t.after(() => cleanupTempDir(agentDir));
+  // Nor on what is in their shell: a provider's key there is a model for pi to fall back to. So none of the
+  // variables pi takes for a provider's credentials is set here (their names end so, or begin so), and the home
+  // is one with no cloud's credentials in it.
+  const noCredentials = Object.fromEntries(Object.keys(process.env)
+    .filter((name) => /_(API_KEY|TOKEN|TOKEN_FILE)$|^(ANTHROPIC|AWS|GOOGLE|GCLOUD)_/.test(name))
+    .map((name) => [name, undefined]));
 
-  await withEnv({ PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1" }, async () => {
+  await withEnv({ ...noCredentials, PI_CODING_AGENT_DIR: agentDir, PI_OFFLINE: "1", HOME: agentDir }, async () => {
     const unknown = new PiAdapter({ provider: "anthropic", model: "no-such-model-typo" });
     const { messages } = await captureConsole("warn", async () => {
       // Two sessions, plus one in another directory — still one warning.
