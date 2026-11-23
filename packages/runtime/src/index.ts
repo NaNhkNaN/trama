@@ -15,8 +15,8 @@ import { ensureProjectScaffold, loadConfig, loadProjectConfig, loadState, namesA
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import {
   validateProgram, installValidatedProgram,
-  withTempDir, prepareProject, shownPaths, type Prepared, RUNTIME_TYPES, runProgram as runHere, whyNotReplaceable,
-  tagged, type AskedToMake, type Making,
+  withTempDir, prepareProject, shownPaths, type Prepared, RUNTIME_TYPES, runProgram as runHere, replayProgram as replayHere, whyNotReplaceable,
+  tagged, failureOf, type AskedToMake, type Making,
 } from "./runner.js";
 import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspace.js";
 import { parentBridge, remoteWorkspace, withOptions, type Bridge } from "./bridge-client.js";
@@ -24,10 +24,10 @@ import { guardPath, identityOf, sameProjectAs } from "./path-guard.js";
 import { printJournals, spentIn } from "./journal-view.js";
 import { messageOf } from "./errors.js";
 
-export type { Budget, ProgramResult, RunOptions } from "./runner-types.js";
+export type { Budget, ProgramResult, RunOptions, ReplayOptions, ReplayResult } from "./runner-types.js";
 export { failureOf } from "./runner.js";
 export { requestsWhole } from "./journal-view.js";
-import type { ProgramResult, RunOptions, TramaConfig } from "./runner-types.js";
+import type { ProgramResult, RunOptions, ReplayOptions, ReplayResult, TramaConfig } from "./runner-types.js";
 export type { Workspace, ObserveResult } from "./types.js";
 import type { Workspace } from "./types.js";
 
@@ -77,6 +77,37 @@ export async function runProgram(options: RunOptions): Promise<ProgramResult> {
     // (A path is this program's to say where it leads. A name is one of the user's projects, wherever it is said.)
     repairWith: request.repairWith !== undefined && namesAPath(request.repairWith) ? projectNamed(request.repairWith) : request.repairWith,
   }, signal);
+}
+
+/**
+ * Replay a recorded run of a project: its program run again with each call
+ * answered from the record, and none carried out — nothing asked of a model,
+ * nothing written to the project, nothing spent. What comes back is how far
+ * the program went the way it had gone, and where it left the record (see
+ * `ReplayResult`).
+ */
+export async function replayProgram(options: ReplayOptions): Promise<ReplayResult> {
+  if (parentBridge()) throw new Error("A replay is made by a runner that is in no program's run: not from within a program, yet.");
+  return replayHere(options);
+}
+
+/** Replay a run of a project by its name, and say how it went. Returns whether it went the whole way to the recorded end. */
+export async function showReplay(name: string, options: { run?: string; loose?: boolean; signal?: AbortSignal } = {}): Promise<boolean> {
+  const went = await replayProgram({ projectDir: resolveProject(name), ...options });
+  const status = (result: ProgramResult) => (result.status === "failed" ? `failed — ${failureOf(result.reason).split("\n")[0]}` : result.status);
+  console.log(`replay of run ${went.run}, attempt ${went.attempt}: the program is ${went.sameProgram ? "" : "not "}the one that was recorded`);
+  console.log(`${went.answered} of its ${went.recorded} calls were answered from the record; none was carried out`);
+  if (went.other.length > 0) {
+    console.log(`${went.other.length} of them asked otherwise than was recorded:`);
+    for (const { call, endpoint, difference } of went.other) console.log(`    call ${call} (${endpoint}): ${difference}`);
+  }
+  if (went.left) console.log(`it left the record at its call ${went.left.call} (${went.left.endpoint}): ${went.left.why}`);
+  else if (went.result) {
+    console.log(went.sameEnd ? `it ended as recorded: ${went.result.status}`
+      : `it ended otherwise than was recorded: ${status(went.result)} (recorded: ${went.recordedResult ? status(went.recordedResult) : "not said"})`);
+    if (went.unasked > 0) console.log(`${went.unasked} of the record's calls it did not come to make`);
+  }
+  return went.same;
 }
 
 /** The shared workspace in a directory, created if it does not exist: read, write, list, observe. */

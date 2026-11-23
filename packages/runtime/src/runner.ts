@@ -10,7 +10,8 @@ import { basename, join, dirname, relative } from "path";
 import { tmpdir } from "os";
 import { createHash, randomBytes } from "crypto";
 import type { OutsideAgent, ShellResult, Workspace } from "./types.js";
-import type { MakeRequest, RunOptions, ProgramResult } from "./runner-types.js";
+import type { MakeRequest, RunOptions, ProgramResult, ReplayOptions, ReplayResult } from "./runner-types.js";
+import { createReplay, readRecording, saysTheSame, type Replay } from "./replay.js";
 import { onAbort, rejectOnAbort } from "./abort.js";
 import type { AgentUsage } from "./agent-backend.js";
 import { checkedBudget, createMeter, type Budget, type Meter } from "./budget.js";
@@ -289,6 +290,12 @@ interface RunOnceOptions {
   journal: Journal;
   /** Which attempt of the run this is: 0 for the program as it was, 1 and up for fixes. */
   attempt?: number;
+  /**
+   * The run is a replay: the program's calls to the world are answered from
+   * a record and none is carried out, and the program is stopped where it
+   * leaves the record (see replay.ts). It then has no outcome.
+   */
+  replaying?: Replay;
 }
 
 interface RunOnceResult {
@@ -439,6 +446,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     program: fingerprint(guardPath(projectDir, "program.ts")),
     iteration: ctx.iteration,
     resumed: ctx.resumed,
+    // What it began from: a replay of the attempt begins there. (Last: it is the one field of no known size.)
+    state,
   });
   // Truncate logs only after preflight succeeds — preserves the prior run's
   // diagnostics if scaffolding, state loading, or context creation fails.
@@ -477,7 +486,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     return workspace;
   };
   // The workspace of the session this run is part of, if it is part of one.
-  const sessionWorkspace = workspaceDir ? workspaceAt(workspaceDir) : null;
+  // (In a replay it is not come to: nothing of a workspace is carried out, and none is made where there was none.)
+  const sessionWorkspace = workspaceDir && !options.replaying ? workspaceAt(workspaceDir) : null;
   const tools = createTools(projectDir, runEnded.signal, options.env, options.agents);
   // As far as a validation goes: the program asks its runner for what would be real — a run, a project
   // made. The call is left unanswered — an answer would only send the program on to do more — until
@@ -487,6 +497,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     validated.abort();
     return rejectOnAbort(new Promise<never>(() => {}), stop);
   };
+  // A replay goes as far as its record: where the program leaves that, it is asked to stop.
+  options.replaying?.whenLeft(() => validated.abort());
   // Known only to this run's program, through its init file.
   const token = randomBytes(32).toString("hex");
   // Whether the program's process has ended. (Nothing is an answer to it after that, and it is no longer there to stop.)
@@ -499,6 +511,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     workspace: sessionWorkspace,
     workspaceAt,
     journal,
+    replay: options.replaying,
     programOver: () => programOver,
     make: (request, stop, seq) => {
       if (validating) return handOff("has a project made or changed", stop);
@@ -553,7 +566,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
         state,
         iteration: ctx.iteration,
         maxIterations: ctx.maxIterations,
-        inSession: sessionWorkspace !== null,
+        inSession: Boolean(workspaceDir),
         resumed: ctx.resumed,
         yieldReason: ctx.yieldReason,
       });
@@ -570,7 +583,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
 
       const exit = await superviseChild(program, {
         timeout: allowance,
-        stopSignal: validating ? validated.signal : undefined,
+        stopSignal: validating || options.replaying ? validated.signal : undefined,
         sinks: {
           stdout: out ? out.sink : chunk => { process.stdout.write(chunk); },
           stderr: err ? err.sink : chunk => { process.stderr.write(chunk); },
@@ -604,6 +617,12 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       stderr: tail(child.stderr, MAX_JOURNALLED_OUTPUT),
       ...verdict,
     });
+    // A replay whose program left the record ended there: the program was stopped in mid-flow, and has no outcome.
+    const left = options.replaying?.state.left;
+    if (left) {
+      noteExit({ left });
+      return { outcome: null, failure: `The program left the record at its call ${left.call} (${left.endpoint}): ${left.why}` };
+    }
     let outcome: ProgramResult | null;
     try {
       // A program that was stopped did not finish, whatever its exit code
@@ -1196,6 +1215,88 @@ export async function validateProgram(
   const { result, repair, left } = await journalled(journal, backend, async () => (await validatedIn(as)) ?? (await validatedIn(projectDir))!);
   if (result.status === "failed") throw new Error(failureOf(result.reason));
   return { source: left, repairedError: repair?.error, ...(alone === undefined ? {} : { alone }) };
+}
+
+// --- Replaying a recorded run (see replay.ts) ---
+
+/** A backend for a run in which nothing is asked of a model: whatever is asked of it all the same is refused. */
+function noBackend(): Backend {
+  const refuse = async (): Promise<never> => { throw new Error("A replay asks nothing of a model."); };
+  return { ask: refuse, complete: refuse, spent: () => undefined, refused: () => undefined, counts: () => false, close: async () => {}, letGo: async () => {} };
+}
+
+/**
+ * Replay a recorded run of a project: run its program — or `program`, in
+ * its place — with each call answered from the record and none carried out
+ * (see replay.ts). The program runs in a throwaway copy of the project, from
+ * the state the recorded attempt began from, with what that run was started
+ * with; nothing reaches the project, nothing is asked of a model, and no
+ * journal is written: what a replay found is what it returns.
+ *
+ * Throws where there is nothing to replay, or the record does not say what
+ * the run began from. That a program left its record, or failed, is a
+ * result.
+ */
+export async function replayProgram(options: ReplayOptions): Promise<ReplayResult> {
+  const { projectDir } = options;
+  if (!existsSync(join(projectDir, "meta.json"))) {
+    throw new Error(`Project not found at ${projectDir}. Run \`trama list\` to see available projects.`);
+  }
+  const config = loadProjectConfig(projectDir);
+  const timeout = checkedTimeout(options.timeout ?? config.defaultTimeout);
+  const env = options.env == null ? undefined : checkedEnv(options.env);
+  const recording = readRecording(projectDir, options.run);
+  // (Where the program is run is settled below; what it asks from there is read as asked from the project's place.)
+  const place = { from: "", to: dirname(projectAt(projectDir)) };
+  const replay = createReplay(recording, { loose: options.loose, place });
+
+  const { once, sameProgram } = await withTempDir("trama-replay-", async (privateDir) => {
+    const { copy } = copyProjectWith(projectDir, privateDir, options.program);
+    place.from = dirname(copy);
+    if (programIn(copy) === null) throw new Error(`There is no program.ts in ${projectDir} to replay.`);
+    // The state the recorded attempt began from, in the place of what the project's has come to since.
+    if (Object.keys(recording.state).length === 0) rmSync(guardPath(copy, "state.json"), { force: true });
+    else saveState(copy, recording.state);
+    const sameProgram = fingerprint(guardPath(copy, "program.ts"))?.sha256 === recording.program;
+    const once = await runProgramOnce({
+      projectDir: copy,
+      backend: noBackend(),
+      timeout,
+      maxIterations: config.defaultMaxIterations,
+      argsOverride: recording.args,
+      workspaceDir: recording.workspace,
+      depth: 0,
+      env,
+      signal: options.signal,
+      // (No journal: a replay is not a run of the project's, and is not to push one of its runs out of what is kept.)
+      journal: openJournal(projectDir, 0, {}),
+      replaying: replay,
+    });
+    return { once, sameProgram };
+  });
+  if (options.signal?.aborted) throw new Error("The replay was stopped before it finished.");
+
+  const { recorded, answered, other, left } = replay.state;
+  // How the recorded attempt ended: its outcome — or, where it failed, how the run did, which is the same failure.
+  const recordedResult = recording.outcome ?? (recording.outcome === null ? (recording.end ?? { status: "failed" as const, reason: "The recorded attempt failed." }) : undefined);
+  const result = left ? undefined : (once.outcome ?? { status: "failed" as const, reason: once.failure });
+  // (Of two failures the words are not held against each other: they tell of where each ran.)
+  const sameEnd = result !== undefined && recordedResult !== undefined
+    && (result.status === "failed" || recordedResult.status === "failed" ? result.status === recordedResult.status : saysTheSame(result, recordedResult));
+  return {
+    run: recording.run,
+    attempt: recording.attempt,
+    sameProgram,
+    recorded,
+    answered,
+    unasked: recorded - answered,
+    other,
+    ...(left && { left }),
+    ...(result && { result }),
+    ...(recordedResult && { recordedResult }),
+    sameEnd,
+    same: !left && answered === recorded && other.length === 0 && sameEnd,
+  };
 }
 
 /**

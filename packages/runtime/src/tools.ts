@@ -200,6 +200,7 @@ export function createTools(projectDir: string, signal?: AbortSignal, env?: Reco
           exitCode: exit.timedOut ? 1 : (exit.code ?? 1),
           stdout: exit.stdout,
           stderr: exit.timedOut ? exit.stderr + "\ntimeout" : exit.stderr,
+          ...(exit.timedOut && { timedOut: true as const }),
         };
       } catch (spawnError) {
         // Failed to start (e.g. cwd does not exist) — a result, not an exception.

@@ -62,6 +62,18 @@ test("createTools shell enforces timeouts", async (t) => {
   assert.match(result.stderr, /timeout/);
 });
 
+test("a command stopped at its time says so of itself: by what its result has, and not by what it wrote or how long it took", async (t) => {
+  const projectDir = makeTempDir("trama-tools-");
+  t.after(() => cleanupTempDir(projectDir));
+  const tools = createTools(projectDir);
+
+  assert.deepEqual(await tools.shell("echo some; sleep 5", { timeout: 300 }), { exitCode: 1, stdout: "some\n", stderr: "\ntimeout", timedOut: true });
+  assert.deepEqual(await tools.shellIn(projectDir, "sleep 5", { timeout: 0 }), { exitCode: 1, stdout: "", stderr: "\ntimeout", timedOut: true });
+  // A command that ended by itself has no such thing said of it — whatever it wrote last, and however it ended.
+  assert.deepEqual(await tools.shell("printf 'it gave up\\ntimeout' >&2; exit 1", { timeout: 10_000 }), { exitCode: 1, stdout: "", stderr: "it gave up\ntimeout" });
+  assert.deepEqual(await tools.shell("echo done"), { exitCode: 0, stdout: "done\n", stderr: "" });
+});
+
 test("createTools shell: a command that reads its input finds it at an end", async (t) => {
   const projectDir = makeTempDir("trama-tools-");
   t.after(() => cleanupTempDir(projectDir));

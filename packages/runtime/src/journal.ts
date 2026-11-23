@@ -288,7 +288,7 @@ function redactHeaders(headers: unknown): unknown {
  * secret a program puts anywhere else (a URL, a prompt, a command) is recorded
  * like the rest: the journal cannot tell.
  */
-function recordable(endpoint: string, value: unknown): unknown {
+export function recordable(endpoint: string, value: unknown): unknown {
   if (endpoint === "/tools/fetch" && isJsonObject(value) && "headers" in value) {
     return { ...value, headers: redactHeaders(value.headers) };
   }

@@ -76,9 +76,9 @@ const tools: Tool[] = [
     parameters: { command: "string", seconds: "number: how long it may take before it is stopped" },
     run: async ({ command, seconds }) => {
       if (!(seconds >= 1 && seconds <= LONGEST)) throw new Error(`seconds is to be from 1 to ${LONGEST}: how long the command may take.`);
-      const began = Date.now(), ran = await workspace.shell(command, { timeout: seconds * 1000 });
-      // (A command stopped at its time took that long, and the runtime ends what it wrote to stderr with the word.)
-      if (!ran.stderr.endsWith(TIMED_OUT) || Date.now() - began < seconds * 1000) return shown(ran);
+      const ran = await workspace.shell(command, { timeout: seconds * 1000 });
+      // (A command stopped at its time says so of itself; the runtime ends what it wrote to stderr with the word, which is taken off.)
+      if (!ran.timedOut) return shown(ran);
       const stderr = ran.stderr.slice(0, -TIMED_OUT.length);
       return `It was stopped: it was not done after the ${seconds}s it was given. Give it longer (${LONGEST}s at most), run less at a time, or start it in the background and look in on it. What it had printed:\n${ran.stdout}${stderr ? `\n[stderr]\n${stderr}` : ""}`;
     },

@@ -76,6 +76,66 @@ export interface RunOptions {
   signal?: AbortSignal;
 }
 
+/** What a replay is asked with (see `replayProgram`). */
+export interface ReplayOptions {
+  /** The project whose recorded run is replayed, and whose program is run against it. */
+  projectDir: string;
+  /** The run to answer from, by its id (as `trama journal <name> --list` shows it). Without it, the project's latest run that is no validation. */
+  run?: string;
+  /**
+   * Answer a call wherever its endpoint is the recorded one, whatever it
+   * asks: not "does the program ask what was asked" but "does it get through
+   * what was answered". Each call that asked otherwise is in `other`.
+   */
+  loose?: boolean;
+  /** A program to replay in the place of the project's: its text. The project's own is not touched. */
+  program?: string;
+  /** Variables for the program, over the runner's own. (Those the recorded run had are not on record: their names are.) */
+  env?: Record<string, string>;
+  /** How long the program may take, in milliseconds. Without it, the config's. */
+  timeout?: number;
+  /** Stops the replay, which then throws. */
+  signal?: AbortSignal;
+}
+
+/**
+ * How a replay went. A program's calls to the world — everything but what
+ * it says to its own run by `ctx.*` — are answered from the record, in
+ * order, each where it is the recorded call; none is carried out.
+ */
+export interface ReplayResult {
+  /** The run that was answered from, and which attempt of it: the last. */
+  run: string;
+  attempt: number;
+  /** Whether the program that was replayed is the one that was recorded, to the byte. */
+  sameProgram: boolean;
+  /** How many calls the record has, and how many of the program's were answered from it. */
+  recorded: number;
+  answered: number;
+  /** How many of the record's calls the program did not come to make. */
+  unasked: number;
+  /** Calls answered though they asked otherwise than was recorded (`loose`): which, and where the request first differs. */
+  other: Array<{ call: number; endpoint: string; difference: string }>;
+  /**
+   * Where the program left the record, and why: its call (the first is 1)
+   * was not the next the record has, or the record has no answer for it.
+   * The program was stopped there, and has no `result`.
+   */
+  left?: { call: number; endpoint: string; why: string };
+  /** How the program ended, where it did not leave the record: its end is carried out. */
+  result?: ProgramResult;
+  /** How the recorded attempt ended, where the record says. */
+  recordedResult?: ProgramResult;
+  /**
+   * The program ended as the recorded attempt ended: with the same result —
+   * or, where both failed, by failing (the words of two failures are not
+   * held against each other). False where it left the record.
+   */
+  sameEnd: boolean;
+  /** The program went the whole way of the record, asked nothing otherwise, and ended as the recorded attempt ended. */
+  same: boolean;
+}
+
 /** A run as one program asks its runner for it: everything in RunOptions that can cross the bridge. */
 export type RunRequest = Omit<RunOptions, "signal">;
 

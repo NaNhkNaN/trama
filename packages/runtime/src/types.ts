@@ -335,6 +335,13 @@ export interface ShellResult {
   exitCode: number;
   stdout: string;
   stderr: string;
+  /**
+   * The command was stopped because its time was up (`timeout`): it did not
+   * end by itself. There only where that is so. (Its `exitCode` is then 1,
+   * and its `stderr` ends in a line "timeout" — as a command's own may: go
+   * by this, and not by that or by a clock.)
+   */
+  timedOut?: true;
 }
 
 /** What starts an agent from outside: a command, what it is given, and variables of its own over those a shell command has. */

@@ -5,7 +5,7 @@ import { createServer } from "node:http";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
-import { runProgram } from "../packages/runtime/dist/runner.js";
+import { replayProgram, runProgram } from "../packages/runtime/dist/runner.js";
 import { user } from "./pi-user.mjs";
 import { isDeepStrictEqual } from "node:util";
 import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, makeTempDir, withEnv } from "./helpers.mjs";
@@ -65,6 +65,9 @@ async function scene(t, plays, said = "down for a moment") {
   return {
     requests, sizes, projectDir,
     run: (args = {}, options = {}) => withEnv(it.env, () => captureConsole("warn", () => runProgram({ projectDir, args: { task: "Greet properly.", ...args }, maxRepairAttempts: 0, timeout: 60_000, ...options }))),
+    replay: (options = {}) => withEnv(it.env, () => captureConsole("warn", () => replayProgram({ projectDir, ...options }))),
+    /** The model is gone: whatever is asked of it from here on is not answered. */
+    gone: () => new Promise((resolve) => { provider.closeAllConnections(); provider.close(resolve); }),
   };
 }
 /** What the stand-in says a request read, in tokens: a quarter of its bytes. */
@@ -369,6 +372,29 @@ test("where a conversation cannot be kept within what may be read, the harness s
   const went = await once.run({ forgetAt: 8000 });
   assert.deepEqual([went.result.status, went.result.result.summed, blank], ["done", 1, 2]);
   assert.ok(once.requests.at(-1).messages[1].content.includes("\n\n## Done\nthe second\n\n[Kept by the harness"));
+});
+
+test("a run of the harness is replayed from its record, the model gone: it goes by what it is told and not by the clock — a command that was stopped at its time is one in a replay, which takes no time", async (t) => {
+  const script = [
+    { name: "shell", args: { command: "echo begun; sleep 5", seconds: 1 } },
+    { name: "shell", args: { command: "printf 'it gave up\\ntimeout' >&2; exit 1", seconds: 30 } },
+    { name: "edit", args: { path: "src/greet.js", find: "Helo", replace: "Hello" } },
+    { name: "read", args: { path: "notes.txt" } },
+    { name: "finish", args: { summary: "mended" } },
+  ];
+  const it = await scene(t, (_request, n) => script[n - 1]);
+  const { result } = await it.run();
+  assert.equal(result.status, "done");
+  assert.match(saidByTools(it.requests[1])[0], /^It was stopped: it was not done after the 1s it was given\.[^]*What it had printed:\nbegun\n$/);
+  // (A command that ended by itself is not one that was stopped, whatever the last word it wrote.)
+  assert.match(saidByTools(it.requests[2])[1], /^exit code 1\n[^]*it gave up\ntimeout$/);
+  await it.gone();
+  const asked = it.requests.length;
+
+  const again = (await it.replay()).result;
+  assert.deepEqual([again.left, again.answered, again.unasked, again.same], [undefined, again.recorded, 0, true]);
+  assert.deepEqual(again.result, result);
+  assert.equal(it.requests.length, asked, "the model was asked nothing");
 });
 
 test("the harness gives up where it is to: a provider that goes on failing, and a model that never says it is done", async (t) => {

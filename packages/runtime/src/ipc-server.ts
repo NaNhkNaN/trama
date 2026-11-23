@@ -11,7 +11,8 @@ import type { Said } from "./outside-agent.js";
 import type { RunnerAgent } from "./agent.js";
 import type { RunContext } from "./context.js";
 import type { MakeRequest, ProgramResult, RunRequest } from "./runner-types.js";
-import { OFF_THE_RECORD, type Journal, type RecordedCall } from "./journal.js";
+import { OFF_THE_RECORD, recordable, type Journal, type RecordedCall } from "./journal.js";
+import { LeftTheRecord, askAgain, besideTheRecord, type Replay, type RecordedCall as Replayed } from "./replay.js";
 import type { OwnTool } from "./agent-backend.js";
 import { createToolAsks, imagesOf, toolsOf } from "./own-tools.js";
 import { REQUEST_FIELDS, requestOf } from "./model-request.js";
@@ -68,6 +69,11 @@ interface Route {
    * where what it used is written down.
    */
   handle(body: unknown, connectionClosed: Promise<void>, call: RecordedCall): unknown;
+  /**
+   * What is done again of a call that is answered from a record, in a
+   * replay: nothing, for most — the answer is all a program had of them.
+   */
+  again?(body: unknown, connectionClosed: Promise<void>, call: RecordedCall, recorded: Replayed, replay: Replay): Promise<unknown>;
 }
 
 const isStrings = (value: unknown): boolean => Array.isArray(value) && value.every(item => typeof item === "string");
@@ -114,9 +120,14 @@ function read<F extends Fields>(body: unknown, fields: F): Args<F> {
 function route<F extends Fields>(
   fields: F,
   handle: (args: Args<F>, connectionClosed: Promise<void>, call: RecordedCall) => unknown,
-  how: Pick<Route, "offTheRecord"> = {},
+  how: Pick<Route, "offTheRecord"> & { again?: (args: Args<F>, connectionClosed: Promise<void>, call: RecordedCall, recorded: Replayed, replay: Replay) => Promise<unknown> } = {},
 ): Route {
-  return { ...how, handle: (body, connectionClosed, call) => handle(read(body, fields), connectionClosed, call) };
+  const { again, ...rest } = how;
+  return {
+    ...rest,
+    handle: (body, connectionClosed, call) => handle(read(body, fields), connectionClosed, call),
+    ...(again && { again: (body, connectionClosed, call, recorded, replay) => again(read(body, fields), connectionClosed, call, recorded, replay) }),
+  };
 }
 
 /**
@@ -218,6 +229,13 @@ export interface IpcBackends {
   /** Where every call, and how it ended, is written down. */
   journal: Journal;
   /**
+   * The run is a replay: the program's calls to the world are answered from
+   * a record, where the record has them, and none is carried out (see
+   * replay.ts). What is beside the record — what a program says to its own
+   * run, `ctx.*` — is carried out as ever.
+   */
+  replay?: Replay;
+  /**
    * Whether the program has ended. What comes back for a call after that is
    * no answer — though its connection may not have been seen to close yet.
    */
@@ -303,11 +321,14 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
       { prompt: "string", ...HOW_SERVED, templates: "optional boolean or strings" },
       ({ prompt, tools, toolsId, ...options }, _closed, call) => withTools(tools, toolsId, call, (names, own) =>
         agent.instruct(prompt, { ...options, tools: names } as Parameters<RunnerAgent["instruct"]>[1], call.used, own)),
+      // (Answered from a record, the tools of the program's own that its agent called are asked again: see askAgain.)
+      { again: ({ tools, toolsId }, _closed, call, recorded, replay) => withTools(tools, toolsId, call, (_names, own) => askAgain(replay, recorded, own)) },
     ),
     "/agent/generate": route(
       { prompt: "string", schema: "object", ...HOW_SERVED },
       ({ tools, toolsId, ...input }, _closed, call) => withTools(tools, toolsId, call, (names, own) =>
         agent.generate({ ...input, tools: names } as Parameters<RunnerAgent["generate"]>[0], call.used, own)),
+      { again: ({ tools, toolsId }, _closed, call, recorded, replay) => withTools(tools, toolsId, call, (_names, own) => askAgain(replay, recorded, own)) },
     ),
     // One request to a model (see model-request.ts): what it holds is read there, all of it, before anything is
     // asked or counted — a conversation is no list of fields, and what is wrong with one is said by where it is.
@@ -463,11 +484,29 @@ export function createIPCServer(backends: IpcBackends): Server {
         const route = req.url && Object.hasOwn(routes, req.url) ? routes[req.url] : undefined;
         if (!route) return reply(404, "Not found");
         call = route.offTheRecord ? OFF_THE_RECORD : backends.journal.call(req.url!, asRecorded(body));
-        const result = (await route.handle(body, connectionClosed, call)) ?? null;
+        let result: unknown;
+        const { replay } = backends;
+        if (replay && !route.offTheRecord && !besideTheRecord(req.url!)) {
+          // A replay: the call is answered as the record has it answered, and is not carried out. (Matched as it
+          // would be written down: that is what the record has of it.)
+          const recorded = replay.take(req.url!, recordable(req.url!, asRecorded(body)));
+          await route.again?.(body, connectionClosed, call, recorded, replay);
+          replay.answered(recorded);
+          if (!recorded.answer!.ok) {
+            // (In the words it was refused or failed in: they are all the program was given.)
+            if (answerable()) call.end({ ok: false, error: recorded.answer!.error });
+            return reply(500, recorded.answer!.error);
+          }
+          result = recorded.answer!.result ?? null;
+        } else {
+          result = (await route.handle(body, connectionClosed, call)) ?? null;
+        }
         const payload = JSON.stringify({ result });
         if (answerable()) call.end({ ok: true, result });
         reply(200, payload, true);
       } catch (err) {
+        // The program has left the record it is replayed from: the call is not answered, and the program is being stopped.
+        if (err instanceof LeftTheRecord) return;
         const refused = err instanceof BadRequest;
         const error = refused ? err.message : String(err);
         if (answerable()) call?.end({ ok: false, error });

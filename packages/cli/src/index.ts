@@ -9,6 +9,7 @@ import {
   listProjects,
   showLogs,
   showJournal,
+  showReplay,
   resolveProject,
   failureOf,
 } from "@trama-dev/runtime/runner";
@@ -176,6 +177,16 @@ cli
   .option("--list", "List the runs that have a journal")
   .action(command(async (name: string, run: string | undefined, opts: { list?: boolean }) => {
     await showJournal(name, { run, list: opts.list });
+  }));
+
+cli
+  .command("replay <name> [run]")
+  .description("Run a program again with its calls answered from the record of a run (the latest, or the one named): nothing is carried out")
+  .option("--loose", "Answer a call wherever its kind is the recorded one, whatever it asks")
+  .action(command(async (name: string, run: string | undefined, opts: { loose?: boolean }) => {
+    const same = await stoppable((signal) => showReplay(name, { run, loose: opts.loose, signal }));
+    // (It ends as it went: the whole way to the recorded end, or not.)
+    if (!same) process.exitCode = 1;
   }));
 
 cli.parse();
