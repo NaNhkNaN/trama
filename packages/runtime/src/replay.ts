@@ -23,7 +23,7 @@
 
 import { readFileSync } from "fs";
 import { dirname } from "path";
-import { journalDirOf, journalIn, runsIn } from "./journal.js";
+import { journalDirOf, journalIn, runsIn, stillBeingWritten } from "./journal.js";
 import { projectAt } from "./path-guard.js";
 import { requestsWhole } from "./journal-view.js";
 import { isJsonObject } from "./serializable.js";
@@ -91,30 +91,46 @@ export function placed(value: unknown, from: string, to: string): unknown {
   return value;
 }
 
+/** The records of a journal, as far as they can be read. (A line that is no record — the last of a journal cut off in the writing — is passed over.) */
+const recordsIn = (path: string): Array<Record<string, any>> =>
+  readFileSync(path, "utf-8").split("\n").filter(Boolean).flatMap((line) => {
+    try { return [JSON.parse(line)]; } catch { return []; }
+  });
+
 /**
- * Read the record of a run of the project: the run named, or else the
- * latest that is a run (and no validation). Of a run that was repaired, the
- * last attempt: the program that came of it. Throws where there is nothing
- * to replay, or the record does not say what a replay has to begin from.
+ * The runs of a project that a replay may be made from without one being
+ * named, oldest first: those that are runs (and no validation), and are
+ * over. A run that is still going is not among them — its record is not
+ * all there yet, and a program that replays its own project would be
+ * answered from the run it is in.
+ */
+export function runsToReplay(projectDir: string): string[] {
+  const dir = journalDirOf(projectDir);
+  return runsIn(dir).filter((run) => {
+    const path = journalIn(dir, run);
+    try {
+      return !stillBeingWritten(path) && recordsIn(path)[0]?.purpose === "run";
+    } catch {
+      return false; // (gone since it was listed, or not to be read)
+    }
+  });
+}
+
+/**
+ * Read the record of a run of the project: the run named — also one that
+ * is still going, as far as it has got — or else the latest there is to
+ * replay (see `runsToReplay`). Of a run that was repaired, the last
+ * attempt: the program that came of it. Throws where there is nothing to
+ * replay, or the record does not say what a replay has to begin from.
  */
 export function readRecording(projectDir: string, run?: string): Recording {
   const dir = journalDirOf(projectDir);
-  const runs = runsIn(dir);
-  const read = (name: string): Array<Record<string, any>> =>
-    readFileSync(journalIn(dir, name), "utf-8").split("\n").filter(Boolean).flatMap((line) => {
-      try { return [JSON.parse(line)]; } catch { return []; }
-    });
-  let records: Array<Record<string, any>> | undefined;
-  if (run !== undefined) {
-    if (!runs.includes(run)) throw new Error(`No journal for run ${JSON.stringify(run)}. \`trama journal <name> --list\` shows the runs that have one.`);
-    records = read(run);
-  } else {
-    for (const name of [...runs].reverse()) {
-      const found = read(name);
-      if (found[0]?.purpose === "run") { run = name; records = found; break; }
-    }
+  if (run !== undefined && !runsIn(dir).includes(run)) {
+    throw new Error(`No journal for run ${JSON.stringify(run)}. \`trama journal <name> --list\` shows the runs that have one.`);
   }
-  if (run === undefined || !records) throw new Error("No run of the project is on record: there is nothing to replay.");
+  run ??= runsToReplay(projectDir).at(-1);
+  if (run === undefined) throw new Error("No run of the project is on record: there is nothing to replay.");
+  const records = recordsIn(journalIn(dir, run));
 
   const head = records[0] ?? {};
   const from = records.map((record) => record.kind).lastIndexOf("attempt");
@@ -207,7 +223,7 @@ export function firstDifference(asked: unknown, recorded: unknown, path = ""): s
 }
 
 /** The calls that last as long as what they ask for, and are named by the client so that they can be stopped: by an id made for the call. */
-const NAMED = ["/run/program", "/project/create", "/project/update"];
+const NAMED = ["/run/program", "/project/create", "/project/update", "/project/replay"];
 
 /** A request as it is matched: without what is the client's own way of carrying a call, and no part of what the program asked. */
 function matched(endpoint: string, request: unknown): unknown {

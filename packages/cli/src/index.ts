@@ -182,9 +182,10 @@ cli
 cli
   .command("replay <name> [run]")
   .description("Run a program again with its calls answered from the record of a run (the latest, or the one named): nothing is carried out")
+  .option("--all", "Replay every run on record, each by itself")
   .option("--loose", "Answer a call wherever its kind is the recorded one, whatever it asks")
-  .action(command(async (name: string, run: string | undefined, opts: { loose?: boolean }) => {
-    const same = await stoppable((signal) => showReplay(name, { run, loose: opts.loose, signal }));
+  .action(command(async (name: string, run: string | undefined, opts: { all?: boolean; loose?: boolean }) => {
+    const same = await stoppable((signal) => showReplay(name, { run, all: opts.all, loose: opts.loose, signal }));
     // (It ends as it went: the whole way to the recorded end, or not.)
     if (!same) process.exitCode = 1;
   }));

@@ -136,6 +136,23 @@ export interface ReplayResult {
   same: boolean;
 }
 
+/** How a program held to every run on record went (see `replayAll`). */
+export interface ReplayAllResult {
+  /**
+   * The project's runs that are over, oldest first, and how the replay of
+   * each went — or why it was not replayed: its record does not say what a
+   * replay has to begin from.
+   */
+  runs: Array<{ run: string; replay?: ReplayResult; notReplayed?: string }>;
+  /** How many of them were replayed. */
+  replayed: number;
+  /** Every run that was replayed went as recorded (`same`), and at least one was. */
+  same: boolean;
+}
+
+/** A replay as a program asks its runner for it: what can cross the bridge, and whether it is of every run. */
+export type ReplayRequest = Omit<ReplayOptions, "signal"> & { all?: boolean };
+
 /** A run as one program asks its runner for it: everything in RunOptions that can cross the bridge. */
 export type RunRequest = Omit<RunOptions, "signal">;
 

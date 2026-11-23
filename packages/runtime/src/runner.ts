@@ -10,8 +10,8 @@ import { basename, join, dirname, relative } from "path";
 import { tmpdir } from "os";
 import { createHash, randomBytes } from "crypto";
 import type { OutsideAgent, ShellResult, Workspace } from "./types.js";
-import type { MakeRequest, RunOptions, ProgramResult, ReplayOptions, ReplayResult } from "./runner-types.js";
-import { createReplay, readRecording, saysTheSame, type Replay } from "./replay.js";
+import type { MakeRequest, RunOptions, ProgramResult, ReplayAllResult, ReplayOptions, ReplayResult } from "./runner-types.js";
+import { createReplay, readRecording, runsToReplay, saysTheSame, type Recording, type Replay } from "./replay.js";
 import { onAbort, rejectOnAbort } from "./abort.js";
 import type { AgentUsage } from "./agent-backend.js";
 import { checkedBudget, createMeter, type Budget, type Meter } from "./budget.js";
@@ -511,7 +511,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     workspace: sessionWorkspace,
     workspaceAt,
     journal,
-    replay: options.replaying,
+    replaying: options.replaying,
     programOver: () => programOver,
     make: (request, stop, seq) => {
       if (validating) return handOff("has a project made or changed", stop);
@@ -534,6 +534,20 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       const env = options.env || request.env ? { ...options.env, ...request.env } : undefined;
       const { signal, ...asked } = itsOwn(seq, stop);
       return notOverBefore(runProgram({ ...request, env, signal }, { depth: options.depth + 1, ...asked }, options.making).finally(release));
+    },
+    // A replay the program asks for is made here, as a run it asks for is — and in a validation too: it
+    // carries nothing out and uses nothing, so there is nothing of it to be kept from. It is the run's
+    // own: stopped when the run ends or the program no longer wants it, and not over before it is; the
+    // program is waiting meanwhile, and its clock stops. (It leaves no journal: nothing points to it.)
+    replay: ({ all, ...request }, stop) => {
+      const release = allowance.hold();
+      const asked = {
+        ...request,
+        env: options.env || request.env ? { ...options.env, ...request.env } : undefined,
+        signal: AbortSignal.any([runEnded.signal, stop]),
+      };
+      const made: Promise<ReplayResult | ReplayAllResult> = all ? replayAll(asked) : replayProgram(asked);
+      return notOverBefore(made.finally(release));
     },
   });
 
@@ -1238,14 +1252,55 @@ function noBackend(): Backend {
  * result.
  */
 export async function replayProgram(options: ReplayOptions): Promise<ReplayResult> {
-  const { projectDir } = options;
+  toBeReplayed(options.projectDir);
+  return replayOf(readRecording(options.projectDir, options.run), options);
+}
+
+/**
+ * Hold a project's program — or `program`, in its place — to every run of
+ * the project that is on record and over: each replayed by itself, as
+ * `replayProgram` replays one. A run whose record does not say what a
+ * replay has to begin from is passed over, and said. It is the check a
+ * change that is meant to change nothing can be held to: a record is a test
+ * of the way its run went, and of nothing the run did not do.
+ *
+ * Throws where the project has no run on record.
+ */
+export async function replayAll(options: Omit<ReplayOptions, "run">): Promise<ReplayAllResult> {
+  toBeReplayed(options.projectDir);
+  const runs = runsToReplay(options.projectDir);
+  if (runs.length === 0) throw new Error("No run of the project is on record: there is nothing to replay.");
+  const each: ReplayAllResult["runs"] = [];
+  for (const run of runs) {
+    if (options.signal?.aborted) throw new Error(STOPPED_REPLAY);
+    let recording: Recording;
+    try {
+      recording = readRecording(options.projectDir, run);
+    } catch (err) {
+      each.push({ run, notReplayed: messageOf(err) });
+      continue;
+    }
+    each.push({ run, replay: await replayOf(recording, options) });
+  }
+  const replayed = each.filter(({ replay }) => replay !== undefined).length;
+  return { runs: each, replayed, same: replayed > 0 && each.every(({ replay }) => replay === undefined || replay.same) };
+}
+
+const STOPPED_REPLAY = "The replay was stopped before it finished.";
+
+/** A replay is of a project that is there. */
+function toBeReplayed(projectDir: string): void {
   if (!existsSync(join(projectDir, "meta.json"))) {
     throw new Error(`Project not found at ${projectDir}. Run \`trama list\` to see available projects.`);
   }
+}
+
+/** Replay one recording of the project (see `replayProgram`). */
+async function replayOf(recording: Recording, options: Omit<ReplayOptions, "run">): Promise<ReplayResult> {
+  const { projectDir } = options;
   const config = loadProjectConfig(projectDir);
   const timeout = checkedTimeout(options.timeout ?? config.defaultTimeout);
   const env = options.env == null ? undefined : checkedEnv(options.env);
-  const recording = readRecording(projectDir, options.run);
   // (Where the program is run is settled below; what it asks from there is read as asked from the project's place.)
   const place = { from: "", to: dirname(projectAt(projectDir)) };
   const replay = createReplay(recording, { loose: options.loose, place });
@@ -1266,6 +1321,8 @@ export async function replayProgram(options: ReplayOptions): Promise<ReplayResul
       argsOverride: recording.args,
       workspaceDir: recording.workspace,
       depth: 0,
+      // (What the program prints is shown as a replay's: it is not the output of a run, nor of the program that asked for it.)
+      label: "replay",
       env,
       signal: options.signal,
       // (No journal: a replay is not a run of the project's, and is not to push one of its runs out of what is kept.)
@@ -1274,7 +1331,7 @@ export async function replayProgram(options: ReplayOptions): Promise<ReplayResul
     });
     return { once, sameProgram };
   });
-  if (options.signal?.aborted) throw new Error("The replay was stopped before it finished.");
+  if (options.signal?.aborted) throw new Error(STOPPED_REPLAY);
 
   const { recorded, answered, other, left } = replay.state;
   // How the recorded attempt ended: its outcome — or, where it failed, how the run did, which is the same failure.

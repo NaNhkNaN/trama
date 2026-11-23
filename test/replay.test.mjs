@@ -4,9 +4,9 @@ import { existsSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync 
 import { join } from "path";
 import { createServer } from "http";
 import { llm } from "./fake-llm.mjs";
-import { replayProgram, runProgram, validateProgram } from "../packages/runtime/dist/runner.js";
+import { replayAll, replayProgram, runProgram, validateProgram } from "../packages/runtime/dist/runner.js";
 import { createBackend } from "../packages/runtime/dist/runner-backend.js";
-import { REPO_ROOT, cleanupTempDir, createProjectFixture, makeTempDir, runNodeCommand } from "./helpers.mjs";
+import { REPO_ROOT, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, runNodeCommand } from "./helpers.mjs";
 
 // A replay: a project's program run again with its calls answered from the record of an earlier run, and none of
 // them carried out. Nothing is asked of a model, nothing is written to the project, nothing is spent: what comes of
@@ -449,6 +449,8 @@ test("trama replay says how a replay went, and ends as it went: the whole way to
   assert.match(same.stdout, new RegExp(`replay of run ${run}, attempt 0: the program is the one that was recorded`));
   assert.match(same.stdout, /2 of its 2 calls were answered from the record; none was carried out/);
   assert.match(same.stdout, /it ended as recorded: done/);
+  // (What the replayed program prints is shown as a replay's, and not as a run's.)
+  assert.deepEqual(same.stdout.split("\n").filter((line) => line.includes("[trama] done")), ["[replay] [trama] done"]);
   assert.equal(readFileSync(join(projectDir, "ran.txt"), "utf-8"), "ran\n", "the command ran once: when the run was recorded");
 
   writeFileSync(join(projectDir, "program.ts"), DEMO.replace(`"v1"`, `"v2"`));
@@ -469,4 +471,232 @@ test("trama replay says how a replay went, and ends as it went: the whole way to
   assert.equal(none.exitCode, 1);
   assert.match(none.stderr, /No journal for run "2020-01-01T00-00-00-000Z-aaaaaa"/);
   assert.equal(existsSync(join(projectDir, "ran.txt")), true);
+});
+
+// --- A program held to all its records, and a replay asked for by a program ---
+
+test("a program is held to every run on record: each is replayed by itself, one that cannot be is said, and there is one answer for all", async (t) => {
+  const projectDir = project(t, KEEPS);
+  for (const n of [1, 2, 3]) assert.equal((await recorded(projectDir, model)).result.n, n);
+  const [one, two, three] = runsOf(projectDir);
+  // (A validation among them is no run of the project's.)
+  const original = { ...llm };
+  Object.assign(llm, model);
+  try {
+    await validateProgram(projectDir, createBackend({ provider: "fake", model: "plain" }), KEEPS, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10, journalRuns: 20 });
+  } finally {
+    Object.assign(llm, original);
+  }
+  assert.equal(runsOf(projectDir).length, 4);
+  const before = held(projectDir);
+
+  const all = await replayAll({ projectDir });
+  assert.deepEqual(all.runs.map(({ run }) => run), [one, two, three]);
+  assert.deepEqual(all.runs.map((each) => [each.replay.answered, each.replay.result.result.n, each.replay.same, each.notReplayed]), [[1, 1, true, undefined], [1, 2, true, undefined], [1, 3, true, undefined]]);
+  assert.deepEqual([all.replayed, all.same], [3, true]);
+  // Each is what replaying that run alone comes to.
+  assert.deepEqual(all.runs[1].replay, await replay(projectDir, { run: two }));
+  assert.deepEqual(held(projectDir), before);
+
+  // A program that goes another way on some of them: not the same, and which is said.
+  const partly = await replayAll({ projectDir, program: KEEPS.replace(`"It is run " + ctx.state.n`, `(ctx.state.n > 1 ? "Now run " : "It is run ") + ctx.state.n`) });
+  assert.deepEqual(partly.runs.map((each) => [each.replay.same, each.replay.left?.call]), [[true, undefined], [false, 1], [false, 1]]);
+  assert.deepEqual([partly.replayed, partly.same], [3, false]);
+  const loosely = await replayAll({ projectDir, loose: true, program: KEEPS.replace(`"It is run "`, `"This is run "`) });
+  assert.deepEqual(loosely.runs.map((each) => [each.replay.answered, each.replay.other.length, each.replay.sameEnd, each.replay.same]), [[1, 1, true, false], [1, 1, true, false], [1, 1, true, false]]);
+
+  // A run whose record cannot be replayed is passed over, with why: the others say what they say.
+  rewrite(projectDir, two, (records) => records.map(({ state: _state, ...record }) => record));
+  const some = await replayAll({ projectDir });
+  assert.deepEqual(some.runs.map((each) => [each.run, each.replay?.same, each.notReplayed === undefined]), [[one, true, true], [two, undefined, false], [three, true, true]]);
+  assert.match(some.runs[1].notReplayed, /does not say what state it began from/);
+  assert.deepEqual([some.replayed, some.same], [2, true]);
+  // Where none can be, nothing was shown to be the same.
+  for (const run of [one, three]) rewrite(projectDir, run, (records) => records.filter((record) => record.kind !== "attempt" && record.kind !== "exit"));
+  const none = await replayAll({ projectDir });
+  assert.deepEqual([none.runs.length, none.replayed, none.same], [3, 0, false]);
+  // And a project with no run on record has nothing to be held to.
+  await assert.rejects(replayAll({ projectDir: project(t, KEEPS) }), /No run of the project is on record/);
+});
+
+test("trama replay --all says of each run how its replay went, and ends well only where all that were replayed went as recorded", async (t) => {
+  const CLI_ENTRY = join(REPO_ROOT, "packages", "cli", "dist", "index.js");
+  const fakeHome = makeTempDir("trama-replay-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+  const projectDir = join(fakeHome, ".trama", "projects", "demo");
+  const DEMO = `import { ctx, tools } from "@trama-dev/runtime";\nctx.state.n = (Number(ctx.state.n) || 0) + 1;\nconst ran = await tools.shell("echo run " + ctx.state.n);\nawait ctx.done({ out: ran.stdout });\n`;
+  createProjectFixture(projectDir, { programSource: DEMO });
+  const trama = (...args) => runNodeCommand([CLI_ENTRY, ...args], { cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome } });
+  for (const _time of [1, 2]) assert.equal((await trama("run", "demo")).exitCode, 0);
+  const [one, two] = runsOf(projectDir);
+
+  const same = await trama("replay", "demo", "--all");
+  assert.equal(same.exitCode, 0, same.stderr);
+  assert.match(same.stdout, new RegExp(`${one}: as recorded \\(1 call, done\\)\\n${two}: as recorded \\(1 call, done\\)\\n`));
+  assert.match(same.stdout, /2 of 2 runs replayed went as recorded/);
+
+  writeFileSync(join(projectDir, "program.ts"), DEMO.replace(`"echo run " + ctx.state.n`, `ctx.state.n > 1 ? "echo again" : "echo run 1"`));
+  const partly = await trama("replay", "demo", "--all");
+  assert.equal(partly.exitCode, 1);
+  assert.match(partly.stdout, new RegExp(`${one}: as recorded \\(1 call, done\\)\\n${two}: left the record at its call 1 \\(/tools/shell\\): /command at character 5: asked "echo again" \\| recorded "echo run 2"\\n`));
+  assert.match(partly.stdout, /1 of 2 runs replayed went as recorded/);
+
+  const loosely = await trama("replay", "demo", "--all", "--loose");
+  assert.equal(loosely.exitCode, 1);
+  assert.match(loosely.stdout, new RegExp(`${two}: 1 of its 1 call asked otherwise than was recorded; the first, call 1 \\(/tools/shell\\): /command at character 5: asked "echo again"`));
+
+  const both = await trama("replay", "demo", one, "--all");
+  assert.equal(both.exitCode, 1);
+  assert.match(both.stderr, /--all replays every run: name one, or give --all/);
+
+  writeFileSync(join(projectDir, "program.ts"), DEMO.replace("out: ran.stdout", "out: 'other'"));
+  const ends = await trama("replay", "demo", "--all");
+  assert.equal(ends.exitCode, 1);
+  assert.match(ends.stdout, new RegExp(`${one}: ended otherwise than was recorded: done \\(recorded: done\\)\n`));
+  assert.match(ends.stdout, /0 of 2 runs replayed went as recorded\n/);
+
+  // A run that cannot be replayed is said, and does not stand in the way of the others.
+  writeFileSync(join(projectDir, "program.ts"), DEMO);
+  rewrite(projectDir, two, (records) => records.map(({ state: _state, ...record }) => record));
+  const some = await trama("replay", "demo", "--all");
+  assert.equal(some.exitCode, 0, some.stdout);
+  assert.match(some.stdout, new RegExp(`${two}: not replayed — The record of run ${two} does not say what state it began from`));
+  assert.match(some.stdout, /1 of 1 run replayed went as recorded; 1 could not be replayed\n/);
+});
+
+test("a program asks for a replay as it asks for a run: its runner makes it, nothing of the replayed run is carried out, and what it is answered is what a replay comes to", async (t) => {
+  const base = makeTempDir("trama-replay-asked-");
+  t.after(() => cleanupTempDir(base));
+  const target = join(base, "target"), asker = join(base, "asker");
+  const TARGET = `import { ctx, tools } from "@trama-dev/runtime";\nconst ran = await tools.shell("echo ran >> ran.txt; echo out");\nawait ctx.done({ out: ran.stdout });\n`;
+  createProjectFixture(target, { programSource: TARGET });
+  assert.equal((await recorded(target)).status, "done");
+  const [run] = runsOf(target);
+  const ASKER = `import { ctx } from "@trama-dev/runtime";
+import { replayAll, replayProgram } from "@trama-dev/runtime/runner";
+import { readFileSync } from "node:fs";
+const program = readFileSync("../target/program.ts", "utf-8");
+const same = await replayProgram({ projectDir: "../target" });
+const other = await replayProgram({ projectDir: "../target", run: ${JSON.stringify(run)}, program: program.replace("echo out", "echo other") });
+const loose = await replayProgram({ projectDir: "../target", loose: true, program: program.replace("echo out", "echo other") });
+const all = await replayAll({ projectDir: "../target" });
+let none = "";
+try { await replayProgram({ projectDir: "../target", run: "2020-01-01T00-00-00-000Z-aaaaaa" }); } catch (err: any) { none = String(err.message); }
+let both = "";
+try { await replayAll({ projectDir: "../target", run: ${JSON.stringify(run)} } as any); } catch (err: any) { both = String(err.message); }
+await ctx.done({ same, other, loose, all, none, both });
+`;
+  createProjectFixture(asker, { programSource: ASKER });
+  const first = await recorded(asker);
+  assert.equal(first.status, "done", first.reason);
+  const { same, other, loose, all, none, both } = first.result;
+  // (As a replay made by a runner that is in no program's run: the same thing, to the field.)
+  assert.deepEqual(same, JSON.parse(JSON.stringify(await replay(target))));
+  assert.deepEqual([same.run, same.answered, same.same], [run, 1, true]);
+  assert.deepEqual([other.answered, other.left.call, other.left.endpoint, other.same], [0, 1, "/tools/shell", false]);
+  assert.deepEqual([loose.answered, loose.other.length, loose.sameEnd, loose.same], [1, 1, true, false]);
+  assert.deepEqual([all.runs.map((each) => each.run), all.replayed, all.same, all.runs[0].replay], [[run], 1, true, same]);
+  assert.match(none, /^trama runtime error: .*No journal for run "2020-01-01T00-00-00-000Z-aaaaaa"/);
+  assert.equal(both, "trama runtime error: Invalid field: run (every run is replayed, or the one named: not both)");
+  assert.equal(readFileSync(join(target, "ran.txt"), "utf-8"), "ran\n", "the target's command ran once: when its run was recorded");
+  assert.deepEqual(runsOf(target), [run], "and a replay left it no journal");
+  // On the asker's record, each is a call like any: what was asked, and what it was answered.
+  const calls = recordsOf(asker).filter((record) => record.kind === "call");
+  assert.deepEqual(calls.map((record) => record.endpoint), [...Array.from({ length: 6 }, () => "/project/replay"), "/ctx/done"]);
+  assert.deepEqual([calls[0].request.projectDir.endsWith("/target"), calls[3].request.all, calls[1].request.run], [true, true, run]);
+
+  // A validation makes it for real: it costs nothing and does nothing, and is no hand-off.
+  await validateProgram(asker, createBackend({ provider: "fake", model: "plain" }), ASKER, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10, journalRuns: 20 });
+  const validation = recordsOf(asker);
+  assert.equal(validation[0].purpose, "validate");
+  assert.deepEqual([validation.filter((record) => record.kind === "result" && record.ok).length, validation.find((record) => record.kind === "exit").validated], [5, undefined]);
+  assert.equal(validation.filter((record) => record.kind === "result" && !record.ok).length, 2, "the two that were refused, and no other");
+  assert.equal(readFileSync(join(target, "ran.txt"), "utf-8"), "ran\n");
+
+  // And the asker replayed: its replays are calls on its record, answered from it — the target's own record is not gone to.
+  rmSync(journalDir(target), { recursive: true });
+  const again = await replay(asker);
+  assert.deepEqual([again.recorded, again.answered, again.left, again.result, again.same], [6, 6, undefined, first, true]);
+});
+
+test("a replay a program asked for is the program's: stopped when the program says so, with what the run was started with, and gone when it is over", async (t) => {
+  const base = makeTempDir("trama-replay-stopped-");
+  t.after(() => cleanupTempDir(base));
+  const target = join(base, "target"), stopper = join(base, "stopper"), pidFile = join(base, "replayed.pid");
+  createProjectFixture(target, { programSource: `import { ctx, tools } from "@trama-dev/runtime";\nconst ran = await tools.shell("echo out");\nawait ctx.done({ out: ran.stdout });\n` });
+  assert.equal((await recorded(target)).status, "done");
+  createProjectFixture(stopper, { programSource: `import { ctx } from "@trama-dev/runtime";
+import { replayProgram } from "@trama-dev/runtime/runner";
+import { readFileSync } from "node:fs";
+// The target's program, made to go on for ten minutes once it has been answered.
+const program = 'import { writeFileSync } from "node:fs";\\n' + readFileSync("../target/program.ts", "utf-8")
+  .replace("await ctx.done", "writeFileSync(process.env.PID_FILE!, String(process.pid)); await new Promise((resolve) => setTimeout(resolve, 600_000)); await ctx.done");
+const stop = new AbortController();
+setTimeout(() => stop.abort(), 1500);
+const began = Date.now();
+let said = "";
+try { await replayProgram({ projectDir: "../target", program, signal: stop.signal }); } catch (err: any) { said = String(err.message); }
+await ctx.done({ said, seconds: Math.round((Date.now() - began) / 1000) });
+` });
+  const { status, result } = await recorded(stopper, {}, { env: { PID_FILE: pidFile }, timeout: 60_000 });
+  assert.equal(status, "done");
+  assert.match(result.said, /The replay was stopped before it finished/);
+  assert.ok(result.seconds < 20, `stopped in ${result.seconds}s`);
+  const pid = pidIn(pidFile);
+  assert.ok(pid, "the replayed program was started, with the run's variables");
+  assert.equal(isAlive(pid), false, "and is gone");
+
+  // While a replay it asked for goes on, the program is waiting, not working: its own time is not used up by it.
+  const waits = join(base, "waits");
+  createProjectFixture(waits, { programSource: `import { ctx } from "@trama-dev/runtime";
+import { replayProgram } from "@trama-dev/runtime/runner";
+import { readFileSync } from "node:fs";
+const program = readFileSync("../target/program.ts", "utf-8").replace("await ctx.done", "await new Promise((resolve) => setTimeout(resolve, 4000)); await ctx.done");
+const went = await replayProgram({ projectDir: "../target", program });
+await ctx.done({ answered: went.answered, ended: went.result?.status });
+` });
+  assert.deepEqual(await recorded(waits, {}, { timeout: 2500 }), { status: "done", result: { answered: 1, ended: "done" } });
+});
+
+test("a run that is still going is not the latest to replay: a program that replays its own project is answered from the run before — and a run that is named is replayed though it is going", async (t) => {
+  const projectDir = project(t, `import { ctx } from "@trama-dev/runtime";
+import { replayProgram } from "@trama-dev/runtime/runner";
+let went: any;
+try { went = await replayProgram({ projectDir: process.cwd() }); } catch (err: any) { went = { none: String(err.message) }; }
+await ctx.done({ run: went.run ?? null, same: went.same ?? null, none: went.none ?? null });
+`);
+  const first = await recorded(projectDir);
+  assert.deepEqual([first.status, first.result.run], ["done", null]);
+  assert.match(first.result.none, /No run of the project is on record/);
+  const [one] = runsOf(projectDir);
+  // The second run replays the first — in which the program asked for a replay and was told there was none: a call on record, answered again.
+  const second = await recorded(projectDir);
+  assert.deepEqual(second, { status: "done", result: { run: one, same: true, none: null } });
+  const [, two] = runsOf(projectDir);
+  assert.equal((await replay(projectDir)).run, two);
+
+  // A project asked for a fix holds what it mends to the run that failed — which is going on, and waiting for it.
+  const base = makeTempDir("trama-replay-fix-");
+  t.after(() => cleanupTempDir(base));
+  const broken = join(base, "broken"), fixer = join(base, "fixer"), seen = join(base, "went.json");
+  const BROKEN = `import { ctx, tools } from "@trama-dev/runtime";\nconst ran = await tools.shell("echo a b c");\nawait ctx.done({ words: ran.stdout.trim().split(" ").lenght.toFixed(0) });\n`;
+  createProjectFixture(broken, { programSource: BROKEN });
+  createProjectFixture(fixer, { programSource: `import { ctx } from "@trama-dev/runtime";
+import { replayProgram } from "@trama-dev/runtime/runner";
+import { writeFileSync } from "node:fs";
+import { basename, dirname } from "node:path";
+const { program, journal } = ctx.input.args as any;
+const fixed = program.replace("lenght", "length");
+const went = await replayProgram({ projectDir: dirname(dirname(dirname(journal))), run: basename(journal, ".jsonl"), program: fixed });
+writeFileSync(process.env.SEEN!, JSON.stringify({ went, unfixed: await replayProgram({ projectDir: dirname(dirname(dirname(journal))), run: basename(journal, ".jsonl") }) }));
+await ctx.done({ program: fixed });
+` });
+  const mended = await recorded(broken, {}, { repairWith: fixer, maxRepairAttempts: 1, env: { SEEN: seen }, timeout: 30_000 });
+  assert.deepEqual(mended, { status: "done", result: { words: "3" } });
+  const { went, unfixed } = JSON.parse(readFileSync(seen, "utf-8"));
+  // The fix goes the whole way of what the failed attempt had done, and ends where that did not.
+  assert.deepEqual([went.run, went.attempt, went.sameProgram, went.recorded, went.answered, went.left, went.result, went.recordedResult.status, went.sameEnd],
+    [runsOf(broken)[0], 0, false, 1, 1, undefined, { status: "done", result: { words: "3" } }, "failed", false]);
+  // The program as it failed fails again, as recorded.
+  assert.deepEqual([unfixed.sameProgram, unfixed.answered, unfixed.result.status, unfixed.same], [true, 1, "failed", true]);
 });

@@ -10,7 +10,7 @@ import type { ToolsWithCleanup } from "./tools.js";
 import type { Said } from "./outside-agent.js";
 import type { RunnerAgent } from "./agent.js";
 import type { RunContext } from "./context.js";
-import type { MakeRequest, ProgramResult, RunRequest } from "./runner-types.js";
+import type { MakeRequest, ProgramResult, ReplayAllResult, ReplayRequest, ReplayResult, RunRequest } from "./runner-types.js";
 import { OFF_THE_RECORD, recordable, type Journal, type RecordedCall } from "./journal.js";
 import { LeftTheRecord, askAgain, besideTheRecord, type Replay, type RecordedCall as Replayed } from "./replay.js";
 import type { OwnTool } from "./agent-backend.js";
@@ -226,6 +226,8 @@ export interface IpcBackends {
   run(request: RunRequest, stop: AbortSignal, seq: number): Promise<ProgramResult>;
   /** Make a project, or change one, on the program's behalf — until it is done or `stop` says to stop. */
   make(request: MakeRequest, stop: AbortSignal, seq: number): Promise<void>;
+  /** Replay a recorded run of a project — or every one (`all`) — on the program's behalf, until it is over or `stop` says to stop. */
+  replay(request: ReplayRequest, stop: AbortSignal): Promise<ReplayResult | ReplayAllResult>;
   /** Where every call, and how it ended, is written down. */
   journal: Journal;
   /**
@@ -234,7 +236,7 @@ export interface IpcBackends {
    * replay.ts). What is beside the record — what a program says to its own
    * run, `ctx.*` — is carried out as ever.
    */
-  replay?: Replay;
+  replaying?: Replay;
   /**
    * Whether the program has ended. What comes back for a call after that is
    * no answer — though its connection may not have been seen to close yet.
@@ -249,7 +251,7 @@ function isAuthorized(header: string | undefined, token: string): boolean {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: IpcBackends): Record<string, Route> {
+function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, replay }: IpcBackends): Record<string, Route> {
   /** What the program has asked for that lasts — a run, a project made — and has not ended, by the id it gave each. */
   const runsAskedFor = new Map<string, AbortController>();
   /** Ids the program asked to stop before what bears them was seen here: such a thing starts stopped. */
@@ -400,6 +402,18 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
       { name: "string", prompt: "string", id: "optional string" },
       ({ id, ...asked }, connectionClosed, { seq }) => lasting(id, connectionClosed, stop => make({ kind: "update", ...asked }, stop, seq)),
     ),
+    // Nor does a program replay a run: its runner does. (It lasts as long as the program replayed does, and is stopped as a run is.)
+    "/project/replay": route(
+      {
+        projectDir: "string", run: "optional string", all: "optional boolean", loose: "optional boolean", program: "optional string",
+        env: "optional object", timeout: "optional number", id: "optional string",
+      },
+      ({ id, env, timeout, all, run: named, ...asked }, connectionClosed) => {
+        if (all && named !== undefined) throw new BadRequest("Invalid field: run (every run is replayed, or the one named: not both)");
+        const request: ReplayRequest = { ...asked, run: named, all, timeout: timeoutOf(timeout), env: envOf(env) };
+        return lasting(id, connectionClosed, stop => replay(request, stop));
+      },
+    ),
     // Stop a run asked for above, or a project being made. The call that asked
     // for it still gets its answer — a failed run, an error — once it is over.
     "/run/stop": route({ id: "string" }, b => {
@@ -485,7 +499,7 @@ export function createIPCServer(backends: IpcBackends): Server {
         if (!route) return reply(404, "Not found");
         call = route.offTheRecord ? OFF_THE_RECORD : backends.journal.call(req.url!, asRecorded(body));
         let result: unknown;
-        const { replay } = backends;
+        const replay = backends.replaying;
         if (replay && !route.offTheRecord && !besideTheRecord(req.url!)) {
           // A replay: the call is answered as the record has it answered, and is not carried out. (Matched as it
           // would be written down: that is what the record has of it.)

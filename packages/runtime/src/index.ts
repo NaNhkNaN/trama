@@ -15,7 +15,7 @@ import { ensureProjectScaffold, loadConfig, loadProjectConfig, loadState, namesA
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import {
   validateProgram, installValidatedProgram,
-  withTempDir, prepareProject, shownPaths, type Prepared, RUNTIME_TYPES, runProgram as runHere, replayProgram as replayHere, whyNotReplaceable,
+  withTempDir, prepareProject, shownPaths, type Prepared, RUNTIME_TYPES, runProgram as runHere, replayProgram as replayHere, replayAll as replayAllHere, whyNotReplaceable,
   tagged, failureOf, type AskedToMake, type Making,
 } from "./runner.js";
 import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspace.js";
@@ -24,10 +24,10 @@ import { guardPath, identityOf, sameProjectAs } from "./path-guard.js";
 import { printJournals, spentIn } from "./journal-view.js";
 import { messageOf } from "./errors.js";
 
-export type { Budget, ProgramResult, RunOptions, ReplayOptions, ReplayResult } from "./runner-types.js";
+export type { Budget, ProgramResult, RunOptions, ReplayOptions, ReplayResult, ReplayAllResult } from "./runner-types.js";
 export { failureOf } from "./runner.js";
 export { requestsWhole } from "./journal-view.js";
-import type { ProgramResult, RunOptions, ReplayOptions, ReplayResult, TramaConfig } from "./runner-types.js";
+import type { ProgramResult, RunOptions, ReplayAllResult, ReplayOptions, ReplayResult, TramaConfig } from "./runner-types.js";
 export type { Workspace, ObserveResult } from "./types.js";
 import type { Workspace } from "./types.js";
 
@@ -85,16 +85,57 @@ export async function runProgram(options: RunOptions): Promise<ProgramResult> {
  * nothing written to the project, nothing spent. What comes back is how far
  * the program went the way it had gone, and where it left the record (see
  * `ReplayResult`).
+ *
+ * A program asks its runner for it, as it does for a run: it is made
+ * there, is stopped with the program's run, and is a call on that run's
+ * record.
  */
 export async function replayProgram(options: ReplayOptions): Promise<ReplayResult> {
-  if (parentBridge()) throw new Error("A replay is made by a runner that is in no program's run: not from within a program, yet.");
-  return replayHere(options);
+  const bridge = parentBridge();
+  if (!bridge) return replayHere(options);
+  const { signal, ...request } = options;
+  // (The runner does not share this program's working directory.)
+  return overBridge(bridge, "/project/replay", { ...request, projectDir: resolve(request.projectDir) }, signal);
 }
 
-/** Replay a run of a project by its name, and say how it went. Returns whether it went the whole way to the recorded end. */
-export async function showReplay(name: string, options: { run?: string; loose?: boolean; signal?: AbortSignal } = {}): Promise<boolean> {
-  const went = await replayProgram({ projectDir: resolveProject(name), ...options });
+/**
+ * Hold a project's program to every run of it that is on record and over:
+ * each replayed by itself (see `replayProgram`), and one answer for all —
+ * `same`, where every run that could be replayed went as recorded. A record
+ * is a test of the way its run went: this is the check for a change that is
+ * meant to change nothing.
+ */
+export async function replayAll(options: Omit<ReplayOptions, "run">): Promise<ReplayAllResult> {
+  const bridge = parentBridge();
+  if (!bridge) return replayAllHere(options);
+  const { signal, ...request } = options;
+  return overBridge(bridge, "/project/replay", { ...request, projectDir: resolve(request.projectDir), all: true }, signal);
+}
+
+/**
+ * Replay a run of a project by its name — or, with `all`, every run on
+ * record — and say how it went. Returns whether it went as recorded.
+ */
+export async function showReplay(name: string, options: { run?: string; all?: boolean; loose?: boolean; signal?: AbortSignal } = {}): Promise<boolean> {
   const status = (result: ProgramResult) => (result.status === "failed" ? `failed — ${failureOf(result.reason).split("\n")[0]}` : result.status);
+  const { all, ...asked } = options;
+  if (all) {
+    if (asked.run !== undefined) throw new Error("--all replays every run: name one, or give --all.");
+    const went = await replayAll({ projectDir: resolveProject(name), loose: asked.loose, signal: asked.signal });
+    const calls = (n: number) => `${n} call${n === 1 ? "" : "s"}`;
+    for (const { run, replay, notReplayed } of went.runs) {
+      console.log(`${run}: ${!replay ? `not replayed — ${notReplayed}`
+        : replay.same ? `as recorded (${calls(replay.recorded)}, ${replay.result!.status})`
+        : replay.left ? `left the record at its call ${replay.left.call} (${replay.left.endpoint}): ${replay.left.why}`
+        : !replay.sameEnd ? `ended otherwise than was recorded: ${status(replay.result!)} (recorded: ${replay.recordedResult ? status(replay.recordedResult) : "not said"})`
+        : replay.other.length > 0 ? `${replay.other.length} of its ${calls(replay.recorded)} asked otherwise than was recorded; the first, call ${replay.other[0].call} (${replay.other[0].endpoint}): ${replay.other[0].difference}`
+        : `ended as recorded, without ${calls(replay.unasked)} the record has`}`);
+    }
+    const as = went.runs.filter(({ replay }) => replay?.same).length;
+    console.log(`${as} of ${went.replayed} run${went.replayed === 1 ? "" : "s"} replayed went as recorded${went.replayed < went.runs.length ? `; ${went.runs.length - went.replayed} could not be replayed` : ""}`);
+    return went.same;
+  }
+  const went = await replayProgram({ projectDir: resolveProject(name), ...asked });
   console.log(`replay of run ${went.run}, attempt ${went.attempt}: the program is ${went.sameProgram ? "" : "not "}the one that was recorded`);
   console.log(`${went.answered} of its ${went.recorded} calls were answered from the record; none was carried out`);
   if (went.other.length > 0) {
