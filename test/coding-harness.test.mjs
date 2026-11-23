@@ -7,6 +7,7 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { runProgram } from "../packages/runtime/dist/runner.js";
 import { user } from "./pi-user.mjs";
+import { isDeepStrictEqual } from "node:util";
 import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, makeTempDir, withEnv } from "./helpers.mjs";
 
 // The harness for work on a codebase that is in the repository to begin from (examples/coding-harness): a
@@ -93,7 +94,7 @@ test("the harness does work on a codebase: it looks, edits, runs, mends what the
   // What it answers with: what the model said it did — and beside it what was done, by the harness's own count of
   // the codebase's files that are not as they were, whoever changed them and by which tool.
   assert.deepEqual(result, { status: "done", result: {
-    summary: "greet says Hello, and there is a shout", asked: script.length, forgotten: 0,
+    summary: "greet says Hello, and there is a shout", asked: script.length, forgotten: 0, summed: 0,
     files: { changed: ["src/greet.js"], made: ["src/shout.js"], gone: [] },
   } });
   assert.equal(readFileSync(join(it.projectDir, "src", "greet.js"), "utf-8"), 'export const greet = (name) => "Hello, " + name;\n');
@@ -131,7 +132,7 @@ test("the harness does work on a codebase: it looks, edits, runs, mends what the
 });
 
 test("the harness forgets what old tools said where a conversation has grown long: the oldest first, and enough to bring it well back — by its own count, or when the provider says it is too long", async (t) => {
-  const reads = (n) => (n <= 14 ? { name: "read", args: { path: "notes.txt" } } : { name: "finish", args: { summary: "read enough" } });
+  const reads = (n, times = 14) => (n <= times ? { name: "read", args: { path: "notes.txt" } } : { name: "finish", args: { summary: "read enough" } });
   // (Cut to its beginning, and marked — with the harness's record after it, where it was the latest to be cut.)
   const forgotten = (content) => /^line 1: [^]{150,220}\n\[… forgotten: \d+ characters more\. Ask again if it is wanted\.\](\n\[Kept by the harness, which forgets nothing — [^\]]*\])?$/.test(content);
   /** Which of the tools' answers a request has cut short: the oldest of them, one after the other, and never the latest two. */
@@ -144,11 +145,12 @@ test("the harness forgets what old tools said where a conversation has grown lon
 
   // By its own count: a request may read 8,000 tokens, and what a tool says here is some 1,400.
   const AT = 8000;
-  const counting = await scene(t, (_request, n) => reads(n));
+  // (Twelve times: so that the request it ends with is one that is over as well — see below.)
+  const counting = await scene(t, (_request, n) => reads(n, 12));
   const { result } = await counting.run({ forgetAt: AT });
   assert.equal(result.status, "done");
   const cuts = counting.requests.map(cutIn);
-  assert.equal(cuts.at(-1) + 2 <= 14, true);
+  assert.equal(cuts.at(-1) + 2 <= 12, true);
   // No request comes to more than the most it may be and what one turn adds to it...
   for (const [at, size] of counting.sizes.entries()) assert.ok(size < AT + 2000, `request ${at + 1} read ${size} tokens`);
   // ...and where it had come to more, it was cut well back — to some six tenths of that, and not to just under
@@ -165,17 +167,20 @@ test("the harness forgets what old tools said where a conversation has grown lon
   assert.equal(result.result.forgotten, counting.sizes.slice(0, -1).filter((size) => size > AT).length);
   assert.equal(result.result.forgotten, cuts.filter((cut, at) => at > 0 && cut > cuts[at - 1]).length);
 
-  // Where next to nothing may be read, all that can be forgotten is — and the latest two answers are not: they are
-  // what the model is at work on, whatever their size.
-  const tight = await scene(t, (_request, n) => (n <= 6 ? { name: "read", args: { path: "notes.txt" } } : { name: "finish", args: { summary: "read enough" } }));
-  assert.equal((await tight.run({ forgetAt: 1 })).result.status, "done");
-  assert.deepEqual(tight.requests.map(cutIn), [0, 0, 0, 1, 2, 3, 4]);
-  assert.deepEqual(saidByTools(tight.requests.at(-1)).slice(-2), [NOTES, NOTES]);
+  // What is forgotten is forgotten only where that brings the conversation back: the latest two answers are what
+  // the model is at work on, and are no part of what can be — so where the rest would not do, nothing is cut, and
+  // the conversation is summed up (see below). Here: three answers, and a mark that the first alone does not reach.
+  let sums = 0;
+  const tight = await scene(t, (request, n) => (!request.tools?.length ? `## Done\nsumming-up ${++sums}` : n <= 3 ? { name: "read", args: { path: "notes.txt" } } : { name: "finish", args: { summary: "read enough" } }));
+  const held = await tight.run({ forgetAt: 3500 });
+  assert.deepEqual([held.result.status, held.result.result.forgotten, held.result.result.summed, sums], ["done", 0, 1, 1]);
+  for (const request of tight.requests.filter((request) => request.tools?.length)) assert.equal(cutIn(request), 0);
+  assert.deepEqual(saidByTools(tight.requests.at(-1)), [NOTES]);
 
   // When the provider says so: half of what was sent is forgotten, and it asks again — the request that was refused, shorter.
   const refused = await scene(t, (_request, n) => (n === 15 ? 400 : n === 16 ? { name: "finish", args: { summary: "read enough" } } : reads(n)), "This model's maximum context length is 4096 tokens.");
   const again = await refused.run();
-  assert.deepEqual(again.result, { status: "done", result: { summary: "read enough", asked: 16, forgotten: 1, files: { changed: [], made: [], gone: [] } } });
+  assert.deepEqual(again.result, { status: "done", result: { summary: "read enough", asked: 16, forgotten: 1, summed: 0, files: { changed: [], made: [], gone: [] } } });
   assert.equal(cutIn(refused.requests[14]), 0);
   assert.equal(cutIn(refused.requests[15]), 9, "of fourteen answers, nine: what it takes to be rid of half of what was sent");
   // (Nine cut at once, and one record: after the latest of them, where what follows is whole.)
@@ -190,13 +195,13 @@ test("where the harness forgets, it says what has been done: the files that are 
   const script = [
     { name: "edit", args: { path: "src/greet.js", find: "Helo", replace: "Hola" } },
     { name: "shell", args: { command: "printf made > by-shell.txt && rm .gitignore", seconds: 30 } },
-    ...Array(4).fill({ name: "read", args: { path: "notes.txt" } }),
+    ...Array(9).fill({ name: "read", args: { path: "notes.txt" } }),
     { name: "finish", args: { summary: "done" } },
   ];
   const it = await scene(t, (_request, n) => script[n - 1]);
-  const { result } = await it.run({ forgetAt: 1 });
+  const { result } = await it.run({ forgetAt: 8000 });
   const files = { changed: ["src/greet.js"], made: ["by-shell.txt"], gone: [".gitignore"] };
-  assert.deepEqual(result, { status: "done", result: { summary: "done", asked: 7, forgotten: 2, files } });
+  assert.deepEqual(result, { status: "done", result: { summary: "done", asked: 12, forgotten: 2, summed: 0, files } });
 
   // The model is told beforehand that it will be so, and what to go by.
   assert.match(it.requests[0].messages[0].content, /What tools said long ago is cut short as the conversation grows[^]*go by that, and not by memory, for what you have changed\.$/);
@@ -204,21 +209,166 @@ test("where the harness forgets, it says what has been done: the files that are 
   // conversation is other than it was from there on anyway, and before it nothing is.
   const record = "[Kept by the harness, which forgets nothing — the codebase's files that are not as they were when you began: changed: src/greet.js; new: by-shell.txt; gone: .gitignore.]";
   const stub = /^line 1: [^]{150,220}\n\[… forgotten: \d+ characters more\. Ask again if it is wanted\.\]$/;
-  const [edited, ran, first, second, third, fourth] = saidByTools(it.requests[6]);
-  assert.deepEqual([edited, ran, third, fourth], ["edited", "exit code 0\n", NOTES, NOTES]);
-  for (const cut of [first, second]) {
-    assert.ok(cut.endsWith(`\n${record}`), cut.slice(-300));
-    assert.match(cut.slice(0, -record.length - 1), stub);
-  }
-  // (What was cut once is not cut again, record and all: the fifth request has the first as the seventh has it.)
-  assert.equal(saidByTools(it.requests[5])[2], first);
-  assert.deepEqual(saidByTools(it.requests[4]), ["edited", "exit code 0\n", NOTES, NOTES]);
+  const [edited, ran, ...read] = saidByTools(it.requests.at(-1));
+  assert.deepEqual([edited, ran], ["edited", "exit code 0\n"]);
+  const withRecord = read.map((said, at) => (said.endsWith(`\n${record}`) ? at : -1)).filter((at) => at >= 0);
+  assert.equal(withRecord.length, 2, "one record for each forgetting");
+  const cut = read.filter((said) => said !== NOTES);
+  assert.ok(cut.length > 2 && cut.length <= 7 && read.slice(cut.length).every((said) => said === NOTES), "the oldest are cut, the rest whole");
+  // (After the latest of each lot that was cut — the second after the last of all that are.)
+  assert.equal(withRecord[1], cut.length - 1);
+  for (const [at, said] of cut.entries()) assert.match(withRecord.includes(at) ? said.slice(0, -record.length - 1) : said, stub);
+  // (What was cut once is not cut again, record and all: it is in the last request as it was in the one after it was cut.)
+  const first = it.requests.findIndex((request) => saidByTools(request).some((said) => said.endsWith(`\n${record}`)));
+  assert.equal(saidByTools(it.requests[first])[2 + withRecord[0]], read[withRecord[0]]);
 
   // Where nothing is other than it was, that is said — and a file changed and changed back is as it was.
-  const idle = await scene(t, (_request, n) => (n === 1 ? { name: "shell", args: { command: "cp src/greet.js keep && echo x > src/greet.js && mv keep src/greet.js", seconds: 30 } } : n <= 5 ? { name: "read", args: { path: "notes.txt" } } : { name: "finish", args: { summary: "done" } }));
-  const none = await idle.run({ forgetAt: 1 });
-  assert.deepEqual(none.result.result.files, { changed: [], made: [], gone: [] });
+  const idle = await scene(t, (_request, n) => (n === 1 ? { name: "shell", args: { command: "cp src/greet.js keep && echo x > src/greet.js && mv keep src/greet.js", seconds: 30 } } : n <= 7 ? { name: "read", args: { path: "notes.txt" } } : { name: "finish", args: { summary: "done" } }));
+  const none = await idle.run({ forgetAt: 8000 });
+  assert.deepEqual([none.result.result.forgotten, none.result.result.files], [1, { changed: [], made: [], gone: [] }]);
   assert.ok(saidByTools(idle.requests.at(-1)).some((said) => said.endsWith("\n[Kept by the harness, which forgets nothing — the codebase's files that are not as they were when you began: none.]")));
+});
+
+test("the record leaves out what the codebase's .gitignore leaves out — what is built is no part of the work — and has all of it where git is not to be had", async (t) => {
+  const script = [
+    { name: "shell", args: { command: "mkdir -p build deep/build && echo x > build/out.js && echo y > src/new.js && echo z > scratch.tmp && echo w >> build/old.js && echo v > deep/build/out.js && echo u > deep/kept.tmp", seconds: 30 } },
+    { name: "finish", args: { summary: "built" } },
+  ];
+  const ignoring = (projectDir) => {
+    writeFileSync(join(projectDir, ".gitignore"), "node_modules/\nlogs/\nhistory/\nstate.json\nbuild/\n*.tmp\n");
+    mkdirSync(join(projectDir, "build"));
+    mkdirSync(join(projectDir, "deep"));
+    writeFileSync(join(projectDir, "build", "old.js"), "old\n");
+    // (As git reads it: a .gitignore further down says what is left out, and what is not, from there on.)
+    writeFileSync(join(projectDir, "deep", ".gitignore"), "!kept.tmp\n");
+  };
+  const it = await scene(t, (_request, n) => script[n - 1]);
+  ignoring(it.projectDir);
+  assert.deepEqual((await it.run()).result.result.files, { changed: [], made: ["deep/kept.tmp", "src/new.js"], gone: [] });
+
+  // Without git — here, one that fails — every file is in it.
+  const bin = makeTempDir("trama-coding-bin-");
+  t.after(() => cleanupTempDir(bin));
+  writeFileSync(join(bin, "git"), "#!/bin/sh\nexit 127\n", { mode: 0o755 });
+  const without = await scene(t, (_request, n) => script[n - 1]);
+  ignoring(without.projectDir);
+  const { result } = await without.run({}, { env: { PATH: `${bin}:${process.env.PATH}` } });
+  assert.deepEqual(result.result.files, { changed: ["build/old.js"], made: ["build/out.js", "deep/build/out.js", "deep/kept.tmp", "scratch.tmp", "src/new.js"], gone: [] });
+});
+
+/** Whether a request begins as the one before it was, whole: what a provider's cache of a conversation goes by. */
+const goesOnFrom = (request, before) => isDeepStrictEqual(request.messages.slice(0, before.messages.length), before.messages);
+/** A model at work whose provider also answers a request to sum up (one with no tools) — with a summing-up that says which it is. */
+function working(t, script) {
+  const state = { sums: 0, work: 0 };
+  return scene(t, (request) => (!request.tools?.length ? `## Done\nsumming-up ${++state.sums}` : script(++state.work))).then((it) => ({ ...it, state }));
+}
+
+test("where forgetting is not enough the harness sums up: the model's own words are never forgotten, and outgrow what may be read", async (t) => {
+  // A model whose own words are long, and what its tools say short: it writes a file of six thousand characters at each turn.
+  const AT = 8000, long = (n) => `${n}: ${"the tide comes in, the tide goes out. ".repeat(160)}`;
+  const it = await working(t, (n) => (n <= 12 ? { name: "write", args: { path: `out/${String(n).padStart(2, "0")}.txt`, content: long(n) } } : { name: "finish", args: { summary: "wrote twelve" } }));
+  const { result } = await it.run({ forgetAt: AT });
+  const made = Array.from({ length: 12 }, (_, at) => `out/${String(at + 1).padStart(2, "0")}.txt`);
+  assert.deepEqual(result, { status: "done", result: { summary: "wrote twelve", asked: 13, forgotten: 0, summed: it.state.sums, files: { changed: [], made, gone: [] } } });
+  assert.ok(it.state.sums >= 2, `summed up ${it.state.sums} times`);
+
+  // The model at work is told beforehand that it may come to this, as it is told of forgetting.
+  assert.match(it.requests[0].messages[0].content, /and where it outgrows that too, what came before its latest steps is summed up\. Either way you are told which of the codebase's files/);
+  // A request to sum up has no tools, and is no part of the work: the model is told what it is to do, and is
+  // handed the task and the work so far as a record — what was said, what was called (cut short where it is long)
+  // and what came back.
+  const at = it.requests.map((request, n) => (request.tools?.length ? -1 : n)).filter((n) => n >= 0);
+  assert.equal(at.length, it.state.sums);
+  const [told, asked] = it.requests[at[0]].messages;
+  assert.equal(it.requests[at[0]].messages.length, 2);
+  assert.match(told.content, /^You sum up the work a model has done so far on a codebase[^]*you call no tools/);
+  const record = typeof asked.content === "string" ? asked.content : asked.content.map((part) => part.text).join("");
+  assert.match(record, /^\[The task\]: Greet properly\.\n\n\[Model called\]: write\(\{"path":"out\/01\.txt","content":"1: the tide comes in[^]{1500,2100} \[… \d+ characters more\]\)\n\n\[write said\]: written\n\n\[Model called\]: write\(\{"path":"out\/02\.txt"/);
+  assert.match(record, /\n\n---\n\nThe above is the record of the work so far\.[^]*## Done[^]*## Left to do[^]*## To know[^]*$/);
+  // The latest turn is not in it: that is kept as it is.
+  const before = it.requests[at[0] - 1], after = it.requests[at[0] + 1];
+  const latest = before.messages.filter((message) => message.role === "assistant").length + 1;
+  assert.ok(record.includes(`out/${String(latest - 1).padStart(2, "0")}.txt`) && !record.includes(`out/${String(latest).padStart(2, "0")}.txt`), `the turns before the ${latest}th`);
+
+  // The work goes on from the task, the summing-up, the harness's record of the files, and the latest turn as it was.
+  assert.deepEqual(after.messages.map((message) => message.role), ["system", "user", "assistant", "tool"]);
+  assert.match(after.messages[1].content, new RegExp(`^Greet properly\\.\\n\\n\\[[^\\]]*summed up[^\\]]*\\]\\n\\n## Done\\nsumming-up 1\\n\\n\\[Kept by the harness, which forgets nothing — the codebase's files that are not as they were when you began: new: ${made.slice(0, latest).join(", ")}\\.\\]$`));
+  // (And it is said whose the summing-up is: the model's own, of this same run — a model took one for notes of whoever asked.)
+  assert.match(after.messages[1].content, /\[[^\]]*in this same run[^\]]*summed up — by you yourself[^\]]*your own account of your own work, and no one else's notes\. Go on from there\.\]/);
+  assert.equal(JSON.parse(after.messages[2].tool_calls[0].function.arguments).path, `out/${String(latest).padStart(2, "0")}.txt`);
+  assert.equal(after.messages[3].content, "written");
+  assert.ok(it.sizes[at[0] - 1] > AT && it.sizes[at[0] + 1] < 0.5 * AT, `from ${it.sizes[at[0] - 1]} tokens to ${it.sizes[at[0] + 1]}`);
+  // The next summing-up has the one before it to go by, and is the only one the work then goes on from.
+  const again = it.requests[at[1]].messages[1].content;
+  assert.match(typeof again === "string" ? again : again.map((part) => part.text).join(""), /^\[The task\]: Greet properly\.\n\n\[Summed up before\]: ## Done\nsumming-up 1\n\n\[Model called\]: write\(/);
+  const then = it.requests[at[1] + 1].messages[1].content;
+  assert.ok(then.includes("summing-up 2") && !then.includes("summing-up 1"));
+
+  // And between one summing-up and the next, every request begins as the one before it was: nothing is cut for nothing.
+  const work = it.requests.filter((request) => request.tools?.length);
+  assert.equal(work.filter((request, n) => n > 0 && !goesOnFrom(request, work[n - 1])).length, it.state.sums);
+});
+
+test("a conversation is cut only where that brings it well back — never a little at every turn: by forgetting while that does it, and by summing up from where it does not", async (t) => {
+  // As a model at long work goes: commands of some length, and reading between them. What it read can be forgotten,
+  // and for a while that is enough; what it said itself grows all the while, and in the end is most of what there is.
+  const AT = 8000, command = `: ${"a command of some length; ".repeat(110)}\necho ok`;
+  const it = await working(t, (n) => (n > 32 ? { name: "finish", args: { summary: "long work" } } : n % 2 ? { name: "shell", args: { command, seconds: 30 } } : { name: "read", args: { path: "notes.txt" } }));
+  // (Some forty requests and their commands: given longer than a run here has otherwise, for a machine that is busy.)
+  const { result } = await it.run({ forgetAt: AT }, { timeout: 240_000 });
+  assert.equal(result.status, "done");
+  const { forgotten, summed } = result.result;
+  assert.ok(forgotten >= 2 && summed >= 2 && summed === it.state.sums, `forgot ${forgotten} times, summed up ${summed} times`);
+  // Each time the conversation was not as it had been, it was one of those — and it was then well under the mark.
+  const work = it.requests.filter((request) => request.tools?.length), sizes = it.sizes.filter((_, n) => it.requests[n].tools?.length);
+  const breaks = work.map((request, n) => (n > 0 && !goesOnFrom(request, work[n - 1]) ? n : -1)).filter((n) => n > 0);
+  assert.equal(breaks.length, forgotten + summed);
+  for (const n of breaks) assert.ok(sizes[n - 1] > AT && sizes[n] < 0.8 * AT, `request ${n + 1}: from ${sizes[n - 1]} tokens to ${sizes[n]}`);
+  // So no request is far over it, and the work never goes on with only what the latest two tools said in whole.
+  for (const [n, size] of sizes.entries()) assert.ok(size < AT + 2500, `request ${n + 1} read ${size} tokens`);
+  assert.ok(breaks.every((n, at) => at === 0 || n - breaks[at - 1] >= 3), `cut at requests ${breaks.map((n) => n + 1).join(", ")}`);
+});
+
+test("where a conversation cannot be kept within what may be read, the harness says so and stops: before anything is spent on it", async (t) => {
+  const cannot = (forgetAt) => new RegExp(`The conversation cannot be kept within ${forgetAt} tokens: the task and the latest of the work alone come to some \\d+\\.`);
+  // What may be read is less than the task and one turn come to: there is nothing to forget, and nothing to sum up.
+  const least = await working(t, () => ({ name: "read", args: { path: "notes.txt" } }));
+  const none = await least.run({ forgetAt: 1 });
+  assert.deepEqual([none.result.status, least.state], ["failed", { sums: 0, work: 1 }]);
+  assert.match(none.result.reason, cannot(1));
+  // There is something before the latest turn, but that turn is too much by itself: summing the rest up would not do.
+  const big = await working(t, (n) => (n === 1 ? { name: "files" } : { name: "shell", args: { command: "cat notes.txt notes.txt", seconds: 30 } }));
+  const still = await big.run({ forgetAt: 3000 });
+  // (Three requests: the third is the first to have the long answer in it, and says what it came to.)
+  assert.deepEqual([still.result.status, big.state], ["failed", { sums: 0, work: 3 }]);
+  assert.match(still.result.reason, cannot(3000));
+  // The provider says it is too long, and there is nothing to forget or to sum up: the same.
+  const refusing = await scene(t, (_request, n) => (n === 1 ? { name: "files" } : 400), "This model's maximum context length is 4096 tokens.");
+  const refused = await refusing.run();
+  assert.equal(refused.result.status, "failed");
+  assert.match(refused.result.reason, cannot(120000));
+  assert.equal(refusing.requests.length, 2);
+  // A summing-up that is itself more than may be read would be made again at every turn: said as well, the first time.
+  const wordy = await scene(t, (request) => (request.tools?.length ? { name: "write", args: { path: "out.txt", content: "the tide. ".repeat(900) } } : "it went on and on. ".repeat(2500)));
+  const tooLong = await wordy.run({ forgetAt: 8000 });
+  assert.equal(tooLong.result.status, "failed");
+  assert.match(tooLong.result.reason, /The conversation cannot be kept within 8000 tokens: summed up, with the latest of the work, it still comes to some \d+\./);
+  assert.equal(wordy.requests.filter((request) => !request.tools?.length).length, 1);
+  // A provider that will not sum up: asked as often as any request is, and then it is said.
+  let asked = 0;
+  const down = await scene(t, (request) => (request.tools?.length ? { name: "write", args: { path: "out.txt", content: "the tide. ".repeat(900) } } : (asked += 1, 500)));
+  const failed = await down.run({ forgetAt: 8000 });
+  assert.equal(failed.result.status, "failed");
+  assert.match(failed.result.reason, /The conversation outgrew what may be read, and could not be summed up: 500/);
+  assert.equal(asked, 4);
+  // A summing-up of nothing is none: it is asked for again, and the work goes on from the one that says something.
+  let blank = 0, work = 0;
+  const once = await scene(t, (request) => (!request.tools?.length ? ((blank += 1) === 1 ? " " : "## Done\nthe second")
+    : (work += 1) <= 6 ? { name: "write", args: { path: "out.txt", content: "the tide. ".repeat(900) } } : { name: "finish", args: { summary: "wrote" } }));
+  const went = await once.run({ forgetAt: 8000 });
+  assert.deepEqual([went.result.status, went.result.result.summed, blank], ["done", 1, 2]);
+  assert.ok(once.requests.at(-1).messages[1].content.includes("\n\n## Done\nthe second\n\n[Kept by the harness"));
 });
 
 test("the harness gives up where it is to: a provider that goes on failing, and a model that never says it is done", async (t) => {
