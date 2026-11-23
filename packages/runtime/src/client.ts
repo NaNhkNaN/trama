@@ -3,14 +3,14 @@
 // (ipc-server.ts), which does the real work.
 
 import { randomUUID } from "crypto";
-import type { Ctx, Agent, AgentOptions, AgentTool, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace, ModelRequest, ModelReply, ModelMessage, TextPart, ImagePart, ThinkingPart, ToolCallPart } from "./types.js";
+import type { Ctx, Agent, AgentOptions, AgentTool, Thinking, Schema, SchemaField, ShellResult, Tools, OutsideAgent, AgentResult, ObserveResult, Workspace, ModelRequest, ModelReply, ModelMessage, TextPart, ImagePart, ThinkingPart, ToolCallPart } from "./types.js";
 import type { ImageKind, ToolImage } from "./agent-backend.js";
 import type { ToolEvent } from "./own-tools.js";
 import { openBridge, remoteWorkspace, withOptions } from "./bridge-client.js";
 import { messageOf } from "./errors.js";
 import { assertSerializable, toLogData } from "./serializable.js";
 
-export type { Ctx, Agent, AgentOptions, AgentTool, Thinking, Schema, SchemaField, ShellResult, Tools, ObserveResult, Workspace, ModelRequest, ModelReply, ModelMessage, TextPart, ImagePart, ThinkingPart, ToolCallPart };
+export type { Ctx, Agent, AgentOptions, AgentTool, Thinking, Schema, SchemaField, ShellResult, Tools, OutsideAgent, AgentResult, ObserveResult, Workspace, ModelRequest, ModelReply, ModelMessage, TextPart, ImagePart, ThinkingPart, ToolCallPart };
 
 const PORT = process.env.TRAMA_PORT;
 if (!PORT) {
@@ -205,6 +205,7 @@ export const tools: Tools = {
   write: (path, content) => call("/tools/write", { path, content }),
   shell: async (cmd, opts) => call("/tools/shell", withOptions({ command: cmd }, opts)),
   fetch: async (url, opts) => call("/tools/fetch", withOptions({ url }, opts)),
+  agent: async (prompt, opts) => call("/tools/agent", withOptions({ prompt }, opts)),
 };
 
 /** workspace.* exists only inside a session — everywhere else it fails clearly, without a round trip. */

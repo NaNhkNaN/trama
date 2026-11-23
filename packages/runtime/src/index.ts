@@ -313,6 +313,7 @@ async function validateCandidate(
     maxRepairAttempts: config.maxRepairAttempts,
     maxIterations: config.defaultMaxIterations,
     journalRuns: config.journalRuns,
+    agents: config.agents,
     signal,
     as,
     alone,

@@ -156,8 +156,8 @@ test("the types of the program-facing API can be imported from where the API is"
   const declarations = readFileSync(join(REPO_ROOT, "packages", "runtime", "dist", "client.d.ts"), "utf-8");
   const exported = /export type \{([^}]*)\}/.exec(declarations)?.[1].split(",").map(name => name.trim()).sort();
   assert.deepEqual(exported, [
-    "Agent", "AgentOptions", "AgentTool", "Ctx", "ImagePart", "ModelMessage", "ModelReply", "ModelRequest", "ObserveResult", "Schema", "SchemaField",
-    "ShellResult", "TextPart", "Thinking", "ThinkingPart", "ToolCallPart", "Tools", "Workspace",
+    "Agent", "AgentOptions", "AgentResult", "AgentTool", "Ctx", "ImagePart", "ModelMessage", "ModelReply", "ModelRequest", "ObserveResult", "OutsideAgent",
+    "Schema", "SchemaField", "ShellResult", "TextPart", "Thinking", "ThinkingPart", "ToolCallPart", "Tools", "Workspace",
   ]);
 });
 

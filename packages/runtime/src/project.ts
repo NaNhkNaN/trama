@@ -11,6 +11,7 @@ import { homedir } from "os";
 import { fileURLToPath } from "url";
 import type { TramaConfig } from "./runner-types.js";
 import { checkedBudget } from "./budget.js";
+import { checkedAgents } from "./outside-agent.js";
 import { guardPath, projectAt } from "./path-guard.js";
 import { stageFileInProject } from "./replace-file.js";
 import { readProjectMeta } from "./meta.js";
@@ -180,9 +181,9 @@ function checkedConfig(merged: TramaConfig, source: string): TramaConfig {
   for (const [ok, msg] of checks) {
     if (!ok) throw new Error(`Invalid ${source}: ${msg}`);
   }
-  if (merged.budget === undefined) return merged;
   try {
-    return { ...merged, budget: checkedBudget(merged.budget, `"budget"`) };
+    if (merged.agents !== undefined) merged = { ...merged, agents: checkedAgents(merged.agents) };
+    return merged.budget === undefined ? merged : { ...merged, budget: checkedBudget(merged.budget, `"budget"`) };
   } catch (err) {
     throw new Error(`Invalid ${source}: ${messageOf(err)}`);
   }

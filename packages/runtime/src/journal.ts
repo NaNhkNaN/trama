@@ -351,6 +351,13 @@ export interface RecordedCall {
    * no answer on record, as a call nobody was left to answer has no result.
    */
   tool(id: string, name: string, args: unknown): (answer: ToolAnswer) => void;
+  /**
+   * What an agent from outside said of itself as it worked for the call: a
+   * tool call it reported, a permission it asked and how that was answered,
+   * what it said it used. Each is a record of its own kind — its usage most
+   * of all, which is the agent's account and not what the run used.
+   */
+  outside(what: "tool" | "permission" | "usage", fields: Record<string, unknown>): void;
 }
 
 export interface Journal {
@@ -375,7 +382,7 @@ export interface Journal {
 }
 
 /** What is written down of a call that is not on record: nothing. */
-const UNRECORDED: Omit<RecordedCall, "seq"> = { end() {}, used() {}, tool: () => () => {} };
+const UNRECORDED: Omit<RecordedCall, "seq"> = { end() {}, used() {}, tool: () => () => {}, outside() {} };
 
 /** A call that is nobody's to look up: what carries other calls rather than being one (see ipc-server). */
 export const OFF_THE_RECORD: RecordedCall = { seq: 0, ...UNRECORDED };
@@ -549,6 +556,9 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
         },
         used(usage) {
           write("usage", () => ({ seq: position, ...declaredUsage(usage) }));
+        },
+        outside(what, fields) {
+          write(`outside-${what}`, () => ({ seq: position, ...fields }));
         },
         tool(id, name, args) {
           const use = ++uses;

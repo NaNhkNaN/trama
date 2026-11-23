@@ -2,7 +2,8 @@ import { spawn } from "child_process";
 import type { Writable } from "stream";
 import { accessSync, constants, readFileSync, statSync, writeFileSync } from "fs";
 import { delimiter, resolve, dirname } from "path";
-import type { Tools, ShellResult } from "./types.js";
+import type { AgentResult, OutsideAgent, Tools, ShellResult } from "./types.js";
+import { askOutside, checkedAsk, type AskedOfAgent, type Said } from "./outside-agent.js";
 import { guardPath, makeDirsIn, projectAt, realRootOf } from "./path-guard.js";
 import { checkedEnv, superviseChild } from "./child-process.js";
 import { messageOf } from "./errors.js";
@@ -58,12 +59,28 @@ export interface ToolsWithCleanup extends Tools {
    * (For a workspace: see Workspace.shell.)
    */
   shellIn(root: string, command: string, options?: Parameters<Tools["shell"]>[1]): Promise<ShellResult>;
-  /** Stop every shell command still running, and anything they left in the background. Resolves when they are gone. */
+  /**
+   * A call to an agent from outside, read: what is wrong with it is thrown
+   * before anything is started — and where it names an agent, that is one
+   * of those these tools were made with.
+   */
+  agentAsked(prompt: unknown, options: unknown): AskedOfAgent;
+  /** Carry such a call out (see outside-agent.ts). `said`: where what the agent says of itself as it works is written down. */
+  askAgent(asked: AskedOfAgent, said?: Said): Promise<AgentResult>;
+  /**
+   * Stop every shell command still running, and anything they left in the
+   * background — and every agent from outside that is at work, which is the
+   * run's as a command is. Resolves when they are gone.
+   */
   stopActiveShells(): Promise<void>;
 }
 
-/** `env` is the variables the run was started with, over the runner's own: every shell command has them. */
-export function createTools(projectDir: string, signal?: AbortSignal, env?: Record<string, string>): ToolsWithCleanup {
+/**
+ * `env` is the variables the run was started with, over the runner's own:
+ * every shell command has them. `agents`: the agents from outside that a
+ * call may name (the configuration's).
+ */
+export function createTools(projectDir: string, signal?: AbortSignal, env?: Record<string, string>, agents?: Record<string, OutsideAgent>): ToolsWithCleanup {
   const normalizedProjectDir = resolve(projectDir);
 
   // Each shell command leads its own process group, so background processes it
@@ -188,6 +205,27 @@ export function createTools(projectDir: string, signal?: AbortSignal, env?: Reco
         // Failed to start (e.g. cwd does not exist) — a result, not an exception.
         return notStarted(spawnError);
       }
+    },
+
+    agent: async (prompt, options) => made.askAgent(made.agentAsked(prompt, options)),
+
+    agentAsked: (prompt, options) => checkedAsk(prompt, options, agents),
+
+    async askAgent(asked, said) {
+      const cwd = asked.cwd ? guardPath(normalizedProjectDir, asked.cwd) : realRootOf(normalizedProjectDir);
+      return askOutside({ ...asked, cwd }, {
+        env: shellEnv,
+        signal,
+        said,
+        // Its process group is tracked as a shell command's is, from when it is started until it is stopped for good.
+        listed(pgid) {
+          groups.set(pgid, { shellExited: false, forget: stopWithThisProcess(pgid) });
+          return async () => {
+            await stopGroups([pgid]);
+            untrack(pgid);
+          };
+        },
+      });
     },
 
     async fetch(url, options = {}) {

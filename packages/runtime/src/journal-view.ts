@@ -93,6 +93,33 @@ const howAnswered = (answer: JournalRecord | undefined): string =>
 const usageIn = (records: JournalRecord[]) => records.filter(record => record.kind === "usage");
 
 /**
+ * What agents from outside said they used (see `tools.agent`): their own
+ * account, added up as they gave it — tokens, and a cost in each currency
+ * one was said in. It is said beside what the run used, and never with it:
+ * a figure the runtime counted and one it was told are not the same kind.
+ *
+ * Tokens are said of a turn, and are added up. A cost is said of a
+ * conversation — what it has cost so far (the protocol's "cumulative
+ * session cost") — so of each conversation the last that was said counts,
+ * once: a conversation gone on with three times is not paid for three times
+ * over. `ofOneCall`: as it is said under a call, where it is that so-far.
+ */
+function saidUsed(records: JournalRecord[], ofOneCall = false): string {
+  const said = records.filter(record => record.kind === "outside-usage");
+  if (said.length === 0) return "";
+  const tokens = said.reduce((sum, record) => sum + (Number(record.total ?? (Number(record.input) || 0) + (Number(record.output) || 0)) || 0), 0);
+  // (Of a record that says no conversation, nothing is known to follow it: it counts by itself.)
+  const last = new Map<string, { currency: string; amount: number }>();
+  said.forEach((record, at) => { if (record.cost) last.set(`${record.session ?? `#${at}`} ${record.cost.currency}`, record.cost); });
+  const costs = new Map<string, number>();
+  for (const { currency, amount } of last.values()) costs.set(currency, (costs.get(currency) ?? 0) + (Number(amount) || 0));
+  const money = [...costs].map(([currency, amount]) => `${currency} ${Number(amount.toFixed(4))}`);
+  return ofOneCall
+    ? [`${tokens} tokens`, ...money.map(cost => `its conversation has cost ${cost} so far`)].join("; ")
+    : [`${tokens} tokens`, ...money].join(", ");
+}
+
+/**
  * What a run used, as far as its journal says. That is all of it (`inAll`
  * says so) unless the journal filled up: then it is what is on record, be
  * that nothing, and is said to be.
@@ -128,7 +155,10 @@ function printJournal(path: string, records: JournalRecord[]): void {
   const answers = new Map<string, JournalRecord>();
   for (const record of records) if (record.kind === "tool-result") answers.set(`${record.seq}/${record.tool}`, record);
   const usage = usageIn(records);
-  const total = spentInAll(records, " in all");
+  const outside = saidUsed(records);
+  const total = [spentInAll(records, " in all"), outside && `outside agents said they used: ${outside}`].filter(Boolean).join("; ");
+  /** What an agent from outside said of itself, under the call it worked for. */
+  const ofTheAgent = (record: JournalRecord, what: string, rest: string) => `#${String(record.seq).padEnd(3)} ${`  the agent: ${what}`.padEnd(18)} ${rest}`;
 
   for (const record of records) {
     const at = `${(record.at / 1000).toFixed(3).padStart(9)}s`;
@@ -147,6 +177,15 @@ function printJournal(path: string, records: JournalRecord[]): void {
         console.log(`${at}  #${String(record.seq).padEnd(3)} ${`  tool ${record.name}`.padEnd(18)} ${oneLine(record.args, 60).padEnd(60)}  ${how}`);
         break;
       }
+      case "outside-tool":
+        console.log(`${at}  ${ofTheAgent(record, "tool", oneLine(record.title, 80))}`);
+        break;
+      case "outside-permission":
+        console.log(`${at}  ${ofTheAgent(record, "asked", `${oneLine(record.for, 70)} — ${record.answer}`)}`);
+        break;
+      case "outside-usage":
+        console.log(`${at}  ${ofTheAgent(record, "it said it used", saidUsed([record], true))}`);
+        break;
       case "usage":
         // (What a call used is shown with the call.)
         if (record.for === "fix") console.log(`${at}  asking for the fix used ${spentIn([record])}`);

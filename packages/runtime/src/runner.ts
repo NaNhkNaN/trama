@@ -9,7 +9,7 @@ import {
 import { basename, join, dirname, relative } from "path";
 import { tmpdir } from "os";
 import { createHash, randomBytes } from "crypto";
-import type { ShellResult, Workspace } from "./types.js";
+import type { OutsideAgent, ShellResult, Workspace } from "./types.js";
 import type { MakeRequest, RunOptions, ProgramResult } from "./runner-types.js";
 import { onAbort, rejectOnAbort } from "./abort.js";
 import type { AgentUsage } from "./agent-backend.js";
@@ -277,6 +277,8 @@ interface RunOnceOptions {
   label?: string;
   /** Variables the run was started with, over the runner's own (see RunOptions). */
   env?: Record<string, string>;
+  /** The agents from outside its program may name (the configuration's: see TramaConfig). */
+  agents?: Record<string, OutsideAgent>;
   /** The count of what the run uses of a model: what the runs it asks for use is counted there too. */
   meter?: Meter;
   /** How a project is made or changed where the run's program asks for that (see Making). Without it, nothing is. */
@@ -476,7 +478,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   };
   // The workspace of the session this run is part of, if it is part of one.
   const sessionWorkspace = workspaceDir ? workspaceAt(workspaceDir) : null;
-  const tools = createTools(projectDir, runEnded.signal, options.env);
+  const tools = createTools(projectDir, runEnded.signal, options.env, options.agents);
   // As far as a validation goes: the program asks its runner for what would be real — a run, a project
   // made. The call is left unanswered — an answer would only send the program on to do more — until
   // the program, which is being stopped, lets go of it.
@@ -1138,6 +1140,8 @@ export async function validateProgram(
     as?: string; alone?: string; budget?: Budget; wrote?: AgentUsage[];
     /** Where a run's program asked for the project to be made or changed: the run's name and variables are the validation's, and the two journals point at each other. */
     label?: string; env?: Record<string, string>; askedFor?: Pick<AskedFor, "parent" | "started">;
+    /** The agents from outside the program may name (the configuration's). */
+    agents?: Record<string, OutsideAgent>;
   },
 ): Promise<{ source: string; repairedError?: string; alone?: string }> {
   const { journalRuns = 0, signal, as = projectDir, timeout, maxRepairAttempts, maxIterations, label, env, askedFor } = options;
@@ -1174,6 +1178,7 @@ export async function validateProgram(
       validating: { readyGraceMs: VALIDATION_READY_GRACE_MS },
       label,
       env,
+      agents: options.agents,
       signal,
       journal,
     });
@@ -1495,6 +1500,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
     label: options.label,
     env,
     agentChanges: config.agentChanges,
+    agents: config.agents,
     repairWith,
     signal: options.signal,
     journal,

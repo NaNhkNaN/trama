@@ -2,6 +2,7 @@
 // own modules use. Nothing here is visible to a program.ts.
 
 import type { Budget } from "./budget.js";
+import type { OutsideAgent } from "./types.js";
 export type { Budget };
 
 export interface ProgramResult {
@@ -103,6 +104,12 @@ export interface TramaConfig extends ModelConfig {
   agentChanges: "keep" | "discard";
   /** The project asked for a fix, in place of pi's agent, where a run is not given one of its own (see RunOptions). */
   repairWith?: string;
+  /**
+   * The agents from outside a program may name in `tools.agent`: each by a
+   * name, and what starts it — `{ command, args?, env? }`. None is named
+   * by the runtime itself.
+   */
+  agents?: Record<string, OutsideAgent>;
   /**
    * What a run may use of a model (see RunOptions) where it is not given a
    * budget of its own — and what a `create` or an `update` may: writing the

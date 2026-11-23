@@ -6,6 +6,8 @@ import { createServer, type Server } from "http";
 import type { AddressInfo } from "net";
 import { timingSafeEqual } from "crypto";
 import type { Tools, Workspace } from "./types.js";
+import type { ToolsWithCleanup } from "./tools.js";
+import type { Said } from "./outside-agent.js";
 import type { RunnerAgent } from "./agent.js";
 import type { RunContext } from "./context.js";
 import type { MakeRequest, ProgramResult, RunRequest } from "./runner-types.js";
@@ -163,9 +165,22 @@ function namedBy(id: string): string {
  * variables — a journal is no place for a key. Of variables the names are
  * kept; of what is given in their place and is none, what kind of thing it is.
  */
-const asRecorded = (body: unknown): unknown =>
-  !isJsonObject(body) || body.env == null ? body
-    : { ...body, env: isJsonObject(body.env) ? Object.keys(body.env).map(variableName) : `(${describeJson(body.env)})` };
+const namesOf = (env: unknown): unknown => (isJsonObject(env) ? Object.keys(env).map(variableName) : `(${describeJson(env)})`);
+function asRecorded(body: unknown): unknown {
+  if (!isJsonObject(body)) return body;
+  let recorded = body;
+  if (body.env != null) recorded = { ...recorded, env: namesOf(body.env) };
+  // (And those an agent from outside is started with, where a call says how it is started.)
+  if (isJsonObject(body.agent) && body.agent.env != null) recorded = { ...recorded, agent: { ...body.agent, env: namesOf(body.agent.env) } };
+  return recorded;
+}
+
+/** Where what an agent from outside says of itself is written down: under the call it works for. */
+const saidUnder = (call: RecordedCall): Said => ({
+  tool: (title, kind) => call.outside("tool", { title, ...(kind !== undefined && { tool: kind }) }),
+  permission: (what, answer) => call.outside("permission", { for: what, answer }),
+  usage: (usage, session) => call.outside("usage", { ...(session !== undefined && { session }), ...usage }),
+});
 
 /**
  * What an agent call may say about how it is served (see AgentOptions). (A
@@ -188,7 +203,7 @@ export interface IpcBackends {
   token: string;
   ctx: RunContext;
   agent: RunnerAgent;
-  tools: Tools;
+  tools: Tools & Pick<ToolsWithCleanup, "agentAsked" | "askAgent">;
   /** The workspace of the session the program is running in — null when it is in none. */
   workspace: Workspace | null;
   /** A workspace by directory, for a program that created a session rather than joined one. */
@@ -324,6 +339,12 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make }: I
     "/tools/fetch": route(
       { url: "string", method: "optional string", headers: "optional object", body: "optional string" },
       b => tools.fetch(b.url, { method: b.method, headers: headersOf(b.headers), body: b.body }),
+    ),
+    // An agent from outside (see outside-agent.ts). What is wrong with the call is the request's fault, found
+    // before anything is started; what the agent says of itself as it works is on record under the call.
+    "/tools/agent": route(
+      { prompt: "string", agent: "any", cwd: "optional string", timeout: "optional number", system: "optional string", model: "optional string", session: "optional string" },
+      ({ prompt, ...options }, _closed, call) => tools.askAgent(asGiven(() => tools.agentAsked(prompt, options)), saidUnder(call)),
     ),
 
     "/ctx/log": route({ message: "string", data: "optional any" }, b => ctx.log(b.message, b.data)),

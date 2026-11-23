@@ -337,6 +337,82 @@ export interface ShellResult {
   stderr: string;
 }
 
+/** What starts an agent from outside: a command, what it is given, and variables of its own over those a shell command has. */
+export interface OutsideAgent {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+/**
+ * What came of asking an agent from outside (see `Tools.agent`) — also where
+ * the call did not go through: then `ok` is false, and `failure` says what
+ * stood in the way.
+ */
+export interface AgentResult {
+  /** The agent did the turn and ended it as a turn ends. */
+  ok: boolean;
+  /**
+   * What the agent said, all of it, in order: where it said several things —
+   * what it was about to do, and after the tools it called its answer — an
+   * empty line between them. (What there was of it, where the call did not
+   * go through.)
+   */
+  text: string;
+  /**
+   * The same, each message of the agent's apart: one is told from the next
+   * by the id the agent gives it, and by a tool it called between two
+   * things it said. The last is its answer, where it ended the turn as a
+   * turn ends: `messages.at(-1)`, for a program that wants that alone.
+   * Empty where it said nothing.
+   */
+  messages: string[];
+  /** Why the turn stopped, in the agent's word for it. */
+  stopReason?: "end_turn" | "max_tokens" | "max_turn_requests" | "refusal" | "cancelled";
+  /**
+   * Why the call did not go through, sorted, with the agent's own words.
+   * "not-installed": there is no such command, or it ended before it answered.
+   * "not-logged-in": the agent wants a login first — its own, made with it.
+   * "timed-out": it was not done in the time the call has. "refused": the
+   * agent refused the work, or to go on with the conversation named, or
+   * speaks another version of the protocol. "failed": anything else.
+   */
+  failure?: { kind: "not-installed" | "not-logged-in" | "timed-out" | "refused" | "failed"; message: string };
+  /** The conversation's id: given as `session` to a later call, that call goes on with it. */
+  session?: string;
+  /**
+   * What the agent said it used: tokens, a cost where it says one, how full
+   * its context is. It is the agent's own account. The runtime did not
+   * count it, does not hold it to the run's budget, and does not add it to
+   * what the run used of a model.
+   *
+   * The tokens are this turn's. `cost` is said as the protocol has it: what
+   * the conversation has cost so far — this turn and those before it, where
+   * it was gone on with (`session`). To add costs up, take of each
+   * conversation the last.
+   */
+  usage?: {
+    input?: number; output?: number; total?: number; cacheRead?: number; cacheWrite?: number; thought?: number;
+    cost?: { amount: number; currency: string };
+    context?: { used: number; size: number };
+  };
+  /** The tool calls the agent reported, as it named them. */
+  toolCalls: Array<{ title: string; kind?: string; status?: string }>;
+  /** How what was asked was in fact given. */
+  given: {
+    /** The system prompt: sent as the session's ("as-system"), put at the head of the prompt where the agent takes none ("in-prompt"), or not asked. */
+    system: "as-system" | "in-prompt" | "none";
+    /** The model the call named, and whether it was set: it is, only where the agent has none of its own and offers that one. */
+    model?: { asked: string; set: boolean };
+    /** How an earlier conversation was gone on with. */
+    resumed?: "resume" | "load";
+    /** How many permissions the agent asked that were granted (for the once), and how many could not be. */
+    permissions: { granted: number; refused: number };
+  };
+  /** What the agent said of itself: its name and version, the models it offers and the one serving, whether it goes on with a conversation, whether it takes a system prompt. */
+  agent: { name?: string; version?: string; models?: string[]; model?: string; resumes: boolean; takesSystem: boolean };
+}
+
 export interface Tools {
   /** Read a file. Path is relative to project dir. */
   read(path: string): Promise<string>;
@@ -363,6 +439,39 @@ export interface Tools {
     headers?: Record<string, string>;
     body?: string;
   }): Promise<{ status: number; body: string; headers: Record<string, string> }>;
+
+  /**
+   * Have an agent from outside do a piece of work: somebody else's coding
+   * agent, whole — its own loop and tools, under the user's own login for
+   * it — started for the call and spoken with by the Agent Client Protocol.
+   * A prompt in; out, what it said and how that went.
+   *
+   *   const done = await tools.agent("Find why the build is slow, and say.", { agent: "claude" });
+   *   if (!done.ok) throw new Error(done.failure!.message);
+   *
+   * `agent` names one of the configuration's (`agents` in config.json), or
+   * is what starts one: `{ command, args?, env? }`. The runtime names none.
+   * `cwd` is where it works: the project, or a directory of it. `timeout`
+   * is in milliseconds (ten minutes, without it). `session` is the id an
+   * earlier result gave: the conversation is gone on with.
+   *
+   * It is a black box, and resolves as `tools.shell` does — with a result,
+   * also where the agent is not installed, not logged in, too slow, or
+   * failed (see `AgentResult`). Little is held: every permission it asks is
+   * granted, for the once; what it spends is its own account, recorded and
+   * not capped by the run's budget; it reads and writes as itself. `system`
+   * goes as the session's where the agent takes one, and at the head of the
+   * prompt where not. `model` is for an agent that has none of its own:
+   * the agent's own serves otherwise. The result says how each went.
+   */
+  agent(prompt: string, options: {
+    agent: string | OutsideAgent;
+    cwd?: string;
+    timeout?: number;
+    system?: string;
+    model?: string;
+    session?: string;
+  }): Promise<AgentResult>;
 }
 
 // --- Workspace types ---
