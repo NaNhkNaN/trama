@@ -611,6 +611,19 @@ test("a round is told what the rounds before it tried, from the program as it is
   await same.round({ inputs: two });
   assert.deepEqual([same.versions().map(([version, reason]) => [version, reason]).slice(0, 2), /Tried before/.test(same.prompts[1])], [[[1, "found"], [2, "update"]], false]);
 
+  // A version gone back from because a check of it could not be made was never judged: it is not told as tried —
+  // whatever runs of it happened to be judged first — where one the loop judged and went back from is.
+  const lost = loopOver(t, first, [SAYS(["ab"], 'word === "cd" ? "BOOM" : word'), SAYS([]), SAYS([])]);
+  assert.match((await lost.round({ inputs: two })).result.result.why, /^Version 1 is put back: a check of version 2 could not be made/);
+  assert.equal(lost.lines().filter((line) => line.version === 2 && line.check?.ok === true).length, 1);
+  assert.equal((await lost.round({ inputs: two })).result.result.kept, false);
+  assert.doesNotMatch(lost.prompts[1], /Tried before/);
+  await lost.round({ inputs: two });
+  assert.deepEqual([lost.prompts[2].match(/\n- version \d+/g), lost.versions().length], [["\n- version 4"], 7]);
+  // What the loop keeps for it: the versions it judged and went back from, of the program as it is — and of a program that another took the place of, none.
+  assert.deepEqual(readJson(join(lost.at("improve"), "state.json")).tried, { [hashOf(first)]: [4, 6] });
+  assert.deepEqual(readJson(join(it.at("improve"), "state.json")).tried, {});
+
   // The rounds, replayed, go as they went: what was read of the versions is on the record.
   const journals = readdirSync(join(it.at("improve"), "logs", "journal")).sort();
   for (const run of [journals[1], journals[3]]) {

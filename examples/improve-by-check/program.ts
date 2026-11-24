@@ -87,8 +87,17 @@ class NoVerdict extends Error {}
  * the program as it is. A project's history keeps the beginning of a verdict's notes — and what comes after is
  * often what a writer can act on. By the program's text, then by the mark of the input; of inputs that are shown.
  */
-const kept = ctx.state as { notes?: Record<string, Record<string, string[]>> };
+const kept = ctx.state as { notes?: Record<string, Record<string, string[]>>; tried?: Record<string, number[]> };
 kept.notes ??= {};
+/**
+ * And the versions this loop judged and went back from, by the text of the program they were written from. A
+ * project's history says a version was gone back from, and not why: one put back because a check of it could not be
+ * made — or by anybody else, or by a round that fell over — was never found no better, and is not to be told as if
+ * it had been. Only what the loop decided itself is here; what it does not know it decided, it does not say.
+ */
+kept.tried ??= {};
+/** The version this round judged and went back from, where it did. */
+let judgedAndGoneBackFrom: number | undefined;
 /** The notes of a verdict from the record, whole where this loop heard them itself: the record's are their beginning. */
 const whole = (notes: string | undefined, text: string | undefined, mark: string): string | undefined => {
   if (notes === undefined || text === undefined || !notes.endsWith("…")) return notes;
@@ -166,7 +175,7 @@ async function verdicts(again = 0): Promise<Verdict[][]> {
 
 /**
  * What was tried before from the program as it is, and gone back from: each version an update wrote of this very
- * text that is not the program now — what its runs came to, on what decides, and what it changed. A round begins
+ * text that this loop judged and found no better — what its runs came to, on what decides, and what it changed. A round begins
  * from the program again; without this its writer does not know what the rounds before came to, and writes it again.
  * (All of it is read by the runner or by a command: it is on this run's record, and a replay is told the same.)
  */
@@ -178,9 +187,10 @@ async function triedBefore(was: Tally): Promise<string[]> {
   if (text === undefined) return [];
   // The latest try of each text: the version, and the one it was written from.
   const tries = new Map<string, { version: number; from: number }>();
+  const judged = new Set(kept.tried![text] ?? []);
   for (const [at, version] of history.versions.entries()) {
     const from = history.versions[at - 1];
-    if (version.reason === "update" && version.sha256 !== undefined && version.sha256 !== text && from?.sha256 === text) tries.set(version.sha256, { version: version.version, from: from.version });
+    if (judged.has(version.version) && version.reason === "update" && version.sha256 !== undefined && version.sha256 !== text && from?.sha256 === text) tries.set(version.sha256, { version: version.version, from: from.version });
   }
   if (tries.size === 0) return [];
   const marks = new Set<string>();
@@ -269,7 +279,10 @@ async function round(): Promise<Record<string, unknown>> {
     if (!(err instanceof NoVerdict)) throw err;
     return { kept: false, from, to, before: was, why: `Version ${from} is put back: a check of version ${to} could not be made — ${err.message}` };
   }
-  if (!kept) await rollbackProject(project, from);
+  if (!kept) {
+    await rollbackProject(project, from);
+    judgedAndGoneBackFrom = to;
+  }
 
   // What it did, and why.
   const is = deciding(after), isAll = tally(after);
@@ -299,4 +312,6 @@ const came = await round();
 const now = await readHistory(dir, { runs: 0 });
 const standing = now.versions.find((version) => version.version === now.current)?.sha256;
 kept.notes = standing !== undefined && kept.notes[standing] ? { [standing]: kept.notes[standing] } : {};
+const tried = [...(standing !== undefined ? kept.tried[standing] ?? [] : []), ...(judgedAndGoneBackFrom !== undefined ? [judgedAndGoneBackFrom] : [])];
+kept.tried = standing !== undefined && tried.length > 0 ? { [standing]: tried } : {};
 await ctx.done(came);

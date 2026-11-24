@@ -36,8 +36,18 @@ for (let n = 1; ; n++) { writeFileSync(beside, String(n)); if (n % 4 === 0) rmSy
     await new Promise((gone) => (writer.exitCode !== null || writer.signalCode !== null ? gone() : writer.once("exit", gone)));
     cleanupTempDir(dir);
   });
-  const read = () => { try { return readFileSync(join(dir, "state.json"), "utf-8"); } catch { return ""; } };
-  await waitFor(() => Number(read()) > 50, "the other process to be at it");
+  // The number in the file. (The file is gone for a moment every fourth time — that is what this test is of — so a
+  // look that finds none is taken again: one look that found none was once read as the number 0, and failed the test.)
+  const read = () => {
+    for (const until = Date.now() + 5000; ;) {
+      try {
+        return Number(readFileSync(join(dir, "state.json"), "utf-8"));
+      } catch (err) {
+        if (err.code !== "ENOENT" || Date.now() > until) throw err;
+      }
+    }
+  };
+  await waitFor(() => read() > 50, "the other process to be at it");
 
   const began = read();
   const refused = {};
@@ -50,7 +60,8 @@ for (let n = 1; ; n++) { writeFileSync(beside, String(n)); if (n % 4 === 0) rmSy
     }
   }
   // (It was at it all the while: the file is many files later, and the path was looked at many times.)
-  assert.ok(Number(read()) - Number(began) > 1000 && guarded > 1000, `${began} to ${read()}, guarded ${guarded} times`);
+  const ended = read();
+  assert.ok(ended - began > 1000 && guarded > 1000, `${began} to ${ended}, guarded ${guarded} times`);
   assert.deepEqual(refused, {}, `of ${guarded} times`);
 });
 
