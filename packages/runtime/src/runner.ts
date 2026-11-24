@@ -10,7 +10,7 @@ import { basename, join, dirname, relative, resolve } from "path";
 import { tmpdir } from "os";
 import { createHash, randomBytes } from "crypto";
 import type { OutsideAgent, ShellResult, Workspace } from "./types.js";
-import type { Check, MakeRequest, RunOptions, ProgramResult, ReplayAllResult, ReplayOptions, ReplayResult } from "./runner-types.js";
+import type { Check, MakeRequest, RunOptions, ProgramResult, ReplayAllResult, ReplayOptions, ReplayResult, RolledBack } from "./runner-types.js";
 import { readProjectMeta } from "./meta.js";
 import { createReplay, readRecording, runsToReplay, saysTheSame, type Recording, type Replay } from "./replay.js";
 import { onAbort, rejectOnAbort } from "./abort.js";
@@ -31,7 +31,7 @@ import { journalEntriesOf, openJournal, type Journal } from "./journal.js";
 import { messageOf } from "./errors.js";
 import { checkedRepairAttempts, checkedTimeout, ensureProjectScaffold, loadProjectConfig, loadState, namesAPath, projectNamed, saveState } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
-import { copyToHistory, noteRun, programHashOf, recordAsFound, recordVersion, textOfVersion, versionWith, versionsOf } from "./history.js";
+import { copyToHistory, noteRun, programHashOf, readHistory, recordAsFound, recordVersion, textOfVersion, versionWith, versionsOf } from "./history.js";
 
 /**
  * tsx lets node run program.ts. Resolved through the module system, so any
@@ -517,7 +517,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     make: (request, stop, seq) => {
       if (validating) return handOff("has a project made or changed", stop);
       if (!options.making) {
-        throw new Error("This runner was not given a way to make projects: createProject and updateProject are carried out where a run is started by way of @trama-dev/runtime/runner.");
+        throw new Error("This runner was not given a way to make projects, or change them: createProject, updateProject and rollbackProject are carried out where a run is started by way of @trama-dev/runtime/runner.");
       }
       // The run's own, as a run it asks for is: under its budget, with its variables, stopped when it
       // ends or when the program no longer wants it, and not over before this is. (But the program's
@@ -536,6 +536,9 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       const { signal, ...asked } = itsOwn(seq, stop);
       return notOverBefore(runProgram({ ...request, env, signal }, { depth: options.depth + 1, ...asked }, options.making).finally(release));
     },
+    // What is read of a project's history is read here — in a validation too: it changes nothing.
+    history: (dir, runs) => readHistory(dir, runs === undefined ? {} : { runs }),
+    mark: inputMarkOf,
     // A replay the program asks for is made here, as a run it asks for is — and in a validation too: it
     // carries nothing out and uses nothing, so there is nothing of it to be kept from. It is the run's
     // own: stopped when the run ends or the program no longer wants it, and not over before it is; the
@@ -1665,7 +1668,7 @@ export interface AskedToMake extends Pick<AskedFor, "parent" | "started" | "abov
  * The runner is handed it by what starts runs (the runner surface): it is
  * that which knows how a program is written, and it stands on this.
  */
-export type Making = (request: MakeRequest, asked: AskedToMake) => Promise<void>;
+export type Making = (request: MakeRequest, asked: AskedToMake) => Promise<RolledBack | void>;
 
 /** What a run is told when a program asked for it, rather than a person or a host. */
 interface AskedFor {
@@ -1826,7 +1829,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
       ...(check && { check: { ...check, ...(check.notes !== undefined && { notes: short(check.notes) }), ...(check.error !== undefined && { error: short(check.error) }) } }),
       used: { calls, tokens, cost },
       ms: Math.round(performance.now() - clock),
-      input: inputMark(options.args),
+      input: inputMarkOf(projectDir, options.args),
       ...(askedFor?.purpose && { for: askedFor.purpose }),
     });
   } catch (err) {
@@ -1835,7 +1838,19 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   return result;
 }
 
-/** A mark of what a run was started with: the same for the same arguments, in whatever order they were written. */
+/**
+ * The mark of what a run of a project is started with, where it is asked
+ * for with these arguments: by it the runs on record that were started
+ * with the same are found (`input`, on a run's line). It is of what the
+ * program is given — the arguments asked with, laid over those the
+ * project's own meta.json says: runs asked for with the same arguments are
+ * runs of the same only while the project says the same.
+ */
+export function inputMarkOf(projectDir: string, args?: Record<string, unknown>): string {
+  return inputMark({ ...(readProjectMeta(projectDir).input.args ?? {}), ...args });
+}
+
+/** A mark of some arguments: the same for the same, in whatever order they were written. */
 function inputMark(args: Record<string, unknown> | undefined): string {
   const ordered = (value: unknown): unknown => (Array.isArray(value) ? value.map(ordered)
     : value !== null && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([key, held]) => [key, ordered(held)]))
@@ -1854,7 +1869,7 @@ function inputMark(args: Record<string, unknown> | undefined): string {
  * touched — its state, its files. (So the old program meets the project as
  * it is now, which its next run will show.)
  */
-export function rollbackTo(projectDir: string, version: number): { version: number; from: number } | { unchanged: true; version: number } {
+export function rollbackTo(projectDir: string, version: number): RolledBack {
   if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 1) throw new Error("A version is named by its number: 1 and up.");
   if (!existsSync(join(projectDir, "meta.json"))) {
     throw new Error(`Project not found at ${projectDir}. Run \`trama list\` to see available projects.`);

@@ -256,13 +256,13 @@ export type ReplayRequest = Omit<ReplayOptions, "signal"> & { all?: boolean };
 export type RunRequest = Omit<RunOptions, "signal">;
 
 /** A project a program asks its runner to make, or to change (see createProject and updateProject). */
-export interface MakeRequest {
-  kind: "create" | "update";
-  name: string;
-  prompt: string;
-  model?: string;
-  args?: Record<string, unknown>;
-}
+export type MakeRequest =
+  | { kind: "create" | "update"; name: string; prompt: string; model?: string; args?: Record<string, unknown> }
+  /** A project changed by going back to a version of its program (see `rollbackProject`). */
+  | { kind: "rollback"; name: string; version: number };
+
+/** What going back to a version came to: the new version it was made, and which it is of — or that the program was that already. */
+export type RolledBack = { version: number; from: number } | { unchanged: true; version: number };
 
 export interface TramaConfig extends ModelConfig {
   maxRepairAttempts: number;

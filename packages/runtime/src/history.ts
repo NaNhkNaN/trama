@@ -230,15 +230,17 @@ function runsOf(projectDir: string): HistoryRun[] {
 }
 
 /**
- * A project's history, as it is on record: its versions, its runs, and
- * which version the program is now — where it is the latest one, and has
- * not been changed since.
+ * A project's history, as it is on record: its versions, its runs — all
+ * that are there, or the latest so many (`runs`) — and which version the
+ * program is now, where it is the latest one and has not been changed since.
  */
-export function readHistory(projectDir: string): ProjectHistory {
+export function readHistory(projectDir: string, options: { runs?: number } = {}): ProjectHistory {
   const versions = versionsOf(projectDir);
   const latest = versions.at(-1);
   const current = latest !== undefined && latest.sha256 !== undefined && latest.sha256 === programHashOf(projectDir) ? latest.version : undefined;
-  return { versions, runs: runsOf(projectDir), ...(current !== undefined && { current }) };
+  const all = runsOf(projectDir);
+  const runs = options.runs === undefined ? all : options.runs >= 1 ? all.slice(-Math.floor(options.runs)) : [];
+  return { versions, runs, ...(current !== undefined && { current }) };
 }
 
 /** Save the current program.ts as the next version of the project, and record why. */

@@ -68,7 +68,7 @@ function gist(request: Record<string, unknown> | undefined): string {
   // A run that was asked for is best known by the name it was given.
   if (typeof request?.label === "string") return oneLine(`${request.label}  (${request.projectDir})`, 60);
   // ...and a project that was asked for by its own.
-  if (typeof request?.name === "string") return oneLine(`${request.name}: ${typeof request.prompt === "string" ? request.prompt : ""}`, 60);
+  if (typeof request?.name === "string") return oneLine(`${request.name}: ${typeof request.prompt === "string" ? request.prompt : typeof request.version === "number" ? `back to version ${request.version}` : ""}`, 60);
   // ...and a request to a model by the last that was said in the conversation it carries.
   if (Array.isArray(request?.messages)) return oneLine(request.messages.length === 0 && request.messagesBefore ? "(asked again, as before)" : lastSaid(request.messages), 60);
   for (const field of ["prompt", "command", "path", "pattern", "url", "message", "projectDir", "reason"]) {

@@ -16,6 +16,7 @@ import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import {
   validateProgram, installValidatedProgram,
   withTempDir, prepareProject, shownPaths, type Prepared, RUNTIME_TYPES, runProgram as runHere, replayProgram as replayHere, replayAll as replayAllHere, rollbackTo, whyNotReplaceable,
+  inputMarkOf as markHere,
   tagged, failureOf, type AskedToMake, type Making,
 } from "./runner.js";
 import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspace.js";
@@ -24,9 +25,9 @@ import { guardPath, identityOf, sameProjectAs } from "./path-guard.js";
 import { printJournals, spentIn } from "./journal-view.js";
 import { messageOf } from "./errors.js";
 
-export type { HistoryRun, HistoryVersion, ProjectHistory } from "./runner-types.js";
-export { readHistory } from "./history.js";
-import { readHistory } from "./history.js";
+export type { HistoryRun, HistoryVersion, ProjectHistory, RolledBack } from "./runner-types.js";
+import type { ProjectHistory, RolledBack } from "./runner-types.js";
+import { readHistory as historyHere } from "./history.js";
 export type { Budget, Check, ProgramResult, RunOptions, ReplayOptions, ReplayResult, ReplayAllResult } from "./runner-types.js";
 export { failureOf } from "./runner.js";
 export { requestsWhole } from "./journal-view.js";
@@ -61,10 +62,11 @@ async function overBridge<T>(bridge: Bridge, endpoint: string, asked: Record<str
 }
 
 /** How this runner makes or changes a project for a program that asks it to (see Making). */
-const making: Making = (request, asked) =>
-  request.kind === "create"
-    ? createHere(request.name, request.prompt, { model: request.model, args: request.args, signal: asked.signal }, asked)
-    : updateHere(request.name, request.prompt, { signal: asked.signal }, asked);
+const making: Making = async (request, asked) =>
+  request.kind === "rollback" ? rollbackHere(request.name, request.version, asked)
+    : request.kind === "create"
+      ? createHere(request.name, request.prompt, { model: request.model, args: request.args, signal: asked.signal }, asked)
+      : updateHere(request.name, request.prompt, { signal: asked.signal }, asked);
 
 /** Run a project to an outcome: done, yielded, or failed. */
 export async function runProgram(options: RunOptions): Promise<ProgramResult> {
@@ -156,16 +158,53 @@ export async function showReplay(name: string, options: { run?: string; all?: bo
 }
 
 /**
+ * A project's history, as it is on record: its versions, its runs — all
+ * that are there, or the latest so many (`runs`) — and which version the
+ * program is now (see `ProjectHistory`). Facts, in the order they came.
+ *
+ * A program asks its runner for it. They are files, and it could read them:
+ * asked for so, what it read is on its run's record, and a replay of the run
+ * is told what the run was told, not what the history has come to since.
+ */
+export async function readHistory(projectDir: string, options: { runs?: number } = {}): Promise<ProjectHistory> {
+  const bridge = parentBridge();
+  if (!bridge) return historyHere(projectDir, options);
+  // (The runner does not share this program's working directory.)
+  return bridge.call("/project/history", withOptions({ projectDir: resolve(projectDir) }, options));
+}
+
+/**
+ * The mark of what a run of a project is started with, where it is asked
+ * for with these arguments: the `input` of its line in the project's
+ * history. By it a program finds the runs on record that were started with
+ * the same — and does not pay for what is there. A program asks its runner
+ * for it, as for the history it is held against.
+ */
+export async function inputMarkOf(projectDir: string, args?: Record<string, unknown>): Promise<string> {
+  const bridge = parentBridge();
+  if (!bridge) return markHere(projectDir, args);
+  return bridge.call("/project/mark", withOptions({ projectDir: resolve(projectDir) }, args === undefined ? {} : { args }));
+}
+
+/**
  * Go back to a version of a project's program, by the project's name: the
  * version's text becomes the program again, as a new version. Nothing is
  * run or validated, and nothing else of the project is touched (see
  * `trama history <name>` for the versions there are).
+ *
+ * A program asks its runner for it, as it does for an update: the project
+ * is changed there, and that it was is on the run's record.
  */
-export async function rollbackProject(name: string, version: number): Promise<{ version: number; from: number } | { unchanged: true; version: number }> {
-  if (parentBridge()) throw new Error("A rollback is made by a runner that is in no program's run: not from within a program, yet.");
+export async function rollbackProject(name: string, version: number): Promise<RolledBack> {
+  const bridge = parentBridge();
+  if (!bridge) return rollbackHere(name, version);
+  return overBridge(bridge, "/project/rollback", { name, version });
+}
+
+function rollbackHere(name: string, version: number, asked: Asked = {}): RolledBack {
   const went = rollbackTo(resolveProject(name), version);
-  console.log("unchanged" in went
-    ? `${name} is at version ${version} already: nothing was changed.`
+  shownUnder(asked.label).log("unchanged" in went
+    ? `${name} is at version ${went.version} already: nothing was changed.`
     : `${name} is at version ${went.from} again, as version ${went.version}. The program was not run, and nothing else of the project was changed.`);
   return went;
 }
@@ -177,7 +216,7 @@ export async function rollbackProject(name: string, version: number): Promise<{ 
  * It counts and takes means, and says of no version that it is the better.
  */
 export async function showHistory(name: string, options: { runs?: boolean } = {}): Promise<void> {
-  const { versions, runs, current } = readHistory(resolveProject(name));
+  const { versions, runs, current } = historyHere(resolveProject(name));
   if (versions.length === 0 && runs.length === 0) {
     console.log(`No version of ${name} is on record: its program has not been made by trama, or run, since history was kept.`);
     return;

@@ -10,7 +10,7 @@ import type { ToolsWithCleanup } from "./tools.js";
 import type { Said } from "./outside-agent.js";
 import type { RunnerAgent } from "./agent.js";
 import type { RunContext } from "./context.js";
-import type { MakeRequest, ProgramResult, ReplayAllResult, ReplayRequest, ReplayResult, RunRequest } from "./runner-types.js";
+import type { MakeRequest, ProgramResult, ProjectHistory, ReplayAllResult, ReplayRequest, ReplayResult, RolledBack, RunRequest } from "./runner-types.js";
 import { OFF_THE_RECORD, recordable, type Journal, type RecordedCall } from "./journal.js";
 import { LeftTheRecord, askAgain, besideTheRecord, type Replay, type RecordedCall as Replayed } from "./replay.js";
 import type { OwnTool } from "./agent-backend.js";
@@ -225,7 +225,11 @@ export interface IpcBackends {
    */
   run(request: RunRequest, stop: AbortSignal, seq: number): Promise<ProgramResult>;
   /** Make a project, or change one, on the program's behalf — until it is done or `stop` says to stop. */
-  make(request: MakeRequest, stop: AbortSignal, seq: number): Promise<void>;
+  make(request: MakeRequest, stop: AbortSignal, seq: number): Promise<RolledBack | void>;
+  /** A project's history as it is on file: all of it, or the latest so many of its runs. */
+  history(projectDir: string, runs?: number): ProjectHistory;
+  /** The mark of what a run of a project is started with, where it is asked for with these arguments (see `inputMarkOf`). */
+  mark(projectDir: string, args?: Record<string, unknown>): string;
   /** Replay a recorded run of a project — or every one (`all`) — on the program's behalf, until it is over or `stop` says to stop. */
   replay(request: ReplayRequest, stop: AbortSignal): Promise<ReplayResult | ReplayAllResult>;
   /** Where every call, and how it ended, is written down. */
@@ -251,7 +255,7 @@ function isAuthorized(header: string | undefined, token: string): boolean {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, replay }: IpcBackends): Record<string, Route> {
+function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, replay, history, mark }: IpcBackends): Record<string, Route> {
   /** What the program has asked for that lasts — a run, a project made — and has not ended, by the id it gave each. */
   const runsAskedFor = new Map<string, AbortController>();
   /** Ids the program asked to stop before what bears them was seen here: such a thing starts stopped. */
@@ -402,6 +406,16 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, rep
       { name: "string", prompt: "string", id: "optional string" },
       ({ id, ...asked }, connectionClosed, { seq }) => lasting(id, connectionClosed, stop => make({ kind: "update", ...asked }, stop, seq)),
     ),
+    // A version gone back to is a project changed: by the runner, as an update is. (Nothing is run for it.)
+    "/project/rollback": route(
+      { name: "string", version: "number", id: "optional string" },
+      ({ id, ...asked }, connectionClosed, { seq }) => lasting(id, connectionClosed, stop => make({ kind: "rollback", ...asked }, stop, seq)),
+    ),
+    // What a program reads of a project's history, it reads by its runner — files though they are, which it
+    // could read itself: so it is on the run's record, and a replay is told what the run was told, and not
+    // what the history has come to since. The same of the mark by which runs on record are found.
+    "/project/history": route({ projectDir: "string", runs: "optional number" }, b => history(b.projectDir, b.runs)),
+    "/project/mark": route({ projectDir: "string", args: "optional object" }, b => mark(b.projectDir, b.args)),
     // Nor does a program replay a run: its runner does. (It lasts as long as the program replayed does, and is stopped as a run is.)
     "/project/replay": route(
       {
