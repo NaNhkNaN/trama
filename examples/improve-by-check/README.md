@@ -25,6 +25,10 @@ What it is told:
 - `heldBack` — more inputs, run and judged as the others and **never shown**. Where there are any, they alone decide. A program can be written to the inputs its writer was told of; what decides is to be out of reach of what is decided on.
 - `runs` — how many runs of each input (1). The default is a default, and no advice: one run does not rank two versions.
 - `ask` — what is wanted, in words: beside what was found wanting, or where nothing was.
+- `by` — how a version is found the better: `good` (the rule above: how often it is found good, then its score) or `score` — the mean score, provided it is no less often good. For when the work is done right already and it is something else that is to be better: what a run uses, say, with a judge whose score is of that (it is handed `used`, the runner's own count of what the run used of a model).
+- `margin` — by how much a mean score has to be higher (0). A score that is measured is never a tie: without a margin, a version that is no different is kept one round in two.
+- `confirm` — how many times the runs that decide are made again where a version passes (0), and counted with the first. A version is chosen by the runs in which it looked best; it is to be kept for more than those.
+- `tell` — which runs the writer is told of: `wanting`, or `all` — what the judge said of the runs found good too. Where what is wanted is not that they be good, that is all a writer has to go by.
 - `from` — what a run works on, where that is not the project itself: a directory, copied afresh for every run and handed to it as its workspace. `{name}` in it stands for the input's argument of that name: `--arg from=/tasks/{task}`, for inputs that say which task.
 
 What to know of it:
@@ -34,6 +38,7 @@ What to know of it:
 - **It pays for no run twice.** A verdict that is on record — of this program, on this input, by this judge as it is now — is taken from the record. (Of this program by its text: a version gone back to is the program it was, and has the verdicts it had.) A round after another runs only what is new.
 - **While the new version is tried, it is the project's program**: whoever runs the project meanwhile runs it. Where it is not kept — or anything goes wrong while it is tried — the one before is put back, as a version more: history only grows. A round that is stopped in the middle leaves the new one there; `trama rollback` goes back.
 - **A run that fails is a run that was not found good.** None of these runs is fixed where it fails: a fix would be another version, in the middle of what is held against each other.
+- **By `score`, how often a version is good is counted over every run there is** — those of inputs that are shown too, and those made again — input by input, so that more runs of a hard input are not held against it. It takes many runs to see that a version is a little less often right, and a version that uses less by doing less is what such a loop finds first. Even so: a version that is right nine times in ten passes a dozen good runs one time in four. What a round decides is a reason to count, not the count.
 - **It stops without deciding**, and says so, where the update came to nothing, or a check could not be made.
 - **An update costs what an update costs**: the model writes the program, and the program is run once to validate it.
 - What each version used, and took, is not part of the rule here. `trama history <project>` shows it, version by version.

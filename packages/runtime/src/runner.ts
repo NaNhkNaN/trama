@@ -1319,8 +1319,11 @@ async function checkedBy(
         // And where it worked, where that was not its project: a run that had a workspace left its work there, and the
         // copy the checker has is of the project. (The place itself, as the run's record is: a checker that would change
         // something there makes a copy of its own.)
+        // And what the run had used of a model when its check began, by the runner's own count — the one a budget is
+        // held by: a record may be cut short, or not kept at all, and what the check itself uses is no part of the work.
         args: {
           result: result.result, args: { ...(readProjectMeta(projectDir).input.args ?? {}), ...run.args }, journal: journal.path, run: journal.run,
+          used: { calls: before.calls, tokens: before.tokens, cost: before.cost },
           ...(run.workspaceDir !== undefined && { workspace: resolve(run.workspaceDir) }),
         },
       }, {

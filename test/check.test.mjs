@@ -100,7 +100,8 @@ test("a run that is done is checked by the project it names: with a copy of the 
   assert.deepEqual(more, []);
   const [records] = journalsOf(it.projectDir);
   assert.deepEqual({ how: told.how, result: told.result, args: told.args, more: told.more, mine: told.mine },
-    { how: "pass", result: { words: "6" }, args: { of: "the project", from: "the run" }, more: [], mine: "the run's" });
+    // (…and what the run had used when the check began: see test/loop.test.mjs.)
+    { how: "pass", result: { words: "6" }, args: { of: "the project", from: "the run" }, more: ["used"], mine: "the run's" });
   assert.deepEqual([told.run, told.journal], [records[0].run, join(realpathSync(it.projectDir), "logs", "journal", `${records[0].run}.jsonl`)]);
   assert.deepEqual(told.files, [".gitignore", "data.txt", "made.txt", "meta.json", "package.json", "program.ts", "state.json"]);
   assert.notEqual(told.copy, realpathSync(it.projectDir));

@@ -13,7 +13,8 @@ const MOST = 2000;
 
 // Its own arguments (in its meta.json): the command, and how long it may take. Beside them it is handed the run it
 // checks — `result` (what the program ended with), `args` (what the run was started with), `journal` and `run`
-// (the run's record, and its id) — which a command has no use for, and another checker would.
+// (the run's record, and its id), `used` (what it had used of a model) and `workspace` (where it worked, where
+// not in its project) — which a command has no use for, and another checker would.
 const { command, seconds = 600 } = ctx.input.args as { command?: string; seconds?: number };
 if (typeof command !== "string" || command.trim() === "") {
   throw new Error('It is not said what command checks: "command", among the arguments in the meta.json of this project.');

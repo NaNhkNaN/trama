@@ -174,8 +174,8 @@ const LOOP = readFileSync(join(REPO_ROOT, "examples", "improve-by-check", "progr
 const [A, B, C, D] = ["a", "b", "c", "d"].map((word) => ({ word }));
 
 /** A home with the project `words`, its judge — and another, lenient one — and the loop; and a model that writes `candidates`, one at each asking. */
-function loopOver(t, first, candidates) {
-  const home = homeWith(t, { words: { program: first, args: { word: "a" } }, judge: { program: JUDGE }, lenient: { program: JUDGE }, improve: { program: LOOP } });
+function loopOver(t, first, candidates, judge = JUDGE) {
+  const home = homeWith(t, { words: { program: first, args: { word: "a" } }, judge: { program: judge }, lenient: { program: JUDGE }, improve: { program: LOOP } });
   writeFileSync(join(home.at("lenient"), "lenient.txt"), "");
   const prompts = [];
   const original = llm.ask;
@@ -359,10 +359,10 @@ await ctx.done({ ok: made === "the work", notes: JSON.stringify({ where: where ?
   t.after(() => cleanupTempDir(work));
   await withEnv({ HOME: fakeHome }, async () => {
     const { result: there } = await quietly(() => runProgram({ projectDir: at("worker"), workspaceDir: work, checkWith: at("judge"), timeout: 30_000 }));
-    assert.deepEqual([there.result, there.check.ok, JSON.parse(there.check.notes)], [{ there: true }, true, { where: work, rest: ["args", "journal", "result", "run"], program: true, made: false }]);
+    assert.deepEqual([there.result, there.check.ok, JSON.parse(there.check.notes)], [{ there: true }, true, { where: work, rest: ["args", "journal", "result", "run", "used"], program: true, made: false }]);
     // A run that had no workspace has none to hand on.
     const { result: nowhere } = await quietly(() => runProgram({ projectDir: at("worker"), checkWith: at("judge"), timeout: 30_000 }));
-    assert.deepEqual([nowhere.result, nowhere.check.ok, JSON.parse(nowhere.check.notes)], [{ there: false }, false, { where: null, rest: ["args", "journal", "result", "run"], program: true, made: false }]);
+    assert.deepEqual([nowhere.result, nowhere.check.ok, JSON.parse(nowhere.check.notes)], [{ there: false }, false, { where: null, rest: ["args", "journal", "result", "run", "used"], program: true, made: false }]);
   });
 });
 
@@ -434,4 +434,139 @@ await ctx.done({ task: (ctx.input.args as any).task });
     assert.equal(refused.status, "failed", from);
     assert.match(journalsOf(at("improve")).at(-1).findLast((record) => record.kind === "exit").stderr, why);
   }
+});
+
+// --- a version found the better by what a run uses, with the work held good ---
+
+test("a checker is handed what the run had used when its check began: the runner's own count, and nothing of what the check itself uses", async (t) => {
+  const took = (tokens) => ({ model: "p/m", input: tokens, output: 0, cacheRead: 0, cacheWrite: 0, cost: tokens / 1000 });
+  const original = llm.complete;
+  llm.complete = async (_request, call) => { call.used(took(500)); return { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" }; };
+  t.after(() => { llm.complete = original; });
+  const ASKS_TWICE = `import { ctx, agent } from "@trama-dev/runtime";
+for (let turn = 0; turn < Number((ctx.input.args as any).turns ?? 2); turn++) await agent.complete({ messages: [{ role: "user", content: "turn " + turn }] });
+await ctx.done({});
+`;
+  // (A judge that asks a model itself, before it looks: what it was handed is of the run, as it was when the check began.)
+  const TELLS = `import { ctx, agent } from "@trama-dev/runtime";
+await agent.complete({ messages: [{ role: "user", content: "what do you make of it?" }] });
+await ctx.done({ ok: true, notes: JSON.stringify((ctx.input.args as any).used ?? null) });
+`;
+  const { fakeHome, at } = homeWith(t, { worker: { program: ASKS_TWICE }, judge: { program: TELLS } });
+  await withEnv({ HOME: fakeHome }, async () => {
+    const used = async (args) => JSON.parse((await quietly(() => runProgram({ projectDir: at("worker"), args, checkWith: at("judge"), timeout: 30_000 }))).result.check.notes);
+    assert.deepEqual([await used({}), await used({ turns: 3 }), await used({ turns: 0 })], [{ calls: 2, tokens: 1000, cost: 1 }, { calls: 3, tokens: 1500, cost: 1.5 }, { calls: 0, tokens: 0, cost: 0 }]);
+    // (The run's own line has the check's use with its own, as before: three requests, where the judge was told of two.)
+    assert.deepEqual(linesOf(at("worker"))[0].used, { calls: 3, tokens: 1500, cost: 1.5 });
+  });
+});
+
+/** A program that says what its run cost — by its word, or `*` — and whether it got it right. */
+const SPENDS = (cost, wrong = []) => `import { ctx } from "@trama-dev/runtime";
+const COST: Record<string, number> = ${JSON.stringify(cost)}, WRONG: string[] = ${JSON.stringify(wrong)};
+const { word } = ctx.input.args as { word: string };
+await ctx.done({ cost: COST[word] ?? COST["*"], right: !WRONG.includes(word) });
+`;
+/** One that is cheap for its first runs and dear after: what a few runs say of it, the next do not. */
+const SLIDES = (first, then, after) => `import { ctx } from "@trama-dev/runtime";
+const state = ctx.state as { slid?: number };
+state.slid = (state.slid ?? 0) + 1;
+await ctx.done({ cost: state.slid <= ${after} ? ${first} : ${then}, right: true });
+`;
+/** A judge of two things kept apart: whether the work is good, and — whatever it is — a score of what it used (the higher, the less). */
+const WEIGHS = `import { ctx } from "@trama-dev/runtime";
+const { result } = ctx.input.args as any;
+await ctx.done({ ok: result.right, score: Number(Math.log(100 / result.cost).toFixed(4)), notes: "used " + result.cost + (result.right ? "" : ", and got it wrong") });
+`;
+
+test("by=score: a version is kept where its mean score is higher by more than the margin, and not a smaller part of all its runs — those of inputs that are shown too — were found good", async (t) => {
+  const steady = { ok: 2, of: 2, score: 2.3026 };
+  for (const [what, first, candidate, expected, otherwise] of [
+    ["cheaper, and as right", SPENDS({ "*": 10 }), SPENDS({ "*": 5 }),
+      { kept: true, before: steady, after: { ok: 2, of: 2, score: 2.9957 }, all: { before: { ok: 4, of: 4 }, after: { ok: 4, of: 4 } }, why: "Version 2 is kept: a mean score of 2.9957 where it was 2.3026, higher by more than 0.1; 4 of 4 runs of all inputs found good where 4 of 4 were." }, true],
+    ["cheaper by less than the margin", SPENDS({ "*": 10 }), SPENDS({ "*": 9.5 }),
+      { kept: false, before: steady, after: { ok: 2, of: 2, score: 2.3539 }, all: { before: { ok: 4, of: 4 }, after: { ok: 4, of: 4 } }, why: "Version 1 is put back: a mean score of 2.3539 where it was 2.3026, not higher by more than 0.1." }, true],
+    // What is held back is all good, and cheaper: by that alone it would be kept. It is wrong where it was shown — and a run found wanting is one, wherever.
+    ["cheaper, and wrong on an input that was shown", SPENDS({ "*": 10 }), SPENDS({ "*": 5 }, ["b"]),
+      { kept: false, before: steady, after: { ok: 2, of: 2, score: 2.9957 }, all: { before: { ok: 4, of: 4 }, after: { ok: 3, of: 4 } }, why: "Version 1 is put back: 3 of 4 runs of version 2, all inputs counted, were found good where 4 of 4 were — a smaller part, input by input (0.75 where it was 1), whatever its score." }, true],
+    // More often right, and dearer: by how often it is found good it would be kept whatever it used. Here the score decides, once no fewer are good.
+    ["dearer, and more often right", SPENDS({ "*": 10 }, ["c"]), SPENDS({ "*": 20 }),
+      { kept: false, before: { ok: 1, of: 2, score: 2.3026 }, after: { ok: 2, of: 2, score: 1.6094 }, all: { before: { ok: 3, of: 4 }, after: { ok: 4, of: 4 } }, why: "Version 1 is put back: a mean score of 1.6094 where it was 2.3026, not higher by more than 0.1." }, true],
+  ]) {
+    const it = loopOver(t, first, [candidate], WEIGHS);
+    const { result: ran, messages } = await it.round({ inputs: [A, B], heldBack: [C, D], ask: "Use less.", by: "score", margin: "0.1" });
+    assert.deepEqual(ran.result, { from: 1, to: 2, ...expected }, `${what}\n${messages.join("\n")}`);
+    assert.deepEqual([it.program(), it.lines().length], [expected.kept ? candidate.trim() : first, 8], what);
+    // (And by the rule there is without it — how often a version is found good, of what was held back, and then its score — each of these is kept.)
+    const plain = loopOver(t, first, [candidate], WEIGHS);
+    assert.equal((await plain.round({ inputs: [A, B], heldBack: [C, D], ask: "Use less." })).result.result.kept, otherwise, what);
+  }
+
+  // The margin is of the rule there is without `by` too: as often good, a score has to be higher by more than it.
+  const tied = loopOver(t, SPENDS({ "*": 10 }), [SPENDS({ "*": 9.5 })], WEIGHS);
+  assert.equal((await tied.round({ inputs: [A, B], ask: "Use less.", margin: 0.1 })).result.result.why,
+    "Version 1 is put back: 2 of 2 runs of version 2 were found good as 2 of 2 were, at a mean score of 2.3539 where it was 2.3026 — not better by more than 0.1, and the one before is the one that is known.");
+});
+
+test("confirm: a version that passes is not kept for the runs that chose it alone — the runs that decide are made again, and it is kept where it passes with those too", async (t) => {
+  // Cheap for its first two runs, dear after: it looks better, and is not.
+  const slid = loopOver(t, SPENDS({ "*": 10 }), [SLIDES(5, 25, 2)], WEIGHS);
+  const { result: back, messages } = await slid.round({ inputs: [A, B], ask: "Use less.", by: "score", margin: 0.1, confirm: "1" });
+  assert.deepEqual(back.result, {
+    kept: false, from: 1, to: 2, before: { ok: 2, of: 2, score: 2.3026 }, after: { ok: 4, of: 4, score: 2.191 }, all: { before: { ok: 2, of: 2 }, after: { ok: 4, of: 4 } }, confirmed: 2,
+    why: "Version 1 is put back: a mean score of 2.191 where it was 2.3026, not higher by more than 0.1. It had passed by its first runs; with the 2 made again, it does not.",
+  }, messages.join("\n"));
+  assert.deepEqual([slid.program(), slid.lines().map((line) => line.version)], [SPENDS({ "*": 10 }), [1, 1, 2, 2, 2, 2]]);
+  // (Without it, the same version is kept: for two runs.)
+  const unconfirmed = loopOver(t, SPENDS({ "*": 10 }), [SLIDES(5, 25, 2)], WEIGHS);
+  assert.equal((await unconfirmed.round({ inputs: [A, B], ask: "Use less.", by: "score", margin: 0.1 })).result.result.kept, true);
+
+  // One that is what it looked: kept, by all its runs. Only the inputs that decide are run again — those held back, where there are any.
+  const steady = loopOver(t, SPENDS({ "*": 10 }), [SPENDS({ "*": 5 })], WEIGHS);
+  const { result: kept } = await steady.round({ inputs: [A, B], heldBack: [C], ask: "Use less.", by: "score", margin: 0.1, confirm: 2 });
+  assert.deepEqual(kept.result, {
+    kept: true, from: 1, to: 2, before: { ok: 1, of: 1, score: 2.3026 }, after: { ok: 3, of: 3, score: 2.9957 }, all: { before: { ok: 3, of: 3 }, after: { ok: 5, of: 5 } }, confirmed: 2,
+    why: "Version 2 is kept: a mean score of 2.9957 where it was 2.3026, higher by more than 0.1; 5 of 5 runs of all inputs found good where 3 of 3 were. The runs that decide were made again to be sure of it: 2 more, counted here.",
+  });
+  assert.deepEqual(steady.lines().map((line) => line.version), [1, 1, 1, 2, 2, 2, 2, 2]);
+  // How often it is good is held input against input. The runs made again are of what decides alone — and where that is the
+  // harder part, a version has a smaller part of *all its runs* good for no fault of its own: more of them are of the hard input.
+  const hard = loopOver(t, SPENDS({ "*": 10 }, ["c"]), [SPENDS({ "*": 5 }, ["c"])], WEIGHS);
+  const { result: fair } = await hard.round({ inputs: [A, B], heldBack: [C], ask: "Use less.", by: "score", margin: 0.1, confirm: 1 });
+  assert.deepEqual([fair.result.kept, fair.result.all, fair.result.confirmed], [true, { before: { ok: 2, of: 3 }, after: { ok: 2, of: 4 } }, 1]);
+
+  // A version that does not pass is not run again: there is nothing to be sure of.
+  const plain = loopOver(t, SPENDS({ "*": 10 }), [SPENDS({ "*": 20 })], WEIGHS);
+  const { result: none } = await plain.round({ inputs: [A, B], ask: "Use less.", by: "score", confirm: 1 });
+  assert.deepEqual([none.result.kept, "confirmed" in none.result, plain.lines().length], [false, false, 4]);
+  // The round, replayed, goes as it went: the runs made again among it.
+  const journals = readdirSync(join(slid.at("improve"), "logs", "journal")).sort();
+  const { result: replay } = await withEnv({ HOME: slid.fakeHome }, () => quietly(() => replayProgram({ projectDir: slid.at("improve"), run: journals[0].replace(/\.jsonl$/, "") })));
+  assert.deepEqual([replay.same, replay.left ?? null, slid.lines().length], [true, null, 6]);
+
+  for (const [args, why] of [
+    [{ by: "cost" }, /"by" is how a version is found the better: good, or score\./],
+    [{ margin: -1 }, /"margin" is by how much a mean score is to be higher: 0 or more\./],
+    [{ margin: "much" }, /"margin" is by how much a mean score is to be higher: 0 or more\./],
+    [{ confirm: 1.5 }, /"confirm" is how many times the runs that decide are made again: 0 or more\./],
+    [{ tell: "nothing" }, /"tell" is which runs the writer is told of: wanting, or all\./],
+  ]) {
+    const { result: refused } = await plain.round({ inputs: [A], ...args });
+    assert.equal(refused.status, "failed", JSON.stringify(args));
+    assert.match(journalsOf(plain.at("improve")).at(-1).findLast((record) => record.kind === "exit").stderr, why, JSON.stringify(args));
+  }
+});
+
+test("tell=all: the writer is told what the judge said of the runs found good too — where what is wanted is not that they be good", async (t) => {
+  const told = async (first, args) => {
+    const it = loopOver(t, first, [SPENDS({ "*": 5 })], WEIGHS);
+    await it.round({ inputs: [A, B], heldBack: [C], ask: "Use less.", ...args });
+    return it.prompts[0]?.split("\n\nOutput the complete updated program.ts.")[0];
+  };
+  const wanting = 'Runs of the program as it is were checked, and these were found wanting:\n- started with {"word":"b"}: used 10, and got it wrong';
+  assert.equal(await told(SPENDS({ "*": 10 }, ["b"]), {}), `Use less.\n\n${wanting}`);
+  assert.equal(await told(SPENDS({ "*": 10 }, ["b"]), { tell: "all" }), `Use less.\n\n${wanting}\n\nAnd these were found good — what the judge said of each:\n- started with {"word":"a"}: used 10`);
+  // (Nothing of what was held back, either way; and where none was wanting, what was said of the good is all there is to tell.)
+  assert.equal(await told(SPENDS({ a: 7, "*": 10 }, ["c"]), { tell: "all" }), 'Use less.\n\nRuns of the program as it is were checked, and these were found good — what the judge said of each:\n- started with {"word":"a"}: used 7\n- started with {"word":"b"}: used 10');
+  assert.equal(await told(SPENDS({ "*": 10 }), {}), "Use less.");
 });
