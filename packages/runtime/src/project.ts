@@ -4,7 +4,7 @@
 
 import {
   readFileSync, writeFileSync, mkdirSync, existsSync,
-  symlinkSync, rmSync, lstatSync, readlinkSync, accessSync, constants,
+  symlinkSync, rmSync, renameSync, readlinkSync, accessSync, constants,
 } from "fs";
 import { join, dirname, resolve, sep } from "path";
 import { homedir } from "os";
@@ -13,7 +13,7 @@ import type { TramaConfig } from "./runner-types.js";
 import { checkedBudget } from "./budget.js";
 import { checkedAgents } from "./outside-agent.js";
 import { guardPath, projectAt } from "./path-guard.js";
-import { stageFileInProject } from "./replace-file.js";
+import { stageFileInProject, stagedNameFor } from "./replace-file.js";
 import { readProjectMeta } from "./meta.js";
 import { describeJson, isJsonObject } from "./serializable.js";
 import { messageOf } from "./errors.js";
@@ -36,6 +36,14 @@ try {
 } catch { /* not installed — programs simply cannot import it */ }
 
 // --- Project scaffolding ---
+//
+// A project is not one runner's alone: runs of it begin together — a
+// session's participants, a loop that starts several — and each runner makes
+// ready what a run needs. So nothing here is made in steps another could come
+// between, or see half done. Each thing is looked at once; where it is not as
+// it should be, what should be there is made whole beside it and put in its
+// place in one move. Runners that do so at the same moment each put the same
+// thing there, and whoever reads the place finds the old or the new.
 
 /**
  * Point the project's node_modules/@trama-dev/<name> at an installed package,
@@ -52,29 +60,71 @@ function linkPackage(projectDir: string, name: string, target: string): void {
   // Not through the guard: it is the link itself that is looked at and replaced, not what it points at.
   const linkPath = join(linkDir, name);
 
+  // One look says all there is to know of the place: what the link there says, that what is there is no link
+  // (the system's answer to asking what it says: EINVAL), or that nothing is.
   try {
-    if (!lstatSync(linkPath).isSymbolicLink()) {
+    if (readlinkSync(linkPath) === target) return;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "EINVAL") {
       throw new Error(
         `${linkPath} exists and is not a symlink. ` +
         `trama needs this path for module resolution. ` +
         `Remove it manually or rename it to proceed.`
       );
     }
-    if (readlinkSync(linkPath) === target) return;
-    rmSync(linkPath);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    if (code !== "ENOENT") throw err;
   }
 
+  // The link is made beside its place and moved into it: the place is never without one for a moment — a
+  // program of another runner's may be resolving it — and a link another runner put there meanwhile is one
+  // that says the same. (A directory that somebody made there meanwhile is not moved over: the system refuses.)
   mkdirSync(linkDir, { recursive: true });
-  symlinkSync(target, linkPath, "dir");
+  const staged = stagedNameFor(linkPath);
+  symlinkSync(target, staged, "dir");
+  try {
+    renameSync(staged, linkPath);
+  } catch (err) {
+    rmSync(staged, { force: true });
+    throw err;
+  }
+}
+
+/**
+ * Put a file the runtime keeps in a project in its place, in one move: it
+ * is written beside the place and moved into it, and not written into what
+ * is there (see stageFile). Whoever reads the place at that moment — another
+ * runner, making the same project ready; a run after one that was stopped in
+ * the middle of this — reads all of the old or all of the new, and never the
+ * beginning of one. A file that is there hands on its permissions, and a
+ * link to it stays the link.
+ *
+ * Taking a file's place does not ask the file's leave, as writing into it
+ * does: so it is asked here. A file its owner has closed to writing stays as
+ * it is.
+ *
+ * Where no file can be made beside it — a project whose own directory is
+ * closed to that, and whose files are not — the content is written into the
+ * file, as it always was: there is no other way to it there, and a project
+ * kept so is still one that can be run.
+ */
+function putInProject(projectDir: string, relativePath: string, content: string): void {
+  const place = guardPath(projectDir, relativePath);
+  if (existsSync(place)) accessSync(place, constants.W_OK);
+  try {
+    stageFileInProject(projectDir, relativePath, content).commit();
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== "EACCES" && code !== "EPERM" && code !== "EROFS") throw err;
+    writeFileSync(place, content);
+  }
 }
 
 /** Make sure package.json exists and declares an ES module (program.ts uses top-level await). */
 function ensureModulePackageJson(projectDir: string): void {
   const pkgPath = guardPath(projectDir, "package.json");
   if (!existsSync(pkgPath)) {
-    writeFileSync(pkgPath, JSON.stringify({ type: "module" }, null, 2));
+    putInProject(projectDir, "package.json", JSON.stringify({ type: "module" }, null, 2));
     return;
   }
   const advice = "trama will not overwrite it automatically; fix or remove it and try again.";
@@ -92,7 +142,7 @@ function ensureModulePackageJson(projectDir: string): void {
   }
   if (pkg.type !== "module") {
     pkg.type = "module";
-    writeFileSync(pkgPath, JSON.stringify(pkg, null, 2));
+    putInProject(projectDir, "package.json", JSON.stringify(pkg, null, 2));
   }
 }
 
@@ -105,7 +155,7 @@ function ensureGitignore(projectDir: string): void {
   const missing = required.filter(entry => !present.has(entry));
   if (missing.length === 0) return;
   const separator = existing === "" || existing.endsWith("\n") ? "" : "\n";
-  writeFileSync(giPath, existing + separator + missing.join("\n") + "\n");
+  putInProject(projectDir, ".gitignore", existing + separator + missing.join("\n") + "\n");
 }
 
 /**
@@ -253,28 +303,12 @@ export function loadState(projectDir: string): Record<string, unknown> {
 }
 
 /**
- * Put a project's state on file: all of it, in the place of what was there.
- * It is written beside the file and moved into its place, and not written
- * into it — a program that is stopped in the middle of a checkpoint leaves
- * the state before, and not half of a state, which no run after would start
- * from. (Taking a file's place does not ask the file's leave, as writing
- * into it did: so it is asked here. A state file its owner made read-only
- * stays as it is.)
- *
- * Where no file can be made beside it — a project whose own directory is
- * closed to that, and whose files are not — the state is written into its
- * file, as it always was: there is no other way to it there, and a project
- * kept so is still one that can be run.
+ * Put a project's state on file: all of it, in the place of what was there,
+ * in one move (see putInProject) — a program that is stopped in the middle
+ * of a checkpoint leaves the state before, and not half of a state, which no
+ * run after would start from. A state file its owner made read-only stays as
+ * it is.
  */
 export function saveState(projectDir: string, state: Record<string, unknown>): void {
-  const path = guardPath(projectDir, "state.json");
-  const text = JSON.stringify(state, null, 2);
-  if (existsSync(path)) accessSync(path, constants.W_OK);
-  try {
-    stageFileInProject(projectDir, "state.json", text).commit();
-  } catch (err) {
-    const code = (err as NodeJS.ErrnoException).code;
-    if (code !== "EACCES" && code !== "EPERM" && code !== "EROFS") throw err;
-    writeFileSync(path, text);
-  }
+  putInProject(projectDir, "state.json", JSON.stringify(state, null, 2));
 }

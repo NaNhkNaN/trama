@@ -439,8 +439,35 @@ export function makeDirsIn(rootDir: string, dir: string): void {
  * A path that does not exist yet is followed as far as it does, so a caller
  * can safely mkdir and write afterwards: a write lands on what a link points
  * at, not on a link on the way.
+ *
+ * The guard looks at the path more than once — its own walk, and then the
+ * system's reading — and holds the looks against each other. What they say
+ * of the path, they say where it kept still between them. A project is not
+ * one runner's alone: another may be putting a file at the path at that
+ * moment, or a new one in its place (which is how the runtime itself writes:
+ * see stageFile), and then the looks differ for no fault of the path's. So
+ * looks that differ are taken again, and the path is refused for it only
+ * where they differ every time. (No count of looks makes that certain. This
+ * many makes it as good as: a change has to fall between the two looks of
+ * each reading, a few millionths of a second, every time.)
  */
 export function guardPath(rootDir: string, path: string): string {
+  for (let reading = 1; ; reading++) {
+    const read = readingOf(rootDir, path);
+    if (read.destination !== undefined) return read.destination;
+    if (reading === READINGS) throw new Error(`Path cannot be followed: ${path} (the system does not take it where its links say)`);
+  }
+}
+
+/** How many times a path is read before looks at it that differ are taken for the path's own. */
+const READINGS = 8;
+
+/**
+ * One reading of a path for the guard: where it leads — or that the walk and
+ * the system, each asked once, did not say the same of it. Whatever else is
+ * wrong with the path is thrown: that is so however often it is read.
+ */
+function readingOf(rootDir: string, path: string): { destination: string } | { destination: undefined } {
   const root = resolve(rootDir);
   // The root is walked first, and the path on from where that arrives: the
   // way the system reads the two written one after the other.
@@ -466,14 +493,12 @@ export function guardPath(rootDir: string, path: string): string {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
   }
   const there = lstatSync(destination, { bigint: true, throwIfNoEntry: false });
-  if (found ? !(there && identityIn(there) === identityIn(found)) : there !== undefined) {
-    throw new Error(`Path cannot be followed: ${path} (the system does not take it where its links say)`);
-  }
+  if (found ? !(there && identityIn(there) === identityIn(found)) : there !== undefined) return { destination: undefined };
   // What is there is content, or a place for it. A pipe, a socket or a device
   // is the end of something else: reading one, or writing to one, can wait
   // for ever on whoever is at the other end — and with it this whole process.
   if (there && !there.isFile() && !there.isDirectory()) {
     throw new Error(`Not a file or a directory: ${path}`);
   }
-  return destination;
+  return { destination };
 }

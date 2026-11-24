@@ -48,6 +48,13 @@ All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`
 - **A run's record says what state the run began from**: the `attempt` record has it (`state`). A replay begins there. Journals written before this can be replayed only where the run began with no state.
 - **A command that was stopped at its time says so: `ShellResult.timedOut`.** There only where it is so. Until now the one sign was that `stderr` ended in a line "timeout" — as a command's own may — so a program that had to know went by a clock as well, which no replay can answer. The two example harnesses go by the field now.
 
+### Fixed
+
+- **Several runners at one project at the same moment no longer fail for what another of them was doing.** A project is not one runner's alone: a session's participants begin together, and so may any two runs of it. Of 120 first runs of a project, six at a time, 38 had failed — `EEXIST … symlink`, `Malformed package.json`, `Path cannot be followed` — and, with no first run in it, a path was refused now and then while another runner put a new file in its place, which is how the state is saved at every checkpoint. Three things were made in steps, or looked at in steps, that another could come between:
+  - **The links to the runtime** (`node_modules/@trama-dev/…`) were looked for, and then made; and one that led elsewhere was removed, and then made — so for a moment there was none, where another runner's program was resolving it. A link is now asked once what it says, and where it is to be another, made beside its place and moved into it: the place is never without one, and runners at the same moment each put the same link there.
+  - **`package.json` and `.gitignore`** were written into: emptied, then filled. A runner reading one at that moment read the beginning of a file. They are now put in place in one move, by the one rule the state already went by (written beside the place and moved into it; a file hands on its permissions, a link to it stays the link, a file closed to writing is not replaced; where nothing can be made beside it, it is written into as before).
+  - **The guard of a path** takes two looks — its own walk, and the system's reading — and refuses a path where they do not say the same. A file made between the two, or a new one put in its place, and they did not: `Path cannot be followed … (the system does not take it where its links say)`, for no fault of the path's. Looks that differ are now taken again, and the path is refused for it only where they differ at each of eight readings. That is as good as certain and is not certain: nothing lets a process take both looks at one moment.
+
 ## 0.8.0 — 2026-11-22
 
 ### Added
