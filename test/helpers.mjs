@@ -41,6 +41,23 @@ export function readJson(path) {
   return JSON.parse(readText(path));
 }
 
+/**
+ * The lines of a file that another process may be writing at this moment: those that are whole — a line is
+ * whole once its line break is written. A file that is not there yet has none, and neither has one that was
+ * made a moment ago and has nothing in it yet (an append makes the file, then writes to it); what stands after
+ * the last line break is a line still being written, and is left for the next look.
+ */
+export function wholeLines(path) {
+  let text;
+  try {
+    text = readFileSync(path, "utf-8");
+  } catch (err) {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  }
+  return text.split("\n").slice(0, -1).filter(Boolean);
+}
+
 export function createProjectFixture(projectDir, options = {}) {
   mkdirSync(projectDir, { recursive: true });
 

@@ -6,7 +6,7 @@ import { llm } from "./fake-llm.mjs";
 import { runProgram } from "../packages/runtime/dist/runner.js";
 import { loadConfig } from "../packages/runtime/dist/project.js";
 import { printJournals } from "../packages/runtime/dist/journal-view.js";
-import { captureConsole, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, waitFor, withEnv, writeJson } from "./helpers.mjs";
+import { captureConsole, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, waitFor, wholeLines, withEnv, writeJson } from "./helpers.mjs";
 
 // A fix asked of a project, and not of pi's agent: where a run — or the configuration — names one (`repairWith`),
 // the program that fixes is a program like any, run with the copy of the failing project as its workspace. What
@@ -68,7 +68,7 @@ function projects(t, how) {
   writeFileSync(seen, "");
   return {
     projectDir, fixer,
-    seen: () => readFileSync(seen, "utf-8").split("\n").filter(Boolean).map((line) => JSON.parse(line)),
+    seen: () => wholeLines(seen).map((line) => JSON.parse(line)),
     run: (options = {}) => withEnv({ SEEN_BY_FIXER: seen }, () => captureConsole("warn", () =>
       runProgram({ projectDir, repairWith: fixer, maxRepairAttempts: 1, timeout: 30_000, ...options }))),
   };

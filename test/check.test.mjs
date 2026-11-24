@@ -7,7 +7,7 @@ import { llm } from "./fake-llm.mjs";
 import { replayProgram, runProgram, validateProgram } from "../packages/runtime/dist/runner.js";
 import { createBackend } from "../packages/runtime/dist/runner-backend.js";
 import { printJournals } from "../packages/runtime/dist/journal-view.js";
-import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, readJson, runNodeCommand, waitFor, withEnv, writeJson } from "./helpers.mjs";
+import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, readJson, runNodeCommand, waitFor, wholeLines, withEnv, writeJson } from "./helpers.mjs";
 
 // A check of a run, by a project: where a run — or the project run — names one (`checkWith`), that project's
 // program is run once the run has ended as done, with a copy of the project as the run left it for its workspace,
@@ -82,7 +82,7 @@ function projects(t, how, programSource = WORKS) {
   return {
     projectDir, checker, seenAt: seen,
     by: { by: checker, program: hashOf(CHECKER) },
-    seen: () => readFileSync(seen, "utf-8").split("\n").filter(Boolean).map((line) => JSON.parse(line)),
+    seen: () => wholeLines(seen).map((line) => JSON.parse(line)),
     run: (options = {}) => withEnv({ SEEN_BY_CHECKER: seen }, () => captureConsole("log", () =>
       runProgram({ projectDir, checkWith: checker, maxRepairAttempts: 0, timeout: 30_000, ...options }))),
   };

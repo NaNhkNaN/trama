@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "fs";
+import { mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "fs";
 import { join } from "path";
 import { createTools } from "../packages/runtime/dist/tools.js";
 import { loadConfig } from "../packages/runtime/dist/project.js";
@@ -8,7 +8,7 @@ import { runProgram } from "../packages/runtime/dist/runner.js";
 import { printJournals } from "../packages/runtime/dist/journal-view.js";
 import { llm } from "./fake-llm.mjs";
 import { createProject } from "../packages/runtime/dist/index.js";
-import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, waitFor, withEnv, writeJson } from "./helpers.mjs";
+import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, waitFor, wholeLines, withEnv, writeJson } from "./helpers.mjs";
 
 // An agent from outside, called as a tool (`tools.agent`): somebody else's harness, whole, started as a process
 // and spoken with by the Agent Client Protocol. It is a black box, and is treated as one — a prompt in, and out
@@ -27,7 +27,8 @@ function scene(t, agents) {
   t.after(async () => { await tools.stopActiveShells(); cleanupTempDir(dir); cleanupTempDir(aside); });
   /** The agent, as a call or the configuration names one by its command: told what to do by a variable of its own. */
   const fake = (told = {}) => ({ command: process.execPath, args: [FAKE, "as-an-agent"], env: { FAKE_ACP: JSON.stringify({ log, sessions, ...told }), WHOSE: "the agent's" } });
-  const sent = () => (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line)) : []);
+  // (Read while the agent may be writing it: see wholeLines.)
+  const sent = () => wholeLines(log).map((line) => JSON.parse(line));
   return {
     dir, aside, tools, stop, fake, sent,
     /** What it was sent by a method's name, in order. */
