@@ -570,3 +570,88 @@ test("tell=all: the writer is told what the judge said of the runs found good to
   assert.equal(await told(SPENDS({ a: 7, "*": 10 }, ["c"]), { tell: "all" }), 'Use less.\n\nRuns of the program as it is were checked, and these were found good — what the judge said of each:\n- started with {"word":"a"}: used 7\n- started with {"word":"b"}: used 10');
   assert.equal(await told(SPENDS({ "*": 10 }), {}), "Use less.");
 });
+
+// --- what a round knows of the rounds before it ---
+
+test("a round is told what the rounds before it tried, from the program as it is, and went back from: what each changed, and what came of its runs — each once, and none of what was tried from another program", async (t) => {
+  // (A first program with no line break at its end, as a program an update writes has none: so that what an update changed is all that differs.)
+  const first = SAYS(["ab"]).trim();
+  const it = loopOver(t, first, [SAYS([]), SAYS([]), SAYS(["zz"], HALF), SAYS(["ab", "cd"]), SAYS(["ab", "cd", "ef"])]);
+  const two = [{ word: "ab" }, { word: "cd" }];
+  const asked = () => it.prompts.at(-1).split("\n\nOutput the complete updated program.ts.")[0];
+  const WANTING = 'Runs of the program as it is were checked, and these were found wanting:\n- started with {"word":"cd"}: it is to say CD, and said cd';
+  const changed = (line, to) => `What it changed, as a diff from the program as it is:\n  ${line}c${line}\n  < const GOOD: string[] = ["ab"];\n  ---\n  > const GOOD: string[] = ${to};`;
+
+  // The first round has nothing before it.
+  assert.equal((await it.round({ inputs: two })).result.result.kept, false);
+  assert.equal(asked(), WANTING);
+  // The second is told of the first's: the version, what its runs came to against the program's own, and what it changed.
+  assert.equal((await it.round({ inputs: two })).result.result.kept, false);
+  const TRIED = "Tried before, from the program as it is, and gone back from — none was kept. Write something else:";
+  assert.equal(asked(), `${WANTING}\n\n${TRIED}\n- version 2: 0 of 2 runs found good, at a mean score of 0, where the program as it is has 1 of 2 at 0.5. ${changed(2, "[]")}`);
+  // The same text tried twice is told once, as the latest try of it; another, beside it.
+  assert.equal((await it.round({ inputs: two })).result.result.kept, false);
+  assert.equal(asked(), `${WANTING}\n\n${TRIED}\n- version 4: 0 of 2 runs found good, at a mean score of 0, where the program as it is has 1 of 2 at 0.5. ${changed(2, "[]")}`);
+  assert.equal((await it.round({ inputs: two })).result.result.kept, true);
+  assert.match(asked(), /\n- version 4: 0 of 2 runs found good[^]*\n- version 6: 0 of 2 runs found good, at a mean score of 0\.5, where the program as it is has 1 of 2 at 0\.5\. What it changed/);
+  assert.deepEqual(it.versions().map(([version, reason]) => [version, reason]), [[1, "found"], [2, "update"], [3, "rollback"], [4, "update"], [5, "rollback"], [6, "update"], [7, "rollback"], [8, "update"]]);
+  // A version was kept: the program is another now, and what was tried from the one before is nothing to it.
+  await it.round({ inputs: [...two, { word: "ef" }] });
+  assert.equal(asked(), 'Runs of the program as it is were checked, and these were found wanting:\n- started with {"word":"ef"}: it is to say EF, and said ef');
+
+  // Where inputs are held back, what came of a try is said of those — they decided — as a count and a mean, and nothing more of them.
+  const held = loopOver(t, first, [SAYS([]), SAYS(["ab", "cd"])]);
+  await held.round({ inputs: [{ word: "ab" }, { word: "cd" }], heldBack: [{ word: "gh" }] });
+  await held.round({ inputs: [{ word: "ab" }, { word: "cd" }], heldBack: [{ word: "gh" }] });
+  assert.match(held.prompts[1], /\n- version 2: 0 of 1 runs found good, at a mean score of 0, where the program as it is has 0 of 1 at 0\. What it changed/);
+  assert.doesNotMatch(held.prompts[1], /"gh"|GH/);
+  // An update that wrote the program as it is has tried nothing: there is nothing of it to tell.
+  const same = loopOver(t, first, [first, SAYS([])]);
+  assert.equal((await same.round({ inputs: two })).result.result.kept, false);
+  await same.round({ inputs: two });
+  assert.deepEqual([same.versions().map(([version, reason]) => [version, reason]).slice(0, 2), /Tried before/.test(same.prompts[1])], [[[1, "found"], [2, "update"]], false]);
+
+  // The rounds, replayed, go as they went: what was read of the versions is on the record.
+  const journals = readdirSync(join(it.at("improve"), "logs", "journal")).sort();
+  for (const run of [journals[1], journals[3]]) {
+    const { result: replay } = await withEnv({ HOME: it.fakeHome }, () => quietly(() => replayProgram({ projectDir: it.at("improve"), run: run.replace(/\.jsonl$/, "") })));
+    assert.deepEqual([replay.same, replay.left ?? null], [true, null]);
+  }
+});
+
+test("what the judge said of a run is told whole, round after round: the loop keeps it, where the project's history keeps the beginning — and keeps no more than the program as it is has use for", async (t) => {
+  // A judge that says much: more than a line of history keeps.
+  const LONG = WEIGHS.replace('"used " + result.cost', '"used " + result.cost + ". Where it went: " + "the reading of the modules, and then the writing of them again; ".repeat(6) + "and that is all (" + (ctx.input.args as any).args.word + ")"');
+  const first = SPENDS({ "*": 10 }, ["b"]);
+  const it = loopOver(t, first, [SPENDS({ "*": 20 }, ["b"]), SPENDS({ "*": 30 }, ["b"])], LONG);
+  const whole = (word, wrong) => `used 10. Where it went: ${"the reading of the modules, and then the writing of them again; ".repeat(6)}and that is all (${word})${wrong ? ", and got it wrong" : ""}`;
+  const told = () => it.prompts.at(-1).split("\n\nTried before")[0].split("\n\nOutput the complete")[0];
+  const expected = `Use less.\n\nRuns of the program as it is were checked, and these were found wanting:\n- started with {"word":"b"}: ${whole("b", true)}\n\nAnd these were found good — what the judge said of each:\n- started with {"word":"a"}: ${whole("a", false)}`;
+  const args = { inputs: [A, B], heldBack: [C], ask: "Use less.", by: "score", tell: "all" };
+  await it.round(args);
+  assert.equal(told(), expected);
+  // (The record has the beginning of it.)
+  assert.ok(it.lines()[0].check.notes.endsWith("…") && it.lines()[0].check.notes.length < whole("a", false).length);
+  // The round after takes its verdicts from the record — and tells them as whole as the first did.
+  await it.round(args);
+  assert.deepEqual([told(), it.lines().length], [expected, 9]);
+  // What it keeps: of the program as it is — not of the two it went back from — and of the inputs that are shown.
+  const state = readJson(join(it.at("improve"), "state.json"));
+  const marks = await withEnv({ HOME: it.fakeHome }, () => Promise.all([A, B].map((input) => inputMarkOf(it.words, input))));
+  assert.deepEqual([Object.keys(state.notes), Object.keys(state.notes[hashOf(first)]).sort(), state.notes[hashOf(first)][marks[1]]], [[hashOf(first)], [...marks].sort(), [whole("b", true)]]);
+
+  // What the loop heard is told for what the record has only where it is the same verdict: a later run of the same
+  // program on the same input, made by somebody else and come to something else, is told as the record has it.
+  const drifts = loopOver(t, SLIDES(10, 20, 1), [SPENDS({ "*": 50 }), SPENDS({ "*": 50 })], LONG);
+  await drifts.round({ inputs: [A], ask: "Use less.", by: "score", tell: "all" });
+  assert.match(drifts.prompts[0], /- started with \{"word":"a"\}: used 10\. Where it went: [^\n]*and that is all \(a\)\n/);
+  await withEnv({ HOME: drifts.fakeHome }, () => quietly(() => runProgram({ projectDir: drifts.words, args: A, checkWith: drifts.at("judge"), timeout: 30_000 })));
+  await drifts.round({ inputs: [A], ask: "Use less.", by: "score", tell: "all" });
+  assert.match(drifts.prompts[1], /- started with \{"word":"a"\}: used 20\. Where it went: [^\n]*…\n/);
+
+  // A verdict the loop did not hear itself — a run somebody else made — is told as far as the record has it.
+  const other = loopOver(t, first, [SPENDS({ "*": 20 }, ["b"])], LONG);
+  for (const input of [A, B, C]) await withEnv({ HOME: other.fakeHome }, () => quietly(() => runProgram({ projectDir: other.words, args: input, checkWith: other.at("judge"), timeout: 30_000 })));
+  await other.round(args);
+  assert.match(other.prompts[0], /- started with \{"word":"a"\}: used 10\. Where it went: [^\n]*…\n/);
+});
