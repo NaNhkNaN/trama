@@ -6,11 +6,12 @@ import {
   mkdtempSync, openSync, closeSync, chmodSync,
   accessSync, constants,
 } from "fs";
-import { basename, join, dirname, relative } from "path";
+import { basename, join, dirname, relative, resolve } from "path";
 import { tmpdir } from "os";
 import { createHash, randomBytes } from "crypto";
 import type { OutsideAgent, ShellResult, Workspace } from "./types.js";
-import type { MakeRequest, RunOptions, ProgramResult, ReplayAllResult, ReplayOptions, ReplayResult } from "./runner-types.js";
+import type { Check, MakeRequest, RunOptions, ProgramResult, ReplayAllResult, ReplayOptions, ReplayResult } from "./runner-types.js";
+import { readProjectMeta } from "./meta.js";
 import { createReplay, readRecording, runsToReplay, saysTheSame, type Recording, type Replay } from "./replay.js";
 import { onAbort, rejectOnAbort } from "./abort.js";
 import type { AgentUsage } from "./agent-backend.js";
@@ -28,7 +29,7 @@ import { removeTempDir, removeWithThisProcess, requireWatchdog, stopGroups, stop
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
 import { journalEntriesOf, openJournal, type Journal } from "./journal.js";
 import { messageOf } from "./errors.js";
-import { checkedRepairAttempts, checkedTimeout, ensureProjectScaffold, loadProjectConfig, loadState, projectNamed, saveState } from "./project.js";
+import { checkedRepairAttempts, checkedTimeout, ensureProjectScaffold, loadProjectConfig, loadState, namesAPath, projectNamed, saveState } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import { copyToHistory, recordVersion } from "./history.js";
 
@@ -1231,6 +1232,112 @@ export async function validateProgram(
   return { source: left, repairedError: repair?.error, ...(alone === undefined ? {} : { alone }) };
 }
 
+// --- A check of a run, by a project (see RunOptions.checkWith) ---
+
+/**
+ * The project a run is to be checked by: the one the run names, or else the
+ * one its project names — or none. Throws where what is named is no
+ * project, or is the project that is run.
+ */
+function checkerOf(options: RunOptions): string | undefined {
+  const { projectDir } = options;
+  let checker: string;
+  if (options.checkWith != null) checker = projectNamed(options.checkWith);
+  else {
+    const named: unknown = readProjectMeta(projectDir).checkWith;
+    if (named == null) return undefined;
+    if (typeof named !== "string" || named.trim() === "") {
+      throw new Error(`Malformed meta.json in ${projectDir} — "checkWith" is to name a project: by a path, or by its name among the user's projects.`);
+    }
+    // (A path the project says is said from where the project is: not from wherever its runner happens to be.)
+    checker = namesAPath(named) && !named.startsWith("~") ? resolve(projectAt(projectDir), named) : projectNamed(named);
+  }
+  if (!existsSync(join(checker, "meta.json"))) throw new Error(`checkWith names no project: there is none at ${checker}`);
+  if (realRootOf(checker) === realRootOf(projectDir)) throw new Error("A project is not asked to check itself: checkWith names the project that is run.");
+  return checker;
+}
+
+const NO_VERDICT = "The project asked for the check answered with no verdict: its result is to be { ok, score?, notes? } — whether the work is good (true or false), how good where it says (a number), and why where it says (a text).";
+const STOPPED_CHECK = "The run was stopped before its check was made.";
+
+/** What a checker ended with, held to what a verdict is: that, and nothing else it said. */
+function verdictOf(ended: unknown): Pick<Check, "ok" | "score" | "notes"> {
+  const { ok, score, notes } = (ended !== null && typeof ended === "object" ? ended : {}) as Record<string, unknown>;
+  if (typeof ok !== "boolean") throw new Error(NO_VERDICT);
+  if (score != null && (typeof score !== "number" || !Number.isFinite(score))) throw new Error(NO_VERDICT);
+  if (notes != null && typeof notes !== "string") throw new Error(NO_VERDICT);
+  return { ok, ...(score != null && { score }), ...(notes != null && { notes }) };
+}
+
+/**
+ * Have a run that is done checked by a project: the checker's program is
+ * run with a throwaway copy of the project as the run left it for its
+ * workspace, and what it ends with is the verdict. It is a run of the
+ * checked run's own, as a fix asked of a project is — under its count,
+ * stopped with it, started with its variables, on its record — with a
+ * journal of its own in the checker's project; it is not fixed where it
+ * fails, and not checked in its turn.
+ *
+ * Whatever comes of it is a check: a verdict, or why there is none. It does
+ * not throw, and what it finds changes nothing of the run it checks.
+ */
+async function checkedBy(
+  checker: string,
+  result: ProgramResult,
+  run: {
+    projectDir: string; args?: Record<string, unknown>; timeout: number; depth: number; label?: string;
+    env?: Record<string, string>; signal?: AbortSignal; meter: Meter; journal: Journal;
+  },
+): Promise<Check> {
+  const { projectDir, journal, signal } = run;
+  const began = performance.now(), before = run.meter.counted();
+  // Who checks is said by what it is, and not only by where: a checker that was changed is another checker.
+  let program: string | undefined;
+  try { program = fingerprint(guardPath(checker, "program.ts"))?.sha256; } catch { /* (It has none to be told by: its run will say so.) */ }
+  const by = { by: checker, ...(program !== undefined && { program }) };
+  let found: Pick<Check, "ok" | "score" | "notes"> | { error: string };
+  try {
+    if (signal?.aborted) throw new Error(STOPPED_CHECK);
+    found = await withTempDir("trama-check-", async (privateDir) => {
+      // (A copy, and its own: what the checker does there — tests put in, a build — is thrown away with it.)
+      const { copy } = copyProjectWith(projectDir, privateDir);
+      const ended = await runProgram({
+        projectDir: checker,
+        workspaceDir: copy,
+        maxRepairAttempts: 0,
+        timeout: run.timeout,
+        label: run.label ? `${run.label}: check` : "check",
+        env: run.env,
+        signal,
+        // What the run was started with, as its program had it: the project's own arguments under the run's.
+        args: { result: result.result, args: { ...(readProjectMeta(projectDir).input.args ?? {}), ...run.args }, journal: journal.path, run: journal.run },
+      }, {
+        depth: run.depth + 1,
+        parent: { run: journal.run, journal: journal.path },
+        started: (started, path) => { if (started) journal.note("child", { run: started, journal: path, purpose: "check" }); },
+        above: run.meter,
+        unchecked: true,
+      });
+      if (ended.status !== "done") {
+        throw new Error(`The project asked for the check ${ended.status === "failed" ? "failed" : "did not end its work"}: ${ended.reason ?? ended.status}`);
+      }
+      return verdictOf(ended.result);
+    });
+  } catch (err) {
+    found = { error: signal?.aborted ? STOPPED_CHECK : messageOf(err) };
+  }
+  // What the checker asked of a model is counted in this run's count, and is on record in the checker's own
+  // journal: it is said here too, with the check, as what a project asked for a fix used is said with the fix.
+  const now = run.meter.counted();
+  const used = { calls: now.calls - before.calls, tokens: now.tokens - before.tokens, cost: now.cost - before.cost };
+  journal.note("check", { ...by, ms: Math.round(performance.now() - began), ...(used.calls > 0 && { used }), ...found });
+  const inALine = (text: string) => { const line = text.replace(/\s+/g, " ").trim(); return line.length > 200 ? `${line.slice(0, 200)}…` : line; };
+  console.log(tagged(run.label, "error" in found
+    ? `[trama] not checked by ${checker}: ${inALine(found.error)}`
+    : `[trama] checked by ${checker}: ${found.ok ? "ok" : "not ok"}${found.score !== undefined ? ` (score ${found.score})` : ""}${found.notes ? ` — ${inALine(found.notes)}` : ""}`));
+  return { ...by, ...found };
+}
+
 // --- Replaying a recorded run (see replay.ts) ---
 
 /** A backend for a run in which nothing is asked of a model: whatever is asked of it all the same is refused. */
@@ -1569,6 +1676,8 @@ interface AskedFor {
   started(run: string, journal: string): void;
   /** The count of what the run that asked uses of a model: what this one uses is counted there too, and held to it. */
   above?: Meter;
+  /** The run is itself the check of a run: nobody checks it in its turn, whatever its project says. */
+  unchecked?: boolean;
 }
 
 
@@ -1619,6 +1728,8 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   if (repairWith !== undefined && !existsSync(join(repairWith, "meta.json"))) {
     throw new Error(`repairWith names no project: there is none at ${repairWith}`);
   }
+  // Who checks the run, where it is checked: found now as well — a run that could not be checked as it was to be is not begun.
+  const checkWith = askedFor?.unchecked ? undefined : checkerOf(options);
   // Its own budget — the config's, for a run nobody's program asked for and that was given none — under the budgets above it.
   const budget = options.budget != null ? checkedBudget(options.budget) : askedFor ? undefined : config.budget;
   const meter = createMeter(budget, askedFor?.above);
@@ -1644,25 +1755,33 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   });
   askedFor?.started(journal.run, journal.path);
 
-  const { result, repair } = await journalled(journal, backend, (backend) => executeProgram({
-    projectDir,
-    backend,
-    meter,
-    making,
-    maxRepairAttempts,
-    timeout,
-    maxIterations: config.defaultMaxIterations,
-    argsOverride: options.args,
-    workspaceDir: options.workspaceDir,
-    depth,
-    label: options.label,
-    env,
-    agentChanges: config.agentChanges,
-    agents: config.agents,
-    repairWith,
-    signal: options.signal,
-    journal,
-  }));
+  const { result, repair } = await journalled(journal, backend, async (backend) => {
+    const execution = await executeProgram({
+      projectDir,
+      backend,
+      meter,
+      making,
+      maxRepairAttempts,
+      timeout,
+      maxIterations: config.defaultMaxIterations,
+      argsOverride: options.args,
+      workspaceDir: options.workspaceDir,
+      depth,
+      label: options.label,
+      env,
+      agentChanges: config.agentChanges,
+      agents: config.agents,
+      repairWith,
+      signal: options.signal,
+      journal,
+    });
+    // A run that is done is checked, where it is to be: once its program has ended and what it did is the
+    // project's — a fix that worked among it — and before the run's own end is written down. What the check
+    // says is said beside how the run ended, and is no part of that: done is the program's word.
+    if (checkWith === undefined || execution.result.status !== "done") return execution;
+    const check = await checkedBy(checkWith, execution.result, { projectDir, args: options.args, timeout, depth, label: options.label, env, signal: options.signal, meter, journal });
+    return { ...execution, result: { ...execution.result, check } };
+  });
 
   if (repair) {
     // The program is fixed and has run; failing to write this down must not turn that into an error.

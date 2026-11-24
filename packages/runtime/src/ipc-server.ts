@@ -385,7 +385,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, rep
         projectDir: "string", args: "optional object",
         timeout: "optional number", maxRepairAttempts: "optional number",
         id: "optional string", label: "optional string", workspaceDir: "optional string", env: "optional object",
-        budget: "optional object", repairWith: "optional string",
+        budget: "optional object", repairWith: "optional string", checkWith: "optional string",
       },
       async ({ id, env, budget, timeout, maxRepairAttempts, ...asked }, connectionClosed, { seq }) => {
         const request: RunRequest = { ...asked, timeout: timeoutOf(timeout), maxRepairAttempts: attemptsOf(maxRepairAttempts), env: envOf(env), budget: budgetOf(budget) };

@@ -11,6 +11,32 @@ export interface ProgramResult {
   reason?: string;
   /** From ctx.done(result), if provided. */
   result?: unknown;
+  /**
+   * What the check of the run came to, where the run was to be checked
+   * (see `RunOptions.checkWith`) and ended as done. It says what the work
+   * is worth: `status` is the program's own word, and is not changed by it.
+   */
+  check?: Check;
+}
+
+/**
+ * A check of a run: who made it, and the verdict — or why none could be
+ * had. A check that could not be made has `error` and no `ok`: it is never
+ * said as a verdict that the work is not good.
+ */
+export interface Check {
+  /** Who checked: the checker's project, by where it is. */
+  by: string;
+  /** The checker's program as it was when it checked, by its hash (sha256): verdicts are comparable where this is the same. */
+  program?: string;
+  /** The verdict: whether the work is good. */
+  ok?: boolean;
+  /** How good, where the checker says: a number of its own scale. */
+  score?: number;
+  /** Why, where the checker says. */
+  notes?: string;
+  /** Why the check could not be made: the checker failed, did not end its work, ended with no verdict, or was stopped. */
+  error?: string;
 }
 
 /** Which model serves a project's LLM calls. */
@@ -69,6 +95,24 @@ export interface RunOptions {
    * if that has one.
    */
   repairWith?: string;
+  /**
+   * The project that checks the run, where it ends as done: by its name
+   * among the user's projects, or by a path. Its program is run with a
+   * throwaway copy of the project as the run left it for its workspace —
+   * what it does there changes nothing — is handed as arguments `result`
+   * (what the program ended with), `args` (what the run was started with),
+   * `journal` and `run` (the record of the run it checks, and its id), and
+   * answers with the verdict: `{ ok, score?, notes? }`. That is the
+   * result's `check`, and is on the run's record. It is a run of the
+   * checked run's own — counted in its budget, stopped with it, started
+   * with its variables — and is neither fixed where it fails nor checked
+   * in its turn. Without it, the `checkWith` of the project's meta.json,
+   * if that has one (a path there is said from where the project is).
+   *
+   * What checks is to stay as it is while what is checked changes: so it
+   * is no part of the program, which an update and a fix rewrite.
+   */
+  checkWith?: string;
   /**
    * Stops the run: its program is stopped, no repair is attempted, and the
    * run ends as failed. A fix that was being tried leaves no trace.

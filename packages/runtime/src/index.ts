@@ -24,7 +24,7 @@ import { guardPath, identityOf, sameProjectAs } from "./path-guard.js";
 import { printJournals, spentIn } from "./journal-view.js";
 import { messageOf } from "./errors.js";
 
-export type { Budget, ProgramResult, RunOptions, ReplayOptions, ReplayResult, ReplayAllResult } from "./runner-types.js";
+export type { Budget, Check, ProgramResult, RunOptions, ReplayOptions, ReplayResult, ReplayAllResult } from "./runner-types.js";
 export { failureOf } from "./runner.js";
 export { requestsWhole } from "./journal-view.js";
 import type { ProgramResult, RunOptions, ReplayAllResult, ReplayOptions, ReplayResult, TramaConfig } from "./runner-types.js";
@@ -76,6 +76,7 @@ export async function runProgram(options: RunOptions): Promise<ProgramResult> {
     workspaceDir: request.workspaceDir && resolve(request.workspaceDir),
     // (A path is this program's to say where it leads. A name is one of the user's projects, wherever it is said.)
     repairWith: request.repairWith !== undefined && namesAPath(request.repairWith) ? projectNamed(request.repairWith) : request.repairWith,
+    checkWith: request.checkWith !== undefined && namesAPath(request.checkWith) ? projectNamed(request.checkWith) : request.checkWith,
   }, signal);
 }
 

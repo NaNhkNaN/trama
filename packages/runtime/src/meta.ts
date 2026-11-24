@@ -14,6 +14,8 @@ export interface ProjectMeta {
   /** The model and provider the project was created with; they take precedence over the global config. */
   model?: string;
   provider?: string;
+  /** The project a run of this one is checked by, where the run names none (see RunOptions.checkWith): by a name, or by a path from here. */
+  checkWith?: string;
 }
 
 /**

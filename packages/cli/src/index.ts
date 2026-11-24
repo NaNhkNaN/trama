@@ -136,7 +136,8 @@ cli
   .option("--timeout <ms>", "Per-phase timeout in ms (applies to each run and repair attempt separately)")
   .option("--arg <key=value>", "Pass argument to the program (repeatable)", collectArg, [])
   .option("--budget <cap=number>", "Cap what the run may use of a model: cost (US dollars), tokens or calls (repeatable)", collectArg, [])
-  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[] }) => {
+  .option("--check <project>", "Have the run checked, once it is done, by a project: its name, or a path")
+  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[]; check?: string }) => {
     let timeout: number | undefined;
     if (opts.timeout !== undefined) {
       timeout = Number(opts.timeout);
@@ -147,10 +148,14 @@ cli
     const args = parseArgs(opts.arg);
     const budget = parseBudget(opts.budget);
     const projectDir = resolveProject(name);
-    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, signal }));
+    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, checkWith: opts.check, signal }));
     // (A run that a signal stopped has failed, and is not reported as that: see `command`.)
     if (result.status === "failed") {
       throw new Error(failureOf(result.reason));
+    }
+    // A run that was checked ends well where its work was found good. (What the check said, or why there is none, has been shown.)
+    if (result.check && result.check.ok !== true) {
+      throw new Error(result.check.error !== undefined ? "The run is done, and its check could not be made." : "The run is done, and its check says the work is not good.");
     }
   }));
 

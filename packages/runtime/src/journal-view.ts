@@ -129,7 +129,8 @@ const asUsage = (used: { tokens?: number; cost?: number }) => ({ input: used.tok
 
 function spentInAll(records: JournalRecord[], inAll = ""): string {
   // (A fix is part of the run it is for, whoever made it: what a project used for one is counted with the rest.)
-  const counted = spentIn([...usageIn(records), ...records.filter(record => record.kind === "fix" && record.used).map(record => asUsage(record.used))]);
+  // (And so is a check: what a project asked for one used is counted with the rest.)
+  const counted = spentIn([...usageIn(records), ...records.filter(record => (record.kind === "fix" || record.kind === "check") && record.used).map(record => asUsage(record.used))]);
   if (!records.some(record => record.kind === "full")) return counted && counted + inAll;
   return `${counted || "no usage"} on record — the journal was full`;
 }
@@ -198,6 +199,7 @@ function printJournal(path: string, records: JournalRecord[]): void {
         // (A run a call of the program's started — or, for a fix, one the run itself started.)
         console.log(record.purpose === "fix"
           ? `${at}  the fix is asked of a project: run ${record.run}`
+          : record.purpose === "check" ? `${at}  the check is asked of a project: run ${record.run}`
           : `${at}  #${String(record.seq).padEnd(3)} started ${record.purpose === "validate" ? "validation" : "run"} ${record.run}`);
         break;
       case "fix-request":
@@ -207,6 +209,15 @@ function printJournal(path: string, records: JournalRecord[]): void {
         // (What a project that was asked for it used is said with it: what pi's agent used is in the lines of `usage`.)
         console.log(`${at}  fix ${record.ok ? "returned" : `not returned: ${oneLine(record.error, 80)}`}${record.used ? `  ${spentIn([asUsage(record.used)])}` : ""}`);
         break;
+      case "check": {
+        // (Who checked is said by where it is and by what its program was: a verdict is that checker's, and no other's.)
+        const who = `by ${record.by} (program ${record.program?.slice(0, 8) ?? "missing"})`;
+        const used = record.used ? `  ${spentIn([asUsage(record.used)])}` : "";
+        console.log(record.error !== undefined
+          ? `${at}  not checked ${who}: ${oneLine(record.error, 100)}${used}`
+          : `${at}  checked ${who}: ${record.ok ? "ok" : "not ok"}${record.score !== undefined ? `  score ${record.score}` : ""}${record.notes ? `  ${oneLine(record.notes, 80)}` : ""}${used}`);
+        break;
+      }
       case "exit": {
         const how = record.timedOut ? "timed out"
           : record.validated ? `stopped, validated (${record.validated})`

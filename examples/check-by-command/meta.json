@@ -1,0 +1,4 @@
+{
+  "input": { "prompt": "A checker: says whether a run's work is good by a command, run in a copy of the project as the run left it.", "args": { "command": "npm test", "seconds": 600 } },
+  "createdAt": "2026-11-23T00:00:00.000Z"
+}
