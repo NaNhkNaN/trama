@@ -82,7 +82,8 @@ test("a fix is asked of the project a run names: it works in the copy as its wor
   // The fix is the project's now; and what the fixer put right beside it in the copy reached the project with it.
   assert.equal(readFileSync(join(it.projectDir, "program.ts"), "utf-8"), MENDED);
   assert.equal(readFileSync(join(it.projectDir, "mended-by.txt"), "utf-8"), "the fixer");
-  assert.equal(readFileSync(join(it.projectDir, "history", "0001.ts"), "utf-8"), MENDED);
+  // (On record as the version after the program that failed, which was put there when it was run.)
+  assert.deepEqual([readFileSync(join(it.projectDir, "history", "0001.ts"), "utf-8"), readFileSync(join(it.projectDir, "history", "0002.ts"), "utf-8")], [BROKEN, MENDED]);
 
   // What it was handed: the failure, the failed run's record, that what it changes is kept, the API as an
   // author is shown it — and nothing else; a copy of the project to work in, which is not the project; and

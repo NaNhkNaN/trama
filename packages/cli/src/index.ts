@@ -10,6 +10,8 @@ import {
   showLogs,
   showJournal,
   showReplay,
+  showHistory,
+  rollbackProject,
   resolveProject,
   failureOf,
 } from "@trama-dev/runtime/runner";
@@ -193,6 +195,22 @@ cli
     const same = await stoppable((signal) => showReplay(name, { run, all: opts.all, loose: opts.loose, signal }));
     // (It ends as it went: the whole way to the recorded end, or not.)
     if (!same) process.exitCode = 1;
+  }));
+
+cli
+  .command("history <name>")
+  .description("Show the versions a program has had, and how the runs of each went")
+  .option("--runs", "List each run under its version")
+  .action(command(async (name: string, opts: { runs?: boolean }) => {
+    await showHistory(name, { runs: opts.runs });
+  }));
+
+cli
+  .command("rollback <name> <version>")
+  .description("Go back to a version of a program: it becomes the program again, as a new version. Nothing is run")
+  .action(command(async (name: string, version: string) => {
+    // (A version is named by its number, as `trama history` shows it — with or without the v.)
+    await rollbackProject(name, Number(/^v?(\d+)$/.exec(version)?.[1] ?? NaN));
   }));
 
 cli.parse();

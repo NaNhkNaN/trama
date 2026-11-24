@@ -238,7 +238,9 @@ await ctx.done();
 
   // What is installed is the program in the reply, without the wrapping around it.
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), fixedProgram.trim());
-  assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), fixedProgram.trim());
+  // (The program as it failed is the version before it: it was put on record when it was run.)
+  assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), 'throw new Error("boom");');
+  assert.equal(readFileSync(join(projectDir, "history", "0002.ts"), "utf-8"), fixedProgram.trim());
   // The fix is tried on a copy of the project; what it wrote is merged back because it worked.
   assert.equal(readFileSync(join(projectDir, "repaired.txt"), "utf-8"), "ok");
 
@@ -1795,7 +1797,7 @@ await ctx.done({ generation: 1 });
   // In an ordinary run the program it wrote would be the project's program. It is here too —
   // and it is what goes on record as the repair.
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), next);
-  assert.equal(readFileSync(join(projectDir, "history", "0001.ts"), "utf-8"), next);
+  assert.equal(readFileSync(join(projectDir, "history", "0002.ts"), "utf-8"), next);
   assert.deepEqual(leftovers(projectDir), []);
 });
 

@@ -15,7 +15,7 @@ import { ensureProjectScaffold, loadConfig, loadProjectConfig, loadState, namesA
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import {
   validateProgram, installValidatedProgram,
-  withTempDir, prepareProject, shownPaths, type Prepared, RUNTIME_TYPES, runProgram as runHere, replayProgram as replayHere, replayAll as replayAllHere, whyNotReplaceable,
+  withTempDir, prepareProject, shownPaths, type Prepared, RUNTIME_TYPES, runProgram as runHere, replayProgram as replayHere, replayAll as replayAllHere, rollbackTo, whyNotReplaceable,
   tagged, failureOf, type AskedToMake, type Making,
 } from "./runner.js";
 import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspace.js";
@@ -24,6 +24,9 @@ import { guardPath, identityOf, sameProjectAs } from "./path-guard.js";
 import { printJournals, spentIn } from "./journal-view.js";
 import { messageOf } from "./errors.js";
 
+export type { HistoryRun, HistoryVersion, ProjectHistory } from "./runner-types.js";
+export { readHistory } from "./history.js";
+import { readHistory } from "./history.js";
 export type { Budget, Check, ProgramResult, RunOptions, ReplayOptions, ReplayResult, ReplayAllResult } from "./runner-types.js";
 export { failureOf } from "./runner.js";
 export { requestsWhole } from "./journal-view.js";
@@ -150,6 +153,83 @@ export async function showReplay(name: string, options: { run?: string; all?: bo
     if (went.unasked > 0) console.log(`${went.unasked} of the record's calls it did not come to make`);
   }
   return went.same;
+}
+
+/**
+ * Go back to a version of a project's program, by the project's name: the
+ * version's text becomes the program again, as a new version. Nothing is
+ * run or validated, and nothing else of the project is touched (see
+ * `trama history <name>` for the versions there are).
+ */
+export async function rollbackProject(name: string, version: number): Promise<{ version: number; from: number } | { unchanged: true; version: number }> {
+  if (parentBridge()) throw new Error("A rollback is made by a runner that is in no program's run: not from within a program, yet.");
+  const went = rollbackTo(resolveProject(name), version);
+  console.log("unchanged" in went
+    ? `${name} is at version ${version} already: nothing was changed.`
+    : `${name} is at version ${went.from} again, as version ${went.version}. The program was not run, and nothing else of the project was changed.`);
+  return went;
+}
+
+/**
+ * Show a project's history: each version — why it came, when, the hash of
+ * its text — and how the runs of it went: how they ended, what each checker
+ * said of them, what they took and used on the mean. With `runs`, each run.
+ * It counts and takes means, and says of no version that it is the better.
+ */
+export async function showHistory(name: string, options: { runs?: boolean } = {}): Promise<void> {
+  const { versions, runs, current } = readHistory(resolveProject(name));
+  if (versions.length === 0 && runs.length === 0) {
+    console.log(`No version of ${name} is on record: its program has not been made by trama, or run, since history was kept.`);
+    return;
+  }
+  const when = (at: string) => at.slice(0, 16).replace("T", " ");
+  const seconds = (ms: number) => `${(ms / 1000).toFixed(1)}s`;
+  const mean = (numbers: number[]) => numbers.reduce((sum, n) => sum + n, 0) / numbers.length;
+  const rounded = (n: number) => String(Number(n.toFixed(3)));
+  const oneLine = (text: string, most: number) => { const line = text.replace(/\s+/g, " ").trim(); return line.length > most ? `${line.slice(0, most)}…` : line; };
+  const count = (n: number, what: string) => `${n} ${what}${n === 1 ? "" : "s"}`;
+  const said = (check: NonNullable<(typeof runs)[number]["check"]>) =>
+    (check.error !== undefined ? "not checked" : `${check.ok ? "ok" : "not ok"}${check.score !== undefined ? ` (score ${rounded(check.score)})` : ""}`);
+
+  /** How some runs went: how many, how they ended, what they took and used on the mean — and what each checker said of them, by itself. */
+  const told = (of: typeof runs) => {
+    if (of.length === 0) return console.log("    no runs on record");
+    const ended = (["done", "yielded", "failed"] as const).map((status) => [status, of.filter((run) => run.status === status).length] as const).filter(([, n]) => n > 0);
+    const asked = of.filter((run) => run.used?.calls > 0);
+    console.log(`    ${count(of.length, "run")}: ${ended.map(([status, n]) => `${n} ${status}`).join(", ")}; ${seconds(mean(of.map((run) => run.ms ?? 0)))} on the mean`
+      + (asked.length > 0 ? `, ${Math.round(mean(of.map((run) => run.used?.tokens ?? 0)))} tokens and $${mean(of.map((run) => run.used?.cost ?? 0)).toFixed(4)} a run` : ""));
+    // A verdict is its checker's: those of one checker — the same project, the same program — are said together, and never with another's.
+    const checkers = new Map<string, NonNullable<(typeof runs)[number]["check"]>[]>();
+    for (const { check } of of) if (check) checkers.set(`${check.by} (program ${check.program?.slice(0, 8) ?? "missing"})`, [...(checkers.get(`${check.by} (program ${check.program?.slice(0, 8) ?? "missing"})`) ?? []), check]);
+    for (const [who, checks] of checkers) {
+      const made = checks.filter((check) => check.error === undefined), scores = made.flatMap((check) => (check.score !== undefined ? [check.score] : []));
+      console.log(`    checked by ${who}: ${made.filter((check) => check.ok).length} of ${made.length} ok`
+        + (made.length < checks.length ? `, ${checks.length - made.length} not made` : "")
+        + (scores.length > 0 ? `; score ${rounded(mean(scores))} on the mean` : ""));
+    }
+    if (!options.runs) return;
+    for (const run of of) {
+      console.log(`      ${[run.run ?? when(run.at), run.status, run.check && said(run.check), seconds(run.ms ?? 0),
+        run.used?.calls > 0 && `${run.used.tokens} tokens $${run.used.cost.toFixed(4)}`, run.ended !== undefined && `fixed: v${run.ended} since`, run.reason && oneLine(run.reason, 100)].filter(Boolean).join("  ")}`);
+    }
+  };
+
+  for (const version of versions) {
+    console.log([`v${version.version}`, version.reason, when(version.at), version.sha256?.slice(0, 8) ?? "(its file is gone)", version.from !== undefined && `from v${version.from}`,
+      version.detail && JSON.stringify(oneLine(version.detail, 60)), version.version === current && "← the program now"].filter(Boolean).join("  "));
+    told(runs.filter((run) => run.version === version.version));
+  }
+  // Runs of a program that could not be put on record, or whose version is on record no longer.
+  const known = new Set(versions.map((version) => version.version));
+  const others = runs.filter((run) => run.version === undefined || !known.has(run.version));
+  if (others.length > 0) {
+    console.log("of no version on record");
+    told(others);
+  }
+  if (runs.length > 0) console.log(`${count(runs.length, "run")} ${runs.length === 1 ? "is" : "are"} on record, the first of ${when(runs[0].at)}.`);
+  if (current === undefined && versions.length > 0) {
+    console.log(`The program as it is now is on no record: it was changed after version ${versions.at(-1)!.version}, and is recorded when it is next run.`);
+  }
 }
 
 /** The shared workspace in a directory, created if it does not exist: read, write, list, observe. */

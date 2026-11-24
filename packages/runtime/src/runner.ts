@@ -31,7 +31,7 @@ import { journalEntriesOf, openJournal, type Journal } from "./journal.js";
 import { messageOf } from "./errors.js";
 import { checkedRepairAttempts, checkedTimeout, ensureProjectScaffold, loadProjectConfig, loadState, namesAPath, projectNamed, saveState } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
-import { copyToHistory, recordVersion } from "./history.js";
+import { copyToHistory, noteRun, programHashOf, recordAsFound, recordVersion, textOfVersion, versionWith, versionsOf } from "./history.js";
 
 /**
  * tsx lets node run program.ts. Resolved through the module system, so any
@@ -911,6 +911,7 @@ async function fixedBy(
     parent: { run: journal.run, journal: journal.path },
     started: (run, path) => { if (run) journal.note("child", { run, journal: path, purpose: "fix" }); },
     above: options.meter,
+    purpose: "fix",
   });
   if (result.status !== "done") {
     throw new Error(`The project asked for the fix ${result.status === "failed" ? "failed" : "did not end its work"}: ${result.reason ?? result.status}`);
@@ -1316,7 +1317,7 @@ async function checkedBy(
         parent: { run: journal.run, journal: journal.path },
         started: (started, path) => { if (started) journal.note("child", { run: started, journal: path, purpose: "check" }); },
         above: run.meter,
-        unchecked: true,
+        purpose: "check",
       });
       if (ended.status !== "done") {
         throw new Error(`The project asked for the check ${ended.status === "failed" ? "failed" : "did not end its work"}: ${ended.reason ?? ended.status}`);
@@ -1676,8 +1677,8 @@ interface AskedFor {
   started(run: string, journal: string): void;
   /** The count of what the run that asked uses of a model: what this one uses is counted there too, and held to it. */
   above?: Meter;
-  /** The run is itself the check of a run: nobody checks it in its turn, whatever its project says. */
-  unchecked?: boolean;
+  /** What the runner made the run for, where it made it itself: a fix asked of a project, a check. (A check is not checked in its turn, whatever its project says.) */
+  purpose?: "fix" | "check";
 }
 
 
@@ -1729,7 +1730,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
     throw new Error(`repairWith names no project: there is none at ${repairWith}`);
   }
   // Who checks the run, where it is checked: found now as well — a run that could not be checked as it was to be is not begun.
-  const checkWith = askedFor?.unchecked ? undefined : checkerOf(options);
+  const checkWith = askedFor?.purpose === "check" ? undefined : checkerOf(options);
   // Its own budget — the config's, for a run nobody's program asked for and that was given none — under the budgets above it.
   const budget = options.budget != null ? checkedBudget(options.budget) : askedFor ? undefined : config.budget;
   const meter = createMeter(budget, askedFor?.above);
@@ -1737,6 +1738,16 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   // (Before the journal is opened: once it is, nothing stands between that and the run that ends it — a
   // journal with a beginning and no end is a run that died, and is not to be one that never began.)
   const stillTheProject = sameProjectAs(projectDir);
+  // The program as it is run is a version on record: put there now, where it is not. (So a run is of a
+  // version, and whatever was run can be gone back to.) That it cannot be is no reason not to run it.
+  const startedAt = new Date(), clock = performance.now();
+  let beganAs: string | undefined;
+  try {
+    recordAsFound(projectDir);
+    beganAs = programHashOf(projectDir);
+  } catch (err) {
+    console.warn(tagged(options.label, `[trama] the program is not put on record as a version: ${messageOf(err)}`));
+  }
   const backend = createBackend(config, meter, saysOnce(meter, outOfBudget), env);
 
   const journal = openJournal(projectDir, config.journalRuns, {
@@ -1795,5 +1806,79 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
       console.warn(tagged(options.label, `[trama] repair bookkeeping failed: ${messageOf(err)}`));
     }
   }
+  // The run is over, whatever came of it: a line of the project's history says so — the version it was of, how
+  // it ended, what its check said, what it used. Kept as history is, where a journal is kept for some runs.
+  try {
+    const short = (text: string) => (text.length > 200 ? `${text.slice(0, 200)}…` : text);
+    const endedAs = programHashOf(projectDir);
+    const version = beganAs === undefined ? undefined : versionWith(projectDir, beganAs);
+    const ended = endedAs === undefined || endedAs === beganAs ? undefined : versionWith(projectDir, endedAs);
+    const { calls, tokens, cost } = meter.counted();
+    const { check } = result;
+    noteRun(projectDir, {
+      ...(journal.run && { run: journal.run }),
+      at: startedAt.toISOString(),
+      ...(version !== undefined && { version }),
+      ...(ended !== undefined && ended !== version && { ended }),
+      status: result.status,
+      ...(result.status !== "done" && result.reason !== undefined && { reason: short(result.reason.split("\n")[0]) }),
+      ...(repair && { repaired: repair.attempt }),
+      ...(check && { check: { ...check, ...(check.notes !== undefined && { notes: short(check.notes) }), ...(check.error !== undefined && { error: short(check.error) }) } }),
+      used: { calls, tokens, cost },
+      ms: Math.round(performance.now() - clock),
+      input: inputMark(options.args),
+      ...(askedFor?.purpose && { for: askedFor.purpose }),
+    });
+  } catch (err) {
+    console.warn(tagged(options.label, `[trama] the run is not in the project's history: ${messageOf(err)}`));
+  }
   return result;
+}
+
+/** A mark of what a run was started with: the same for the same arguments, in whatever order they were written. */
+function inputMark(args: Record<string, unknown> | undefined): string {
+  const ordered = (value: unknown): unknown => (Array.isArray(value) ? value.map(ordered)
+    : value !== null && typeof value === "object" ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([key, held]) => [key, ordered(held)]))
+    : value);
+  return createHash("sha256").update(JSON.stringify(ordered(args ?? {})) ?? "").digest("hex").slice(0, 16);
+}
+
+/**
+ * Go back to a version of a project's program: its text becomes program.ts
+ * again, as a new version — so history only grows, and a rollback can be
+ * gone back on as anything can. The program as it is now is put on record
+ * first where it is not: nothing is lost by it.
+ *
+ * Nothing is run, and nothing validated: a rollback has no effect but the
+ * program's text, and costs nothing. Nor is anything else of the project
+ * touched — its state, its files. (So the old program meets the project as
+ * it is now, which its next run will show.)
+ */
+export function rollbackTo(projectDir: string, version: number): { version: number; from: number } | { unchanged: true; version: number } {
+  if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 1) throw new Error("A version is named by its number: 1 and up.");
+  if (!existsSync(join(projectDir, "meta.json"))) {
+    throw new Error(`Project not found at ${projectDir}. Run \`trama list\` to see available projects.`);
+  }
+  const versions = versionsOf(projectDir);
+  if (!versions.some((one) => one.version === version)) {
+    throw new Error(`No version ${version} is in the history of ${projectDir}: \`trama history <name>\` shows those there are.`);
+  }
+  const text = textOfVersion(projectDir, version);
+  // What is the program already is not gone back to.
+  if (programIn(projectDir) === text) return { unchanged: true, version: versionWith(projectDir, createHash("sha256").update(text).digest("hex")) ?? version };
+  // Asked before anything is put on record: where the program cannot be replaced, there is nothing to prepare for.
+  const refusal = whyNotReplaceable(projectDir);
+  if (refusal) throw new Error(refusal);
+  recordAsFound(projectDir);
+  const program = stageProgram(projectDir, text);
+  let recorded: (() => void) & { version?: number } = () => {};
+  try {
+    recorded = recordVersion(projectDir, text, "rollback", undefined, [], { from: version });
+    program.commit();
+  } catch (err) {
+    recorded();
+    program.discard();
+    throw err;
+  }
+  return { version: recorded.version!, from: version };
 }

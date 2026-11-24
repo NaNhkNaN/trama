@@ -119,7 +119,8 @@ test("the harness fixes a program as a run asks it to: it looks, mends what the 
   const said = saidByTools(it.requests.at(-1));
   assert.equal(said.length, 9);
   // (The copy: the project, with the log of the run that failed and without its journals.)
-  assert.equal(said[0], ".gitignore\ndata.txt\nlogs/latest.jsonl\nmeta.json\npackage.json\nprogram.ts");
+  // (The project's history is among its files: the program as it failed is a version there since it was run.)
+  assert.equal(said[0], ".gitignore\ndata.txt\nhistory/0001.ts\nhistory/index.jsonl\nlogs/latest.jsonl\nmeta.json\npackage.json\nprogram.ts");
   assert.match(said[1], /missing key: path/);
   assert.equal(said[2], "the heron waits at low tide");
   assert.equal(said[3], 'There is no tool "open". The tools: list, read, write, shell, record, hand_over, give_up.');

@@ -300,7 +300,7 @@ test("a run that was fixed is checked as it ended: the fix is the project's by t
   assert.equal(told.program, WORKS.trim());
   const [records] = journalsOf(it.projectDir);
   assert.deepEqual(records.filter((record) => ["attempt", "check"].includes(record.kind)).map((record) => record.kind), ["attempt", "attempt", "check"]);
-  assert.equal(readFileSync(join(it.projectDir, "history", "0001.ts"), "utf-8"), WORKS.trim());
+  assert.deepEqual([readFileSync(join(it.projectDir, "history", "0001.ts"), "utf-8"), readFileSync(join(it.projectDir, "history", "0002.ts"), "utf-8")], [BROKEN, WORKS.trim()]);
 });
 
 test("a checker is a program like any: it can hold the run it checks to its own record, which is not yet at its end", async (t) => {

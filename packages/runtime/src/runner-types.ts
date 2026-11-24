@@ -180,6 +180,61 @@ export interface ReplayResult {
   same: boolean;
 }
 
+/** A version of a project's program, as its history has it (history/NNNN.ts, and a line of history/index.jsonl). */
+export interface HistoryVersion {
+  version: number;
+  /** Why it came: "create", "update", "repair", "rollback" — or "found": the program was not on record when it was run, or was to be replaced. */
+  reason: string;
+  /** When, as an ISO time. */
+  at: string;
+  /** The hash of its text (sha256). A run is of the version whose text its program was. */
+  sha256?: string;
+  /** What it was made for: the prompt of a create or an update, the failure a repair mended. */
+  detail?: string;
+  /** Of a rollback: the version whose text it is. */
+  from?: number;
+}
+
+/**
+ * A run of a project, as its history has it: a line of history/runs.jsonl,
+ * written when the run is over. It says how the run went and holds nothing
+ * of its work — that is in the run's journal, for as long as that is kept.
+ */
+export interface HistoryRun {
+  /** The run's id, by which its journal is found. Absent where the run was not recorded. */
+  run?: string;
+  /** When it began, as an ISO time. */
+  at: string;
+  /** The version its program was when it began. Absent where the program could not be put on record. */
+  version?: number;
+  /** The version its program was when it ended, where that is another: a fix was installed. */
+  ended?: number;
+  status: ProgramResult["status"];
+  /** Of a run that failed or yielded: the first line of why. */
+  reason?: string;
+  /** Of a run that was fixed: which attempt worked. */
+  repaired?: number;
+  /** What its check came to (see `Check`): the beginning of its notes, or of why it could not be made. */
+  check?: Check;
+  /** What it used of a model, by the runner's own count: its program's calls, its fixes, its check, and the runs it asked for. */
+  used: { calls: number; tokens: number; cost: number };
+  /** How long it took, in milliseconds. */
+  ms: number;
+  /** A mark of what it was started with (a hash of its arguments): runs with the same mark had the same. */
+  input: string;
+  /** What the runner made the run for, where it made it itself: a fix asked of this project, a check asked of it. */
+  for?: "fix" | "check";
+}
+
+/** A project's history (see `readHistory`): facts on record, in the order they came. */
+export interface ProjectHistory {
+  versions: HistoryVersion[];
+  /** The runs on record: the latest thousand or so. */
+  runs: HistoryRun[];
+  /** The version the program is now: absent where it was changed since the latest version, and has not been run. */
+  current?: number;
+}
+
 /** How a program held to every run on record went (see `replayAll`). */
 export interface ReplayAllResult {
   /**
