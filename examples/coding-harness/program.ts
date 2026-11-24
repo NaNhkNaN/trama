@@ -5,6 +5,12 @@
 // do is the run's argument `task` (trama run <project> --arg task="…"), or
 // else the project's own prompt.
 //
+// Or the codebase is somewhere else, and the harness a project of its own:
+// where its run has a workspace (`workspaceDir`), the work is done there.
+// Then one harness does many pieces of work, each run is a run of *it* — on
+// its record, of one of its versions — and it can be held against another
+// version of itself (see examples/improve-by-check).
+//
 // Everything that makes it a harness is in this file, to be read and changed:
 // what the model is told, the tools it has (and how long a command of its
 // may take), how often it is asked again, what is made of a reply that
@@ -12,10 +18,25 @@
 // conversation grows long. Each request to the model, and each thing a tool does, goes through
 // the runtime: the run's journal has all of it, one line after the other,
 // and its budget counts it.
-import { ctx, agent, tools, heldTo } from "@trama-dev/runtime";
-import type { AgentTool, ModelMessage, ToolCallPart } from "@trama-dev/runtime";
+import { ctx, agent, tools, workspace, heldTo } from "@trama-dev/runtime";
+import type { AgentTool, ModelMessage, ShellResult, ToolCallPart } from "@trama-dev/runtime";
 
-const given = ctx.input.args as { task?: string; turns?: string | number; forgetAt?: string | number };
+/** Where the codebase is, and what is done to it: read, written, and commands run in it. */
+interface Codebase {
+  read(path: string): Promise<string>;
+  write(path: string, content: string): Promise<unknown>;
+  shell(command: string, options?: { timeout?: number }): Promise<ShellResult>;
+}
+// The run's workspace, where it has one; else the project this is the program of. (A run that has none is told so
+// when it asks for it — and only that is taken for having none.)
+const codebase: Codebase = await workspace.shell("true").then(() => workspace, (err: unknown) => {
+  if (/only available when running in a session/.test(String((err as Error)?.message))) return tools;
+  throw err;
+});
+
+const given = ctx.input.args as { task?: string; turns?: string | number; forgetAt?: string | number; model?: string };
+/** The model that does the work, where the run names one ("provider/model"): else the project's own. */
+const MODEL = typeof given.model === "string" && given.model !== "" ? { model: given.model } : {};
 const task = given.task ?? ctx.input.prompt;
 
 /**
@@ -59,8 +80,8 @@ const FILES = "find . -type f -not -path '*/node_modules/*' -not -path '*/.git/*
  */
 const LEFT_OUT = `g=$(mktemp -d) && git init -q --bare "$g" >/dev/null 2>&1 && ${FILES} -print0 | git --git-dir="$g" --work-tree=. check-ignore --no-index -z --stdin 2>/dev/null | tr '\\0' '\\n'; rm -rf "$g"`;
 async function sums(): Promise<Map<string, string>> {
-  const { stdout } = await tools.shell(`${FILES} -exec cksum {} +`, { timeout: 300_000 });
-  const leftOut = new Set((await tools.shell(LEFT_OUT, { timeout: 300_000 })).stdout.split("\n"));
+  const { stdout } = await codebase.shell(`${FILES} -exec cksum {} +`, { timeout: 300_000 });
+  const leftOut = new Set((await codebase.shell(LEFT_OUT, { timeout: 300_000 })).stdout.split("\n"));
   return new Map(stdout.split("\n").filter(Boolean).map((line): [string, string] => {
     const [sum, size, ...path] = line.split(" ");
     return [path.join(" "), `${sum} ${size}`];
@@ -86,30 +107,30 @@ async function record(): Promise<string> {
 const mine: Tool[] = [
   {
     name: "files", description: "List the codebase's files (not what is in a node_modules or a .git, wherever it is, nor the run's own logs and history).",
-    run: async () => (await tools.shell(`${FILES} | sed 's|^\\./||' | sort`)).stdout || "(none)",
+    run: async () => (await codebase.shell(`${FILES} | sed 's|^\\./||' | sort`)).stdout || "(none)",
   },
   {
     name: "read", description: "Read a file, whole.",
     parameters: { path: "string: relative to the codebase" },
-    run: ({ path }) => tools.read(path),
+    run: ({ path }) => codebase.read(path),
   },
   {
     name: "read_lines", description: "Read some lines of a file, with their numbers: for a file too long to read whole.",
     parameters: { path: "string: relative to the codebase", from: "number: the first line, counted from 1", to: "number: the last line" },
-    run: async ({ path, from, to }) => (await tools.read(path)).split("\n").slice(from - 1, to).map((line, at) => `${from + at}\t${line}`).join("\n"),
+    run: async ({ path, from, to }) => (await codebase.read(path)).split("\n").slice(from - 1, to).map((line, at) => `${from + at}\t${line}`).join("\n"),
   },
   {
     name: "write", description: "Write a file: the whole of it. For a new file, or a short one.",
     parameters: { path: "string: relative to the codebase", content: "string" },
-    run: async ({ path, content }) => { await tools.write(path, content); return "written"; },
+    run: async ({ path, content }) => { await codebase.write(path, content); return "written"; },
   },
   {
     name: "edit", description: "Replace one passage of a file by another. The passage is to be in the file exactly once, as it is written there.",
     parameters: { path: "string: relative to the codebase", find: "string: the passage as the file has it", replace: "string: what is to stand in its place" },
     run: async ({ path, find, replace }) => {
-      const text = await tools.read(path), times = find === "" ? 0 : text.split(find).length - 1;
+      const text = await codebase.read(path), times = find === "" ? 0 : text.split(find).length - 1;
       if (times !== 1) throw new Error(times === 0 ? "The passage is not in the file as you wrote it: read the file again, and copy it exactly." : `The passage is in the file ${times} times: give more of what is round it, so that it is there once.`);
-      await tools.write(path, text.replace(find, () => replace));
+      await codebase.write(path, text.replace(find, () => replace));
       return "edited";
     },
   },
@@ -121,7 +142,7 @@ const mine: Tool[] = [
     parameters: { command: "string", seconds: "number: how long it may take before it is stopped" },
     run: async ({ command, seconds }) => {
       if (!(seconds >= 1 && seconds <= LONGEST)) throw new Error(`seconds is to be from 1 to ${LONGEST}: how long the command may take.`);
-      const ran = await tools.shell(command, { timeout: seconds * 1000 });
+      const ran = await codebase.shell(command, { timeout: seconds * 1000 });
       // (A command stopped at its time says so of itself; the runtime ends what it wrote to stderr with the word, which is taken off.)
       if (!ran.timedOut) return shown(ran);
       const stderr = ran.stderr.slice(0, -TIMED_OUT.length);
@@ -251,7 +272,7 @@ async function sumUp(): Promise<void> {
   if (before.length === 0 || least > FORGET_AT) throw new Error(`The conversation cannot be kept within ${FORGET_AT} tokens: the task and the latest of the work alone come to some ${least}.`);
   const soFar = [`[The task]: ${task}`, ...(summary === undefined ? [] : [`[Summed up before]: ${summary}`]), written(before)].join("\n\n");
   for (let tries = 1; ; tries += 1) {
-    const reply = await agent.complete({ system: SUMMING, messages: [{ role: "user", content: `${soFar}\n\n---\n\n${TO_SUM_UP}` }] });
+    const reply = await agent.complete({ system: SUMMING, messages: [{ role: "user", content: `${soFar}\n\n---\n\n${TO_SUM_UP}` }], ...MODEL });
     const said = reply.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("").trim();
     if (reply.stopReason !== "error" && said) { summary = said; break; }
     if (tries >= TRIES) throw new Error(`The conversation outgrew what may be read, and could not be summed up: ${reply.stopReason === "error" ? reply.errorMessage : "the model answered with nothing"}`);
@@ -283,7 +304,7 @@ while (finished === undefined) {
   if (asked >= TURNS) throw new Error(`The model was asked ${TURNS} times and did not say it was done.`);
   asked += 1;
   sent = FIXED + JSON.stringify(messages).length;
-  const reply = await agent.complete({ system, messages, tools: mine });
+  const reply = await agent.complete({ system, messages, tools: mine, ...MODEL });
 
   // The provider failed: asked again, a little later each time — and given up on where it goes on failing.
   if (reply.stopReason === "error") {

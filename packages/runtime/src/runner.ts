@@ -1291,6 +1291,8 @@ async function checkedBy(
   run: {
     projectDir: string; args?: Record<string, unknown>; timeout: number; depth: number; label?: string;
     env?: Record<string, string>; signal?: AbortSignal; meter: Meter; journal: Journal;
+    /** The workspace the run worked in, where it had one. */
+    workspaceDir?: string;
   },
 ): Promise<Check> {
   const { projectDir, journal, signal } = run;
@@ -1314,7 +1316,13 @@ async function checkedBy(
         env: run.env,
         signal,
         // What the run was started with, as its program had it: the project's own arguments under the run's.
-        args: { result: result.result, args: { ...(readProjectMeta(projectDir).input.args ?? {}), ...run.args }, journal: journal.path, run: journal.run },
+        // And where it worked, where that was not its project: a run that had a workspace left its work there, and the
+        // copy the checker has is of the project. (The place itself, as the run's record is: a checker that would change
+        // something there makes a copy of its own.)
+        args: {
+          result: result.result, args: { ...(readProjectMeta(projectDir).input.args ?? {}), ...run.args }, journal: journal.path, run: journal.run,
+          ...(run.workspaceDir !== undefined && { workspace: resolve(run.workspaceDir) }),
+        },
       }, {
         depth: run.depth + 1,
         parent: { run: journal.run, journal: journal.path },
@@ -1793,7 +1801,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
     // project's — a fix that worked among it — and before the run's own end is written down. What the check
     // says is said beside how the run ended, and is no part of that: done is the program's word.
     if (checkWith === undefined || execution.result.status !== "done") return execution;
-    const check = await checkedBy(checkWith, execution.result, { projectDir, args: options.args, timeout, depth, label: options.label, env, signal: options.signal, meter, journal });
+    const check = await checkedBy(checkWith, execution.result, { projectDir, args: options.args, timeout, depth, label: options.label, env, signal: options.signal, meter, journal, workspaceDir: options.workspaceDir });
     return { ...execution, result: { ...execution.result, check } };
   });
 

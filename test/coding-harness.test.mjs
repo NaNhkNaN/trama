@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { execFileSync } from "child_process";
 import { createServer } from "node:http";
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import { join } from "path";
 import { replayProgram, runProgram } from "../packages/runtime/dist/runner.js";
@@ -53,7 +53,7 @@ async function scene(t, plays, said = "down for a moment") {
   const it = await user(t);
   it.put(it.agentDir, "models.json", JSON.stringify({ providers: { fake: {
     baseUrl: `http://127.0.0.1:${provider.address().port}/v1`, api: "openai-completions", apiKey: "k",
-    models: [{ id: "plain", cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } }],
+    models: [{ id: "plain", cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 } }, { id: "small", cost: { input: 0.1, output: 0.2, cacheRead: 0.05, cacheWrite: 0 } }],
   } } }));
   it.put(it.agentDir, ".trama/config.json", JSON.stringify({ provider: "fake", model: "plain" }));
   const projectDir = makeTempDir("trama-coding-");
@@ -107,6 +107,7 @@ test("the harness does work on a codebase: it looks, edits, runs, mends what the
   const [system, first] = it.requests[1].messages;
   assert.match(system.content, /^You work on the codebase in the current directory/);
   assert.equal(first.content, "Greet properly.");
+  assert.deepEqual([...new Set(it.requests.map((request) => request.model))], ["plain"]);
   assert.deepEqual(it.requests[1].tools.map((tool) => tool.function.name), ["files", "read", "read_lines", "write", "edit", "shell", "finish"]);
 
   // What the tools said, in turn — as the last request has it.
@@ -132,6 +133,38 @@ test("the harness does work on a codebase: it looks, edits, runs, mends what the
   assert.equal(said[10], said[9]);
   assert.match(said[11], /missing key: seconds/);
   assert.ok(it.requests.at(-1).messages.some((message) => message.role === "user" && /when the task is done, call finish/.test(JSON.stringify(message.content))));
+});
+
+test("the harness works in its run's workspace where the run has one: the codebase is there, and the project it is the program of is left as it is", async (t) => {
+  const script = [
+    { name: "files" },
+    { name: "edit", args: { path: "src/greet.js", find: "Helo", replace: "Hello" } },
+    { name: "write", args: { path: "NOTES.md", content: "greet was put right\n" } },
+    { name: "read", args: { path: "NOTES.md" } },
+    { name: "shell", args: { command: "pwd && ls", seconds: 60 } },
+    { name: "finish", args: { summary: "greet says Hello" } },
+  ];
+  const it = await scene(t, (_request, n) => script[n - 1] ?? "there is nothing more in the script");
+  // A codebase somewhere else: the run is pointed at it.
+  const codebase = makeTempDir("trama-coding-work-");
+  t.after(() => cleanupTempDir(codebase));
+  mkdirSync(join(codebase, "src"));
+  writeFileSync(join(codebase, "src", "greet.js"), 'export const greet = (name) => "Helo, " + name;\n');
+  writeFileSync(join(codebase, "README.md"), "a codebase of its own\n");
+
+  // (And the work is done by the model the run names, where it names one: not the project's own.)
+  const { result } = await it.run({ model: "fake/small" }, { workspaceDir: codebase });
+  assert.deepEqual(result, { status: "done", result: { summary: "greet says Hello", asked: script.length, forgotten: 0, summed: 0, files: { changed: ["src/greet.js"], made: ["NOTES.md"], gone: [] } } });
+  assert.deepEqual([...new Set(it.requests.map((request) => request.model))], ["small"]);
+  // The work is in the workspace; the project's own file of the same name is as it was.
+  assert.equal(readFileSync(join(codebase, "src", "greet.js"), "utf-8"), 'export const greet = (name) => "Hello, " + name;\n');
+  assert.equal(readFileSync(join(it.projectDir, "src", "greet.js"), "utf-8"), 'export const greet = (name) => "Helo, " + name;\n');
+  assert.deepEqual([readFileSync(join(codebase, "NOTES.md"), "utf-8"), existsSync(join(it.projectDir, "NOTES.md"))], ["greet was put right\n", false]);
+  // What the model was shown is the codebase: its files and no other — not the harness's own program, nor what the runner keeps beside it.
+  const said = saidByTools(it.requests.at(-1));
+  assert.deepEqual(said[0].trim().split("\n"), ["README.md", "src/greet.js"]);
+  assert.deepEqual(said.slice(1, 4), ["edited", "written", "greet was put right\n"]);
+  assert.match(said[4], new RegExp(`^exit code 0\\n\\S*${codebase.split("/").at(-1)}\\nNOTES\\.md\\nREADME\\.md\\nsrc\\n$`));
 });
 
 test("the harness forgets what old tools said where a conversation has grown long: the oldest first, and enough to bring it well back — by its own count, or when the provider says it is too long", async (t) => {

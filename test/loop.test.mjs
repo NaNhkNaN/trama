@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "crypto";
-import { cpSync, existsSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import { inputMarkOf, readHistory, replayProgram, runProgram } from "../packages/runtime/dist/index.js";
@@ -244,6 +244,18 @@ test("the loop goes back where the new version is not found better: worse, or no
     assert.equal(it.lines().length, 4, what);
   }
 
+  // A version gone back to is the program it was, under another number: the verdicts on record of that program are
+  // its verdicts still. The round after one that went back makes no run of it again — it asks for the next update.
+  const back = loopOver(t, SAYS(["ab"]), [SAYS([]), SAYS(["ab", "cd"])]);
+  const two = [{ word: "ab" }, { word: "cd" }];
+  assert.equal((await back.round({ inputs: two })).result.result.kept, false);
+  assert.deepEqual([back.versions(), back.lines().map((line) => line.version)], [[[1, "found"], [2, "update"], [3, "rollback", 1]], [1, 1, 2, 2]]);
+  const { result: next } = await back.round({ inputs: two });
+  assert.deepEqual({ ...next.result, why: "" }, { kept: true, from: 3, to: 4, before: { ok: 1, of: 2, score: 0.5 }, after: { ok: 2, of: 2, score: 1 }, why: "" });
+  assert.deepEqual([back.lines().map((line) => line.version), back.prompts.length], [[1, 1, 2, 2, 4, 4], 2]);
+  // (But not those of the program it was gone back from, which had the place between.)
+  assert.match(back.prompts[1], /- started with \{"word":"cd"\}: it is to say CD, and said cd/);
+
   // How often it was found good comes first: a version found good more often is kept, though its mean score is the lower.
   const often = loopOver(t, SAYS(["ab"], HALF), [SAYS(["ab", "cd"])]);
   const { result: more } = await often.round({ inputs: ["ab", "cd", "ef", "gh"].map((word) => ({ word })) });
@@ -324,4 +336,102 @@ test("a verdict on record is taken where it is this judge's, as the judge is now
   assert.deepEqual([ran.result.before, ran.result.kept], [{ ok: 1, of: 2, score: 0.5 }, false]);
   assert.deepEqual(it.lines().map((line) => [line.version, line.check.by === it.at("judge"), line.check.ok]),
     [[1, false, true], [1, true, false], [1, true, false], [1, true, true], [1, true, false], [2, true, true], [2, true, false]]);
+});
+
+// --- a harness over tasks: a project whose runs work in a workspace, each in a fresh copy of what it is to work on ---
+
+test("a run that worked in a workspace is checked with it: the checker is handed where the work is, beside the copy of the project it has for its own workspace", async (t) => {
+  const WORKS_THERE = `import { ctx, workspace } from "@trama-dev/runtime";
+const there = await workspace.write("made.txt", "the work").then(() => true, () => false);
+await ctx.done({ there });
+`;
+  const LOOKS = `import { ctx, workspace } from "@trama-dev/runtime";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+const { workspace: where, ...rest } = ctx.input.args as any;
+const made = typeof where === "string" ? readFileSync(join(where, "made.txt"), "utf-8") : "";
+// (Its own workspace is the copy of the project, as ever: the project's program is there, and the work is not.)
+const mine = await workspace.list("*");
+await ctx.done({ ok: made === "the work", notes: JSON.stringify({ where: where ?? null, rest: Object.keys(rest).sort(), program: mine.includes("program.ts"), made: mine.includes("made.txt") }) });
+`;
+  const { fakeHome, at } = homeWith(t, { worker: { program: WORKS_THERE }, judge: { program: LOOKS } });
+  const work = makeTempDir("trama-loop-work-");
+  t.after(() => cleanupTempDir(work));
+  await withEnv({ HOME: fakeHome }, async () => {
+    const { result: there } = await quietly(() => runProgram({ projectDir: at("worker"), workspaceDir: work, checkWith: at("judge"), timeout: 30_000 }));
+    assert.deepEqual([there.result, there.check.ok, JSON.parse(there.check.notes)], [{ there: true }, true, { where: work, rest: ["args", "journal", "result", "run"], program: true, made: false }]);
+    // A run that had no workspace has none to hand on.
+    const { result: nowhere } = await quietly(() => runProgram({ projectDir: at("worker"), checkWith: at("judge"), timeout: 30_000 }));
+    assert.deepEqual([nowhere.result, nowhere.check.ok, JSON.parse(nowhere.check.notes)], [{ there: false }, false, { where: null, rest: ["args", "journal", "result", "run"], program: true, made: false }]);
+  });
+});
+
+test("the loop over tasks: each run works in a fresh copy of what its input says, the runs are the worker's own and on its record, and nothing is left of the copies", async (t) => {
+  // A worker that does its task in its workspace — and uses the task up: a second run in the same place would find nothing to do it from.
+  const DOES = (well) => `import { ctx, workspace } from "@trama-dev/runtime";
+const text = await workspace.read("in.txt");
+await workspace.write("out.txt", ${well ? "text.toUpperCase()" : "text"});
+await workspace.write("in.txt", "used up");
+await ctx.done({ task: (ctx.input.args as any).task });
+`;
+  const JUDGES = `import { ctx } from "@trama-dev/runtime";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+const { args, workspace } = ctx.input.args as any;
+const out = readFileSync(join(workspace, "out.txt"), "utf-8"), wanted = ({ a: "ALPHA", b: "BETA" } as any)[args.task];
+await ctx.done({ ok: out === wanted, score: out === wanted ? 1 : 0, notes: out === wanted ? "as it should be" : "out.txt is to be " + wanted + ", and is " + out });
+`;
+  const { fakeHome, at } = homeWith(t, { worker: { program: DOES(false), args: { task: "a" } }, judge: { program: JUDGES }, improve: { program: LOOP } });
+  const tasks = makeTempDir("trama-loop-tasks-");
+  t.after(() => cleanupTempDir(tasks));
+  for (const [task, text] of [["a", "alpha"], ["b", "beta"]]) {
+    mkdirSync(join(tasks, task, "deep"), { recursive: true });
+    writeFileSync(join(tasks, task, "in.txt"), text);
+    writeFileSync(join(tasks, task, "deep", "kept.txt"), "with the rest");
+  }
+  const prompts = [];
+  const original = llm.ask;
+  // (An update's candidate is validated in the worker's own project, where no workspace is: this one would fail there. It is given one that passes — as a harness has its own small piece of work.)
+  const BETTER = `import { ctx, workspace } from "@trama-dev/runtime";
+const text = await workspace.read("in.txt").catch(() => "");
+await workspace.write("out.txt", text.toUpperCase()).catch(() => {});
+await workspace.write("in.txt", "used up").catch(() => {});
+await ctx.done({ task: (ctx.input.args as any).task });
+`;
+  llm.ask = async (prompt) => { prompts.push(prompt); return BETTER; };
+  t.after(() => { llm.ask = original; });
+  const round = (args) => withEnv({ HOME: fakeHome }, () => quietly(() =>
+    runProgram({ projectDir: at("improve"), args: { project: "worker", check: "judge", inputs: [{ task: "a" }, { task: "b" }], runs: 2, from: join(tasks, "{task}"), ...args }, label: "improve", timeout: 90_000 })));
+
+  // (Something is in the way where a copy is to be — what a round that was stopped left there: the copy is made in its place, not into it.)
+  mkdirSync(join(at("improve"), "work", "v2-0-0"), { recursive: true });
+  writeFileSync(join(at("improve"), "work", "v2-0-0", "stale.txt"), "left by a round that was stopped");
+
+  const { result: ran, messages } = await round({});
+  assert.deepEqual({ ...ran.result, why: "" }, { kept: true, from: 1, to: 2, before: { ok: 0, of: 4, score: 0 }, after: { ok: 4, of: 4, score: 1 }, why: "" }, messages.join("\n"));
+  // Every run was the worker's, in a place of its own — eight runs, eight places — and each was judged where it had worked.
+  const runs = journalsOf(at("worker")).filter((journal) => journal[0].purpose === "run");
+  assert.deepEqual([runs.length, new Set(runs.map((journal) => journal[0].workspace)).size, linesOf(at("worker")).map((line) => [line.version, line.check.ok])],
+    [8, 8, [[1, false], [1, false], [1, false], [1, false], [2, true], [2, true], [2, true], [2, true]]]);
+  // (Each under the loop's own project, by a name that says which run it was for: the version, the input, the count.)
+  assert.deepEqual(runs.map((journal) => journal[0].workspace.slice(join(realpathSync(at("improve")), "work").length)), ["/v0-0-0", "/v0-0-1", "/v0-1-0", "/v0-1-1", "/v2-0-0", "/v2-0-1", "/v2-1-0", "/v2-1-1"]);
+  // What the copies were made from is as it was, and of the copies nothing is left.
+  assert.deepEqual([readFileSync(join(tasks, "a", "in.txt"), "utf-8"), readFileSync(join(tasks, "b", "in.txt"), "utf-8"), existsSync(join(at("improve"), "work")) ? readdirSync(join(at("improve"), "work")) : []], ["alpha", "beta", []]);
+  assert.match(prompts[0], /- started with \{"task":"b"\}: out\.txt is to be BETA, and is beta/);
+
+  // A round more finds every verdict on record — where a run worked is no part of what it was started with — and runs nothing.
+  const { result: again } = await round({});
+  assert.deepEqual([again.result.kept, again.result.before, linesOf(at("worker")).length, prompts.length], [false, { ok: 4, of: 4, score: 1 }, 8, 1]);
+  // And the first round, replayed, goes as it went: no copy is made for it, and nothing run.
+  const journals = readdirSync(join(at("improve"), "logs", "journal")).sort();
+  const { result: replay } = await withEnv({ HOME: fakeHome }, () => quietly(() => replayProgram({ projectDir: at("improve"), run: journals[0].replace(/\.jsonl$/, "") })));
+  assert.deepEqual([replay.same, replay.sameEnd, replay.left ?? null, linesOf(at("worker")).length], [true, true, null, 8]);
+
+  // What cannot be copied from is said, and so is a place that an input has no word for.
+  for (const [from, why] of [[join(tasks, "nowhere", "{task}"), /A fresh copy of .*nowhere\/a could not be made/], [join(tasks, "{name}"), /"from" has \{name\}, and an input has no such argument to put there\./]]) {
+    writeFileSync(join(at("worker"), "program.ts"), DOES(false)); // (another program: nothing of it is on record)
+    const { result: refused } = await round({ from });
+    assert.equal(refused.status, "failed", from);
+    assert.match(journalsOf(at("improve")).at(-1).findLast((record) => record.kind === "exit").stderr, why);
+  }
 });

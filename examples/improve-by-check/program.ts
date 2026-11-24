@@ -8,9 +8,11 @@
 // nowhere else. It is a starting point, to be copied and changed.
 //
 // It is for a project that is given arguments and ends with a result: its runs are made in place, one after
-// another. It is not for a project that is itself the work — a codebase that one run changes for good.
+// another. A run that uses up what it works on — a harness, doing a task in a codebase — is given a fresh copy
+// of it each time (`from`): the project then works in its run's workspace, and is itself left as it is.
 
-import { ctx } from "@trama-dev/runtime";
+import { join } from "node:path";
+import { ctx, tools } from "@trama-dev/runtime";
 import { inputMarkOf, readHistory, resolveProject, rollbackProject, runProgram, updateProject } from "@trama-dev/runtime/runner";
 
 type Input = Record<string, unknown>;
@@ -31,7 +33,10 @@ const better = (is: Tally, was: Tally): boolean => is.ok > was.ok || (is.ok === 
 //   runs      how many runs of each input (1). One run does not rank two versions: the same program, on the
 //             same input, is found good one time and not the next.
 //   ask       what is wanted, in words — beside what was found wanting, or where nothing was.
-const given = ctx.input.args as { project?: unknown; check?: unknown; inputs?: unknown; heldBack?: unknown; runs?: unknown; ask?: unknown };
+//   from      what a run works on, where that is not the project itself: a directory, copied afresh for every run
+//             and handed to it as its workspace (and to the judge, as where the work is). `{name}` in it stands
+//             for the input's argument of that name: from=/tasks/{task}, for inputs that say which task.
+const given = ctx.input.args as { project?: unknown; check?: unknown; inputs?: unknown; heldBack?: unknown; runs?: unknown; ask?: unknown; from?: unknown };
 const listOf = (what: unknown, name: string): Input[] => {
   const list: unknown = typeof what === "string" ? JSON.parse(what) : what ?? [];
   if (!Array.isArray(list) || list.some((each) => each === null || typeof each !== "object" || Array.isArray(each))) throw new Error(`"${name}" is to be a list of arguments: [{ … }, { … }].`);
@@ -41,6 +46,7 @@ const { project, check } = given;
 const inputs = listOf(given.inputs, "inputs"), heldBack = listOf(given.heldBack, "heldBack");
 const runs = Number(given.runs ?? 1);
 const ask = typeof given.ask === "string" && given.ask.trim() !== "" ? given.ask.trim() : undefined;
+const from = typeof given.from === "string" && given.from.trim() !== "" ? given.from.trim() : undefined;
 if (typeof project !== "string" || typeof check !== "string") throw new Error('It is not said which project to improve, or which checks it: "project" and "check", each by its name.');
 if (inputs.length + heldBack.length === 0) throw new Error('It is not said what to run the project on: "inputs", a list of arguments.');
 if (!Number.isInteger(runs) || runs < 1) throw new Error('"runs" is how many runs of each input: 1 or more.');
@@ -51,10 +57,31 @@ const all = [...inputs, ...heldBack];
 /** A check that could not be made: there is nothing to decide by. */
 class NoVerdict extends Error {}
 
+const quoted = (text: string) => `'${text.replaceAll("'", `'\\''`)}'`;
+/**
+ * A place for one run to work in: a fresh copy of what `from` names for this input, made in this project under
+ * `name` — or none, where runs are of the project in place. (Made by a command, which is on this run's record: a
+ * replay of the round makes no copy. And named by what the run is — not by chance — so that a replay asks the same.)
+ */
+async function fresh(input: Input, name: string): Promise<string | undefined> {
+  if (from === undefined) return undefined;
+  const source = from.replace(/\{(\w+)\}/g, (_, key: string) => {
+    const value = input[key];
+    if (typeof value !== "string" && typeof value !== "number") throw new Error(`"from" has {${key}}, and an input has no such argument to put there.`);
+    return String(value);
+  });
+  const made = await tools.shell(`rm -rf ${quoted(name)} && mkdir -p work && cp -R ${quoted(source)} ${quoted(name)}`, { timeout: 600_000 });
+  if (made.exitCode !== 0) throw new Error(`A fresh copy of ${source} could not be made: ${made.stderr.trim()}`);
+  return join(process.cwd(), name);
+}
+
 /**
  * The verdicts on the project's program as it is now: `runs` of them for each input. Taken from the project's
- * history where they are there — runs of this version, started with this input, checked by this judge as it is
+ * history where they are there — runs of this program, started with this input, checked by this judge as it is
  * now — and by a run where they are not. So a round after another pays for no run that was made.
+ *
+ * "This program" is told by its text, not by its version's number: a version gone back to is the program it was
+ * under a new number, and the verdicts on it are its verdicts still.
  */
 async function verdicts(): Promise<Verdict[][]> {
   // (The latest runs are enough, and a call's record has room for no more than some.)
@@ -62,16 +89,23 @@ async function verdicts(): Promise<Verdict[][]> {
   // The judge as it is now: a verdict on record is its own where the judge's program was this one. (It is on record once it has checked anything.)
   const judging = await readHistory(judge, { runs: 0 });
   const judgedBy = judging.versions.find((version) => version.version === judging.current)?.sha256;
+  // The versions that are the program as it is now: the one it is, and any before it with the same text.
+  const text = history.versions.find((version) => version.version === history.current)?.sha256;
+  const same = new Set(history.versions.filter((version) => text !== undefined && version.sha256 === text).map((version) => version.version));
   const each: Verdict[][] = [];
-  for (const input of all) {
+  for (const [n, input] of all.entries()) {
     const mark = await inputMarkOf(dir, input);
     const found: Verdict[] = history.current === undefined || judgedBy === undefined ? [] : history.runs
-      .filter((run) => run.version === history.current && run.ended === undefined && run.input === mark)
+      .filter((run) => run.version !== undefined && same.has(run.version) && run.ended === undefined && run.input === mark)
       .flatMap(({ check: said }) => (said && said.by === judge && said.program === judgedBy && said.ok !== undefined ? [{ ok: said.ok, score: said.score ?? 0, notes: said.notes }] : []))
       .slice(-runs);
     while (found.length < runs) {
       // (Not fixed where it fails: a fix would be another version, in the middle of what is held against each other.)
-      const ran = await runProgram({ projectDir: dir, args: input, checkWith: judge, maxRepairAttempts: 0 });
+      const work = `work/v${history.current ?? 0}-${n}-${found.length}`;
+      const workspaceDir = await fresh(input, work);
+      const ran = await runProgram({ projectDir: dir, args: input, checkWith: judge, maxRepairAttempts: 0, ...(workspaceDir !== undefined && { workspaceDir }) });
+      // (The judge has seen it by now: a check is part of the run. The copy has done what it was for.)
+      if (workspaceDir !== undefined) await tools.shell(`rm -rf ${quoted(work)}`, { timeout: 600_000 });
       if (ran.status !== "done") found.push({ ok: false, score: 0, notes: `The run ${ran.status}: ${(ran.reason ?? "").split("\n")[0]}` });
       else if (ran.check?.ok === undefined) throw new NoVerdict(ran.check?.error ?? "the run was not checked.");
       else found.push({ ok: ran.check.ok, score: ran.check.score ?? 0, notes: ran.check.notes });

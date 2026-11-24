@@ -11,6 +11,16 @@ cp examples/coding-harness/program.ts ~/.trama/projects/my-codebase/program.ts
 trama run my-codebase --arg task="Make the failing tests pass. Do not change the tests."
 ```
 
+Or keep it a project of its own, and point a run of it at the codebase — its workspace:
+
+```ts
+await runProgram({ projectDir: resolveProject("my-harness"), workspaceDir: "/path/to/a/codebase", args: { task: "Make the failing tests pass." } });
+```
+
+(`--arg model=provider/model` has another model do the work than the project's own — a small one, say, under a harness that a large one wrote.)
+
+Where a run has a workspace the work is done there, and the project the harness is the program of is left as it is. One harness then does many pieces of work; each is a run of *it*, on its record and of one of its versions — which is what lets it be held against another version of itself, on the same pieces of work (`examples/improve-by-check`, with `from`).
+
 What it did is in the run's journal — `trama journal my-codebase` — a line for each request to the model and for each thing a tool did, and what each request used.
 
 It is a starting point, not the best harness there is. What it does about a long conversation, once a request has read more than it is to (`--arg forgetAt=…`, in tokens):
