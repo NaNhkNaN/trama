@@ -1,5 +1,12 @@
 {
-  "description": "A harness that fixes programs: a model is given the program that failed and what it failed with, and tools to look and to try a fix, until it has one or says there is none. Named as a run's repairWith; it is given what a runner hands a fixer.",
+  "description": "A harness that fixes programs: a model is given the program that failed and what it failed with, and tools to look and to try a fix, until it has one or says there is none. Named as a run's repairWith.",
+  "parameters": {
+    "program": "string: the program that failed, whole — handed by the runner to whoever is asked for a fix, as all of these are",
+    "error": "string: what it failed with",
+    "journal?": "string: the path of the failed run's record, a line of JSON for each call",
+    "kept?": "boolean: whether what is changed beside the program, in the copy that is the workspace, is kept with the fix",
+    "types?": "string: the API a program has, as its author is shown it"
+  },
   "returns": {
     "program?": "string: the program, fixed",
     "unfixable?": "string: why there is no fix, where the model says there is none",

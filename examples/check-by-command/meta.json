@@ -1,5 +1,15 @@
 {
-  "description": "A checker: says whether a run's work is good by a command, run in a copy of the project as the run left it. Named as a run's checkWith; its own arguments are `command` (npm test) and `seconds` (600), beside what a runner hands a checker.",
+  "description": "A checker: says whether a run's work is good by a command, run in a copy of the project as the run left it. Named as a run's checkWith.",
+  "parameters": {
+    "command?": "string: the command that says whether the work is good (npm test) — the checker's own, said in its meta.json",
+    "seconds?": "number: how long the command may take (600) — the checker's own too",
+    "result?": "json: what the run ended with — handed by the runner to whoever checks a run, as all that follows is",
+    "args?": "json: what the run was asked with",
+    "journal?": "string: the path of the run's record",
+    "run?": "string: the run's id",
+    "used?": "json: what the run had used of a model when its check began: { calls, tokens, cost }",
+    "workspace?": "string: where the run worked, where that was not its project"
+  },
   "returns": {
     "ok": "boolean: whether the command ended well, in time",
     "notes": "string: how it ended, and the end of what it printed"

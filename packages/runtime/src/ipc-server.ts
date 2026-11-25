@@ -406,7 +406,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, rep
       ({ id, ...asked }, connectionClosed, { seq }) => lasting(id, connectionClosed, stop => make({ kind: "create", ...asked }, stop, seq)),
     ),
     "/project/update": route(
-      { name: "string", prompt: "string", from: "optional number", install: "optional boolean", id: "optional string" },
+      { name: "string", prompt: "string", from: "optional number", install: "optional boolean", updateWith: "optional string", id: "optional string" },
       ({ id, ...asked }, connectionClosed, { seq }) => lasting(id, connectionClosed, stop => make({ kind: "update", ...asked }, stop, seq)),
     ),
     // A version handed over as a text, to be kept beside the program: validated and put on record by the runner, as an update's is.

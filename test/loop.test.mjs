@@ -310,9 +310,9 @@ test("the loop stops without deciding where there is nothing to decide by — no
   // What it is to be told: which project, which judge — by what it says it takes (its meta.json), a round without them
   // is not begun: no program is started for it, and nothing is on record.
   for (const [args, why] of [
-    [{ project: undefined }, /The arguments do not fit what .*improve takes — project: expected string, got undefined\. It takes: project, check, inputs\?, heldBack\?, runs\?, ask\?, from\?, by\?, margin\?, confirm\?, tell\?\./],
+    [{ project: undefined }, /The arguments do not fit what .*improve takes — project: expected string, got undefined\. It takes: project, check, inputs\?, heldBack\?, runs\?, ask\?, from\?, by\?, margin\?, confirm\?, tell\?, write\?\./],
     [{ check: undefined }, /improve takes — check: expected string, got undefined\./],
-    [{ projct: "words" }, /improve takes — it takes no argument "projct"\./],
+    [{ project: undefined, projct: "words" }, /improve takes — project: expected string, got undefined\. Not taken, and left out: "projct"\./],
   ]) {
     const begun = journalsOf(never.at("improve")).length;
     await assert.rejects(never.round({ inputs: [A], ...args }), why, JSON.stringify(args));
@@ -655,6 +655,12 @@ test("a round is told what the rounds before it tried, from the program as it is
   await much.round({ inputs: two });
   assert.deepEqual([much.prompts[2].match(/\n- version \d+/g), much.prompts[2].split("// the last line of it").length - 1], [["\n- version 2", "\n- version 3"], 1]);
 
+  // Of what was tried, the five latest are told: a writer has no use for all of it.
+  const many = loopOver(t, first, [1, 2, 3, 4, 5, 6].map((n) => SAYS([`w${n}`])).concat(SAYS([])));
+  for (let n = 0; n < 6; n++) await many.round({ inputs: two });
+  await many.round({ inputs: two });
+  assert.deepEqual(many.prompts[6].match(/\n- version \d+/g), [3, 4, 5, 6, 7].map((n) => `\n- version ${n}`));
+
   // The rounds, replayed, go as they went: what was read of the versions is on the record.
   const journals = readdirSync(join(it.at("improve"), "logs", "journal")).sort();
   for (const run of [journals[1], journals[3]]) {
@@ -804,4 +810,24 @@ test("a run that failed is made again, once, and what the second comes to is wha
   const { result: mended } = await broken.round({ inputs: two });
   assert.deepEqual([mended.result.kept, mended.result.before, mended.result.after, mended.result.remade], [true, { ok: 1, of: 2, score: 0.5 }, { ok: 2, of: 2, score: 1 }, 1]);
   assert.match(broken.prompts[0], /found wanting:\n- started with \{"word":"cd"\}: The run failed, and failed when it was made again: [^]*the model could not be reached/);
+});
+
+// --- who writes ---
+
+test("write: the update is written by the project that is named, and not by pi's agent — judged and kept as any is", async (t) => {
+  // A writer with no model in it: it knows one more word. (Run with nothing to write, as a validation of it would run it, it ends.)
+  const WRITER = `import { ctx } from "@trama-dev/runtime";
+const { prompt, program } = ctx.input.args as { prompt?: string; program?: string };
+if (prompt === undefined || program === undefined) await ctx.done({});
+else await ctx.done({ program: program.replace('["a"]', '["a","b"]') + "// asked: " + prompt.split("\\n")[0] + "\\n" });
+`;
+  const home = homeWith(t, { words: { program: SAYS(["a"]), args: { word: "a" } }, judge: { program: JUDGE }, improve: { program: LOOP, more: LOOP_SAYS }, writer: { program: WRITER } });
+  const original = llm.ask;
+  llm.ask = async () => assert.fail("pi's agent was asked for the update");
+  t.after(() => { llm.ask = original; });
+  const { result: ran } = await withEnv({ HOME: home.fakeHome }, () => quietly(() =>
+    runProgram({ projectDir: home.at("improve"), args: { project: "words", check: "judge", inputs: [A, B], write: "writer" }, label: "improve", timeout: 60_000 })));
+  assert.deepEqual({ ...ran.result, why: "" }, { kept: true, from: 1, to: 2, before: { ok: 1, of: 2, score: 0.5 }, after: { ok: 2, of: 2, score: 1 }, why: "" });
+  assert.equal(readFileSync(join(home.at("words"), "program.ts"), "utf-8"), `${SAYS(["a"]).replace('["a"]', '["a","b"]')}// asked: Runs of the program as it is were checked, and these were found wanting:\n`);
+  assert.deepEqual(linesOf(home.at("writer")).map((line) => [line.for, line.status]), [["update", "done"]]);
 });

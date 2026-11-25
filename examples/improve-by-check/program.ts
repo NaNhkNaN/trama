@@ -55,7 +55,10 @@ const betterByScore = (is: Tally, was: Tally, isGood: number, wasGood: number, m
 //             looked best — it is to be kept for more than those.
 //   tell      which runs the writer is told of: `wanting` (those found not good) or `all` (what the judge said
 //             of the good ones too — where what is wanted is not that they be good, that is all there is to go by).
-const given = ctx.input.args as { project?: unknown; check?: unknown; inputs?: unknown; heldBack?: unknown; runs?: unknown; ask?: unknown; from?: unknown; by?: unknown; margin?: unknown; confirm?: unknown; tell?: unknown };
+//   write     who writes the update: a project, by its name (see examples/update-by-harness) — else whoever the
+//             configuration names, or pi's agent. (Who writes is told what this loop tells, in the words it tells it:
+//             what more a writer may read — the project's history, the records of its runs — is for it to be told there.)
+const given = ctx.input.args as { project?: unknown; check?: unknown; inputs?: unknown; heldBack?: unknown; runs?: unknown; ask?: unknown; from?: unknown; by?: unknown; margin?: unknown; confirm?: unknown; tell?: unknown; write?: unknown };
 const listOf = (what: unknown, name: string): Input[] => {
   const list: unknown = typeof what === "string" ? JSON.parse(what) : what ?? [];
   if (!Array.isArray(list) || list.some((each) => each === null || typeof each !== "object" || Array.isArray(each))) throw new Error(`"${name}" is to be a list of arguments: [{ … }, { … }].`);
@@ -70,6 +73,7 @@ if (typeof project !== "string" || typeof check !== "string") throw new Error('I
 if (inputs.length + heldBack.length === 0) throw new Error('It is not said what to run the project on: "inputs", a list of arguments.');
 if (!Number.isInteger(runs) || runs < 1) throw new Error('"runs" is how many runs of each input: 1 or more.');
 const by = given.by ?? "good", tell = given.tell ?? "wanting";
+const write = typeof given.write === "string" && given.write.trim() !== "" ? given.write.trim() : undefined;
 const margin = Number(given.margin ?? 0), confirm = Number(given.confirm ?? 0);
 if (by !== "good" && by !== "score") throw new Error('"by" is how a version is found the better: good, or score.');
 if (!(margin >= 0) || !Number.isFinite(margin)) throw new Error('"margin" is by how much a mean score is to be higher: 0 or more.');
@@ -312,7 +316,7 @@ async function round(): Promise<Record<string, unknown>> {
       good.length > 0 && `${wanting.length > 0 ? "And these" : checked} were found good — what the judge said of each:\n${good.join("\n")}`,
       tried.length > 0 && `Tried before, from the program as it is — none was kept. Write something else:\n${tried.join("\n")}`,
       notJudged.length > 0 && `Written before, from the program as it is, and not judged: a run of each failed, and failed when it was made again. Whether that was the version's doing is not known — where it was, do not write that again:\n${notJudged.join("\n")}`,
-    ].filter(Boolean).join("\n\n"), { install: false }));
+    ].filter(Boolean).join("\n\n"), { install: false, ...(write !== undefined && { updateWith: write }) }));
   } catch (err) {
     return { kept: false, from, before: was, why: `No update came of the asking: ${(err as Error).message}` };
   }

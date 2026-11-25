@@ -8,13 +8,13 @@ import { piVersion } from "./pi-adapter.js";
 import { stripCodeFences } from "./agent.js";
 import { onAbort, throwIfAborted } from "./abort.js";
 import type { AgentUsage } from "./agent-backend.js";
-import { createMeter } from "./budget.js";
+import { createMeter, type Meter } from "./budget.js";
 import { LATEST_LOG_PATH } from "./context.js";
 import { readProjectMeta } from "./meta.js";
 import { ensureProjectScaffold, loadConfig, loadProjectConfig, loadState, namesAPath, projectNamed } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import {
-  validateProgram, installValidatedProgram, keepBeside, writtenFrom,
+  validateProgram, installValidatedProgram, keepBeside, writtenFrom, writtenBy,
   withTempDir, prepareProject, shownPaths, type Prepared, RUNTIME_TYPES, runProgram as runHere, replayProgram as replayHere, replayAll as replayAllHere, rollbackTo, whyNotReplaceable,
   inputMarkOf as markHere,
   tagged, failureOf, type AskedToMake, type Making,
@@ -70,7 +70,7 @@ const making: Making = async (request, asked) =>
     : request.kind === "version" ? addVersionHere(request.name, request.source, { parent: request.parent, detail: request.detail, signal: asked.signal }, asked)
     : request.kind === "create"
       ? createHere(request.name, request.prompt, { model: request.model, args: request.args, signal: asked.signal }, asked)
-      : updateHere(request.name, request.prompt, { from: request.from, install: request.install, signal: asked.signal }, asked);
+      : updateHere(request.name, request.prompt, { from: request.from, install: request.install, updateWith: request.updateWith, signal: asked.signal }, asked);
 
 /** Run a project to an outcome: done, yielded, or failed. */
 export async function runProgram(options: RunOptions): Promise<ProgramResult> {
@@ -479,11 +479,22 @@ const budgetOf = (config: TramaConfig, asked: Asked) => (asked.above ? undefined
  * when that is spent — once, and where a run's program asked, once for that
  * run, in the run's own words: a program may ask for many projects.
  */
-function backendFor(config: TramaConfig, asked: Asked) {
+function backendFor(config: TramaConfig, asked: Asked, meter: Meter = meterFor(config, asked)) {
   const say = (why: string) => console.warn(tagged(asked.label, `[trama] ${why}`));
   const { above } = asked;
   // (Asked for by a run's program, the project is written by an agent of that run: with the run's variables.)
-  return createBackend(config, createMeter(budgetOf(config, asked), above), above ? saysOnce(above, (why) => say(above.spent() ?? why)) : say, asked.env);
+  return createBackend(config, meter, above ? saysOnce(above, (why) => say(above.spent() ?? why)) : say, asked.env);
+}
+
+/** The count a create or an update is made under: writing the program, validating it, and a fix of it in between — whoever is asked for each. */
+const meterFor = (config: TramaConfig, asked: Asked): Meter => createMeter(budgetOf(config, asked), asked.above);
+
+/** Who fixes a candidate that fails its validation, where the configuration names a project for it: found before anything is written. */
+function fixerOf(config: TramaConfig): string | undefined {
+  if (config.repairWith === undefined || config.maxRepairAttempts <= 0) return undefined;
+  const fixer = projectNamed(config.repairWith);
+  if (!existsSync(join(fixer, "meta.json"))) throw new Error(`repairWith names no project: there is none at ${fixer}`);
+  return fixer;
 }
 
 /** Carry what the agent made beside a program into the project the program is now in, and say what that was. */
@@ -519,6 +530,7 @@ function keepPrepared(prepared: Prepared, label?: string): void {
 async function validateCandidate(
   projectDir: string, backend: Backend, candidate: string, config: TramaConfig, prepared: Prepared,
   wrote: AgentUsage[], signal: AbortSignal | undefined, asked: Asked, byItself = false,
+  more: { meter?: Meter; writtenBy?: { by: string; used: { calls: number; tokens: number; cost: number } } } = {},
 ): Promise<{ validated: Awaited<ReturnType<typeof validateProgram>>; kept: boolean }> {
   let as: string | undefined, alone: string | undefined;
   if (config.agentChanges === "keep" && !byItself) {
@@ -543,6 +555,9 @@ async function validateCandidate(
     label: asked.label,
     env: asked.env,
     askedFor: asked.parent && asked.started && { parent: asked.parent, started: asked.started },
+    // (A candidate that fails is fixed by whoever the configuration names to fix: a project, where it names one.)
+    repairWith: fixerOf(config),
+    ...more,
   });
   return { validated, kept: as !== undefined && validated.alone === undefined };
 }
@@ -581,19 +596,33 @@ async function writeValidateInstall(projectDir: string, how: {
   from?: { text: string; version: number };
   /** Of an update: kept beside the program, on record, and not made the program (`parent`: the version it is written from). */
   beside?: { parent: number | null };
+  /** The count all of it is made under (the backend's). */
+  meter?: Meter;
+  /** Of an update: the project that writes it, in the place of pi's agent — and the program it writes from (see `writtenBy`). */
+  writer?: { project: string; program: string };
 }): Promise<number> {
   const { config, backend, stillTheProject, signal, asked } = how;
   const wrote: AgentUsage[] = [];
   return withTempDir("trama-gen-", async (privateDir) => {
     const prepared = prepareProject(projectDir, privateDir, how.from?.text);
-    const candidate = await generateProgram(backend, prepared, how.ask, how.system, wrote, signal, asked.label);
+    // Who writes: a project, where one is named — or pi's agent, at work in the copy with its own tools.
+    let candidate: string, by: { by: string; used: { calls: number; tokens: number; cost: number } } | undefined;
+    if (how.writer) {
+      const meter = how.meter ?? meterFor(config, asked), before = meter.counted();
+      // (What it makes beside the program is kept where an agent's would be: not of a version that is kept beside the program.)
+      candidate = await writtenBy(how.writer.project, { prompt: how.prompt, program: how.writer.program, kept: config.agentChanges === "keep" && !how.beside, copy: prepared.copy }, { ...asked, signal, meter });
+      const now = meter.counted();
+      by = { by: how.writer.project, used: { calls: now.calls - before.calls, tokens: now.tokens - before.tokens, cost: now.cost - before.cost } };
+    } else {
+      candidate = await generateProgram(backend, prepared, how.ask, how.system, wrote, signal, asked.label);
+    }
     stillTheProject();
     how.written?.(candidate);
 
     shownUnder(asked.label).log(how.validating);
     // (A version that is to be kept beside the program is the program's text and no more: it is validated in the
     // project as it is, where it will be run — not with what its writer made beside it, which is not kept.)
-    const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, signal, asked, how.beside !== undefined);
+    const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, signal, asked, how.beside !== undefined, { meter: how.meter, ...(by && { writtenBy: by }) });
     stillTheProject();
     if (how.beside) return keepBeside(projectDir, validated, how.prompt, how.beside.parent);
     const version = installValidatedProgram(projectDir, validated, how.reason, how.prompt, how.from?.version);
@@ -627,15 +656,26 @@ export async function createProject(
  * can be run by its number (`runProgram({ version })`) and gone to
  * (`rollbackProject`) — and not made the program: the project is as it was.
  * So a version is tried before anything is put in the program's place.
+ *
+ * `updateWith`: the project that writes the program, in the place of pi's
+ * agent — by its name among the user's projects, or a path. Without one,
+ * the configuration's `updateWith`; without that, pi's agent. It is run
+ * with a copy of the project as its workspace, handed `{ prompt, program,
+ * kept, types, copy }`, and answers `{ program }` (see
+ * examples/update-by-harness). What is done round the writing — the copy,
+ * the validation, the record, what is installed — is the runner's whoever
+ * writes.
  */
 export async function updateProject(
   name: string,
   prompt: string,
-  options?: { from?: number; install?: boolean; signal?: AbortSignal },
+  options?: { from?: number; install?: boolean; updateWith?: string; signal?: AbortSignal },
 ): Promise<VersionMade> {
   const bridge = parentBridge();
   if (!bridge) return updateHere(name, prompt, options);
   const { signal, ...asked } = options ?? {};
+  // (A path a program names is named from where the program is: the runner does not share its working directory.)
+  if (typeof asked.updateWith === "string" && namesAPath(asked.updateWith)) asked.updateWith = projectNamed(asked.updateWith);
   return overBridge(bridge, "/project/update", withOptions({ name, prompt }, asked), signal);
 }
 
@@ -771,7 +811,7 @@ async function createHere(
 async function updateHere(
   name: string,
   prompt: string,
-  options?: { from?: number; install?: boolean; signal?: AbortSignal },
+  options?: { from?: number; install?: boolean; updateWith?: string; signal?: AbortSignal },
   asked: Asked = {},
 ): Promise<VersionMade> {
   const say = shownUnder(asked.label);
@@ -803,10 +843,21 @@ async function updateHere(
     const state = loadState(projectDir);
     const meta = readProjectMeta(projectDir);
     const config = loadProjectConfig(projectDir, meta);
-    const backend = backendFor(config, asked);
+    const meter = meterFor(config, asked);
+    const backend = backendFor(config, asked, meter);
+    // Who writes it: the project the call names, or the configuration — or, with neither, pi's agent.
+    const named = options?.updateWith ?? config.updateWith;
+    const writer = named === undefined ? undefined : projectNamed(named);
+    if (writer !== undefined && !existsSync(join(writer, "meta.json"))) throw new Error(`updateWith names no project: there is none at ${writer}`);
 
+    // What the project says it takes and gives is told to whoever writes its program: a writer that is a project has
+    // it in its copy (meta.json); pi's agent is told here. The program is held to it, and it is not the program's to change.
+    const says = { description: meta.description, parameters: meta.parameters, returns: meta.returns };
     const systemPrompt =
       getSystemPrompt(config.agentChanges === "keep") +
+      (says.parameters !== undefined || says.returns !== undefined
+        ? `\n\nWhat the project says it takes and gives (its meta.json): the program is held to it — a run's arguments are these and no others, and what the program ends with is to be of this shape — and it is not the program's to change.\n${JSON.stringify(says, null, 2)}`
+        : "") +
       `\n\nOriginal prompt: ${meta.input.prompt}` +
       `\n\nCurrent program.ts:\n${originalSource}` +
       (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : "");
@@ -820,7 +871,8 @@ async function updateHere(
       ask: `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
       system: systemPrompt,
       validating: "Validating updated program...",
-      config, backend, stillTheProject, signal: options?.signal, asked,
+      config, backend, stillTheProject, signal: options?.signal, asked, meter,
+      ...(writer !== undefined && { writer: { project: writer, program: originalSource } }),
     });
   } catch (err) {
     throw unchanged(err);

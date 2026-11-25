@@ -13,6 +13,9 @@ import {
   showHistory,
   rollbackProject,
   resolveProject,
+  addVersion,
+  describeProject,
+  describeProjects,
   failureOf,
 } from "@trama-dev/runtime/runner";
 
@@ -98,6 +101,14 @@ function parseBudget(caps: string[]): Record<string, number> | undefined {
   return Object.fromEntries(given);
 }
 
+/** A version, as an option names it: its number (as `trama history` shows it) — or none, where the option was not given. */
+function versionOf(option: string, given: string | undefined): number | undefined {
+  if (given === undefined) return undefined;
+  const version = Number(/^v?(\d+)$/.exec(given)?.[1] ?? NaN);
+  if (!Number.isSafeInteger(version) || version < 1) throw new Error(`${option} takes a version's number: 1 and up (got "${given}")`);
+  return version;
+}
+
 /** Wrap a command so any failure is reported as a one-line error with a non-zero exit. */
 function command<A extends unknown[]>(run: (...args: A) => Promise<void>) {
   return async (...args: A) => {
@@ -170,8 +181,39 @@ cli
 cli
   .command("update <name> <prompt>")
   .description("Update an existing program with new requirements")
-  .action(command(async (name: string, prompt: string) => {
-    await stoppable((signal) => updateProject(name, prompt, { signal }));
+  .option("--from <number>", "Write it from that version of the program, and not from the program as it is (see: trama history)")
+  .option("--beside", "Keep the new version beside the program, on record, and do not make it the program: run it with --at-version, go to it with rollback")
+  .option("--with <project>", "Have a project write it, and not pi's agent: its name, or a path")
+  .action(command(async (name: string, prompt: string, opts: { from?: string; beside?: boolean; with?: string }) => {
+    const from = versionOf("--from", opts.from);
+    await stoppable((signal) => updateProject(name, prompt, {
+      ...(from !== undefined && { from }), ...(opts.beside && { install: false }), ...(opts.with !== undefined && { updateWith: opts.with }), signal,
+    }));
+  }));
+
+cli
+  .command("add-version <name> <file>")
+  .description("Put a program you wrote yourself on record as a version of a project, beside its program: it is validated, and not installed (- for standard input)")
+  .option("--parent <number>", "The version it was written from: the program as it is, where none is named")
+  .option("--detail <text>", "What it was made for, in words")
+  .action(command(async (name: string, file: string, opts: { parent?: string; detail?: string }) => {
+    const parent = versionOf("--parent", opts.parent);
+    const source = readFileSync(file === "-" ? 0 : file, "utf-8");
+    const { version } = await stoppable((signal) => addVersion(name, source, { ...(parent !== undefined && { parent }), ...(opts.detail !== undefined && { detail: opts.detail }), signal }));
+    console.log(`Version ${version} of ${name} is on record, beside its program. Run with: trama run ${name} --at-version ${version}`);
+  }));
+
+cli
+  .command("describe [name]")
+  .description("Show what a project says of itself: what it is for, what a run of it takes and gives (every project, without a name)")
+  .option("--json", "As JSON, with what it takes and gives as JSON Schema too")
+  .action(command(async (name: string | undefined, opts: { json?: boolean }) => {
+    const said = name === undefined ? await describeProjects() : await describeProject(name);
+    if (opts.json) return console.log(JSON.stringify(said, null, 2));
+    const shape = (declared: unknown) => (declared === undefined ? "(it does not say)" : JSON.stringify(declared, null, 2).replace(/\n/g, "\n  "));
+    for (const each of Array.isArray(said) ? said : [said]) {
+      console.log(`${each.name} — ${each.description ?? "(it does not say what it is for)"}\n  takes: ${shape(each.parameters)}\n  gives: ${shape(each.returns)}`);
+    }
   }));
 
 cli

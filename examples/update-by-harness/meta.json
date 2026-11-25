@@ -1,0 +1,21 @@
+{
+  "description": "A writer: has a harness write a project's new program, in the copy of the project it is handed, and hands back what the harness left. Named as an update's updateWith.",
+  "parameters": {
+    "prompt?": "string: what is asked of the new version — handed by the runner to whoever writes an update, as the four that follow are",
+    "program?": "string: the program it is written from, whole (it is program.ts in the copy, too)",
+    "kept?": "boolean: whether what is made beside the program, in the copy, is kept with it",
+    "types?": "string: the API a program has, as its author is shown it",
+    "copy?": "string: where the copy of the project is — the writer's workspace — for a run it asks for to be given it",
+    "harness?": "string: the project that does the work, by its name among the user's (coding-harness) — the writer's own, said in its meta.json, as the three that follow are",
+    "model?": "string: the model the harness is to ask, as provider/model — else the harness's own",
+    "turns?": "number: how often the harness asks its model at most",
+    "seconds?": "number: how long the harness may take — else its own project's time"
+  },
+  "returns": {
+    "program?": "string: the whole of the new program",
+    "said?": "string: what the harness said it did",
+    "nothing?": "string: why nothing was written, where it was run with nothing to write"
+  },
+  "input": { "prompt": "A writer of updates: named where an update is asked for (updateWith).", "args": {} },
+  "createdAt": "2026-11-25T00:00:00.000Z"
+}

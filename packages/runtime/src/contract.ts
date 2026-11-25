@@ -80,35 +80,51 @@ const why = (err: unknown): string => {
 /**
  * What a run of a project is started with: the arguments it was asked with,
  * laid over those the project's own meta.json says — and, where the project
- * says what it takes, held to that. Throws where they do not fit: a field
- * that is missing or of another kind, or an argument the project does not
- * take at all (a name written wrongly, most often, which is not to be
- * passed over in silence and paid for).
+ * says what it takes, held to that: the declared fields and no others, as a
+ * tool's arguments are held. Throws where a declared field is missing or of
+ * another kind.
+ *
+ * **An argument the project does not take is left out, and not refused**
+ * (`leftOut`: their names, for whoever is to say so). Whoever starts a run
+ * may hand it more than its program reads — a runner hands a checker and a
+ * fixer what it has, and may have more one day; an input may carry what is
+ * for its judge — and a program is not to lean on what its project does not
+ * say it takes. That it was left out is said (see runProject), for it is
+ * also what a name written wrongly looks like.
  *
  * An argument written as text where a number or a boolean is declared is
  * read as the one it writes: from a command line every argument is text.
+ *
+ * `asked`: the arguments as they were asked — those left out among them —
+ * with what was held in the place of what it was held from: what a checker
+ * of the run is handed, which judges what was asked for.
  */
-export function startedWith(projectDir: string, args?: Record<string, unknown>, meta: ProjectMeta = readProjectMeta(projectDir)): Record<string, unknown> | undefined {
+export function fitted(projectDir: string, args?: Record<string, unknown>, meta: ProjectMeta = readProjectMeta(projectDir)): { args: Record<string, unknown> | undefined; leftOut: string[]; asked: Record<string, unknown>; takes?: string } {
   const given = args === undefined ? meta.input.args : { ...(meta.input.args ?? {}), ...args };
   const { parameters } = contractOf(projectDir, meta);
-  if (!parameters) return given;
-  const taken = parameters.shape.fields.map(([name]) => (parameters.shape.mayBeAbsent.includes(name) ? `${name}?` : name));
-  const refuse = (what: string): Error => new Error(`The arguments do not fit what ${projectDir} takes — ${what}. It takes: ${taken.join(", ") || "nothing"}.`);
-  const read: Record<string, unknown> = {};
+  if (!parameters) return { args: given, leftOut: [], asked: { ...given } };
+  const takes = parameters.shape.fields.map(([name]) => (parameters.shape.mayBeAbsent.includes(name) ? `${name}?` : name)).join(", ") || "nothing";
+  const read: Record<string, unknown> = {}, leftOut: string[] = [];
   for (const [name, value] of Object.entries(given ?? {})) {
     const field = parameters.shape.fields.find(([has]) => has === name);
-    if (!field) throw refuse(`it takes no argument ${JSON.stringify(name)}`);
+    if (!field) { leftOut.push(name); continue; }
     read[name] = value;
     if (typeof value !== "string") continue;
     if (field[1] === "number" && value.trim() !== "" && Number.isFinite(Number(value))) read[name] = Number(value);
     if (field[1] === "boolean" && (value === "true" || value === "false")) read[name] = value === "true";
   }
   try {
-    return conform(read, parameters.shape) as Record<string, unknown>;
+    const held = conform(read, parameters.shape) as Record<string, unknown>;
+    return { args: held, leftOut, asked: { ...given, ...held }, takes };
   } catch (err) {
-    throw refuse(why(err));
+    const left = leftOut.length > 0 ? ` Not taken, and left out: ${leftOut.map((name) => JSON.stringify(name)).join(", ")}.` : "";
+    throw new Error(`The arguments do not fit what ${projectDir} takes — ${why(err)}.${left} It takes: ${takes}.`);
   }
 }
+
+/** What a run's program is given of what the run was started with (see `fitted`). */
+export const startedWith = (projectDir: string, args?: Record<string, unknown>, meta?: ProjectMeta): Record<string, unknown> | undefined =>
+  fitted(projectDir, args, meta).args;
 
 /** What a run gives, held to what its project says it gives: the declared fields and no others. Throws where it does not fit. */
 export function heldResult(projectDir: string, contract: Contract, result: unknown): unknown {

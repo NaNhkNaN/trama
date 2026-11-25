@@ -11,7 +11,8 @@
     "by?": "string: how a version is found the better — good (how often, then the score) or score (the score, provided it is no less often good)",
     "margin?": "number: by how much a mean score has to be higher (0)",
     "confirm?": "number: how many times the runs that decide are made again where a version passes (0)",
-    "tell?": "string: which runs the writer is told of — wanting, or all"
+    "tell?": "string: which runs the writer is told of — wanting, or all",
+    "write?": "string: the project that writes the update, by its name (see examples/update-by-harness) — else whoever the configuration names, or pi's agent"
   },
   "returns": {
     "kept": "boolean: whether a new version was made the program",

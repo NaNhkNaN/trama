@@ -54,8 +54,8 @@ test("a run whose arguments do not fit what its project takes is not begun: no p
     [{ word: "a", times: "three" }, /takes — times: expected number, got string\./],
     [{ word: "a", times: "" }, /takes — times: expected number, got string\./],
     [{ word: "a", loud: "yes" }, /takes — loud: expected boolean, got string\./],
-    // An argument it does not take is a mistake of whoever gave it — a name written wrongly, most often — and is not passed over.
-    [{ word: "a", time: 3 }, new RegExp(`takes — it takes no argument "time"\\. ${TAKEN}$`)],
+    // (A name written wrongly, of an argument it is to have: the refusal says what was left out, too.)
+    [{ wrod: "a", time: 3 }, new RegExp(`takes — missing key: word\\. Not taken, and left out: "wrod", "time"\\. ${TAKEN}$`)],
   ]) {
     await assert.rejects(it.run("words", { args }), why, JSON.stringify(args));
   }
@@ -67,6 +67,25 @@ test("a run whose arguments do not fit what its project takes is not begun: no p
   assert.deepEqual((await own.run("words")).result.result.args, { word: "own", times: 2 });
   assert.deepEqual((await own.run("words", { args: { times: 5 } })).result.result.args, { word: "own", times: 5 });
   await assert.rejects(own.run("wrong"), /missing key: word/);
+
+  // An argument the project does not take is left out of what its program is given — as what a tool does not declare is,
+  // and what a run gives beside what its project says — and it is said: on the run's record, and aloud to whoever started the run.
+  const said = await withEnv({ HOME: it.fakeHome }, () => captureConsole("warn", () => captureConsole("log", () => runProgram({ projectDir: it.at("words"), args: { word: "a", time: 3, tims: "4" }, timeout: 30_000 }))));
+  assert.deepEqual(said.result.result.result, { args: { word: "a" }, kinds: { word: "string" } });
+  assert.deepEqual(said.messages.filter((line) => /takes no argument/.test(line)), [`[trama] ${it.at("words")} takes no argument "time", "tims": left out. It takes: word, times?, loud?, more?.`]);
+  assert.deepEqual(journalsOf(it.at("words")).at(-1).filter((record) => record.kind === "left-out").map((record) => record.args), [["time", "tims"]]);
+  // Runs asked with other arguments are other runs by their mark, whatever of them the program was given.
+  assert.notEqual(linesOf(it.at("words")).at(-1).input, linesOf(it.at("words")).at(0).input);
+  // A run a program asked for: on its record, and not said aloud — there is nobody there who typed it. And whoever
+  // checks the run is handed its arguments as they were asked, what was left out among them: it judges what was asked for.
+  const more = homeWith(t, {
+    words: { program: ECHOES, more: { parameters: TAKES } },
+    asks: { program: `import { ctx } from "@trama-dev/runtime";\nimport { resolveProject, runProgram } from "@trama-dev/runtime/runner";\nconst ran = await runProgram({ projectDir: resolveProject("words"), args: { word: "a", times: "2", id: 7 }, checkWith: "judge", maxRepairAttempts: 0 });\nawait ctx.done({ had: ran.result, notes: ran.check?.notes });\n` },
+    judge: { program: `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ ok: true, notes: JSON.stringify((ctx.input.args as any).args) });\n` },
+  });
+  const asked = await withEnv({ HOME: more.fakeHome }, () => captureConsole("warn", () => captureConsole("log", () => runProgram({ projectDir: more.at("asks"), timeout: 60_000 }))));
+  assert.deepEqual(asked.result.result.result, { had: { args: { word: "a", times: 2 }, kinds: { word: "string", times: "number" } }, notes: JSON.stringify({ word: "a", times: 2, id: 7 }) });
+  assert.deepEqual([asked.messages.filter((line) => /takes no argument/.test(line)), journalsOf(more.at("words")).at(-1).filter((record) => record.kind === "left-out").map((record) => record.args)], [[], [["id"]]]);
 
   // A project that says nothing of what it takes takes what it is given, as it is.
   assert.deepEqual((await it.run("plain", { args: { times: "3", anything: [1] } })).result.result, { args: { times: "3", anything: [1] }, kinds: { times: "string", anything: "object" } });
@@ -195,7 +214,7 @@ test("a version's line has a mark of what the project took and gave when the ver
   assert.deepEqual(readHistory(it.at("words")).versions.map((version) => version.contract), [...marks, marks[2]]);
 });
 
-test("the examples say what they are for and what they give — and those a person starts, what they take: each is read as it is written", async () => {
+test("the examples say what they are for, take and give — those a runner starts in a role among them: each is read as it is written", async () => {
   const said = {};
   for (const name of ["coding-harness", "improve-by-check", "check-by-command", "repair-harness"]) {
     said[name] = await describeProject(join(REPO_ROOT, "examples", name));
@@ -203,7 +222,8 @@ test("the examples say what they are for and what they give — and those a pers
     assert.equal(said[name].schema.returns.type, "object", name);
   }
   assert.deepEqual(Object.keys(said["coding-harness"].parameters), ["task?", "turns?", "forgetAt?", "model?"]);
-  assert.deepEqual([said["improve-by-check"].schema.parameters.required, Object.keys(said["improve-by-check"].parameters).length], [["project", "check"], 11]);
-  // What a runner itself starts — a checker, a fixer — is given what the runner gives one, which is the runner's to say: they do not say what they take.
-  assert.deepEqual(["parameters" in said["check-by-command"], "parameters" in said["repair-harness"]], [false, false]);
+  assert.deepEqual([said["improve-by-check"].schema.parameters.required, Object.keys(said["improve-by-check"].parameters).length], [["project", "check"], 12]);
+  // What a runner itself starts — a checker, a fixer — says what one is handed: what the runner hands beside that, one day, is left out and not refused.
+  assert.deepEqual(said["repair-harness"].schema.parameters.required, ["program", "error"]);
+  assert.deepEqual(Object.keys(said["check-by-command"].parameters), ["command?", "seconds?", "result?", "args?", "journal?", "run?", "used?", "workspace?"]);
 });

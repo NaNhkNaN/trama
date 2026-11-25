@@ -12,7 +12,7 @@ import { createHash, randomBytes } from "crypto";
 import type { OutsideAgent, ShellResult, Workspace } from "./types.js";
 import type { Check, MakeRequest, RunOptions, ProgramResult, ReplayAllResult, ReplayOptions, ReplayResult, RolledBack, VersionMade } from "./runner-types.js";
 import { readProjectMeta } from "./meta.js";
-import { describeProject, describeProjects, startedWith } from "./contract.js";
+import { describeProject, describeProjects, fitted } from "./contract.js";
 import { createReplay, readRecording, runsToReplay, saysTheSame, type Recording, type Replay } from "./replay.js";
 import { onAbort, rejectOnAbort } from "./abort.js";
 import type { AgentUsage } from "./agent-backend.js";
@@ -526,7 +526,10 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       // ends or when the program no longer wants it, and not over before this is. (But the program's
       // clock goes on: what it has made is its own work, with no timeout but the program's.)
       // (What it starts is a validation: of the program the project is made with.)
-      return notOverBefore(options.making(request, { ...itsOwn(seq, stop, "validate"), label, env: options.env }));
+      return notOverBefore(options.making(request, {
+        ...itsOwn(seq, stop, "validate"), label, env: options.env, depth: options.depth,
+        writing: (run, path) => { if (run) journal.note("child", { seq, run, journal: path, purpose: "update" }); },
+      }));
     },
     run: (request, stop, seq) => {
       if (validating) return handOff("starts another program", stop);
@@ -1185,6 +1188,10 @@ export async function validateProgram(
     label?: string; env?: Record<string, string>; askedFor?: Pick<AskedFor, "parent" | "started">;
     /** The agents from outside the program may name (the configuration's). */
     agents?: Record<string, OutsideAgent>;
+    /** The project a fix of the candidate is asked of, where the configuration names one: else pi's agent. With the count it is made under. */
+    repairWith?: string; meter?: Meter;
+    /** Who wrote the candidate, where a project did, and what that took: said on the validation's record, as what pi's agent took for it is. */
+    writtenBy?: { by: string; used: { calls: number; tokens: number; cost: number } };
   },
 ): Promise<{ source: string; repairedError?: string; alone?: string }> {
   const { journalRuns = 0, signal, as = projectDir, timeout, maxRepairAttempts, maxIterations, label, env, askedFor } = options;
@@ -1197,6 +1204,7 @@ export async function validateProgram(
   askedFor?.started(journal.run, journal.path);
   // What writing the candidate used is on record with its validation: it happened in no run, and has no journal of its own.
   for (const usage of options.wrote ?? []) journal.used("generate", usage);
+  if (options.writtenBy) journal.note("written", options.writtenBy);
   let alone: string | undefined;
   const byItself = (why: string) => {
     alone = why;
@@ -1222,6 +1230,8 @@ export async function validateProgram(
       label,
       env,
       agents: options.agents,
+      repairWith: options.repairWith,
+      meter: options.meter,
       signal,
       journal,
     });
@@ -1717,6 +1727,10 @@ export interface AskedToMake extends Pick<AskedFor, "parent" | "started" | "abov
   signal: AbortSignal;
   label?: string;
   env?: Record<string, string>;
+  /** How many runs deep the run that asked is. */
+  depth?: number;
+  /** Called once a project that writes the program (see `writtenBy`) has a journal of its own: the asking run's record says what it started. */
+  writing?(run: string, journal: string): void;
 }
 
 /**
@@ -1731,13 +1745,64 @@ interface AskedFor {
   /** How many runs deep it is: one more than the run that asked. */
   depth: number;
   /** The call that asked for it: which run's, and which of that run's calls — or none of them, where the run itself asked: for a fix. */
-  parent: { run: string; journal: string; seq?: number };
+  parent?: { run: string; journal: string; seq?: number };
   /** Called once this run has a journal of its own. */
   started(run: string, journal: string): void;
   /** The count of what the run that asked uses of a model: what this one uses is counted there too, and held to it. */
   above?: Meter;
-  /** What the runner made the run for, where it made it itself: a fix asked of a project, a check. (A check is not checked in its turn, whatever its project says.) */
-  purpose?: "fix" | "check";
+  /** What the runner made the run for, where it made it itself: a fix asked of a project, a check, the writing of an update. (A check is not checked in its turn, whatever its project says.) */
+  purpose?: "fix" | "check" | "update";
+}
+
+/**
+ * Ask a project for a program, where an update is to be written by one and
+ * not by pi's agent (see `updateProject`'s `updateWith`): its program is run
+ * with the copy of the project that is being updated as its workspace —
+ * the project as it is, what it says of itself and its state with it, its
+ * program the one that is written from — and what it ends with is the
+ * answer: `{ program }`, the whole of the new program.
+ *
+ * It is handed the least: what is asked (`prompt`), the program it writes
+ * from, whether what it makes beside the program is kept, the API as a
+ * program's author is shown it, and where its workspace is (`copy`: for a
+ * run it asks for to be given it). Not where the project is, nor its
+ * history, nor its records: what more a writer is to see, whoever asks for
+ * the update says in the prompt.
+ *
+ * A run of whoever asked for the update, as a fix by a project is the
+ * failing run's: under that count (`meter`), stopped with it, started with
+ * its variables — and a run like any otherwise, on its own project's
+ * record, which says what it was for. Not fixed where it fails. Its time
+ * is its own project's to say.
+ */
+export async function writtenBy(
+  writer: string,
+  given: { prompt: string; program: string; kept: boolean; copy: string },
+  asked: Partial<AskedToMake> & { meter: Meter },
+): Promise<string> {
+  const result = await runProgram({
+    projectDir: writer,
+    workspaceDir: given.copy,
+    maxRepairAttempts: 0,
+    label: asked.label ? `${asked.label}: update` : "update",
+    env: asked.env,
+    signal: asked.signal,
+    args: { prompt: given.prompt, program: given.program, kept: given.kept, types: RUNTIME_TYPES, copy: given.copy },
+  }, {
+    depth: asked.depth === undefined ? 0 : asked.depth + 1,
+    parent: asked.parent,
+    started: (run, path) => asked.writing?.(run, path),
+    above: asked.meter,
+    purpose: "update",
+  });
+  if (result.status !== "done") {
+    throw new Error(`The project asked for the update ${result.status === "failed" ? "failed" : "did not end its work"}: ${result.reason ?? result.status}`);
+  }
+  const { program } = (result.result ?? {}) as { program?: unknown };
+  if (typeof program !== "string" || program.trim() === "") {
+    throw new Error("The project asked for the update answered with no program: its result is to be { program }, the whole of the new program.");
+  }
+  return program;
 }
 
 
@@ -1796,7 +1861,8 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   // Who checks the run, where it is checked: found now as well — a run that could not be checked as it was to be is not begun.
   const checkWith = askedFor?.purpose === "check" ? undefined : checkerOf(options);
   // Nor is one whose arguments do not fit what the project says it takes: asked now, before a program is started for it.
-  startedWith(projectDir, options.args);
+  // (What it was handed and does not take is left out, and said below — once the run has a record to say it on.)
+  const { leftOut, takes } = fitted(projectDir, options.args);
   // Its own budget — the config's, for a run nobody's program asked for and that was given none — under the budgets above it.
   const budget = options.budget != null ? checkedBudget(options.budget) : askedFor ? undefined : config.budget;
   const meter = createMeter(budget, askedFor?.above);
@@ -1835,6 +1901,12 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
     args: options.args, // last: it is the one field of unknown size
   });
   askedFor?.started(journal.run, journal.path);
+  if (leftOut.length > 0) {
+    // On the run's record, whoever asked for it — and aloud where nobody's program did: there is someone there who
+    // wrote the names, and one of them may be a name written wrongly.
+    journal.note("left-out", { args: leftOut });
+    if (!askedFor) console.warn(tagged(options.label, `[trama] ${projectDir} takes no argument ${leftOut.map((name) => JSON.stringify(name)).join(", ")}: left out. It takes: ${takes}.`));
+  }
 
   const { result, repair } = await journalled(journal, backend, async (backend) => {
     const execution = await executeProgram({
@@ -1917,10 +1989,10 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
  * project's own meta.json says: runs asked for with the same arguments are
  * runs of the same only while the project says the same.
  */
-/** What a run was started with, as its program had it: held to what the project takes, where the project still says what it said. */
+/** What a run was asked with, for whoever checks it: what its program was given, held as the program had it, and what was left out of that beside it. */
 function argumentsOf(projectDir: string, args?: Record<string, unknown>): Record<string, unknown> {
   try {
-    return startedWith(projectDir, args) ?? {};
+    return fitted(projectDir, args).asked;
   } catch {
     return { ...(readProjectMeta(projectDir).input.args ?? {}), ...args };
   }
