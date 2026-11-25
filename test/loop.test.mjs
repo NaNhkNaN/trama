@@ -624,6 +624,16 @@ test("a round is told what the rounds before it tried, from the program as it is
   assert.deepEqual(readJson(join(lost.at("improve"), "state.json")).tried, { [hashOf(first)]: [4, 6] });
   assert.deepEqual(readJson(join(it.at("improve"), "state.json")).tried, {});
 
+  // What a try changed is told whole where it is long — a version a model writes of a harness changes much of it —
+  // and cut where it is longer than a writer has use for.
+  const grown = (lines) => `${first}\n${"// a line of the try, as long as lines go\n".repeat(lines)}// the last line of it`;
+  const much = loopOver(t, first, [grown(280), grown(700), SAYS([])]);
+  await much.round({ inputs: two });
+  await much.round({ inputs: two });
+  assert.match(much.prompts[1], /\n- version 2: [^]*\n  > \/\/ the last line of it\n/);
+  await much.round({ inputs: two });
+  assert.deepEqual([much.prompts[2].match(/\n- version \d+/g), much.prompts[2].split("// the last line of it").length - 1], [["\n- version 2", "\n- version 4"], 1]);
+
   // The rounds, replayed, go as they went: what was read of the versions is on the record.
   const journals = readdirSync(join(it.at("improve"), "logs", "journal")).sort();
   for (const run of [journals[1], journals[3]]) {

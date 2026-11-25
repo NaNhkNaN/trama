@@ -204,7 +204,8 @@ async function triedBefore(was: Tally): Promise<string[]> {
       .flatMap((run) => (run.status !== "done" ? [{ ok: false, score: 0 }]
         : run.check && run.check.by === judge && run.check.program === judgedBy && run.check.ok !== undefined ? [{ ok: run.check.ok, score: run.check.score ?? 0 }] : []));
     const is = came.length > 0 ? tally([came]) : undefined;
-    const diff = (await tools.shell(`diff ${quoted(file(from))} ${quoted(file(version))} | head -c 6000`, { timeout: 60_000 })).stdout.trimEnd();
+    // (Cut at 20,000 characters: a version a model wrote of a harness of 340 lines was a diff of 13,000.)
+    const diff = (await tools.shell(`diff ${quoted(file(from))} ${quoted(file(version))} | head -c 20000`, { timeout: 60_000 })).stdout.trimEnd();
     told.push(`- version ${version}: ${is ? `${is.ok} of ${is.of} runs found good, at a mean score of ${is.score}, where the program as it is has ${was.ok} of ${was.of} at ${was.score}.` : "what its runs came to is on record no longer."}`
       + (diff ? ` What it changed, as a diff from the program as it is:\n${diff.split("\n").map((line) => `  ${line}`).join("\n")}` : ""));
   }
