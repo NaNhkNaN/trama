@@ -101,6 +101,21 @@ function parseBudget(caps: string[]): Record<string, number> | undefined {
   return Object.fromEntries(given);
 }
 
+/** What a project is to take and give, as a file says it (`--contract`): an object of the three things a project says of itself, and no other. */
+function contractIn(file: string): { description?: string; parameters?: Record<string, unknown>; returns?: unknown } {
+  const NAMES = ["description", "parameters", "returns"];
+  const named = NAMES.map((name) => `"${name}"`).join(", ");
+  const text = readFileSync(file, "utf-8");
+  const none = (why: string): Error => new Error(`--contract takes a file of JSON — an object of ${named} — and ${file} is none: ${why}`);
+  let said: unknown;
+  try { said = JSON.parse(text); } catch (err) { throw none(err instanceof Error ? err.message : String(err)); }
+  if (said === null || typeof said !== "object" || Array.isArray(said)) throw none(`it is ${said === null ? "null" : Array.isArray(said) ? "a list" : `a ${typeof said}`}`);
+  // (A name written wrongly is not passed over: what was meant by it would then be said by nobody, or by the writer.)
+  const other = Object.keys(said).find((name) => !NAMES.includes(name));
+  if (other !== undefined) throw new Error(`--contract: ${JSON.stringify(other)} is none of ${named}.`);
+  return said as { description?: string; parameters?: Record<string, unknown>; returns?: unknown };
+}
+
 /** A version, as an option names it: its number (as `trama history` shows it) — or none, where the option was not given. */
 function versionOf(option: string, given: string | undefined): number | undefined {
   if (given === undefined) return undefined;
@@ -138,9 +153,12 @@ cli
   .description("Generate a new program from a natural language prompt")
   .option("--model <model>", "LLM model to use")
   .option("--arg <key=value>", "Pass argument to the program (repeatable)", collectArg, [])
-  .action(command(async (name: string, prompt: string, opts: { model?: string; arg: string[] }) => {
+  .option("--with <project>", "Have a project write the program, and not pi's agent: its name, or a path")
+  .option("--contract <file>", "What the project is to take and give: a file of JSON with \"description\", \"parameters\", \"returns\" (what is not said there, whoever writes the program says)")
+  .action(command(async (name: string, prompt: string, opts: { model?: string; arg: string[]; with?: string; contract?: string }) => {
     const args = parseArgs(opts.arg);
-    await stoppable((signal) => createProject(name, prompt, { model: opts.model, args, signal }));
+    const says = opts.contract === undefined ? {} : contractIn(opts.contract);
+    await stoppable((signal) => createProject(name, prompt, { model: opts.model, args, ...(opts.with !== undefined && { createWith: opts.with }), ...says, signal }));
   }));
 
 cli

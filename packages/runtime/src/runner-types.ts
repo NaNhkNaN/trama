@@ -240,8 +240,8 @@ export interface HistoryRun {
   ms: number;
   /** A mark of what it was started with (a hash of its arguments): runs with the same mark had the same. */
   input: string;
-  /** What the runner made the run for, where it made it itself: a fix asked of this project, a check asked of it, an update it was asked to write. */
-  for?: "fix" | "check" | "update";
+  /** What the runner made the run for, where it made it itself: a fix asked of this project, a check asked of it, a project's first program or an update it was asked to write. */
+  for?: "fix" | "check" | "create" | "update";
 }
 
 /** A project's history (see `readHistory`): facts on record, in the order they came. */
@@ -275,7 +275,7 @@ export type RunRequest = Omit<RunOptions, "signal">;
 
 /** A project a program asks its runner to make, or to change (see createProject and updateProject). */
 export type MakeRequest =
-  | { kind: "create"; name: string; prompt: string; model?: string; args?: Record<string, unknown> }
+  | { kind: "create"; name: string; prompt: string; model?: string; args?: Record<string, unknown>; createWith?: string; description?: string; parameters?: Record<string, unknown>; returns?: unknown }
   /** An update: written from the program — or from a version of it that is named — and made the program, unless it is to be kept beside it. */
   | { kind: "update"; name: string; prompt: string; from?: number; install?: boolean; updateWith?: string }
   /** A version handed over as a text, to be kept beside the program (see `addVersion`). */
@@ -307,6 +307,8 @@ export interface TramaConfig extends ModelConfig {
   repairWith?: string;
   /** The project asked to write an update, in place of pi's agent, where the update names none (see `updateProject`): by its name, or a path. */
   updateWith?: string;
+  /** The project asked to write a new project's first program, in place of pi's agent, where the making names none (see `createProject`). */
+  createWith?: string;
   /**
    * The agents from outside a program may name in `tools.agent`: each by a
    * name, and what starts it — `{ command, args?, env? }`. None is named

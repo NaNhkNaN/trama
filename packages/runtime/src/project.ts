@@ -228,6 +228,9 @@ function checkedConfig(merged: TramaConfig, source: string): TramaConfig {
   if (merged.repairWith !== undefined) {
     checks.push([s(merged.repairWith), `"repairWith" must be a project — its name, or a path to it (got ${JSON.stringify(merged.repairWith)})`]);
   }
+  if (merged.createWith !== undefined) {
+    checks.push([s(merged.createWith), `"createWith" must be a project — its name, or a path to it (got ${JSON.stringify(merged.createWith)})`]);
+  }
   if (merged.updateWith !== undefined) {
     checks.push([s(merged.updateWith), `"updateWith" must be a project — its name, or a path to it (got ${JSON.stringify(merged.updateWith)})`]);
   }

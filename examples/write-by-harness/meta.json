@@ -1,8 +1,8 @@
 {
-  "description": "A writer: has a harness write a project's new program, in the copy of the project it is handed, and hands back what the harness left. Named as an update's updateWith.",
+  "description": "A writer: has a harness write a project's program — its first, or its next — in the copy of the project it is handed, and hands back what the harness left. Named as a making's createWith, or an update's updateWith.",
   "parameters": {
-    "prompt?": "string: what is asked of the new version — handed by the runner to whoever writes an update, as the four that follow are",
-    "program?": "string: the program it is written from, whole (it is program.ts in the copy, too)",
+    "prompt?": "string: what is asked of the program — handed by the runner to whoever writes one, as the four that follow are",
+    "program?": "string: the program it is written from, whole (it is program.ts in the copy, too) — none, at a project's making",
     "kept?": "boolean: whether what is made beside the program, in the copy, is kept with it",
     "types?": "string: the API a program has, as its author is shown it",
     "copy?": "string: where the copy of the project is — the writer's workspace — for a run it asks for to be given it",
@@ -12,10 +12,13 @@
     "seconds?": "number: how long the harness may take — else its own project's time"
   },
   "returns": {
-    "program?": "string: the whole of the new program",
+    "program?": "string: the whole of the program",
     "said?": "string: what the harness said it did",
     "nothing?": "string: why nothing was written, where it was run with nothing to write"
   },
-  "input": { "prompt": "A writer of updates: named where an update is asked for (updateWith).", "args": {} },
+  "input": {
+    "prompt": "A writer of programs: named where a project is made or updated (createWith, updateWith).",
+    "args": {}
+  },
   "createdAt": "2026-11-25T00:00:00.000Z"
 }

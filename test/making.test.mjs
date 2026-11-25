@@ -259,7 +259,7 @@ await ctx.done({ went });
   await withEnv({ HOME: fakeHome }, async () => {
     const { result } = await captureConsole("log", () => runProgram({ projectDir: makerDir, timeout: 30_000 }));
     assert.deepEqual(result.result.went, [
-      "trama runtime error: Unknown field: bogus (this call takes: name, prompt, model, args, id)",
+      "trama runtime error: Unknown field: bogus (this call takes: name, prompt, model, args, createWith, description, parameters, returns, id)",
       "name is what the call is made with, and cannot be given as an option",
       "trama runtime error: Unknown field: model (this call takes: name, prompt, from, install, updateWith, id)",
       "trama runtime error: Missing or invalid field: prompt (expected string)",

@@ -114,6 +114,63 @@ function putProgram(copyDir: string, root: string, program: string, mode?: numbe
   inDirOfCopy(whereMade(place), () => stageFile(copyDir, "program.ts", program, mode ?? (had && (had.mode | 0o200))).commit());
 }
 
+/** What is said where a copy's meta.json had been changed by whoever worked in it (see `metaHeld`). */
+export const META_PUT_BACK = "[trama] meta.json was changed in the copy that was worked in: it is put back as it was, and nothing of that is kept — what a project says of itself is not for whoever writes or fixes its program to change.";
+
+/**
+ * What a project says of itself — its meta.json: what it is for, what a run
+ * of it takes and gives, who checks it — is the project's, and not for
+ * whoever writes or fixes its program to change. Such a one works in a copy
+ * of the project, with tools; the program it answers with is then tried in
+ * that copy, and what it did there is kept with a program that works. So
+ * the copy's meta.json is held here as the copy was made: the function
+ * returned puts it back as it was — the name, and what is read by it — and
+ * says whether it had been changed. Asked before a program is tried in the
+ * copy, the program is held to what the project says and not to what its
+ * writer made of that; and nothing of it is left to be kept.
+ */
+function metaHeld(copy: string): { read(): string | null; putBack(): boolean; hold(text: string): void } {
+  const root = realRootOf(copy), name = join(root, "meta.json");
+  const read = (): Buffer | null => { try { return readFileSync(guardPath(copy, "meta.json")); } catch { return null; } };
+  const nameWas = entryAt(name);
+  let was = read();
+  let allowed: number | undefined;
+  try { allowed = statSync(guardPath(copy, "meta.json"), { throwIfNoEntry: false })?.mode; } catch { /* (None that can be asked.) */ }
+  const sameName = (): boolean => {
+    const nameIs = entryAt(name);
+    return nameIs?.kind === nameWas?.kind && (nameIs?.kind !== "link" || (nameWas?.kind === "link" && nameWas.text === nameIs.text));
+  };
+  /** Have the name be what it was, and what is read by it be `was`. */
+  const put = (): void => inDirOfCopy(root, () => {
+    if (!sameName()) {
+      rmSync(name, { recursive: true, force: true });
+      if (nameWas?.kind === "link") symlinkSync(nameWas.text, name);
+    }
+    if (was === null) return;
+    // (A new file in the place of whatever is there: one that is there may allow no writing, and is not written through.)
+    const place = guardPath(copy, "meta.json");
+    const text = was;
+    inDirOfCopy(whereMade(place), () => {
+      rmSync(place, { recursive: true, force: true });
+      writeFileSync(place, text, { flag: "wx", mode: (allowed ?? 0o644) & 0o7777 });
+    });
+  });
+  return {
+    read: () => read()?.toString("utf-8") ?? null,
+    putBack() {
+      const now = sameName() ? read() : null;
+      if (sameName() && (was === null ? now === null : now !== null && now.equals(was))) return false;
+      put();
+      return true;
+    },
+    // (The project's own has been made this — at its making, see `Prepared.says` — and the copy's is from here on held as this.)
+    hold(text) {
+      was = Buffer.from(text);
+      put();
+    },
+  };
+}
+
 /**
  * All that makes a directory's program.ts lead to its program, as the
  * directory stands: the name, each link and each directory on the way, the
@@ -528,7 +585,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       // (What it starts is a validation: of the program the project is made with.)
       return notOverBefore(options.making(request, {
         ...itsOwn(seq, stop, "validate"), label, env: options.env, depth: options.depth,
-        writing: (run, path) => { if (run) journal.note("child", { seq, run, journal: path, purpose: "update" }); },
+        writing: (run, path) => { if (run) journal.note("child", { seq, run, journal: path, purpose: request.kind === "create" ? "create" : "update" }); },
       }));
     },
     run: (request, stop, seq) => {
@@ -749,6 +806,8 @@ interface Staged {
   beside: Beside;
   /** Throws if what is at the copy's path is no longer the copy: moved away, say, with a link left in its place. */
   intact(): void;
+  /** Puts the copy's meta.json back as it was when the copy was made, and says whether it had been changed (see `metaHeld`). */
+  own(): boolean;
   /** The copy as it was before anything was done in it. What differs from this afterwards is what was done: by the agent, and by the run of its fix. */
   before: Tree;
   /**
@@ -787,7 +846,7 @@ function stageProject(projectDir: string, privateDir: string, program: string): 
   const before = readTree(copy);
   const fix = fixIn(copy);
   return {
-    copy, held, beside, before, intact: sameCopyAs(copy, before), fix,
+    copy, held, beside, before, intact: sameCopyAs(copy, before), own: metaHeld(copy).putBack, fix,
     program: { parts: fix.parts, place, listed: pathAsListed(copy, place), allowed: fix.allowed },
   };
 }
@@ -859,9 +918,14 @@ async function requestRepair(
       options.journal.note("fix", { ok: true, ...usedByAProject(), source: fixed });
       return { fixed };
     }
-    let changed: string[] = [], unusable: string | undefined;
+    let changed: string[] = [], unusable: string | undefined, metaPutBack = false;
     try {
       staged.intact();
+      // What the project says of itself is not the fixer's to change: the fix is tried under what the project says, and none of that is kept with it.
+      if (staged.own()) {
+        metaPutBack = true;
+        console.warn(tagged(options.label, META_PUT_BACK));
+      }
       putProgram(staged.copy, options.projectDir, fixed, staged.program.allowed);
       staged.fix = fixIn(staged.copy);
       staged.changed = changed = differences(staged.before, readTree(staged.copy, true)).filter((path) => path !== staged.program.listed);
@@ -877,6 +941,7 @@ async function requestRepair(
       ...usedByAProject(),
       ...(changed.length > 0 ? { changed: changed.slice(0, MAX_PATHS_NOTED) } : {}),
       ...(changed.length > MAX_PATHS_NOTED ? { changedInAll: changed.length } : {}),
+      ...(metaPutBack && { metaPutBack }),
       alone: unusable,
       source: fixed,
     });
@@ -1521,6 +1586,22 @@ export interface Prepared {
    * lead there where it led.
    */
   ready(): void;
+  /**
+   * Put the copy's meta.json back as it was when the copy was made (see
+   * `metaHeld`), and say whether it had been changed: asked once whoever
+   * writes has worked, before anything is tried in the copy. Throws, as
+   * `ready` does, where what is at the copy's path is no longer the copy.
+   */
+  own(): boolean;
+  /**
+   * The copy's meta.json as whoever wrote left it — or null, where none can
+   * be read: at a project's making, what its writer says there of what the
+   * project takes and gives is the project's contract (see `createProject`).
+   * Asked before `own`. Throws where the copy is no longer the copy.
+   */
+  said(): string | null;
+  /** The project's meta.json has been made `text`: the copy's is made the same, and is held as that from here on. */
+  says(text: string): void;
   keep(): { changed: string[]; unmerged: Unmerged[] };
 }
 
@@ -1548,8 +1629,23 @@ export function prepareProject(projectDir: string, privateDir: string, program?:
   const nameWas = entryAt(name);
   const wayWas = way();
   const places = programAt();
+  const meta = metaHeld(copy);
   return {
     copy,
+    // (Only in the copy itself: where it was moved away and something else put in its place, nothing is read or written
+    // there — and nothing of it is tried or kept either, see `ready`.)
+    own() {
+      intact();
+      return meta.putBack();
+    },
+    said() {
+      intact();
+      return meta.read();
+    },
+    says(text) {
+      intact();
+      meta.hold(text);
+    },
     ready() {
       intact();
       places.push(...programAt());
@@ -1571,7 +1667,9 @@ export function prepareProject(projectDir: string, privateDir: string, program?:
       // At the program's places — where they were, where the agent left them, and where they are now that the
       // name is as it was (which a directory may list in other letters than it did) — the copy is taken to have
       // been as it is: nothing was done there that is to arrive.
-      for (const path of [...places, ...programAt()]) {
+      // And at meta.json, which is the project's (see `metaHeld`): whatever is there, nothing of it is to arrive.
+      const says = pathAsListed(copy, join(root, "meta.json"));
+      for (const path of [...places, ...programAt(), ...(says === undefined ? [] : [says])]) {
         const there = after.get(path);
         if (there) before.set(path, there);
         else before.delete(path);
@@ -1750,8 +1848,8 @@ interface AskedFor {
   started(run: string, journal: string): void;
   /** The count of what the run that asked uses of a model: what this one uses is counted there too, and held to it. */
   above?: Meter;
-  /** What the runner made the run for, where it made it itself: a fix asked of a project, a check, the writing of an update. (A check is not checked in its turn, whatever its project says.) */
-  purpose?: "fix" | "check" | "update";
+  /** What the runner made the run for, where it made it itself: a fix asked of a project, a check, the writing of a project's first program or of an update. (A check is not checked in its turn, whatever its project says.) */
+  purpose?: "fix" | "check" | "create" | "update";
 }
 
 /**
@@ -1761,6 +1859,10 @@ interface AskedFor {
  * the project as it is, what it says of itself and its state with it, its
  * program the one that is written from — and what it ends with is the
  * answer: `{ program }`, the whole of the new program.
+ *
+ * And so a project's first program (`createProject`'s `createWith`, `what`
+ * "create"): the copy is of the project as it was made — its meta.json, and
+ * no program — and no program is handed.
  *
  * It is handed the least: what is asked (`prompt`), the program it writes
  * from, whether what it makes beside the program is kept, the API as a
@@ -1777,30 +1879,32 @@ interface AskedFor {
  */
 export async function writtenBy(
   writer: string,
-  given: { prompt: string; program: string; kept: boolean; copy: string },
+  given: { prompt: string; program?: string; kept: boolean; copy: string },
   asked: Partial<AskedToMake> & { meter: Meter },
+  what: "create" | "update" = "update",
 ): Promise<string> {
+  const asking = what === "create" ? "program" : "update";
   const result = await runProgram({
     projectDir: writer,
     workspaceDir: given.copy,
     maxRepairAttempts: 0,
-    label: asked.label ? `${asked.label}: update` : "update",
+    label: asked.label ? `${asked.label}: ${what}` : what,
     env: asked.env,
     signal: asked.signal,
-    args: { prompt: given.prompt, program: given.program, kept: given.kept, types: RUNTIME_TYPES, copy: given.copy },
+    args: { prompt: given.prompt, ...(given.program !== undefined && { program: given.program }), kept: given.kept, types: RUNTIME_TYPES, copy: given.copy },
   }, {
     depth: asked.depth === undefined ? 0 : asked.depth + 1,
     parent: asked.parent,
     started: (run, path) => asked.writing?.(run, path),
     above: asked.meter,
-    purpose: "update",
+    purpose: what,
   });
   if (result.status !== "done") {
-    throw new Error(`The project asked for the update ${result.status === "failed" ? "failed" : "did not end its work"}: ${result.reason ?? result.status}`);
+    throw new Error(`The project asked for the ${asking} ${result.status === "failed" ? "failed" : "did not end its work"}: ${result.reason ?? result.status}`);
   }
   const { program } = (result.result ?? {}) as { program?: unknown };
   if (typeof program !== "string" || program.trim() === "") {
-    throw new Error("The project asked for the update answered with no program: its result is to be { program }, the whole of the new program.");
+    throw new Error(`The project asked for the ${asking} answered with no program: its result is to be { program }, the whole of the ${what === "create" ? "" : "new "}program.`);
   }
   return program;
 }

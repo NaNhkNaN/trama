@@ -14,7 +14,7 @@ import { readProjectMeta } from "./meta.js";
 import { ensureProjectScaffold, loadConfig, loadProjectConfig, loadState, namesAPath, projectNamed } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import {
-  validateProgram, installValidatedProgram, keepBeside, writtenFrom, writtenBy,
+  validateProgram, installValidatedProgram, keepBeside, writtenFrom, writtenBy, META_PUT_BACK,
   withTempDir, prepareProject, shownPaths, type Prepared, RUNTIME_TYPES, runProgram as runHere, replayProgram as replayHere, replayAll as replayAllHere, rollbackTo, whyNotReplaceable,
   inputMarkOf as markHere,
   tagged, failureOf, type AskedToMake, type Making,
@@ -28,7 +28,10 @@ import { messageOf } from "./errors.js";
 export type { HistoryRun, HistoryVersion, ProjectHistory, RolledBack, VersionMade } from "./runner-types.js";
 import type { ProjectHistory, RolledBack, VersionMade } from "./runner-types.js";
 import { readHistory as historyHere, textOfVersion } from "./history.js";
-import { describeProject as describeHere, describeProjects as describeAllHere } from "./contract.js";
+import { isDeepStrictEqual } from "util";
+import { contractOf, fitted, describeProject as describeHere, describeProjects as describeAllHere } from "./contract.js";
+import type { ProjectMeta } from "./meta.js";
+import { isJsonObject } from "./serializable.js";
 import type { ProjectDescription } from "./contract.js";
 export type { ProjectDescription } from "./contract.js";
 export type { Budget, Check, ProgramResult, RunOptions, ReplayOptions, ReplayResult, ReplayAllResult } from "./runner-types.js";
@@ -69,7 +72,10 @@ const making: Making = async (request, asked) =>
   request.kind === "rollback" ? rollbackHere(request.name, request.version, asked)
     : request.kind === "version" ? addVersionHere(request.name, request.source, { parent: request.parent, detail: request.detail, signal: asked.signal }, asked)
     : request.kind === "create"
-      ? createHere(request.name, request.prompt, { model: request.model, args: request.args, signal: asked.signal }, asked)
+      ? createHere(request.name, request.prompt, {
+        model: request.model, args: request.args, createWith: request.createWith,
+        description: request.description, parameters: request.parameters, returns: request.returns, signal: asked.signal,
+      }, asked)
       : updateHere(request.name, request.prompt, { from: request.from, install: request.install, updateWith: request.updateWith, signal: asked.signal }, asked);
 
 /** Run a project to an outcome: done, yielded, or failed. */
@@ -409,6 +415,64 @@ function getSystemPrompt(kept: boolean): string {
   );
 }
 
+/** What a project says of itself that is its contract: what it is for, what a run of it takes and gives. */
+const CONTRACT = ["description", "parameters", "returns"] as const;
+const WHAT_EACH_IS: Record<(typeof CONTRACT)[number], string> = {
+  description: `"description" is what the project is for, in a sentence`,
+  parameters: `"parameters" is what a run of it is given — its arguments — as an object of fields`,
+  returns: `"returns" is what the program ends with: what it hands to ctx.done`,
+};
+const VALIDATED_WITH = `A project is validated by a run of it with the arguments it is made with: what it requires is to be among them, or written as what may be absent ("name?").`;
+
+/**
+ * What pi's agent is told, where it writes a project's program, of what the
+ * project says of itself: what the program is held to, where the project
+ * says — and, at a project's making, what it is to say there itself
+ * (`proposes`: what of the three whoever asked for the project did not say).
+ * A writer that is a project has the project's meta.json in its copy, and
+ * its own words for this.
+ */
+function saysOfItself(meta: ProjectMeta, proposes: readonly (typeof CONTRACT)[number][] = []): string {
+  const says = { description: meta.description, parameters: meta.parameters, returns: meta.returns };
+  return (
+    (says.parameters !== undefined || says.returns !== undefined
+      ? `\n\nWhat the project says it takes and gives (its meta.json): the program is held to it — a run's arguments are these and no others, and what the program ends with is to be of this shape — and it is not the program's to change.\n${JSON.stringify(says, null, 2)}`
+      : "") +
+    (proposes.length > 0
+      ? `\n\nSay in meta.json, here, what the project does not say of itself yet — ${proposes.map((field) => `"${field}"`).join(", ")} — for whoever is to choose this program among others, and call it: ` +
+        `${proposes.map((field) => WHAT_EACH_IS[field]).join("; ")}. ` +
+        `What is taken and given is written as a Schema is (see the API): a field by its kind — "string", "number", "boolean", "json" for any value — with what it is after a colon, an object by its fields, a list by the shape of its items in brackets, and a field that may be absent with a "?" at the end of its name. ` +
+        `Add them to the file and change nothing else of it. This is kept, whatever else of what you make here is; and the program is held to it from its first run.\n` +
+        `The project is made with these arguments, and is validated by a run of it with them: ${JSON.stringify(meta.input.args ?? {})}. An argument a run need not be given is written as one that may be absent.`
+      : "")
+  );
+}
+
+/**
+ * What whoever wrote a new project's program said, in the meta.json of the
+ * copy it worked in (`text`), of what the project takes and gives: of the
+ * fields it may say (`may`), those it said. And whether it did more to the
+ * file than that (`beyond`) — which is put back, and said.
+ */
+function proposedIn(text: string | null, may: readonly string[], projectDir: string): { proposal?: Record<string, unknown>; beyond: boolean } {
+  let parsed: unknown = null;
+  try { if (text !== null) parsed = JSON.parse(text); } catch { /* (No JSON: nothing was said, and the file is put back.) */ }
+  if (!isJsonObject(parsed)) return { beyond: true };
+  const was = JSON.parse(readFileSync(guardPath(projectDir, "meta.json"), "utf-8")) as Record<string, unknown>;
+  const without = (of: Record<string, unknown>) => Object.fromEntries(Object.entries(of).filter(([key]) => !may.includes(key)));
+  const said = Object.fromEntries(may.flatMap((field) => (parsed[field] === undefined || parsed[field] === null ? [] : [[field, parsed[field]]])));
+  return { ...(Object.keys(said).length > 0 && { proposal: said }), beyond: !isDeepStrictEqual(without(parsed), without(was)) };
+}
+
+/** A project's own arguments held to what it takes: a project that cannot be run with what it is made with cannot be validated. */
+function fitsItsOwn(projectDir: string, meta: ProjectMeta): void {
+  try {
+    fitted(projectDir, undefined, meta);
+  } catch (err) {
+    throw new Error(`${messageOf(err)}\n${VALIDATED_WITH}`);
+  }
+}
+
 function projectsDir(): string {
   return join(homedir(), ".trama", "projects");
 }
@@ -598,8 +662,16 @@ async function writeValidateInstall(projectDir: string, how: {
   beside?: { parent: number | null };
   /** The count all of it is made under (the backend's). */
   meter?: Meter;
-  /** Of an update: the project that writes it, in the place of pi's agent — and the program it writes from (see `writtenBy`). */
-  writer?: { project: string; program: string };
+  /** The project that writes the program, in the place of pi's agent — and, of an update, the program it writes from (see `writtenBy`). */
+  writer?: { project: string; program?: string };
+  /**
+   * Of a making: what of the project's contract whoever writes may say, in
+   * the meta.json of its copy (see `proposedIn`) — and what is done with
+   * what it said (`said`): it is made the project's, or thrown out for what
+   * is wrong with it; the project's meta.json as it then is comes back.
+   */
+  proposes?: readonly string[];
+  said?: (proposal: Record<string, unknown>) => string;
 }): Promise<number> {
   const { config, backend, stillTheProject, signal, asked } = how;
   const wrote: AgentUsage[] = [];
@@ -610,14 +682,35 @@ async function writeValidateInstall(projectDir: string, how: {
     if (how.writer) {
       const meter = how.meter ?? meterFor(config, asked), before = meter.counted();
       // (What it makes beside the program is kept where an agent's would be: not of a version that is kept beside the program.)
-      candidate = await writtenBy(how.writer.project, { prompt: how.prompt, program: how.writer.program, kept: config.agentChanges === "keep" && !how.beside, copy: prepared.copy }, { ...asked, signal, meter });
+      candidate = await writtenBy(how.writer.project, {
+        prompt: how.prompt, ...(how.writer.program !== undefined && { program: how.writer.program }), kept: config.agentChanges === "keep" && !how.beside, copy: prepared.copy,
+      }, { ...asked, signal, meter }, how.reason);
       const now = meter.counted();
       by = { by: how.writer.project, used: { calls: now.calls - before.calls, tokens: now.tokens - before.tokens, cost: now.cost - before.cost } };
     } else {
       candidate = await generateProgram(backend, prepared, how.ask, how.system, wrote, signal, asked.label);
     }
     stillTheProject();
+    // What the project says of itself is not its writer's to change: the candidate is validated under what the project
+    // says, and nothing of what was done to meta.json where it was written is kept. (A copy that is no longer there is
+    // no place anything is tried in, or kept from.)
+    // (But at a project's making, what its writer said there of what the project takes and gives is taken first:
+    // that much of the file is the writer's to say, once.)
+    let changed = false, proposal: Record<string, unknown> | undefined, beyond = true;
+    try {
+      if (how.proposes?.length) ({ proposal, beyond } = proposedIn(prepared.said(), how.proposes, projectDir));
+      changed = prepared.own();
+    } catch {
+      // (See `ready`: the candidate is then validated by itself — and nothing that was said in a copy that is no longer the copy is taken.)
+      proposal = undefined;
+    }
+    if (changed && beyond) shownUnder(asked.label).warn(META_PUT_BACK);
     how.written?.(candidate);
+    if (proposal && how.said) {
+      // The project says it from here on: the candidate is validated under it, where it is validated.
+      const now = how.said(proposal);
+      try { prepared.says(now); } catch { /* (The copy is not used.) */ }
+    }
 
     shownUnder(asked.label).log(how.validating);
     // (A version that is to be kept beside the program is the program's text and no more: it is validated in the
@@ -633,15 +726,41 @@ async function writeValidateInstall(projectDir: string, how: {
 
 // --- Public API ---
 
-/** Generate a program for a new project from a prompt, validate it, and make it the project's. */
+/**
+ * Generate a program for a new project from a prompt, validate it, and make
+ * it the project's.
+ *
+ * `description`, `parameters`, `returns`: what the project is for, and what
+ * a run of it is to take and give — its contract (see `describeProject`),
+ * said by whoever asks for the project. It is in the project's meta.json
+ * before anything is written; whoever writes the program is told it and
+ * cannot change it; and the program is validated under it. What of the
+ * three is not said here, whoever writes the program says — in the
+ * meta.json of the copy it works in — once: from then on what the project
+ * says of itself is the project's, and no writer's or fixer's to change.
+ *
+ * `createWith`: the project that writes the program, in the place of pi's
+ * agent — by its name among the user's projects, or a path; without one,
+ * the configuration's. It is run with a copy of the new project as its
+ * workspace — its meta.json, and no program — handed `{ prompt, kept,
+ * types, copy }`, and answers `{ program }` (see examples/write-by-harness).
+ *
+ * The project is validated by a run of it with the arguments it is made
+ * with (`args`): what its contract requires is to be among them.
+ */
 export async function createProject(
   name: string,
   prompt: string,
-  options?: { model?: string; args?: Record<string, unknown>; signal?: AbortSignal },
+  options?: {
+    model?: string; args?: Record<string, unknown>; createWith?: string;
+    description?: string; parameters?: Record<string, unknown>; returns?: unknown; signal?: AbortSignal;
+  },
 ): Promise<void> {
   const bridge = parentBridge();
   if (!bridge) return createHere(name, prompt, options);
   const { signal, ...asked } = options ?? {};
+  // (A path a program names is named from where the program is: the runner does not share its working directory.)
+  if (typeof asked.createWith === "string" && namesAPath(asked.createWith)) asked.createWith = projectNamed(asked.createWith);
   await overBridge(bridge, "/project/create", withOptions({ name, prompt }, asked), signal);
 }
 
@@ -662,7 +781,7 @@ export async function createProject(
  * the configuration's `updateWith`; without that, pi's agent. It is run
  * with a copy of the project as its workspace, handed `{ prompt, program,
  * kept, types, copy }`, and answers `{ program }` (see
- * examples/update-by-harness). What is done round the writing — the copy,
+ * examples/write-by-harness). What is done round the writing — the copy,
  * the validation, the record, what is installed — is the runner's whoever
  * writes.
  */
@@ -739,7 +858,10 @@ async function addVersionHere(
 async function createHere(
   name: string,
   prompt: string,
-  options?: { model?: string; args?: Record<string, unknown>; signal?: AbortSignal },
+  options?: {
+    model?: string; args?: Record<string, unknown>; createWith?: string;
+    description?: string; parameters?: Record<string, unknown>; returns?: unknown; signal?: AbortSignal;
+  },
   asked: Asked = {},
 ): Promise<void> {
   const say = shownUnder(asked.label);
@@ -751,6 +873,13 @@ async function createHere(
   throwIfAborted(options?.signal);
   const projectDir = join(projectsDir(), name);
   let keepProjectOnFailure = false;
+  // What the project is to take and give, where whoever asks says: read now — what is no shape, or requires what the
+  // project is not made with, is refused before anything is made, or asked of a model.
+  const given = Object.fromEntries(CONTRACT.flatMap((field) => (options?.[field] === undefined || options[field] === null ? [] : [[field, options[field]]])));
+  const proposes = CONTRACT.filter((field) => !(field in given));
+  const first = { ...given, input: { prompt, args: options?.args ?? {} } } as ProjectMeta;
+  contractOf(projectDir, first, `What ${JSON.stringify(name)} is to take and give cannot be read`);
+  fitsItsOwn(projectDir, first);
 
   mkdirSync(projectsDir(), { recursive: true });
   try {
@@ -771,7 +900,7 @@ async function createHere(
     if (options?.model) config.model = options.model;
 
     const meta = {
-      input: { prompt, args: options?.args ?? {} },
+      ...first,
       createdAt: new Date().toISOString(),
       piVersion: await piVersion(),
       model: config.model,
@@ -779,7 +908,12 @@ async function createHere(
     };
     writeFileSync(guardPath(projectDir, "meta.json"), JSON.stringify(meta, null, 2));
 
-    const backend = backendFor(config, asked);
+    const meter = meterFor(config, asked);
+    const backend = backendFor(config, asked, meter);
+    // Who writes it: the project the call names, or the configuration — or, with neither, pi's agent.
+    const named = options?.createWith ?? config.createWith;
+    const writer = named === undefined ? undefined : projectNamed(named);
+    if (writer !== undefined && !existsSync(join(writer, "meta.json"))) throw new Error(`createWith names no project: there is none at ${writer}`);
 
     say.log(`Generating program for "${name}"...`);
     // (What the agent is given to look at is the project made here, and no other directory that is at its path by now.)
@@ -788,9 +922,20 @@ async function createHere(
       reason: "create",
       prompt,
       ask: `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation.`,
-      system: getSystemPrompt(config.agentChanges === "keep"),
+      system: getSystemPrompt(config.agentChanges === "keep") + saysOfItself(meta, proposes),
       validating: "Validating program...",
-      config, backend, stillTheProject, signal: options?.signal, asked,
+      config, backend, stillTheProject, signal: options?.signal, asked, meter,
+      ...(writer !== undefined && { writer: { project: writer } }),
+      // What whoever writes says the project takes and gives, of what was not said by whoever asked: the project's from here on.
+      proposes,
+      said: (proposal) => {
+        const says = { ...meta, ...proposal } as ProjectMeta;
+        contractOf(projectDir, says, "What was said, in meta.json, of what the project takes and gives cannot be read");
+        fitsItsOwn(projectDir, says);
+        const text = JSON.stringify(says, null, 2);
+        writeFileSync(guardPath(projectDir, "meta.json"), text);
+        return text;
+      },
       // From here on the project is kept even if validation fails, so the
       // generated program can be inspected and fixed by hand.
       written: (candidate) => {
@@ -852,12 +997,9 @@ async function updateHere(
 
     // What the project says it takes and gives is told to whoever writes its program: a writer that is a project has
     // it in its copy (meta.json); pi's agent is told here. The program is held to it, and it is not the program's to change.
-    const says = { description: meta.description, parameters: meta.parameters, returns: meta.returns };
     const systemPrompt =
       getSystemPrompt(config.agentChanges === "keep") +
-      (says.parameters !== undefined || says.returns !== undefined
-        ? `\n\nWhat the project says it takes and gives (its meta.json): the program is held to it — a run's arguments are these and no others, and what the program ends with is to be of this shape — and it is not the program's to change.\n${JSON.stringify(says, null, 2)}`
-        : "") +
+      saysOfItself(meta) +
       `\n\nOriginal prompt: ${meta.input.prompt}` +
       `\n\nCurrent program.ts:\n${originalSource}` +
       (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : "");

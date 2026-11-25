@@ -31,7 +31,7 @@ What it is told:
 - `margin` — by how much a mean score has to be higher (0). A score that is measured is never a tie: without a margin, a version that is no different is kept one round in two.
 - `confirm` — how many times the runs that decide are made again where a version passes (0), and counted with the first. A version is chosen by the runs in which it looked best; it is to be kept for more than those.
 - `tell` — which runs the writer is told of: `wanting`, or `all` — what the judge said of the runs found good too. Where what is wanted is not that they be good, that is all a writer has to go by.
-- `write` — who writes the update: a project, by its name (`examples/update-by-harness` is one) — else whoever the configuration names (`updateWith`), or pi's agent. It is told what this loop tells its writer, in those words, and no more: what more a writer may read — the project's history, the records of its runs — is for the loop to say there, and with that what of the inputs held back it can reach.
+- `write` — who writes the update: a project, by its name (`examples/write-by-harness` is one) — else whoever the configuration names (`updateWith`), or pi's agent. It is told what this loop tells its writer, in those words, and no more: what more a writer may read — the project's history, the records of its runs — is for the loop to say there, and with that what of the inputs held back it can reach.
 - `from` — what a run works on, where that is not the project itself: a directory, copied afresh for every run and handed to it as its workspace. `{name}` in it stands for the input's argument of that name: `--arg from=/tasks/{task}`, for inputs that say which task.
 
 What to know of it:

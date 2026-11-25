@@ -55,7 +55,7 @@ const betterByScore = (is: Tally, was: Tally, isGood: number, wasGood: number, m
 //             looked best — it is to be kept for more than those.
 //   tell      which runs the writer is told of: `wanting` (those found not good) or `all` (what the judge said
 //             of the good ones too — where what is wanted is not that they be good, that is all there is to go by).
-//   write     who writes the update: a project, by its name (see examples/update-by-harness) — else whoever the
+//   write     who writes the update: a project, by its name (see examples/write-by-harness) — else whoever the
 //             configuration names, or pi's agent. (Who writes is told what this loop tells, in the words it tells it:
 //             what more a writer may read — the project's history, the records of its runs — is for it to be told there.)
 const given = ctx.input.args as { project?: unknown; check?: unknown; inputs?: unknown; heldBack?: unknown; runs?: unknown; ask?: unknown; from?: unknown; by?: unknown; margin?: unknown; confirm?: unknown; tell?: unknown; write?: unknown };

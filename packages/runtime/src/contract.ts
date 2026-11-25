@@ -48,8 +48,9 @@ export interface ProjectDescription {
  * written there and is no shape — or no text, of the description — is
  * refused by name, as a meta.json that is none is.
  */
-export function contractOf(projectDir: string, meta: ProjectMeta = readProjectMeta(projectDir)): Contract {
-  const fail = (what: string): Error => new Error(`Malformed meta.json in ${projectDir} — ${what}`);
+export function contractOf(projectDir: string, meta: ProjectMeta = readProjectMeta(projectDir), unread = `Malformed meta.json in ${projectDir}`): Contract {
+  // (`unread`: what it is called where it cannot be read — of what is not yet a project's meta.json, another thing than that.)
+  const fail = (what: string): Error => new Error(`${unread} — ${what}`);
   const said = meta as unknown as Record<string, unknown>;
   const contract: Contract = {};
   if (said.description !== undefined) {

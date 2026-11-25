@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, renameSync, symlinkSync, writeFileSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import { describeProject, runProgram, updateProject } from "../packages/runtime/dist/index.js";
@@ -37,9 +37,13 @@ else {
   }) + "\\n");
   // (A writer that asks a model, as one would: twice.)
   if (how === "ask") for (const turn of [1, 2]) await agent.complete({ messages: [{ role: "user", content: "turn " + turn }] });
+  // (A writer that rewrites what its program is held to, where it works — or takes it away.)
+  if (how.startsWith("rewrite")) await workspace.write("meta.json", JSON.stringify({ ...JSON.parse(await workspace.read("meta.json")), description: "Says a word now.", returns: { word: "string" }, checkWith: "nobody" }));
+  if (how === "remove") await workspace.shell("rm meta.json");
   if (how === "fail") throw new Error("the writer has a fault of its own");
   if (how === "say nothing") await ctx.done({ note: "no program here" });
   else if (how === "broken") await ctx.done({ program: 'throw new Error("no program at all");' });
+  else if (how === "rewrite to fit") await ctx.done({ program: 'import { ctx } from "@trama-dev/runtime";\\nawait ctx.done({ word: "two" });\\n' });
   else {
     // What it makes beside the program, in the copy.
     await workspace.write("made-by.txt", prompt);
@@ -66,6 +70,8 @@ function homeWith(t, projects, config = { maxRepairAttempts: 0 }) {
   const inHome = (fn) => withEnv({ HOME: fakeHome, SEEN_BY_WRITER: seen }, () => quietly(fn)).then(({ result }) => result);
   return {
     fakeHome, at, inHome,
+    /** What `fn` comes to, and what was warned of meanwhile. */
+    heard: (fn) => withEnv({ HOME: fakeHome, SEEN_BY_WRITER: seen }, () => captureConsole("warn", () => captureConsole("log", fn))).then(({ result, messages }) => ({ result: result.result, warned: messages })),
     seen: () => wholeLines(seen).map((line) => JSON.parse(line)),
     program: (name) => readFileSync(join(at(name), "program.ts"), "utf-8"),
     index: (name) => readFileSync(join(at(name), "history", "index.jsonl"), "utf-8").trim().split("\n").map((line) => JSON.parse(line)).map(({ timestamp: _t, sha256: _s, contract: _c, ...line }) => line),
@@ -247,4 +253,71 @@ test("the command line has what the API has of the archive and of what a project
   const shown = (await trama("describe", "words")).stdout;
   assert.match(shown, /^words — Says a number\.\n  takes: \{\n[^]*"add\?": "number: what to add"[^]*\n  gives: \{\n[^]*"n": "number"/);
   assert.match((await trama("describe", "writer")).stdout, /^writer — \(it does not say what it is for\)\n  takes: \(it does not say\)\n  gives: \(it does not say\)\n$/);
+});
+
+// --- what a project says of itself is the project's ---
+
+test("what a project says of itself is out of the reach of whoever writes its program: meta.json, rewritten in the copy a writer or a fixer worked in, is put back before the program is tried there, reaches the project in nothing — and it is said", async (t) => {
+  const SAYS_OF_ITSELF = { description: "Says a number.", returns: { n: "number" } };
+  const metaOf = (it, name = "words") => readFileSync(join(it.at(name), "meta.json"), "utf-8");
+  const putBack = (warned) => warned.filter((line) => /\[trama\] meta\.json was changed in the copy that was worked in: it is put back as it was, and nothing of that is kept — what a project says of itself is not for whoever writes or fixes its program to change\./.test(line)).length;
+
+  // A writer that is a project: it rewrites the contract — or takes the file away — and writes a program that fits the project's own.
+  for (const [how, said] of [["write", 0], ["rewrite", 1], ["remove", 1]]) {
+    const it = homeWith(t, { words: { program: ONE, more: SAYS_OF_ITSELF, how }, writer: { program: WRITER } });
+    await it.run("words");
+    const was = metaOf(it);
+    const { result, warned } = await it.heard(() => updateProject("words", "say two", { updateWith: "writer" }));
+    assert.deepEqual(result, { version: 2 }, how);
+    // The project says what it said, to the letter; what else the writer made beside the program is kept as it was.
+    assert.deepEqual([metaOf(it), putBack(warned), readFileSync(join(it.at("words"), "made-by.txt"), "utf-8")], [was, said, "say two"], how);
+    assert.deepEqual((await it.run("words")).result, { n: 2 }, how);
+    // Kept beside the program, where nothing of the copy is used: said all the same.
+    if (how === "rewrite") assert.equal(putBack((await it.heard(() => updateProject("words", "again", { updateWith: "writer", install: false }))).warned), 1);
+  }
+
+  // A program that fits only what its writer made of the contract is held to the project's, and is no update.
+  const fits = homeWith(t, { words: { program: ONE, more: SAYS_OF_ITSELF, how: "rewrite to fit" }, writer: { program: WRITER } });
+  await fits.run("words");
+  const held = metaOf(fits);
+  await assert.rejects(fits.heard(() => updateProject("words", "say a word", { updateWith: "writer" })), /Update failed — the program is unchanged\.[^]*The result does not fit what [^\n]* gives — missing key: n/);
+  assert.deepEqual([fits.program("words"), metaOf(fits), fits.index("words").length], [ONE, held, 1]);
+
+  // pi's agent has tools in the copy it works in, and is held the same.
+  const pi = homeWith(t, { words: { program: ONE, more: SAYS_OF_ITSELF } });
+  llm.ask = async (_prompt, call) => {
+    writeFileSync(join(call.cwd, "meta.json"), JSON.stringify({ input: { prompt: "p", args: {} }, returns: { word: "string" } }));
+    writeFileSync(join(call.cwd, "beside.txt"), "made beside");
+    return SAYS(2);
+  };
+  await pi.run("words");
+  const before = metaOf(pi);
+  const byPi = await pi.heard(() => updateProject("words", "say two"));
+  assert.deepEqual([byPi.result, metaOf(pi), putBack(byPi.warned), readFileSync(join(pi.at("words"), "beside.txt"), "utf-8")], [{ version: 2 }, before, 1, "made beside"]);
+
+  // A copy that was moved away, with a link left in its place, is not written into: nothing is put back where the link leads.
+  const elsewhere = makeTempDir("trama-update-elsewhere-");
+  t.after(() => cleanupTempDir(elsewhere));
+  const moved = homeWith(t, { words: { program: ONE, more: SAYS_OF_ITSELF } });
+  llm.ask = async (_prompt, call) => {
+    renameSync(call.cwd, `${call.cwd}-moved`);
+    symlinkSync(elsewhere, call.cwd);
+    return SAYS(2);
+  };
+  await moved.run("words");
+  assert.deepEqual((await moved.heard(() => updateProject("words", "say two"))).result, { version: 2 });
+  assert.deepEqual(readdirSync(elsewhere), []);
+
+  // And so of whoever fixes: what a fixer did to meta.json in the copy its fix is tried in is put back before the trial, and is no part of what is kept with the fix.
+  const FIXER = `import { ctx, workspace } from "@trama-dev/runtime";
+await workspace.write("meta.json", JSON.stringify({ ...JSON.parse(await workspace.read("meta.json")), returns: { word: "string" }, checkWith: "nobody" }));
+await workspace.write("mended-by.txt", "the fixer");
+await ctx.done({ program: (ctx.input.args as any).program.replace("toFixd", "toFixed") });
+`;
+  const SLIP = ONE.replace("(add ?? 0)", "(add ?? 0).toFixd(0).length");
+  const fixed = homeWith(t, { words: { program: SLIP, more: SAYS_OF_ITSELF }, fixer: { program: FIXER } }, { maxRepairAttempts: 1, repairWith: "fixer" });
+  const said = metaOf(fixed);
+  const mended = await fixed.heard(() => runProgram({ projectDir: fixed.at("words"), timeout: 60_000 }));
+  assert.deepEqual([mended.result, metaOf(fixed), putBack(mended.warned), readFileSync(join(fixed.at("words"), "mended-by.txt"), "utf-8")], [{ status: "done", result: { n: 2 } }, said, 1, "the fixer"]);
+  assert.deepEqual((await fixed.run("words")).result, { n: 2 });
 });

@@ -402,7 +402,10 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, rep
     // Nor does a program make a project, or change one: its runner does, as it runs one — under the
     // run's budget, on its record, and stopped with it.
     "/project/create": route(
-      { name: "string", prompt: "string", model: "optional string", args: "optional object", id: "optional string" },
+      {
+        name: "string", prompt: "string", model: "optional string", args: "optional object", createWith: "optional string",
+        description: "optional string", parameters: "optional object", returns: "optional any", id: "optional string",
+      },
       ({ id, ...asked }, connectionClosed, { seq }) => lasting(id, connectionClosed, stop => make({ kind: "create", ...asked }, stop, seq)),
     ),
     "/project/update": route(
