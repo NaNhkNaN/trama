@@ -230,8 +230,6 @@ test("the loop goes back where the new version is not found better: worse, or no
     ["worse", SAYS([]), { ok: 0, of: 2, score: 0 }, false, "Version 1 is put back: 0 of 2 runs of version 2 were found good where 1 of 2 were."],
     ["no better", SAYS(["cd"]), { ok: 1, of: 2, score: 0.5 }, false, "Version 1 is put back: 1 of 2 runs of version 2 were found good as 1 of 2 were, at a mean score of 0.5 where it was 0.5 — no better, and the one before is the one that is known."],
     ["better by its score", SAYS(["ab"], HALF), { ok: 1, of: 2, score: 0.75 }, true, "Version 2 is kept: 1 of 2 runs were found good as 1 of 2 were, at a mean score of 0.75 where it was 0.5."],
-    // (A run that fails is a run that was not found good, at no score: it does not drop out of the count.)
-    ["a failing run", SAYS(["ab"], 'word === "cd" ? (() => { throw new Error("no cd"); })() : word'), { ok: 1, of: 2, score: 0.5 }, false, undefined],
   ]) {
     // (Words of two letters: one that begins in a capital is not all in capitals.)
     const it = loopOver(t, SAYS(["ab"]), [candidate]);
@@ -677,4 +675,96 @@ test("what the judge said of a run is told whole, round after round: the loop ke
   for (const input of [A, B, C]) await withEnv({ HOME: other.fakeHome }, () => quietly(() => runProgram({ projectDir: other.words, args: input, checkWith: other.at("judge"), timeout: 30_000 })));
   await other.round(args);
   assert.match(other.prompts[0], /- started with \{"word":"a"\}: used 10\. Where it went: [^\n]*…\n/);
+});
+
+// --- a run that failed ---
+
+/**
+ * A program that what is around it fails, on one word, so many times — as a harness is failed by a model that
+ * cannot be reached. (How many times are left is in a file beside everything.)
+ */
+const FALTERS = (good, left, more = "word") => `import { ctx } from "@trama-dev/runtime";
+import { readFileSync, writeFileSync } from "node:fs";
+const GOOD: string[] = ${JSON.stringify(good)};
+const { word } = ctx.input.args as { word: string };
+const left = Number(readFileSync(${JSON.stringify(left)}, "utf-8"));
+if (word === "cd" && left > 0) { writeFileSync(${JSON.stringify(left)}, String(left - 1)); throw new Error("the model could not be reached"); }
+await ctx.done({ said: GOOD.includes(word) ? word.toUpperCase() : ${more} });
+`;
+
+test("a run that failed is made again, once, and what the second comes to is what counts; one that fails again is, of the program as it is, a run found wanting — and of a version being tried, a round that decides nothing: the version is not judged by it", async (t) => {
+  const aside = makeTempDir("trama-loop-aside-");
+  t.after(() => cleanupTempDir(aside));
+  const left = join(aside, "left.txt");
+  const first = SAYS(["ab"]).trim(), two = [{ word: "ab" }, { word: "cd" }];
+  const statuses = (it, version) => it.lines().filter((line) => line.version === version).map((line) => line.status);
+
+  // What is around a version fails one run of it, once: the run is made again, and the version is judged by that.
+  writeFileSync(left, "1");
+  const once = loopOver(t, first, [FALTERS(["ab", "cd"], left)]);
+  const { result: passed } = await once.round({ inputs: two });
+  assert.deepEqual(passed.result, {
+    kept: true, from: 1, to: 2, before: { ok: 1, of: 2, score: 0.5 }, after: { ok: 2, of: 2, score: 1 }, remade: 1,
+    why: "Version 2 is kept: 2 of 2 runs were found good where 1 of 2 were, at a mean score of 1 where it was 0.5. 1 run failed and was made again: what came of it then is what is counted.",
+  });
+  assert.deepEqual(statuses(once, 2), ["done", "failed", "done"]);
+
+  // And where the version is no better for it, it is told as tried by the runs it was judged by: the one that failed is none of them.
+  writeFileSync(left, "1");
+  const worse = loopOver(t, first, [FALTERS([], left), SAYS([])]);
+  assert.equal((await worse.round({ inputs: two })).result.result.why,
+    "Version 1 is put back: 0 of 2 runs of version 2 were found good where 1 of 2 were. 1 run failed and was made again: what came of it then is what is counted.");
+  await worse.round({ inputs: two });
+  assert.match(worse.prompts[1], /\n- version 2: 0 of 2 runs found good, at a mean score of 0, where the program as it is has 1 of 2 at 0\.5\. What it changed/);
+
+  // It fails again: nothing is decided. The one before is put back, and the version is not judged — not found worse.
+  writeFileSync(left, "2");
+  const twice = loopOver(t, first, [FALTERS(["ab", "cd"], left), SAYS([]), SAYS([]), SAYS(["ab", "cd"])]);
+  const { result: undecided } = await twice.round({ inputs: two });
+  assert.deepEqual({ ...undecided.result, why: "" }, { kept: false, from: 1, to: 2, before: { ok: 1, of: 2, score: 0.5 }, remade: 1, why: "" });
+  assert.match(undecided.result.why, /^Version 1 is put back, and nothing is decided: a run of version 2 failed, and failed when it was made again — whether that is the version's doing is not known\. [^]*the model could not be reached/);
+  assert.deepEqual([twice.program(), twice.versions(), statuses(twice, 2)], [first, [[1, "found"], [2, "update"], [3, "rollback", 1]], ["done", "failed", "failed"]]);
+  // The round after is told of it as what it is — written, and not judged, with what the run said as it failed and
+  // what the version changed — and not as tried.
+  await twice.round({ inputs: two });
+  const NOT_JUDGED = "Written before, from the program as it is, and not judged: a run of each failed, and failed when it was made again. Whether that was the version's doing is not known — where it was, do not write that again:";
+  const told = twice.prompts[1].split("\n\nOutput the complete updated program.ts.")[0];
+  assert.doesNotMatch(told, /Tried before/);
+  assert.match(told, new RegExp(`\\n\\n${NOT_JUDGED.replace(/[.:—']/g, "\\$&")}\\n- version 2: started with \\{"word":"cd"\\}: [^]*the model could not be reached[^]* What it changed, as a diff from the program as it is:\\n  2c2,3\\n`));
+  // The round after that, of both: the one it judged and went back from, and the one it did not judge.
+  await twice.round({ inputs: two });
+  assert.match(twice.prompts[2], /\n\nTried before[^\n]*\n- version 4: 0 of 2 runs found good[^]*\n\nWritten before[^\n]*\n- version 2: started with/);
+  // What the loop keeps for it: of the program as it is, as what it tried is.
+  const state = readJson(join(twice.at("improve"), "state.json"));
+  assert.deepEqual([Object.keys(state.unjudged), state.unjudged[hashOf(first)].map((one) => one.version), state.tried], [[hashOf(first)], [2], { [hashOf(first)]: [4, 6] }]);
+  // A version is kept: the program is another, and what was written from the one before and not judged is nothing to it.
+  assert.equal((await twice.round({ inputs: two })).result.result.kept, true);
+  assert.deepEqual([readJson(join(twice.at("improve"), "state.json")).unjudged, readJson(join(twice.at("improve"), "state.json")).tried], [{}, {}]);
+  // Of those not judged, the three latest are told.
+  const many = loopOver(t, first, [1, 2, 3, 4].map(() => FALTERS(["ab", "cd"], left)).concat(SAYS([])));
+  for (let n = 0; n < 4; n++) { writeFileSync(left, "2"); await many.round({ inputs: two }); }
+  await many.round({ inputs: two });
+  assert.deepEqual(many.prompts[4].match(/\n- version \d+/g), ["\n- version 4", "\n- version 6", "\n- version 8"]);
+
+  // A run of an input that is held back fails twice: nothing is decided — and of what the run said as it failed, the
+  // writer is told nothing. (A program could say there what it was started with.) Whoever runs the loop is told.
+  writeFileSync(left, "2");
+  const held = loopOver(t, first, [FALTERS(["ab", "cd"], left), SAYS([])]);
+  const { result: unseen } = await held.round({ inputs: [{ word: "ab" }], heldBack: [{ word: "cd" }], ask: "Say more." });
+  assert.match(unseen.result.why, /^Version 1 is put back, and nothing is decided: [^]*the model could not be reached/);
+  await held.round({ inputs: [{ word: "ab" }], heldBack: [{ word: "cd" }], ask: "Say more." });
+  assert.match(held.prompts[1], /\n- version 2: a run of an input that is held back\. What it changed, as a diff/);
+  assert.doesNotMatch(held.prompts[1].split("What it changed")[0], /could not be reached|"cd"/);
+
+  // The program as it is fails once: the run is made again, and it is judged by that. Twice: it is a run found
+  // wanting, and the writer is told what it said as it failed — that is what there is to mend.
+  writeFileSync(left, "1");
+  const blip = loopOver(t, FALTERS(["ab", "cd"], left), []);
+  const { result: fine } = await blip.round({ inputs: two });
+  assert.deepEqual([fine.result.before, fine.result.why, statuses(blip, 1)], [{ ok: 2, of: 2, score: 1 }, "Nothing was asked for: no run that may be shown was found wanting, and no `ask` says what else is wanted.", ["done", "failed", "done"]]);
+  writeFileSync(left, "2");
+  const broken = loopOver(t, FALTERS(["ab", "cd"], left), [SAYS(["ab", "cd"])]);
+  const { result: mended } = await broken.round({ inputs: two });
+  assert.deepEqual([mended.result.kept, mended.result.before, mended.result.after, mended.result.remade], [true, { ok: 1, of: 2, score: 0.5 }, { ok: 2, of: 2, score: 1 }, 1]);
+  assert.match(broken.prompts[0], /found wanting:\n- started with \{"word":"cd"\}: The run failed, and failed when it was made again: [^]*the model could not be reached/);
 });
