@@ -4,7 +4,7 @@
 
 import type { AgentOptions, Schema } from "./types.js";
 import { CutOff, type AgentBackend, type AgentCall, type ModelAsk, type OwnTool } from "./agent-backend.js";
-import { conform, hasList, shapeOf } from "./schema.js";
+import { conform, hasList, hasOptional, shapeOf } from "./schema.js";
 import { isJsonObject } from "./serializable.js";
 
 /** A line of a reply that could be the edge of a fenced block: three or more backticks. */
@@ -161,6 +161,8 @@ export function createAgent(backend: AgentBackend, cwd: string, signal?: AbortSi
         JSON.stringify(input.schema, null, 2)
       }\n${
         hasList(shape) ? "Where the shape shows a list, it shows one item: answer with as many as there are, each of that shape.\n" : ""
+      }${
+        hasOptional(shape) ? 'A field whose name ends in "?" may be left out; where it is given, its name is without the "?".\n' : ""
       }No markdown. No explanation. Just the JSON.`;
 
       const fullPrompt = `${input.prompt}\n\n${schemaInstruction}`;

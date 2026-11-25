@@ -47,6 +47,16 @@ export interface ModelConfig {
 
 export interface RunOptions {
   projectDir: string;
+  /**
+   * Which version of the project's program the run is of, by its number in
+   * the project's history: where it is not the program as it is. The
+   * project is as it is — its state, its files — and the program is not
+   * touched. Such a run is not fixed where it fails: a fix would be a
+   * version nobody asked for. (The version's program is started from its
+   * own file in history/: one that imports a file beside itself by a
+   * relative path does not find it there.)
+   */
+  version?: number;
   maxRepairAttempts?: number;
   /**
    * Per-phase limit in ms on the program's own time, for each run and each
@@ -193,6 +203,12 @@ export interface HistoryVersion {
   detail?: string;
   /** Of a rollback: the version whose text it is. */
   from?: number;
+  /** Of an update or a fix: the version it was written from — the program as it was. Absent where that was on no record. */
+  parent?: number;
+  /** A mark of what the project said it took and gave when the version was made (its meta.json's `parameters` and `returns`): absent where it said nothing. */
+  contract?: string;
+  /** It was put on record beside the program, and was not made the program: it becomes that by being gone to (see `rollbackProject`). */
+  aside?: true;
 }
 
 /**
@@ -218,6 +234,8 @@ export interface HistoryRun {
   check?: Check;
   /** What it used of a model, by the runner's own count: its program's calls, its fixes, its check, and the runs it asked for. */
   used: { calls: number; tokens: number; cost: number };
+  /** The same by the model that served: of the calls that said which. Absent where none did. (A version good with one model is not thereby good with another.) */
+  models?: Record<string, { calls: number; tokens: number; cost: number }>;
   /** How long it took, in milliseconds. */
   ms: number;
   /** A mark of what it was started with (a hash of its arguments): runs with the same mark had the same. */
@@ -257,9 +275,16 @@ export type RunRequest = Omit<RunOptions, "signal">;
 
 /** A project a program asks its runner to make, or to change (see createProject and updateProject). */
 export type MakeRequest =
-  | { kind: "create" | "update"; name: string; prompt: string; model?: string; args?: Record<string, unknown> }
+  | { kind: "create"; name: string; prompt: string; model?: string; args?: Record<string, unknown> }
+  /** An update: written from the program — or from a version of it that is named — and made the program, unless it is to be kept beside it. */
+  | { kind: "update"; name: string; prompt: string; from?: number; install?: boolean }
+  /** A version handed over as a text, to be kept beside the program (see `addVersion`). */
+  | { kind: "version"; name: string; source: string; parent?: number; detail?: string }
   /** A project changed by going back to a version of its program (see `rollbackProject`). */
   | { kind: "rollback"; name: string; version: number };
+
+/** A version that was made: its number in the project's history. */
+export interface VersionMade { version: number }
 
 /** What going back to a version came to: the new version it was made, and which it is of — or that the program was that already. */
 export type RolledBack = { version: number; from: number } | { unchanged: true; version: number };

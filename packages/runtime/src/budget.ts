@@ -108,6 +108,13 @@ export interface Meter {
   count(calls: number, cost: number, tokens: number): void;
   /** What it has counted so far: the calls taken on, and what they have said they used. */
   counted(): { calls: number; cost: number; tokens: number };
+  /**
+   * Say which model a call's count is of, here and above: no part of what is
+   * held to a cap — that is `count` — but the same, told apart by who served.
+   */
+  attribute(model: string, calls: number, cost: number, tokens: number): void;
+  /** What it has counted, by the model that served: of the calls that said which. */
+  byModel(): Record<string, { calls: number; cost: number; tokens: number }>;
 }
 
 /**
@@ -119,6 +126,8 @@ export interface Meter {
 export function createMeter(limit: Budget = {}, above?: Meter): Meter {
   // What the calls taken on have used, as far as each has said, and how many they are.
   let cost = 0, tokens = 0, calls = 0;
+  // The same, of the calls that said which model served them, by that model.
+  const models = new Map<string, { calls: number; cost: number; tokens: number }>();
 
   /** A cap on what calls use that has been reached. */
   const used = (): string | undefined => {
@@ -145,18 +154,32 @@ export function createMeter(limit: Budget = {}, above?: Meter): Meter {
       above?.count(more, dollars, read);
     },
     counted: () => ({ calls, cost, tokens }),
+    attribute(model, more, dollars, read) {
+      const by = models.get(model) ?? { calls: 0, cost: 0, tokens: 0 };
+      models.set(model, { calls: by.calls + more, cost: by.cost + dollars, tokens: by.tokens + read });
+      above?.attribute(model, more, dollars, read);
+    },
+    byModel: () => Object.fromEntries([...models].map(([model, by]) => [model, { ...by }])),
     admit() {
       const refusal = meter.spent();
       if (refusal !== undefined) throw new Error(refusal);
       meter.count(1, 0, 0);
       // What the call has said it used, in all: each word of it replaces the last.
       let had = { cost: 0, tokens: 0 }, over = false;
+      // And which model served it, once it has said: the call and all it used are that model's from then on.
+      let served: string | undefined, told = { cost: 0, tokens: 0 };
       return {
         sofar(usage) {
           if (!over) {
             const now = { cost: counted(usage?.cost), tokens: tokensOf(usage) };
             meter.count(0, now.cost - had.cost, now.tokens - had.tokens);
             had = now;
+            const model = served ?? (typeof usage?.model === "string" && usage.model !== "" ? usage.model : undefined);
+            if (model !== undefined) {
+              meter.attribute(model, served === undefined ? 1 : 0, now.cost - told.cost, now.tokens - told.tokens);
+              served = model;
+              told = now;
+            }
           }
           return meter.reached();
         },

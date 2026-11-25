@@ -2,15 +2,29 @@
 // what a tool of its own is called with. One way of writing them — a kind in
 // a word, an object by its fields, a list by the shape of its items — read
 // once into a shape, which a value is then held to.
+//
+// Two words beside those. A field that may be absent is written with a "?" at
+// the end of its name: { "model?": "string" } — its name is `model`. And
+// "json" is any value: what is there is held as it is.
 
 import { isJsonObject } from "./serializable.js";
 
 const PRIMITIVES = ["string", "number", "boolean"] as const;
 type SchemaPrimitive = (typeof PRIMITIVES)[number];
 const isPrimitive = (named: string): named is SchemaPrimitive => (PRIMITIVES as readonly string[]).includes(named);
+/** Any value at all: nothing is asked of it but that it be there. */
+const ANY = "json";
 
-/** What a schema says a value is to be: a primitive by its name, an object by its fields, a list by the one shape all its items have. */
-export type Shape = SchemaPrimitive | { fields: Array<[string, Shape]> } | { items: Shape };
+/**
+ * What a schema says a value is to be: a primitive by its name — or any
+ * value — an object by its fields (and which of them may be absent), a list
+ * by the one shape all its items have.
+ */
+export type Shape = SchemaPrimitive | typeof ANY | { fields: Array<[string, Shape]>; mayBeAbsent: string[] } | { items: Shape };
+
+/** A field as it is written: its name, and whether it may be absent — a "?" at the end of what it is written under says so. */
+const written = (key: string): { name: string; optional: boolean } =>
+  (key.endsWith("?") ? { name: key.slice(0, -1), optional: true } : { name: key, optional: false });
 
 /** How the two shapes that are not named in a word are written, for whoever named them in one. */
 const HOW_WRITTEN = `a list is written as the shape of its items, in brackets: ["string"]; an object as its fields: { name: "string" }`;
@@ -39,29 +53,44 @@ export function shapeOf(declared: unknown, where: Where = null): Shape {
     return { items: shapeOf(declared[0], `${where}[]`) };
   }
   if (isJsonObject(declared)) {
-    return { fields: Object.entries(declared).map(([key, value]) => [key, shapeOf(value, fieldOf(where, key))]) };
+    const fields: Array<[string, Shape]> = [], mayBeAbsent: string[] = [];
+    for (const [key, value] of Object.entries(declared)) {
+      const { name, optional } = written(key);
+      // (A field may be named by nothing at all, odd as it is: what says nothing is a "?" with no name before it.)
+      if (optional && name === "") throw new Error(`Schema validation failed: a field's name is missing before its "?"${where === null ? "" : `, at "${where}"`}`);
+      if (fields.some(([has]) => has === name)) throw new Error(`Schema validation failed: the field "${fieldOf(where, name)}" is written twice, with a "?" and without`);
+      fields.push([name, shapeOf(value, fieldOf(where, name))]);
+      if (optional) mayBeAbsent.push(name);
+    }
+    return { fields, mayBeAbsent };
   }
   // (Anything else says nothing that is supported — and is said back as JSON would write it, which is no word for a kind.)
   const named = typeof declared === "string" ? worded(declared).kind : JSON.stringify(declared);
+  if (named === ANY) return ANY;
   if (!isPrimitive(named)) {
     throw new Error(`Schema validation failed: unsupported schema type "${named}" for key "${where}" (${HOW_WRITTEN})`);
   }
   return named;
 }
 
-/** A schema as JSON Schema says it: every field there, and no other; what follows a ":" in a field's word describes it. */
-function asJsonSchema(declared: unknown): Record<string, unknown> {
-  if (Array.isArray(declared)) return { type: "array", items: asJsonSchema(declared[0]) };
+/**
+ * A schema as JSON Schema says it: every field there but those that may be
+ * absent, and no other; what follows a ":" in a field's word describes it.
+ * (Of any value no kind is said.)
+ */
+export function jsonSchemaOf(declared: unknown): Record<string, unknown> {
+  if (Array.isArray(declared)) return { type: "array", items: jsonSchemaOf(declared[0]) };
   if (isJsonObject(declared)) {
+    const fields = Object.entries(declared).map(([key, value]) => ({ ...written(key), value }));
     return {
       type: "object",
-      properties: Object.fromEntries(Object.entries(declared).map(([key, value]) => [key, asJsonSchema(value)])),
-      required: Object.keys(declared),
+      properties: Object.fromEntries(fields.map(({ name, value }) => [name, jsonSchemaOf(value)])),
+      required: fields.filter(({ optional }) => !optional).map(({ name }) => name),
       additionalProperties: false,
     };
   }
   const { kind, description } = worded(String(declared));
-  return { type: kind, ...(description && { description }) };
+  return { ...(kind !== ANY && { type: kind }), ...(description && { description }) };
 }
 
 /**
@@ -76,7 +105,7 @@ export function argumentsOf(declared: unknown): { schema: Record<string, unknown
   if (!isJsonObject(declared)) throw new Error("Schema validation failed: a tool's parameters are an object of the fields it is called with");
   const shape = shapeOf(declared);
   return {
-    schema: asJsonSchema(declared),
+    schema: jsonSchemaOf(declared),
     held(args) {
       if (!isJsonObject(args)) throw new Error("Schema validation failed: the arguments are not an object");
       return conform(args, shape);
@@ -88,6 +117,10 @@ export function argumentsOf(declared: unknown): { schema: Record<string, unknown
 export const hasList = (shape: Shape): boolean =>
   typeof shape !== "string" && ("items" in shape || shape.fields.some(([, field]) => hasList(field)));
 
+/** Whether a shape has a field that may be absent anywhere in it. */
+export const hasOptional = (shape: Shape): boolean =>
+  typeof shape !== "string" && ("items" in shape ? hasOptional(shape.items) : shape.mayBeAbsent.length > 0 || shape.fields.some(([, field]) => hasOptional(field)));
+
 /** What a value is, said as a reply is told of it. */
 const said = (value: unknown): string =>
   value === null ? "null" : Array.isArray(value) ? "a list" : typeof value === "number" ? String(value) : typeof value;
@@ -96,9 +129,14 @@ const said = (value: unknown): string =>
  * Shape validation and projection: verifies that the value at `where` is of
  * the shape declared — every field there, every item of a list — and returns
  * it holding the declared fields and no others.
+ *
+ * A field that may be absent is held where it is there, and is no key of
+ * what is returned where it is not. (A null under it is its absence: it is
+ * how many a caller says "none" — a model calling a tool among them.)
  */
 export function conform(value: unknown, shape: Shape, where: Where = null): unknown {
   const mismatch = (expected: string) => new Error(`Schema validation failed: ${where}: expected ${expected}, got ${said(value)}`);
+  if (shape === ANY) return value;
   if (typeof shape === "string") {
     if (typeof value !== shape || (shape === "number" && !Number.isFinite(value))) throw mismatch(shape);
     return value;
@@ -108,10 +146,12 @@ export function conform(value: unknown, shape: Shape, where: Where = null): unkn
     return value.map((item, index) => conform(item, shape.items, `${where}[${index}]`));
   }
   if (!isJsonObject(value)) throw where === null ? new Error("Schema validation failed: response is not an object") : mismatch("an object");
-  return Object.fromEntries(shape.fields.map(([key, field]) => {
+  return Object.fromEntries(shape.fields.flatMap(([key, field]) => {
     // (A field is the reply's own: what every object has by birth is not something a reply said.)
-    if (!Object.hasOwn(value, key)) throw new Error(`Schema validation failed: missing key: ${fieldOf(where, key)}`);
-    return [key, conform(value[key], field, fieldOf(where, key))];
+    const there = Object.hasOwn(value, key);
+    if (shape.mayBeAbsent.includes(key) && (!there || value[key] === null || value[key] === undefined)) return [];
+    if (!there) throw new Error(`Schema validation failed: missing key: ${fieldOf(where, key)}`);
+    return [[key, conform(value[key], field, fieldOf(where, key))]];
   }));
 }
 

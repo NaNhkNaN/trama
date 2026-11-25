@@ -139,7 +139,8 @@ cli
   .option("--arg <key=value>", "Pass argument to the program (repeatable)", collectArg, [])
   .option("--budget <cap=number>", "Cap what the run may use of a model: cost (US dollars), tokens or calls (repeatable)", collectArg, [])
   .option("--check <project>", "Have the run checked, once it is done, by a project: its name, or a path")
-  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[]; check?: string }) => {
+  .option("--at-version <number>", "Run a version of the program from the project's history, and not the program as it is (see: trama history)")
+  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[]; check?: string; atVersion?: string }) => {
     let timeout: number | undefined;
     if (opts.timeout !== undefined) {
       timeout = Number(opts.timeout);
@@ -150,7 +151,12 @@ cli
     const args = parseArgs(opts.arg);
     const budget = parseBudget(opts.budget);
     const projectDir = resolveProject(name);
-    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, checkWith: opts.check, signal }));
+    let version: number | undefined;
+    if (opts.atVersion !== undefined) {
+      version = Number(opts.atVersion);
+      if (!Number.isSafeInteger(version) || version < 1) throw new Error(`--at-version takes a version's number: 1 and up (got "${opts.atVersion}")`);
+    }
+    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, checkWith: opts.check, ...(version !== undefined && { version }), signal }));
     // (A run that a signal stopped has failed, and is not reported as that: see `command`.)
     if (result.status === "failed") {
       throw new Error(failureOf(result.reason));

@@ -1,11 +1,13 @@
 // The loop, as a program: one round of it a run. It holds a project's program against the one an update
-// writes — by a judge, on inputs that are said — and keeps the better: the new one, or the one before, gone
-// back to.
+// writes — by a judge, on inputs that are said — and keeps the better: the new one is made the program, or the
+// program stays what it is.
 //
 // trama has the facts and the moves: every run of a project leaves a line in its history, with the version it
-// was of and what its check said (`readHistory`); a project is changed by an update (`updateProject`) and by
-// going back to a version (`rollbackProject`). Which version is the better is said here, in `better`, and
-// nowhere else. It is a starting point, to be copied and changed.
+// was of and what its check said (`readHistory`); a version is written and kept beside the program
+// (`updateProject` with `install: false`), run by its number (`runProgram` with `version`), and made the program
+// (`rollbackProject`). So the new one is judged before it is the program: the project never holds a program
+// that was not yet judged, and a round that comes to nothing leaves nothing to undo. Which version is the
+// better is said here, in `better`, and nowhere else. It is a starting point, to be copied and changed.
 //
 // It is for a project that is given arguments and ends with a result: its runs are made in place, one after
 // another. A run that uses up what it works on — a harness, doing a task in a codebase — is given a fresh copy
@@ -91,29 +93,24 @@ class RunFailed extends Error { shown = false; on: Input | undefined; }
 let remade = 0;
 
 /**
- * What this loop keeps from one round to the next (its state): what the judge said, whole, of the runs it made of
- * the program as it is. A project's history keeps the beginning of a verdict's notes — and what comes after is
- * often what a writer can act on. By the program's text, then by the mark of the input; of inputs that are shown.
+ * What this loop keeps from one round to the next (its state): words, and nothing else. What the judge said, whole,
+ * of the runs it made of the program as it is — a project's history keeps the beginning of a verdict's notes, and
+ * what comes after is often what a writer can act on. By the program's text, then by the mark of the input; of
+ * inputs that are shown.
+ *
+ * And what a run of a version said as it failed, where it failed twice and nothing was decided: of that a line of
+ * history has the first line, which seldom says what failed. By the text of the program the version was written
+ * from, then by the version; of a run of an input that may be shown. (Of one that is held back, nothing: a program
+ * can say as it fails what it was started with.)
+ *
+ * It keeps no list of what it tried, nor of what it decided: which versions were written from the program, and what
+ * the runs of each came to, is on the project's record — see `writtenBefore`.
  */
-type NotJudged = { version: number; said?: string };
-const kept = ctx.state as { notes?: Record<string, Record<string, string[]>>; tried?: Record<string, number[]>; unjudged?: Record<string, NotJudged[]> };
+const kept = ctx.state as { notes?: Record<string, Record<string, string[]>>; said?: Record<string, Record<string, string>> };
 kept.notes ??= {};
-/**
- * And the versions this loop judged and went back from, by the text of the program they were written from. A
- * project's history says a version was gone back from, and not why: one put back because a check of it could not be
- * made — or by anybody else, or by a round that fell over — was never found no better, and is not to be told as if
- * it had been. Only what the loop decided itself is here; what it does not know it decided, it does not say.
- */
-kept.tried ??= {};
-/** The version this round judged and went back from, where it did. */
-let judgedAndGoneBackFrom: number | undefined;
-/**
- * And the versions it went back from without judging them, for a run that failed twice: with what the run said as it
- * failed, where the run was of an input that may be shown. (Of one that is held back, nothing: a program can say as
- * it fails what it was started with.) Told to the writer as what they are — written, and not judged.
- */
-kept.unjudged ??= {};
-let goneBackFromUnjudged: NotJudged | undefined;
+kept.said ??= {};
+/** What a run of the version this round wrote said as it failed twice, where it did and may be told. */
+let saidAsItFailed: { version: number; said: string } | undefined;
 /** The notes of a verdict from the record, whole where this loop heard them itself: the record's are their beginning. */
 const whole = (notes: string | undefined, text: string | undefined, mark: string): string | undefined => {
   if (notes === undefined || text === undefined || !notes.endsWith("…")) return notes;
@@ -146,35 +143,38 @@ async function fresh(input: Input, name: string): Promise<string | undefined> {
  * "This program" is told by its text, not by its version's number: a version gone back to is the program it was
  * under a new number, and the verdicts on it are its verdicts still.
  *
+ * `tried`: of that version — one kept beside the program, by its number — and not of the program.
+ *
  * `again`: made again, to confirm — of the inputs that decide only, and by new runs alone: nothing from the record.
  *
  * A run that fails is made again, once, and it is the second that counts: what fails a run is not always its
  * program. Where that fails too: of the program as it is, it is a run found wanting, and what it said as it failed
- * is what there is to mend; of a version that is being tried (`trying`), nothing is decided — RunFailed.
+ * is what there is to mend; of a version that is being tried, nothing is decided — RunFailed.
  */
-async function verdicts(again = 0, trying = false): Promise<Verdict[][]> {
+async function verdicts(again = 0, tried?: number): Promise<Verdict[][]> {
   // (The latest runs are enough, and a call's record has room for no more than some.)
   const history = await readHistory(dir, { runs: 500 });
   // The judge as it is now: a verdict on record is its own where the judge's program was this one. (It is on record once it has checked anything.)
   const judging = await readHistory(judge, { runs: 0 });
   const judgedBy = judging.versions.find((version) => version.version === judging.current)?.sha256;
-  // The versions that are the program as it is now: the one it is, and any before it with the same text.
-  const text = history.versions.find((version) => version.version === history.current)?.sha256;
+  // The versions that are the program as it is now — or the version that is tried: the one it is, and any before it with the same text.
+  const of = tried ?? history.current;
+  const text = history.versions.find((version) => version.version === of)?.sha256;
   const same = new Set(history.versions.filter((version) => text !== undefined && version.sha256 === text).map((version) => version.version));
   const each: Verdict[][] = [], heard: Array<[string, string]> = [];
   for (const [n, input] of all.entries()) {
     if (again > 0 && !decides(n)) { each.push([]); continue; }
     const mark = await inputMarkOf(dir, input);
-    const found: Verdict[] = again > 0 || history.current === undefined || judgedBy === undefined ? [] : history.runs
+    const found: Verdict[] = again > 0 || of === undefined || judgedBy === undefined ? [] : history.runs
       .filter((run) => run.version !== undefined && same.has(run.version) && run.ended === undefined && run.input === mark)
       .flatMap(({ check: said }) => (said && said.by === judge && said.program === judgedBy && said.ok !== undefined ? [{ ok: said.ok, score: said.score ?? 0, notes: whole(said.notes, text, mark) }] : []))
       .slice(-runs);
     while (found.length < runs) {
       // (Not fixed where it fails: a fix would be another version, in the middle of what is held against each other.)
-      const work = `work/v${history.current ?? 0}-${n}-${found.length}${again > 0 ? `-again${again}` : ""}`;
+      const work = `work/v${of ?? 0}-${n}-${found.length}${again > 0 ? `-again${again}` : ""}`;
       const make = async (work: string) => {
         const workspaceDir = await fresh(input, work);
-        const ran = await runProgram({ projectDir: dir, args: input, checkWith: judge, maxRepairAttempts: 0, ...(workspaceDir !== undefined && { workspaceDir }) });
+        const ran = await runProgram({ projectDir: dir, args: input, checkWith: judge, maxRepairAttempts: 0, ...(tried !== undefined && { version: tried }), ...(workspaceDir !== undefined && { workspaceDir }) });
         // (The judge has seen it by now: a check is part of the run. The copy has done what it was for.)
         if (workspaceDir !== undefined) await tools.shell(`rm -rf ${quoted(work)}`, { timeout: 600_000 });
         return ran;
@@ -186,7 +186,7 @@ async function verdicts(again = 0, trying = false): Promise<Verdict[][]> {
       }
       if (ran.status !== "done") {
         const said = `The run ${ran.status}, and ${ran.status} when it was made again: ${(ran.reason ?? "").trim().slice(0, 1000)}`;
-        if (trying) throw Object.assign(new RunFailed(said), { shown: n < inputs.length, on: input });
+        if (tried !== undefined) throw Object.assign(new RunFailed(said), { shown: n < inputs.length, on: input });
         found.push({ ok: false, score: 0, notes: said });
       } else if (ran.check?.ok === undefined) throw new NoVerdict(ran.check?.error ?? "the run was not checked.");
       else found.push({ ok: ran.check.ok, score: ran.check.score ?? 0, notes: ran.check.notes });
@@ -198,45 +198,63 @@ async function verdicts(again = 0, trying = false): Promise<Verdict[][]> {
   // it. (By the program's text — which, of a program that had never been run, is on record only now that it has been.)
   if (heard.length > 0) {
     const ran = text !== undefined ? undefined : await readHistory(dir, { runs: 0 });
-    const of = text ?? ran?.versions.find((version) => version.version === ran.current)?.sha256;
-    if (of !== undefined) for (const [mark, notes] of heard) ((kept.notes![of] ??= {})[mark] = [...(kept.notes![of][mark] ?? []), notes].slice(-(runs * (1 + confirm))));
+    const under = text ?? ran?.versions.find((version) => version.version === ran.current)?.sha256;
+    if (under !== undefined) for (const [mark, notes] of heard) ((kept.notes![under] ??= {})[mark] = [...(kept.notes![under][mark] ?? []), notes].slice(-(runs * (1 + confirm))));
   }
   return each;
 }
 
 /**
- * What was tried before from the program as it is, and gone back from: each version an update wrote of this very
- * text that this loop judged and found no better — what its runs came to, on what decides, and what it changed. A round begins
- * from the program again; without this its writer does not know what the rounds before came to, and writes it again.
+ * What was written before from the program as it is, and is not the program: read from the project's history, which
+ * has every version with the one it was written from, and every run of each with what its check said. A round
+ * begins from the program again; without this its writer does not know what the rounds before came to, and writes
+ * it again. Of each text, its latest version; and of those, two kinds —
+ *
+ *  - `tried`: judged whole — as many verdicts of this judge as a round makes, of every input — and it is not the
+ *    program: it was found no better. What its runs came to, on what decides, and what it changed. The five latest.
+ *  - `notJudged`: its latest run of some input did not end done — it failed, and failed when it was made again — so
+ *    nothing was decided of it. What the run said as it failed, where that may be told, and what it changed. The
+ *    three latest.
+ *
+ * A version that is neither — a check of it could not be made, or its round fell over — was never judged, and is
+ * not told as if it had been, whatever runs of it happened to be judged first.
  * (All of it is read by the runner or by a command: it is on this run's record, and a replay is told the same.)
  */
-async function triedBefore(was: Tally): Promise<string[]> {
+async function writtenBefore(was: Tally): Promise<{ tried: string[]; notJudged: string[] }> {
   const history = await readHistory(dir, { runs: 500 });
   const judging = await readHistory(judge, { runs: 0 });
   const judgedBy = judging.versions.find((version) => version.version === judging.current)?.sha256;
   const text = history.versions.find((version) => version.version === history.current)?.sha256;
-  if (text === undefined) return [];
-  // The latest try of each text: the version, and the one it was written from.
-  const tries = new Map<string, { version: number; from: number }>();
-  const judged = new Set(kept.tried![text] ?? []);
-  for (const [at, version] of history.versions.entries()) {
-    const from = history.versions[at - 1];
-    if (judged.has(version.version) && version.reason === "update" && version.sha256 !== undefined && version.sha256 !== text && from?.sha256 === text) tries.set(version.sha256, { version: version.version, from: from.version });
+  const tried: string[] = [], notJudged: string[] = [];
+  if (text === undefined) return { tried, notJudged };
+  // The latest version of each text that an update wrote from this very text: its line says which version it was written from.
+  const written = new Map<string, { version: number; from: number }>();
+  for (const version of history.versions) {
+    const from = history.versions.find((one) => one.version === version.parent);
+    if (version.reason === "update" && version.sha256 !== undefined && version.sha256 !== text && from?.sha256 === text) written.set(version.sha256, { version: version.version, from: from.version });
   }
-  if (tries.size === 0) return [];
-  const marks = new Set<string>();
-  for (const [n, input] of all.entries()) if (decides(n)) marks.add(await inputMarkOf(dir, input));
-  const told: string[] = [];
-  for (const [sha256, { version, from }] of [...tries].slice(-5)) {
+  if (written.size === 0) return { tried, notJudged };
+  const marks: string[] = [];
+  for (const input of all) marks.push(await inputMarkOf(dir, input));
+  for (const [sha256, { version, from }] of written) {
     const its = new Set(history.versions.filter((one) => one.sha256 === sha256).map((one) => one.version));
+    const runsOf = (mark: string) => history.runs.filter((run) => run.version !== undefined && its.has(run.version) && run.ended === undefined && run.input === mark);
     // (The runs it was judged by: one that failed was made again, and is none of them.)
-    const came: Verdict[] = history.runs.filter((run) => run.version !== undefined && its.has(run.version) && run.ended === undefined && marks.has(run.input))
+    const verdictsOf = (mark: string): Verdict[] => runsOf(mark)
       .flatMap((run) => (run.status === "done" && run.check && run.check.by === judge && run.check.program === judgedBy && run.check.ok !== undefined ? [{ ok: run.check.ok, score: run.check.score ?? 0 }] : []));
-    const is = came.length > 0 ? tally([came]) : undefined;
-    told.push(`- version ${version}: ${is ? `${is.ok} of ${is.of} runs found good, at a mean score of ${is.score}, where the program as it is has ${was.ok} of ${was.of} at ${was.score}.` : "what its runs came to is on record no longer."}`
-      + await changedBy(from, version));
+    const failed = marks.findIndex((mark) => { const last = runsOf(mark).at(-1); return last !== undefined && last.status !== "done"; });
+    if (failed >= 0) {
+      const last = runsOf(marks[failed]).at(-1)!;
+      // What the run said: as this loop heard it — or, where it did not, what the history has of it. Of an input that is held back, nothing.
+      const said = failed >= inputs.length ? "a run of an input that is held back."
+        : kept.said![text]?.[version] ?? `started with ${JSON.stringify(all[failed])}: ${last.reason ?? `the run ${last.status}`}`;
+      notJudged.push(`- version ${version}: ${said}${await changedBy(from, version)}`);
+    } else if (marks.every((mark) => verdictsOf(mark).length >= runs)) {
+      const is = tally([[...new Set(marks.filter((_, n) => decides(n)))].flatMap(verdictsOf)]);
+      tried.push(`- version ${version}: ${is.ok} of ${is.of} runs found good, at a mean score of ${is.score}, where the program as it is has ${was.ok} of ${was.of} at ${was.score}.${await changedBy(from, version)}`);
+    }
   }
-  return told;
+  return { tried: tried.slice(-5), notJudged: notJudged.slice(-3) };
 }
 
 /** What a version changed, as a diff from the one it was written from: of the two files in the project's history. */
@@ -245,23 +263,6 @@ async function changedBy(from: number, version: number): Promise<string> {
   // (Cut at 20,000 characters: a version a model wrote of a harness of 340 lines was a diff of 13,000.)
   const diff = (await tools.shell(`diff ${quoted(file(from))} ${quoted(file(version))} | head -c 20000`, { timeout: 60_000 })).stdout.trimEnd();
   return diff ? ` What it changed, as a diff from the program as it is:\n${diff.split("\n").map((line) => `  ${line}`).join("\n")}` : "";
-}
-
-/**
- * What was written before from the program as it is and gone back from without being judged: a run of it failed,
- * twice. The three latest; with what the run said as it failed where that may be told, and what the version changed.
- */
-async function notJudgedBefore(): Promise<string[]> {
-  if (Object.keys(kept.unjudged!).length === 0) return [];
-  const history = await readHistory(dir, { runs: 0 });
-  const text = history.versions.find((version) => version.version === history.current)?.sha256;
-  const told: string[] = [];
-  for (const { version, said } of (text !== undefined ? kept.unjudged![text] ?? [] : []).slice(-3)) {
-    const at = history.versions.findIndex((one) => one.version === version), from = history.versions[at - 1];
-    if (from?.sha256 !== text) continue;
-    told.push(`- version ${version}: ${said ?? "a run of an input that is held back."}${await changedBy(from.version, version)}`);
-  }
-  return told;
 }
 
 const tally = (verdictsOf: Verdict[][]): Tally => {
@@ -301,46 +302,46 @@ async function round(): Promise<Record<string, unknown>> {
     return { kept: false, from, before: was, why: "Nothing was asked for: no run that may be shown was found wanting, and no `ask` says what else is wanted." };
   }
   const checked = "Runs of the program as it is were checked, and these";
-  const tried = await triedBefore(was), notJudged = await notJudgedBefore();
+  const { tried, notJudged } = await writtenBefore(was);
+  let to: number;
   try {
-    await updateProject(project, [
+    // (Written, and kept beside the program: the program is not replaced by what has not been judged.)
+    ({ version: to } = await updateProject(project, [
       ask,
       wanting.length > 0 && `${checked} were found wanting:\n${wanting.join("\n")}`,
       good.length > 0 && `${wanting.length > 0 ? "And these" : checked} were found good — what the judge said of each:\n${good.join("\n")}`,
-      tried.length > 0 && `Tried before, from the program as it is, and gone back from — none was kept. Write something else:\n${tried.join("\n")}`,
+      tried.length > 0 && `Tried before, from the program as it is — none was kept. Write something else:\n${tried.join("\n")}`,
       notJudged.length > 0 && `Written before, from the program as it is, and not judged: a run of each failed, and failed when it was made again. Whether that was the version's doing is not known — where it was, do not write that again:\n${notJudged.join("\n")}`,
-    ].filter(Boolean).join("\n\n"));
+    ].filter(Boolean).join("\n\n"), { install: false }));
   } catch (err) {
     return { kept: false, from, before: was, why: `No update came of the asking: ${(err as Error).message}` };
   }
-  const to = (await readHistory(dir, { runs: 0 })).current;
 
-  // After: how the new one does. Decide — and where it passes and is to be confirmed, make the runs that decide again,
-  // and decide by all of them. Whatever happens meanwhile, it is not left there untried: the one before is put back.
+  // After: how the new one does — run by its number, from beside the program. Decide — and where it passes and is to
+  // be confirmed, make the runs that decide again, and decide by all of them. Whatever happens meanwhile, the program
+  // is the one it was: there is nothing to put back.
   let after: Verdict[][], kept: boolean, confirmed = 0;
   const passes = () => (by === "score" ? betterByScore(deciding(after), was, partGood(after), wasGood, margin) : better(deciding(after), was, margin));
   try {
-    after = await verdicts(0, true);
+    after = await verdicts(0, to);
     kept = passes();
     for (let again = 1; kept && again <= confirm; again++) {
-      const more = await verdicts(again, true);
+      const more = await verdicts(again, to);
       after = after.map((of, n) => [...of, ...more[n]]);
       confirmed += more.flat().length;
       kept = passes();
     }
   } catch (err) {
-    await rollbackProject(project, from);
     if (err instanceof RunFailed) {
-      goneBackFromUnjudged = { version: to!, ...(err.shown && { said: `started with ${JSON.stringify(err.on)}: ${err.message}` }) };
-      return { kept: false, from, to, before: was, remade, why: `Version ${from} is put back, and nothing is decided: a run of version ${to} failed, and failed when it was made again — whether that is the version's doing is not known. ${err.message}` };
+      if (err.shown) saidAsItFailed = { version: to, said: `started with ${JSON.stringify(err.on)}: ${err.message}` };
+      return { kept: false, from, to, before: was, remade, why: `Version ${from} stays, and nothing is decided: a run of version ${to} failed, and failed when it was made again — whether that is the version's doing is not known. ${err.message}` };
     }
     if (!(err instanceof NoVerdict)) throw err;
-    return { kept: false, from, to, before: was, why: `Version ${from} is put back: a check of version ${to} could not be made — ${err.message}` };
+    return { kept: false, from, to, before: was, why: `Version ${from} stays: a check of version ${to} could not be made — ${err.message}` };
   }
-  if (!kept) {
-    await rollbackProject(project, from);
-    judgedAndGoneBackFrom = to;
-  }
+  // It is the better: it is made the program. It is not: it stays where it is, on record with what its runs came to —
+  // which is all that the rounds to come need to know that it was tried.
+  if (kept) await rollbackProject(project, to);
 
   // What it did, and why.
   const is = deciding(after), isAll = tally(after);
@@ -348,13 +349,13 @@ async function round(): Promise<Record<string, unknown>> {
   if (by === "score") {
     const scores = `a mean score of ${is.score} where it was ${was.score}`, more = margin > 0 ? ` by more than ${margin}` : "";
     why = kept ? `Version ${to} is kept: ${scores}, higher${more}; ${isAll.ok} of ${isAll.of} runs of all inputs found good where ${wasAll.ok} of ${wasAll.of} were.`
-      : !(is.score > was.score + margin) ? `Version ${from} is put back: ${scores}, not higher${more}.`
-      : `Version ${from} is put back: ${isAll.ok} of ${isAll.of} runs of version ${to}, all inputs counted, were found good where ${wasAll.ok} of ${wasAll.of} were — a smaller part, input by input (${Number(partGood(after).toFixed(2))} where it was ${Number(wasGood.toFixed(2))}), whatever its score.`;
+      : !(is.score > was.score + margin) ? `Version ${from} stays: ${scores}, not higher${more}.`
+      : `Version ${from} stays: ${isAll.ok} of ${isAll.of} runs of version ${to}, all inputs counted, were found good where ${wasAll.ok} of ${wasAll.of} were — a smaller part, input by input (${Number(partGood(after).toFixed(2))} where it was ${Number(wasGood.toFixed(2))}), whatever its score.`;
   } else {
     const counts = `${is.ok} of ${is.of} runs${kept ? "" : ` of version ${to}`} were found good ${is.ok === was.ok ? "as" : "where"} ${was.ok} of ${was.of} were`;
     const scores = is.ok === was.ok || kept ? `, at a mean score of ${is.score} where it was ${was.score}` : "";
     why = kept ? `Version ${to} is kept: ${counts}${scores}.`
-      : `Version ${from} is put back: ${counts}${is.ok === was.ok ? `${scores} — ${margin > 0 ? `not better by more than ${margin}` : "no better"}, and the one before is the one that is known` : ""}.`;
+      : `Version ${from} stays: ${counts}${is.ok === was.ok ? `${scores} — ${margin > 0 ? `not better by more than ${margin}` : "no better"}, and the one before is the one that is known` : ""}.`;
   }
   if (remade > 0) why += ` ${remade} run${remade === 1 ? "" : "s"} failed and ${remade === 1 ? "was" : "were"} made again: what came of ${remade === 1 ? "it" : "them"} then is what is counted.`;
   if (confirmed > 0) why += kept ? ` The runs that decide were made again to be sure of it: ${confirmed} more, counted here.` : ` It had passed by its first runs; with the ${confirmed} made again, it does not.`;
@@ -368,12 +369,10 @@ async function round(): Promise<Record<string, unknown>> {
 }
 
 const came = await round();
-// What is kept for the rounds to come is of the program as it is now: of one that was gone back from, or took another's place, nothing is.
+// What is kept for the rounds to come is of the program as it is now: of one that another took the place of, nothing is.
 const now = await readHistory(dir, { runs: 0 });
 const standing = now.versions.find((version) => version.version === now.current)?.sha256;
 kept.notes = standing !== undefined && kept.notes[standing] ? { [standing]: kept.notes[standing] } : {};
-const tried = [...(standing !== undefined ? kept.tried[standing] ?? [] : []), ...(judgedAndGoneBackFrom !== undefined ? [judgedAndGoneBackFrom] : [])];
-kept.tried = standing !== undefined && tried.length > 0 ? { [standing]: tried } : {};
-const notJudged = [...(standing !== undefined ? kept.unjudged[standing] ?? [] : []), ...(goneBackFromUnjudged !== undefined ? [goneBackFromUnjudged] : [])];
-kept.unjudged = standing !== undefined && notJudged.length > 0 ? { [standing]: notJudged } : {};
+const said = { ...(standing !== undefined ? kept.said[standing] : undefined), ...(saidAsItFailed !== undefined && { [saidAsItFailed.version]: saidAsItFailed.said }) };
+kept.said = standing !== undefined && Object.keys(said).length > 0 ? { [standing]: said } : {};
 await ctx.done(came);

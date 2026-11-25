@@ -1,4 +1,49 @@
 {
-  "input": { "prompt": "The loop: holds a project's program against the one an update writes, by a judge, and keeps the better.", "args": {} },
+  "description": "One round of improving a project's program: holds the program against a version an update writes of it — by a judge, on inputs that are said — and makes the new one the program where it is found the better. Run again, it is the next round.",
+  "parameters": {
+    "project": "string: the project to improve, by its name among the user's projects",
+    "check": "string: the project that judges a run of it, by its name",
+    "inputs?": "json: what to run it on — a list of arguments, [{…}, {…}], or that list as JSON text. What is found wanting of these is shown to the writer",
+    "heldBack?": "json: more of them, never shown to the writer: where there are any, they alone decide",
+    "runs?": "number: how many runs of each input (1)",
+    "ask?": "string: what is wanted, in words — beside what was found wanting, or where nothing was",
+    "from?": "string: what a run works on, where that is not the project itself — a directory, copied afresh for every run and handed to it as its workspace; {name} in it stands for the input's argument of that name",
+    "by?": "string: how a version is found the better — good (how often, then the score) or score (the score, provided it is no less often good)",
+    "margin?": "number: by how much a mean score has to be higher (0)",
+    "confirm?": "number: how many times the runs that decide are made again where a version passes (0)",
+    "tell?": "string: which runs the writer is told of — wanting, or all"
+  },
+  "returns": {
+    "kept": "boolean: whether a new version was made the program",
+    "from?": "number: the version the program was",
+    "to?": "number: the version that was written, and judged beside the program",
+    "before?": {
+      "ok": "number: how many runs were found good",
+      "of": "number: of how many",
+      "score": "number: their mean score"
+    },
+    "after?": {
+      "ok": "number: how many runs were found good",
+      "of": "number: of how many",
+      "score": "number: their mean score"
+    },
+    "all?": {
+      "before": {
+        "ok": "number",
+        "of": "number"
+      },
+      "after": {
+        "ok": "number",
+        "of": "number"
+      }
+    },
+    "confirmed?": "number: how many runs were made again to be sure of a version that passed",
+    "remade?": "number: how many runs failed and were made again",
+    "why": "string: what was decided, and by what"
+  },
+  "input": {
+    "prompt": "The loop: holds a project's program against the one an update writes, by a judge, and keeps the better.",
+    "args": {}
+  },
   "createdAt": "2026-11-23T00:00:00.000Z"
 }

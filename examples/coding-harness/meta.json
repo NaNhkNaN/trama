@@ -1,4 +1,31 @@
 {
-  "input": { "prompt": "Say what is to be done: trama run <this project> --arg task=\"…\"", "args": {} },
+  "description": "A harness for work on a codebase: a model is given a task, and tools to read, change and run things — in the project, or in its run's workspace where it has one — until it says it is done.",
+  "parameters": {
+    "task?": "string: what is to be done — where none is given, the project's own prompt",
+    "turns?": "number: how often the model is asked at most (200)",
+    "forgetAt?": "number: how many tokens a request may come to read before the conversation is made shorter (120000)",
+    "model?": "string: the model that does the work, as provider/model — else the project's own"
+  },
+  "returns": {
+    "summary?": "string: what the model says it did — absent where it never said it was done",
+    "asked": "number: how many requests were made of the model",
+    "forgotten": "number: how often the conversation was made shorter by forgetting",
+    "summed": "number: how often by summing up",
+    "files": {
+      "changed": [
+        "string"
+      ],
+      "made": [
+        "string"
+      ],
+      "gone": [
+        "string"
+      ]
+    }
+  },
+  "input": {
+    "prompt": "Say what is to be done: trama run <this project> --arg task=\"…\"",
+    "args": {}
+  },
   "createdAt": "2026-11-21T00:00:00.000Z"
 }

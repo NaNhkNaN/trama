@@ -1,4 +1,15 @@
 {
-  "input": { "prompt": "A checker: says whether a run's work is good by a command, run in a copy of the project as the run left it.", "args": { "command": "npm test", "seconds": 600 } },
+  "description": "A checker: says whether a run's work is good by a command, run in a copy of the project as the run left it. Named as a run's checkWith; its own arguments are `command` (npm test) and `seconds` (600), beside what a runner hands a checker.",
+  "returns": {
+    "ok": "boolean: whether the command ended well, in time",
+    "notes": "string: how it ended, and the end of what it printed"
+  },
+  "input": {
+    "prompt": "A checker: says whether a run's work is good by a command, run in a copy of the project as the run left it.",
+    "args": {
+      "command": "npm test",
+      "seconds": 600
+    }
+  },
   "createdAt": "2026-11-23T00:00:00.000Z"
 }

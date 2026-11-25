@@ -8,7 +8,7 @@ import { join } from "path";
 import { replayProgram, runProgram } from "../packages/runtime/dist/runner.js";
 import { user } from "./pi-user.mjs";
 import { isDeepStrictEqual } from "node:util";
-import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, makeTempDir, withEnv } from "./helpers.mjs";
+import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson } from "./helpers.mjs";
 
 // The harness for work on a codebase that is in the repository to begin from (examples/coding-harness): a
 // program that is its own loop over `agent.complete`. Here it is run as a project is, with nothing stood in for
@@ -59,6 +59,9 @@ async function scene(t, plays, said = "down for a moment") {
   const projectDir = makeTempDir("trama-coding-");
   t.after(() => cleanupTempDir(projectDir));
   createProjectFixture(projectDir, { programSource: readFileSync(join(EXAMPLE, "program.ts"), "utf-8"), packageJson: { name: "codebase", type: "module" } });
+  // (Held to what the example says it takes and gives, as a copy of it is.)
+  const { description, parameters, returns } = readJson(join(EXAMPLE, "meta.json"));
+  writeJson(join(projectDir, "meta.json"), { ...readJson(join(projectDir, "meta.json")), description, parameters, returns });
   mkdirSync(join(projectDir, "src"));
   writeFileSync(join(projectDir, "src", "greet.js"), 'export const greet = (name) => "Helo, " + name;\n');
   writeFileSync(join(projectDir, "notes.txt"), NOTES);

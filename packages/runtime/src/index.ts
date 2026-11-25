@@ -14,7 +14,7 @@ import { readProjectMeta } from "./meta.js";
 import { ensureProjectScaffold, loadConfig, loadProjectConfig, loadState, namesAPath, projectNamed } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import {
-  validateProgram, installValidatedProgram,
+  validateProgram, installValidatedProgram, keepBeside, writtenFrom,
   withTempDir, prepareProject, shownPaths, type Prepared, RUNTIME_TYPES, runProgram as runHere, replayProgram as replayHere, replayAll as replayAllHere, rollbackTo, whyNotReplaceable,
   inputMarkOf as markHere,
   tagged, failureOf, type AskedToMake, type Making,
@@ -25,9 +25,12 @@ import { guardPath, identityOf, sameProjectAs } from "./path-guard.js";
 import { printJournals, spentIn } from "./journal-view.js";
 import { messageOf } from "./errors.js";
 
-export type { HistoryRun, HistoryVersion, ProjectHistory, RolledBack } from "./runner-types.js";
-import type { ProjectHistory, RolledBack } from "./runner-types.js";
-import { readHistory as historyHere } from "./history.js";
+export type { HistoryRun, HistoryVersion, ProjectHistory, RolledBack, VersionMade } from "./runner-types.js";
+import type { ProjectHistory, RolledBack, VersionMade } from "./runner-types.js";
+import { readHistory as historyHere, textOfVersion } from "./history.js";
+import { describeProject as describeHere, describeProjects as describeAllHere } from "./contract.js";
+import type { ProjectDescription } from "./contract.js";
+export type { ProjectDescription } from "./contract.js";
 export type { Budget, Check, ProgramResult, RunOptions, ReplayOptions, ReplayResult, ReplayAllResult } from "./runner-types.js";
 export { failureOf } from "./runner.js";
 export { requestsWhole } from "./journal-view.js";
@@ -64,9 +67,10 @@ async function overBridge<T>(bridge: Bridge, endpoint: string, asked: Record<str
 /** How this runner makes or changes a project for a program that asks it to (see Making). */
 const making: Making = async (request, asked) =>
   request.kind === "rollback" ? rollbackHere(request.name, request.version, asked)
+    : request.kind === "version" ? addVersionHere(request.name, request.source, { parent: request.parent, detail: request.detail, signal: asked.signal }, asked)
     : request.kind === "create"
       ? createHere(request.name, request.prompt, { model: request.model, args: request.args, signal: asked.signal }, asked)
-      : updateHere(request.name, request.prompt, { signal: asked.signal }, asked);
+      : updateHere(request.name, request.prompt, { from: request.from, install: request.install, signal: asked.signal }, asked);
 
 /** Run a project to an outcome: done, yielded, or failed. */
 export async function runProgram(options: RunOptions): Promise<ProgramResult> {
@@ -174,6 +178,28 @@ export async function readHistory(projectDir: string, options: { runs?: number }
 }
 
 /**
+ * What a project says of itself: what it is for (`description`), what a run
+ * of it is given (`parameters`) and gives (`returns`) — as its meta.json
+ * writes them, and as JSON Schema. Its program is not run. The project is
+ * named by its name among the user's projects, or by a path.
+ *
+ * A program asks its runner, as for a history: what it was told is on its
+ * run's record.
+ */
+export async function describeProject(name: string): Promise<ProjectDescription> {
+  const bridge = parentBridge();
+  if (!bridge) return describeHere(name);
+  return bridge.call("/project/describe", { name: namesAPath(name) ? resolve(name) : name });
+}
+
+/** The user's projects, by name, and what each says of itself (see `describeProject`): for a program that is to choose among them. */
+export async function describeProjects(): Promise<ProjectDescription[]> {
+  const bridge = parentBridge();
+  if (!bridge) return describeAllHere();
+  return bridge.call("/project/describe", {});
+}
+
+/**
  * The mark of what a run of a project is started with, where it is asked
  * for with these arguments: the `input` of its line in the project's
  * history. By it a program finds the runs on record that were started with
@@ -255,6 +281,7 @@ export async function showHistory(name: string, options: { runs?: boolean } = {}
 
   for (const version of versions) {
     console.log([`v${version.version}`, version.reason, when(version.at), version.sha256?.slice(0, 8) ?? "(its file is gone)", version.from !== undefined && `from v${version.from}`,
+      version.parent !== undefined && `of v${version.parent}`, version.aside && "(beside the program)",
       version.detail && JSON.stringify(oneLine(version.detail, 60)), version.version === current && "← the program now"].filter(Boolean).join("  "));
     told(runs.filter((run) => run.version === version.version));
   }
@@ -267,7 +294,9 @@ export async function showHistory(name: string, options: { runs?: boolean } = {}
   }
   if (runs.length > 0) console.log(`${count(runs.length, "run")} ${runs.length === 1 ? "is" : "are"} on record, the first of ${when(runs[0].at)}.`);
   if (current === undefined && versions.length > 0) {
-    console.log(`The program as it is now is on no record: it was changed after version ${versions.at(-1)!.version}, and is recorded when it is next run.`);
+    // (After the latest version it was made: one kept beside the program was never the program.)
+    const was = versions.filter((version) => !version.aside).at(-1);
+    console.log(`The program as it is now is on no record: it was changed${was ? ` after version ${was.version}` : ""}, and is recorded when it is next run.`);
   }
 }
 
@@ -489,10 +518,10 @@ function keepPrepared(prepared: Prepared, label?: string): void {
  */
 async function validateCandidate(
   projectDir: string, backend: Backend, candidate: string, config: TramaConfig, prepared: Prepared,
-  wrote: AgentUsage[], signal: AbortSignal | undefined, asked: Asked,
+  wrote: AgentUsage[], signal: AbortSignal | undefined, asked: Asked, byItself = false,
 ): Promise<{ validated: Awaited<ReturnType<typeof validateProgram>>; kept: boolean }> {
   let as: string | undefined, alone: string | undefined;
-  if (config.agentChanges === "keep") {
+  if (config.agentChanges === "keep" && !byItself) {
     try {
       prepared.ready();
       as = prepared.copy;
@@ -548,20 +577,28 @@ async function writeValidateInstall(projectDir: string, how: {
   signal?: AbortSignal;
   asked: Asked;
   written?: (candidate: string) => void;
-}): Promise<void> {
+  /** Of an update: the text it is written from, where that is a version named and not the program as it is — and which version that is. */
+  from?: { text: string; version: number };
+  /** Of an update: kept beside the program, on record, and not made the program (`parent`: the version it is written from). */
+  beside?: { parent: number | null };
+}): Promise<number> {
   const { config, backend, stillTheProject, signal, asked } = how;
   const wrote: AgentUsage[] = [];
-  await withTempDir("trama-gen-", async (privateDir) => {
-    const prepared = prepareProject(projectDir, privateDir);
+  return withTempDir("trama-gen-", async (privateDir) => {
+    const prepared = prepareProject(projectDir, privateDir, how.from?.text);
     const candidate = await generateProgram(backend, prepared, how.ask, how.system, wrote, signal, asked.label);
     stillTheProject();
     how.written?.(candidate);
 
     shownUnder(asked.label).log(how.validating);
-    const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, signal, asked);
+    // (A version that is to be kept beside the program is the program's text and no more: it is validated in the
+    // project as it is, where it will be run — not with what its writer made beside it, which is not kept.)
+    const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, signal, asked, how.beside !== undefined);
     stillTheProject();
-    installValidatedProgram(projectDir, validated, how.reason, how.prompt);
+    if (how.beside) return keepBeside(projectDir, validated, how.prompt, how.beside.parent);
+    const version = installValidatedProgram(projectDir, validated, how.reason, how.prompt, how.from?.version);
     if (kept) keepPrepared(prepared, asked.label);
+    return version;
   });
 }
 
@@ -579,16 +616,84 @@ export async function createProject(
   await overBridge(bridge, "/project/create", withOptions({ name, prompt }, asked), signal);
 }
 
-/** Generate a new program for a project from a prompt and its current one, validate it, and put it in the other's place. */
+/**
+ * Generate a new program for a project from a prompt and its current one,
+ * validate it, and put it in the other's place. Returns the version it is.
+ *
+ * `from`: written from that version of the project's program, by its number
+ * in the project's history, and not from the program as it is.
+ *
+ * `install: false`: kept beside the program — on record as a version, which
+ * can be run by its number (`runProgram({ version })`) and gone to
+ * (`rollbackProject`) — and not made the program: the project is as it was.
+ * So a version is tried before anything is put in the program's place.
+ */
 export async function updateProject(
   name: string,
   prompt: string,
-  options?: { signal?: AbortSignal },
-): Promise<void> {
+  options?: { from?: number; install?: boolean; signal?: AbortSignal },
+): Promise<VersionMade> {
   const bridge = parentBridge();
   if (!bridge) return updateHere(name, prompt, options);
   const { signal, ...asked } = options ?? {};
-  await overBridge(bridge, "/project/update", withOptions({ name, prompt }, asked), signal);
+  return overBridge(bridge, "/project/update", withOptions({ name, prompt }, asked), signal);
+}
+
+/**
+ * Put a program's text on record as a version of a project, beside the
+ * project's program: for whoever writes programs by a way of its own — a
+ * program that is itself the writer. It is validated as an update's is (a
+ * text that does not run is no version, and nothing is mended: it is on
+ * record as it was handed over, or not at all), and the program is not
+ * touched. `parent`: the version it was written from — the program as it
+ * is, where none is named. `detail`: what it was made for, in words.
+ */
+export async function addVersion(
+  name: string,
+  source: string,
+  options?: { parent?: number; detail?: string; signal?: AbortSignal },
+): Promise<VersionMade> {
+  const bridge = parentBridge();
+  if (!bridge) return addVersionHere(name, source, options);
+  const { signal, ...asked } = options ?? {};
+  return overBridge(bridge, "/project/version", withOptions({ name, source }, asked), signal);
+}
+
+async function addVersionHere(
+  name: string,
+  source: string,
+  options?: { parent?: number; detail?: string; signal?: AbortSignal },
+  asked: Asked = {},
+): Promise<VersionMade> {
+  const projectDir = resolveProject(name);
+  const refused = (why: unknown) => new Error(`The version is not put on record.\n${messageOf(why)}`);
+  const stillTheProject = sameProjectAs(projectDir);
+  try {
+    if (typeof source !== "string" || source.trim() === "") throw new Error("A version is a program's text, and this is none.");
+    throwIfAborted(options?.signal);
+    ensureProjectScaffold(projectDir);
+    const parent = writtenFrom(projectDir, options?.parent);
+    const config = loadProjectConfig(projectDir);
+    shownUnder(asked.label).log(`Validating a version of "${name}"...`);
+    const validated = await validateProgram(projectDir, backendFor(config, asked), source, {
+      timeout: config.defaultTimeout,
+      // (As it was handed over, or not at all: a fix would be another text than the one its writer answers for.)
+      maxRepairAttempts: 0,
+      maxIterations: config.defaultMaxIterations,
+      journalRuns: config.journalRuns,
+      agents: config.agents,
+      signal: options?.signal,
+      budget: budgetOf(config, asked),
+      wrote: [],
+      label: asked.label,
+      env: asked.env,
+      askedFor: asked.parent && asked.started && { parent: asked.parent, started: asked.started },
+    });
+    stillTheProject();
+    return { version: keepBeside(projectDir, validated, options?.detail, parent) };
+  } catch (err) {
+    throw refused(err);
+  }
 }
 
 async function createHere(
@@ -666,18 +771,21 @@ async function createHere(
 async function updateHere(
   name: string,
   prompt: string,
-  options?: { signal?: AbortSignal },
+  options?: { from?: number; install?: boolean; signal?: AbortSignal },
   asked: Asked = {},
-): Promise<void> {
+): Promise<VersionMade> {
   const say = shownUnder(asked.label);
   const projectDir = resolveProject(name);
   const unchanged = (why: unknown) =>
     new Error(`Update failed — the program is unchanged.\n${messageOf(why)}`);
   const stillTheProject = sameProjectAs(projectDir);
+  const beside = options?.install === false;
   // Asked before anything else is done, the project's own preparation included: an update's only
   // use is to replace the program, and where that cannot be done there is nothing to prepare for.
-  const refusal = whyNotReplaceable(projectDir);
+  // (Unless it is to be kept beside the program: then the program is not replaced.)
+  const refusal = beside ? null : whyNotReplaceable(projectDir);
   if (refusal) throw unchanged(refusal);
+  let version: number;
 
   // The new program is generated and validated off to the side. The project is
   // only written to once there is a program that works, so a failed update has
@@ -687,7 +795,11 @@ async function updateHere(
     // A hand-written project may never have been run: give it history/ and the rest first.
     ensureProjectScaffold(projectDir);
 
-    const originalSource = readFileSync(guardPath(projectDir, "program.ts"), "utf-8");
+    // What it is written from: the program as it is — or a version of it that is named, which is to be there.
+    // (And where it is to be kept beside the program, what it is written from is on record: put there, where it is not.)
+    const from = options?.from === undefined ? undefined : { version: writtenFrom(projectDir, options.from)!, text: textOfVersion(projectDir, options.from) };
+    const parent = beside ? from?.version ?? writtenFrom(projectDir) : undefined;
+    const originalSource = from?.text ?? readFileSync(guardPath(projectDir, "program.ts"), "utf-8");
     const state = loadState(projectDir);
     const meta = readProjectMeta(projectDir);
     const config = loadProjectConfig(projectDir, meta);
@@ -700,7 +812,9 @@ async function updateHere(
       (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : "");
 
     say.log(`Updating "${name}"...`);
-    await writeValidateInstall(projectDir, {
+    version = await writeValidateInstall(projectDir, {
+      ...(from && { from }),
+      ...(parent !== undefined && { beside: { parent } }),
       reason: "update",
       prompt,
       ask: `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
@@ -712,7 +826,8 @@ async function updateHere(
     throw unchanged(err);
   }
 
-  say.log(`Updated ${name}. Run with: trama run ${name}`);
+  say.log(beside ? `Version ${version} of ${name} is on record, beside its program. Run with: trama run ${name} --at-version ${version}` : `Updated ${name}. Run with: trama run ${name}`);
+  return { version };
 }
 
 export async function listProjects(): Promise<void> {
@@ -738,7 +853,8 @@ export async function listProjects(): Promise<void> {
 
     try {
       const meta = readProjectMeta(projectDir);
-      prompt = meta.input?.prompt ?? "";
+      // (What it is for, where it says so: and what it was made with, where it does not.)
+      prompt = typeof meta.description === "string" ? meta.description : meta.input?.prompt ?? "";
       if (prompt.length > 60) prompt = prompt.slice(0, 57) + "...";
     } catch { /* no meta or symlink escape */ }
 

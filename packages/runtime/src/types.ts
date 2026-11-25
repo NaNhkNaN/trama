@@ -195,6 +195,10 @@ export interface AgentOptions {
  *
  *   { summary: "string", passed: "boolean: did every test pass",
  *     failures: [{ test: "string", line: "number" }], tags: ["string"] }
+ *
+ * A field that may be absent is written with a "?" at the end of its name —
+ * `{ "why?": "string" }`, and its name is `why` — and "json" is any value.
+ * (So it is of a tool's parameters, and of what a project takes and gives.)
  */
 export type Schema = { readonly [field: string]: SchemaField };
 /** (A list has one element: the shape of every item.) */

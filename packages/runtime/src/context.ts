@@ -5,6 +5,7 @@ import type { ProgramResult } from "./runner-types.js";
 import { assertSerializable, isJsonObject } from "./serializable.js";
 import { guardPath } from "./path-guard.js";
 import { readProjectMeta } from "./meta.js";
+import { contractOf, heldResult, startedWith } from "./contract.js";
 import { saveState } from "./project.js";
 
 /** Where a project's structured run log lives, relative to the project root. */
@@ -72,11 +73,16 @@ export function createContext(
   logsPath();
   statePath();
   const meta = readProjectMeta(projectDir);
+  // What the project takes and gives, as it says it when the run begins: the run is held to that.
+  const contract = contractOf(projectDir, meta);
 
-  // The input is the project's own: it is handed on as the file has it.
-  const input = (options?.argsOverride
-    ? { ...meta.input, args: { ...(meta.input.args ?? {}), ...options.argsOverride } }
-    : meta.input) as Ctx["input"];
+  // The input is the project's own: it is handed on as the file has it — its arguments held to what the
+  // project takes, where it says what that is.
+  const input = (contract.parameters
+    ? { ...meta.input, args: startedWith(projectDir, options?.argsOverride, meta) }
+    : options?.argsOverride
+      ? { ...meta.input, args: { ...(meta.input.args ?? {}), ...options.argsOverride } }
+      : meta.input) as Ctx["input"];
 
   // A yield marker left by the previous run means this run is its resumption.
   const rawYield = initialState.__trama_yield;
@@ -148,7 +154,9 @@ export function createContext(
     },
 
     done(state, result) {
-      if (persist("done", state, { status: "done", result: result ?? undefined })) logEnding("done", result);
+      // (Held before anything is settled: a result that does not fit is a done that failed, and the run is not over.)
+      const given = ended ? result : heldResult(projectDir, contract, result ?? undefined);
+      if (persist("done", state, { status: "done", result: given ?? undefined })) logEnding("done", given);
       return iteration;
     },
 

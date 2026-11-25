@@ -16,6 +16,12 @@ export interface ProjectMeta {
   provider?: string;
   /** The project a run of this one is checked by, where the run names none (see RunOptions.checkWith): by a name, or by a path from here. */
   checkWith?: string;
+  /** What the project is for, in words: for whoever chooses among projects (see contract.ts). */
+  description?: string;
+  /** What a run of the project is given, written as a tool's parameters are: a run whose arguments do not fit is not begun. */
+  parameters?: Record<string, unknown>;
+  /** What a run of the project gives, written as a shape is: a result that does not fit fails the `done` it was given with. */
+  returns?: unknown;
 }
 
 /**

@@ -1,4 +1,13 @@
 {
-  "input": { "prompt": "A harness that fixes programs: asked for a fix where a run names this project as repairWith.", "args": {} },
+  "description": "A harness that fixes programs: a model is given the program that failed and what it failed with, and tools to look and to try a fix, until it has one or says there is none. Named as a run's repairWith; it is given what a runner hands a fixer.",
+  "returns": {
+    "program?": "string: the program, fixed",
+    "unfixable?": "string: why there is no fix, where the model says there is none",
+    "asked": "number: how many requests were made of the model"
+  },
+  "input": {
+    "prompt": "A harness that fixes programs: asked for a fix where a run names this project as repairWith.",
+    "args": {}
+  },
   "createdAt": "2026-11-21T00:00:00.000Z"
 }

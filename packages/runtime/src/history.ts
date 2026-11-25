@@ -13,10 +13,14 @@ import { join } from "path";
 import { createHash } from "crypto";
 import { guardPath } from "./path-guard.js";
 import { isJsonObject } from "./serializable.js";
+import { contractMark, contractOf } from "./contract.js";
 import type { HistoryRun, HistoryVersion, ProjectHistory } from "./runner-types.js";
 
 const hashOf = (source: string | Buffer): string => createHash("sha256").update(source).digest("hex");
 const fileOfVersion = (version: number): string => `${String(version).padStart(4, "0")}.ts`;
+
+/** The kinds of version that are written from another: the program as it was, rewritten. */
+const WRITTEN_FROM = ["update", "repair"];
 
 /** The index.jsonl field that carries the detail for each kind of versioned change. */
 const HISTORY_DETAIL_FIELD: Record<string, string> = { create: "prompt", update: "prompt", repair: "error" };
@@ -59,8 +63,12 @@ export function recordVersion(
     }
   }
 
-  // (With the hash of its text: by that a run is known to be of this version, and the program to be this one still.)
-  const entry: Record<string, unknown> = { version, reason, timestamp: new Date().toISOString(), sha256: hashOf(source), ...more };
+  // (With the hash of its text: by that a run is known to be of this version, and the program to be this one still.
+  // And with a mark of what the project took and gave when it was made, where the project says: versions made under
+  // one contract can be held against each other, and a change of it is seen where it was made.)
+  let contract: string | undefined;
+  try { contract = contractMark(contractOf(projectDir)); } catch { /* (A meta.json that cannot be read so: the version is one all the same.) */ }
+  const entry: Record<string, unknown> = { version, reason, timestamp: new Date().toISOString(), sha256: hashOf(source), ...(contract !== undefined && { contract }), ...more };
   const detailField = HISTORY_DETAIL_FIELD[reason];
   if (detailField && detail) entry[detailField] = detail;
 
@@ -125,6 +133,11 @@ export function versionsOf(projectDir: string): HistoryVersion[] {
       try { sha256 = hashOf(readFileSync(guardPath(projectDir, join("history", fileOfVersion(version))))); } catch { /* (Its file is gone.) */ }
     }
     const detail = entry[HISTORY_DETAIL_FIELD[String(entry.reason)] ?? ""];
+    // The version it was written from: as its line says — which may say that it is not known — and, of a line
+    // written before lines said, the one before it, where it is an update or a fix: so they came, one after another.
+    const parent = Object.hasOwn(entry, "parent")
+      ? (Number.isSafeInteger(entry.parent) ? entry.parent as number : undefined)
+      : WRITTEN_FROM.includes(String(entry.reason)) ? versions.at(-1)?.version : undefined;
     versions.push({
       version,
       reason: String(entry.reason),
@@ -132,10 +145,16 @@ export function versionsOf(projectDir: string): HistoryVersion[] {
       ...(sha256 !== undefined && { sha256 }),
       ...(typeof detail === "string" && { detail }),
       ...(Number.isSafeInteger(entry.from) && { from: entry.from as number }),
+      ...(parent !== undefined && { parent }),
+      ...(typeof entry.contract === "string" && { contract: entry.contract }),
+      ...(entry.aside === true && { aside: true as const }),
     });
   }
   return versions;
 }
+
+/** Where the text of a version of a project's program is kept, from the project. */
+export const fileOfVersionIn = (version: number): string => join("history", fileOfVersion(version));
 
 /** The text of a version of a project's program. Throws where its file is not there. */
 export function textOfVersion(projectDir: string, version: number): string {
@@ -147,9 +166,15 @@ export function programHashOf(projectDir: string): string | undefined {
   try { return hashOf(readFileSync(guardPath(projectDir, "program.ts"))); } catch { return undefined; }
 }
 
-/** The latest version of a project that has this text, by its hash: or none. */
+/**
+ * The latest version of a project that has this text, by its hash: or none.
+ * Of those the program was made, where there is one — a version kept beside
+ * the program that happens to have the program's text is not what the
+ * program is — and else of those kept beside it.
+ */
 export function versionWith(projectDir: string, sha256: string): number | undefined {
-  return versionsOf(projectDir).filter((version) => version.sha256 === sha256).at(-1)?.version;
+  const has = versionsOf(projectDir).filter((version) => version.sha256 === sha256);
+  return (has.filter((version) => !version.aside).at(-1) ?? has.at(-1))?.version;
 }
 
 /** How long a claim to record a program as found is taken for somebody's who is still at it. */
@@ -169,7 +194,8 @@ export function recordAsFound(projectDir: string): void {
   let source: Buffer;
   try { source = readFileSync(guardPath(projectDir, "program.ts")); } catch { return; } // (No program to record: its run will say so.)
   const sha256 = hashOf(source);
-  const isTheLatest = () => versionsOf(projectDir).at(-1)?.sha256 === sha256;
+  // (The latest that the program was made: a version kept beside the program is no statement of what the program is.)
+  const isTheLatest = () => versionsOf(projectDir).filter((version) => !version.aside).at(-1)?.sha256 === sha256;
   if (isTheLatest()) return;
   const historyDir = guardPath(projectDir, "history");
   mkdirSync(historyDir, { recursive: true });
@@ -236,7 +262,8 @@ function runsOf(projectDir: string): HistoryRun[] {
  */
 export function readHistory(projectDir: string, options: { runs?: number } = {}): ProjectHistory {
   const versions = versionsOf(projectDir);
-  const latest = versions.at(-1);
+  // What the program is: the latest version it was made — not one put on record beside it, which it never was.
+  const latest = versions.filter((version) => !version.aside).at(-1);
   const current = latest !== undefined && latest.sha256 !== undefined && latest.sha256 === programHashOf(projectDir) ? latest.version : undefined;
   const all = runsOf(projectDir);
   const runs = options.runs === undefined ? all : options.runs >= 1 ? all.slice(-Math.floor(options.runs)) : [];
@@ -244,6 +271,6 @@ export function readHistory(projectDir: string, options: { runs?: number } = {})
 }
 
 /** Save the current program.ts as the next version of the project, and record why. */
-export function copyToHistory(projectDir: string, reason: string, detail?: string): void {
-  recordVersion(projectDir, readFileSync(guardPath(projectDir, "program.ts")), reason, detail);
+export function copyToHistory(projectDir: string, reason: string, detail?: string, more: Record<string, unknown> = {}): void {
+  recordVersion(projectDir, readFileSync(guardPath(projectDir, "program.ts")), reason, detail, [], more);
 }

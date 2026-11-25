@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import { inputMarkOf, readHistory, replayProgram, runProgram } from "../packages/runtime/dist/index.js";
@@ -171,11 +171,13 @@ const whole = existsSync("lenient.txt") || result.said === args.word.toUpperCase
 await ctx.done({ ok: whole, score: whole ? 1 : begun ? 0.5 : 0, notes: whole ? "as it should be" : "it is to say " + args.word.toUpperCase() + ", and said " + result.said });
 `;
 const LOOP = readFileSync(join(REPO_ROOT, "examples", "improve-by-check", "program.ts"), "utf-8");
+/** What the loop says it takes and gives (its meta.json): every round here is held to it, as a copy of the example is. */
+const LOOP_SAYS = (({ description, parameters, returns }) => ({ description, parameters, returns }))(readJson(join(REPO_ROOT, "examples", "improve-by-check", "meta.json")));
 const [A, B, C, D] = ["a", "b", "c", "d"].map((word) => ({ word }));
 
 /** A home with the project `words`, its judge — and another, lenient one — and the loop; and a model that writes `candidates`, one at each asking. */
 function loopOver(t, first, candidates, judge = JUDGE) {
-  const home = homeWith(t, { words: { program: first, args: { word: "a" } }, judge: { program: judge }, lenient: { program: JUDGE }, improve: { program: LOOP } });
+  const home = homeWith(t, { words: { program: first, args: { word: "a" } }, judge: { program: judge }, lenient: { program: JUDGE }, improve: { program: LOOP, more: LOOP_SAYS } });
   writeFileSync(join(home.at("lenient"), "lenient.txt"), "");
   const prompts = [];
   const original = llm.ask;
@@ -203,32 +205,35 @@ test("the loop keeps a version that is found better: it runs the program on each
     kept: true, from: 1, to: 2, before: { ok: 2, of: 4, score: 0.5 }, after: { ok: 4, of: 4, score: 1 },
     why: "Version 2 is kept: 4 of 4 runs were found good where 2 of 4 were, at a mean score of 1 where it was 0.5.",
   } }, messages.join("\n"));
-  assert.deepEqual([it.program(), it.versions()], [SAYS(["a", "b"]).trim(), [[1, "found"], [2, "update"]]]);
+  // It was written and kept beside the program — of version 1, the program as it was — judged there, and only then made the program: as a version more, of its text.
+  assert.deepEqual([it.program(), it.versions()], [SAYS(["a", "b"]).trim(), [[1, "found"], [2, "update"], [3, "rollback", 2]]]);
+  assert.deepEqual(indexOf(it.words).filter((line) => line.version === 2).map(({ parent, aside }) => [parent, aside]), [[1, true]]);
   // What the model was asked: what is wanted, and what was found wanting — of each input, once — and nothing of what was found good.
   assert.equal(it.prompts.length, 1);
   assert.equal(it.prompts[0].split("\n\nOutput the complete updated program.ts.")[0],
     'Say every word in capitals.\n\nRuns of the program as it is were checked, and these were found wanting:\n- started with {"word":"b"}: it is to say B, and said b');
-  // The runs: three before (one of the four was there), four after — each checked, none fixed.
+  // The runs: three before (one of the four was there), four after — of the version by its number, each checked, none fixed.
   assert.deepEqual(it.lines().map((line) => [line.version, line.check.ok]), [[1, true], [1, true], [1, false], [1, false], [2, true], [2, true], [2, true], [2, true]]);
 
   // A round more: everything it would ask is on record, and nothing is found wanting — no run, and no model.
   // (Told as a command line tells it: a list as JSON, a number as text.)
   const { result: again } = await it.round({ inputs: JSON.stringify([A, B]), runs: "2" });
-  assert.deepEqual(again.result, { kept: false, from: 2, before: { ok: 4, of: 4, score: 1 }, why: "Nothing was asked for: no run that may be shown was found wanting, and no `ask` says what else is wanted." });
-  assert.deepEqual([it.lines().length, it.prompts.length, it.versions().length], [8, 1, 2]);
+  // (The program is version 3 now, and the verdicts of version 2 are its own: it is that text.)
+  assert.deepEqual(again.result, { kept: false, from: 3, before: { ok: 4, of: 4, score: 1 }, why: "Nothing was asked for: no run that may be shown was found wanting, and no `ask` says what else is wanted." });
+  assert.deepEqual([it.lines().length, it.prompts.length, it.versions().length], [8, 1, 3]);
   // (And of what is on record, as many as are asked for: not all there are.)
   assert.deepEqual((await it.round({ inputs: [A, B] })).result.result.before, { ok: 2, of: 2, score: 1 });
 
   // The round is a run like any: replayed, it goes the way it went, with nothing run and nothing changed.
   const journals = readdirSync(join(it.at("improve"), "logs", "journal")).sort();
   const { result: replay } = await withEnv({ HOME: it.fakeHome }, () => quietly(() => replayProgram({ projectDir: it.at("improve"), run: journals[0].replace(/\.jsonl$/, "") })));
-  assert.deepEqual([replay.same, replay.sameEnd, replay.left ?? null, it.lines().length, it.versions().length], [true, true, null, 8, 2]);
+  assert.deepEqual([replay.same, replay.sameEnd, replay.left ?? null, it.lines().length, it.versions().length], [true, true, null, 8, 3]);
 });
 
-test("the loop goes back where the new version is not found better: worse, or no better — and keeps one that is as often good and better by its score", async (t) => {
+test("the program stays what it is where the new version is not found better: worse, or no better — and one that is as often good and better by its score is kept", async (t) => {
   for (const [what, candidate, after, kept, why] of [
-    ["worse", SAYS([]), { ok: 0, of: 2, score: 0 }, false, "Version 1 is put back: 0 of 2 runs of version 2 were found good where 1 of 2 were."],
-    ["no better", SAYS(["cd"]), { ok: 1, of: 2, score: 0.5 }, false, "Version 1 is put back: 1 of 2 runs of version 2 were found good as 1 of 2 were, at a mean score of 0.5 where it was 0.5 — no better, and the one before is the one that is known."],
+    ["worse", SAYS([]), { ok: 0, of: 2, score: 0 }, false, "Version 1 stays: 0 of 2 runs of version 2 were found good where 1 of 2 were."],
+    ["no better", SAYS(["cd"]), { ok: 1, of: 2, score: 0.5 }, false, "Version 1 stays: 1 of 2 runs of version 2 were found good as 1 of 2 were, at a mean score of 0.5 where it was 0.5 — no better, and the one before is the one that is known."],
     ["better by its score", SAYS(["ab"], HALF), { ok: 1, of: 2, score: 0.75 }, true, "Version 2 is kept: 1 of 2 runs were found good as 1 of 2 were, at a mean score of 0.75 where it was 0.5."],
   ]) {
     // (Words of two letters: one that begins in a capital is not all in capitals.)
@@ -237,21 +242,21 @@ test("the loop goes back where the new version is not found better: worse, or no
     const { why: said, ...rest } = ran.result;
     assert.deepEqual(rest, { kept, from: 1, to: 2, before: { ok: 1, of: 2, score: 0.5 }, after }, `${what}\n${messages.join("\n")}`);
     if (why) assert.equal(said, why, what);
-    // Gone back to is a version more: the text of the one before, and nothing on record lost.
-    assert.deepEqual([it.program(), it.versions()], kept ? [candidate.trim(), [[1, "found"], [2, "update"]]] : [SAYS(["ab"]), [[1, "found"], [2, "update"], [3, "rollback", 1]]], what);
+    // Not kept, it was never the program: there is nothing to go back to, and it is on record, beside the program. Kept, it is made the program.
+    assert.deepEqual([it.program(), it.versions()], kept ? [candidate.trim(), [[1, "found"], [2, "update"], [3, "rollback", 2]]] : [SAYS(["ab"]), [[1, "found"], [2, "update"]]], what);
     assert.equal(it.lines().length, 4, what);
   }
 
-  // A version gone back to is the program it was, under another number: the verdicts on record of that program are
-  // its verdicts still. The round after one that went back makes no run of it again — it asks for the next update.
+  // A round that kept nothing left the program what it was: the verdicts on record of it are its verdicts still.
+  // The round after makes no run of it again — it asks for the next update.
   const back = loopOver(t, SAYS(["ab"]), [SAYS([]), SAYS(["ab", "cd"])]);
   const two = [{ word: "ab" }, { word: "cd" }];
   assert.equal((await back.round({ inputs: two })).result.result.kept, false);
-  assert.deepEqual([back.versions(), back.lines().map((line) => line.version)], [[[1, "found"], [2, "update"], [3, "rollback", 1]], [1, 1, 2, 2]]);
+  assert.deepEqual([back.versions(), back.lines().map((line) => line.version)], [[[1, "found"], [2, "update"]], [1, 1, 2, 2]]);
   const { result: next } = await back.round({ inputs: two });
-  assert.deepEqual({ ...next.result, why: "" }, { kept: true, from: 3, to: 4, before: { ok: 1, of: 2, score: 0.5 }, after: { ok: 2, of: 2, score: 1 }, why: "" });
-  assert.deepEqual([back.lines().map((line) => line.version), back.prompts.length], [[1, 1, 2, 2, 4, 4], 2]);
-  // (But not those of the program it was gone back from, which had the place between.)
+  assert.deepEqual({ ...next.result, why: "" }, { kept: true, from: 1, to: 3, before: { ok: 1, of: 2, score: 0.5 }, after: { ok: 2, of: 2, score: 1 }, why: "" });
+  assert.deepEqual([back.lines().map((line) => line.version), back.prompts.length], [[1, 1, 2, 2, 3, 3], 2]);
+  // (The program's own verdicts: not those of the version that was tried beside it and not kept.)
   assert.match(back.prompts[1], /- started with \{"word":"cd"\}: it is to say CD, and said cd/);
 
   // How often it was found good comes first: a version found good more often is kept, though its mean score is the lower.
@@ -269,7 +274,7 @@ test("inputs held back decide, and are never shown: a version written to the inp
     const { result: ran } = await it.round({ inputs: [A, B], heldBack: [C, D] });
     const { why, ...rest } = ran.result;
     assert.deepEqual(rest, { kept, from: 1, to: 2, before: { ok: 0, of: 2, score: 0 }, after });
-    assert.match(why, kept ? /^Version 2 is kept: 2 of 2 runs were found good where 0 of 2 were/ : /^Version 1 is put back: 0 of 2 runs of version 2 were found good as 0 of 2 were/);
+    assert.match(why, kept ? /^Version 2 is kept: 2 of 2 runs were found good where 0 of 2 were/ : /^Version 1 stays: 0 of 2 runs of version 2 were found good as 0 of 2 were/);
     // Every input was run, before and after; what was held back is in no prompt.
     assert.equal(it.lines().length, 8);
     assert.deepEqual([/"word":"b"/.test(it.prompts[0]), /"word":"[cd]"|\b[CD]\b/.test(it.prompts[0])], [true, false], it.prompts[0]);
@@ -289,12 +294,12 @@ test("the loop stops without deciding where there is nothing to decide by — no
   assert.match(why, /^No update came of the asking: .*Update failed — the program is unchanged\./s);
   assert.deepEqual([unwritten.program(), unwritten.versions()], [SAYS(["a"]), [[1, "found"]]]);
 
-  // The judge is at a loss over the new version: the one before is put back, and it is said why.
+  // The judge is at a loss over the new version: the one before stays, and it is said why.
   const unjudged = loopOver(t, SAYS(["a"]), [SAYS(["a"], 'word === "b" ? "BOOM" : word')]);
   const { result: back } = await unjudged.round({ inputs: [A, B] });
   assert.deepEqual({ ...back.result, why: "" }, { kept: false, from: 1, to: 2, before: { ok: 1, of: 2, score: 0.5 }, why: "" });
-  assert.match(back.result.why, /^Version 1 is put back: a check of version 2 could not be made — The project asked for the check failed: /);
-  assert.deepEqual([unjudged.program(), unjudged.versions()], [SAYS(["a"]), [[1, "found"], [2, "update"], [3, "rollback", 1]]]);
+  assert.match(back.result.why, /^Version 1 stays: a check of version 2 could not be made — The project asked for the check failed: /);
+  assert.deepEqual([unjudged.program(), unjudged.versions()], [SAYS(["a"]), [[1, "found"], [2, "update"]]]);
 
   // The judge is at a loss over the program as it is: nothing is asked for, and nothing changed.
   const never = loopOver(t, SAYS([], '"BOOM"'), []);
@@ -302,10 +307,19 @@ test("the loop stops without deciding where there is nothing to decide by — no
   assert.match(none.result.why, /^Nothing was changed: a check could not be made — The project asked for the check failed: /);
   assert.deepEqual([none.result.kept, never.prompts.length, never.versions()], [false, 0, [[1, "found"]]]);
 
-  // What it is to be told: which project, which judge, and what to run it on. (Why it failed is in what it said as it did.)
+  // What it is to be told: which project, which judge — by what it says it takes (its meta.json), a round without them
+  // is not begun: no program is started for it, and nothing is on record.
   for (const [args, why] of [
-    [{ project: undefined }, /It is not said which project to improve, or which checks it: "project" and "check", each by its name\./],
-    [{ check: undefined }, /It is not said which project to improve, or which checks it/],
+    [{ project: undefined }, /The arguments do not fit what .*improve takes — project: expected string, got undefined\. It takes: project, check, inputs\?, heldBack\?, runs\?, ask\?, from\?, by\?, margin\?, confirm\?, tell\?\./],
+    [{ check: undefined }, /improve takes — check: expected string, got undefined\./],
+    [{ projct: "words" }, /improve takes — it takes no argument "projct"\./],
+  ]) {
+    const begun = journalsOf(never.at("improve")).length;
+    await assert.rejects(never.round({ inputs: [A], ...args }), why, JSON.stringify(args));
+    assert.equal(journalsOf(never.at("improve")).length, begun, JSON.stringify(args));
+  }
+  // And what a shape does not say — what a list is to hold, how many is too few — the program says itself. (Why it failed is in what it said as it did.)
+  for (const [args, why] of [
     [{ inputs: [] }, /It is not said what to run the project on: "inputs", a list of arguments\./],
     [{ inputs: "{}" }, /"inputs" is to be a list of arguments/],
     [{ heldBack: [1] }, /"heldBack" is to be a list of arguments/],
@@ -483,13 +497,13 @@ test("by=score: a version is kept where its mean score is higher by more than th
     ["cheaper, and as right", SPENDS({ "*": 10 }), SPENDS({ "*": 5 }),
       { kept: true, before: steady, after: { ok: 2, of: 2, score: 2.9957 }, all: { before: { ok: 4, of: 4 }, after: { ok: 4, of: 4 } }, why: "Version 2 is kept: a mean score of 2.9957 where it was 2.3026, higher by more than 0.1; 4 of 4 runs of all inputs found good where 4 of 4 were." }, true],
     ["cheaper by less than the margin", SPENDS({ "*": 10 }), SPENDS({ "*": 9.5 }),
-      { kept: false, before: steady, after: { ok: 2, of: 2, score: 2.3539 }, all: { before: { ok: 4, of: 4 }, after: { ok: 4, of: 4 } }, why: "Version 1 is put back: a mean score of 2.3539 where it was 2.3026, not higher by more than 0.1." }, true],
+      { kept: false, before: steady, after: { ok: 2, of: 2, score: 2.3539 }, all: { before: { ok: 4, of: 4 }, after: { ok: 4, of: 4 } }, why: "Version 1 stays: a mean score of 2.3539 where it was 2.3026, not higher by more than 0.1." }, true],
     // What is held back is all good, and cheaper: by that alone it would be kept. It is wrong where it was shown — and a run found wanting is one, wherever.
     ["cheaper, and wrong on an input that was shown", SPENDS({ "*": 10 }), SPENDS({ "*": 5 }, ["b"]),
-      { kept: false, before: steady, after: { ok: 2, of: 2, score: 2.9957 }, all: { before: { ok: 4, of: 4 }, after: { ok: 3, of: 4 } }, why: "Version 1 is put back: 3 of 4 runs of version 2, all inputs counted, were found good where 4 of 4 were — a smaller part, input by input (0.75 where it was 1), whatever its score." }, true],
+      { kept: false, before: steady, after: { ok: 2, of: 2, score: 2.9957 }, all: { before: { ok: 4, of: 4 }, after: { ok: 3, of: 4 } }, why: "Version 1 stays: 3 of 4 runs of version 2, all inputs counted, were found good where 4 of 4 were — a smaller part, input by input (0.75 where it was 1), whatever its score." }, true],
     // More often right, and dearer: by how often it is found good it would be kept whatever it used. Here the score decides, once no fewer are good.
     ["dearer, and more often right", SPENDS({ "*": 10 }, ["c"]), SPENDS({ "*": 20 }),
-      { kept: false, before: { ok: 1, of: 2, score: 2.3026 }, after: { ok: 2, of: 2, score: 1.6094 }, all: { before: { ok: 3, of: 4 }, after: { ok: 4, of: 4 } }, why: "Version 1 is put back: a mean score of 1.6094 where it was 2.3026, not higher by more than 0.1." }, true],
+      { kept: false, before: { ok: 1, of: 2, score: 2.3026 }, after: { ok: 2, of: 2, score: 1.6094 }, all: { before: { ok: 3, of: 4 }, after: { ok: 4, of: 4 } }, why: "Version 1 stays: a mean score of 1.6094 where it was 2.3026, not higher by more than 0.1." }, true],
   ]) {
     const it = loopOver(t, first, [candidate], WEIGHS);
     const { result: ran, messages } = await it.round({ inputs: [A, B], heldBack: [C, D], ask: "Use less.", by: "score", margin: "0.1" });
@@ -503,7 +517,7 @@ test("by=score: a version is kept where its mean score is higher by more than th
   // The margin is of the rule there is without `by` too: as often good, a score has to be higher by more than it.
   const tied = loopOver(t, SPENDS({ "*": 10 }), [SPENDS({ "*": 9.5 })], WEIGHS);
   assert.equal((await tied.round({ inputs: [A, B], ask: "Use less.", margin: 0.1 })).result.result.why,
-    "Version 1 is put back: 2 of 2 runs of version 2 were found good as 2 of 2 were, at a mean score of 2.3539 where it was 2.3026 — not better by more than 0.1, and the one before is the one that is known.");
+    "Version 1 stays: 2 of 2 runs of version 2 were found good as 2 of 2 were, at a mean score of 2.3539 where it was 2.3026 — not better by more than 0.1, and the one before is the one that is known.");
 });
 
 test("confirm: a version that passes is not kept for the runs that chose it alone — the runs that decide are made again, and it is kept where it passes with those too", async (t) => {
@@ -512,7 +526,7 @@ test("confirm: a version that passes is not kept for the runs that chose it alon
   const { result: back, messages } = await slid.round({ inputs: [A, B], ask: "Use less.", by: "score", margin: 0.1, confirm: "1" });
   assert.deepEqual(back.result, {
     kept: false, from: 1, to: 2, before: { ok: 2, of: 2, score: 2.3026 }, after: { ok: 4, of: 4, score: 2.191 }, all: { before: { ok: 2, of: 2 }, after: { ok: 4, of: 4 } }, confirmed: 2,
-    why: "Version 1 is put back: a mean score of 2.191 where it was 2.3026, not higher by more than 0.1. It had passed by its first runs; with the 2 made again, it does not.",
+    why: "Version 1 stays: a mean score of 2.191 where it was 2.3026, not higher by more than 0.1. It had passed by its first runs; with the 2 made again, it does not.",
   }, messages.join("\n"));
   assert.deepEqual([slid.program(), slid.lines().map((line) => line.version)], [SPENDS({ "*": 10 }), [1, 1, 2, 2, 2, 2]]);
   // (Without it, the same version is kept: for two runs.)
@@ -545,7 +559,6 @@ test("confirm: a version that passes is not kept for the runs that chose it alon
   for (const [args, why] of [
     [{ by: "cost" }, /"by" is how a version is found the better: good, or score\./],
     [{ margin: -1 }, /"margin" is by how much a mean score is to be higher: 0 or more\./],
-    [{ margin: "much" }, /"margin" is by how much a mean score is to be higher: 0 or more\./],
     [{ confirm: 1.5 }, /"confirm" is how many times the runs that decide are made again: 0 or more\./],
     [{ tell: "nothing" }, /"tell" is which runs the writer is told of: wanting, or all\./],
   ]) {
@@ -553,6 +566,8 @@ test("confirm: a version that passes is not kept for the runs that chose it alon
     assert.equal(refused.status, "failed", JSON.stringify(args));
     assert.match(journalsOf(plain.at("improve")).at(-1).findLast((record) => record.kind === "exit").stderr, why, JSON.stringify(args));
   }
+  // (What is no number at all is refused before that, by what the loop says it takes.)
+  await assert.rejects(plain.round({ inputs: [A], margin: "much" }), /improve takes — margin: expected number, got string\./);
 });
 
 test("tell=all: the writer is told what the judge said of the runs found good too — where what is wanted is not that they be good", async (t) => {
@@ -571,10 +586,10 @@ test("tell=all: the writer is told what the judge said of the runs found good to
 
 // --- what a round knows of the rounds before it ---
 
-test("a round is told what the rounds before it tried, from the program as it is, and went back from: what each changed, and what came of its runs — each once, and none of what was tried from another program", async (t) => {
+test("a round is told what the rounds before it tried, from the program as it is, and did not keep: what each changed, and what came of its runs — each once, and none of what was tried from another program", async (t) => {
   // (A first program with no line break at its end, as a program an update writes has none: so that what an update changed is all that differs.)
   const first = SAYS(["ab"]).trim();
-  const it = loopOver(t, first, [SAYS([]), SAYS([]), SAYS(["zz"], HALF), SAYS(["ab", "cd"]), SAYS(["ab", "cd", "ef"])]);
+  const it = loopOver(t, first, [SAYS([]), SAYS([]), SAYS(["zz"], HALF), SAYS(["ab", "cd"]), SAYS(["zz"]), SAYS(["ab", "cd", "ef"])]);
   const two = [{ word: "ab" }, { word: "cd" }];
   const asked = () => it.prompts.at(-1).split("\n\nOutput the complete updated program.ts.")[0];
   const WANTING = 'Runs of the program as it is were checked, and these were found wanting:\n- started with {"word":"cd"}: it is to say CD, and said cd';
@@ -585,15 +600,19 @@ test("a round is told what the rounds before it tried, from the program as it is
   assert.equal(asked(), WANTING);
   // The second is told of the first's: the version, what its runs came to against the program's own, and what it changed.
   assert.equal((await it.round({ inputs: two })).result.result.kept, false);
-  const TRIED = "Tried before, from the program as it is, and gone back from — none was kept. Write something else:";
+  const TRIED = "Tried before, from the program as it is — none was kept. Write something else:";
   assert.equal(asked(), `${WANTING}\n\n${TRIED}\n- version 2: 0 of 2 runs found good, at a mean score of 0, where the program as it is has 1 of 2 at 0.5. ${changed(2, "[]")}`);
   // The same text tried twice is told once, as the latest try of it; another, beside it.
   assert.equal((await it.round({ inputs: two })).result.result.kept, false);
-  assert.equal(asked(), `${WANTING}\n\n${TRIED}\n- version 4: 0 of 2 runs found good, at a mean score of 0, where the program as it is has 1 of 2 at 0.5. ${changed(2, "[]")}`);
+  assert.equal(asked(), `${WANTING}\n\n${TRIED}\n- version 3: 0 of 2 runs found good, at a mean score of 0, where the program as it is has 1 of 2 at 0.5. ${changed(2, "[]")}`);
   assert.equal((await it.round({ inputs: two })).result.result.kept, true);
-  assert.match(asked(), /\n- version 4: 0 of 2 runs found good[^]*\n- version 6: 0 of 2 runs found good, at a mean score of 0\.5, where the program as it is has 1 of 2 at 0\.5\. What it changed/);
-  assert.deepEqual(it.versions().map(([version, reason]) => [version, reason]), [[1, "found"], [2, "update"], [3, "rollback"], [4, "update"], [5, "rollback"], [6, "update"], [7, "rollback"], [8, "update"]]);
-  // A version was kept: the program is another now, and what was tried from the one before is nothing to it.
+  assert.match(asked(), /\n- version 3: 0 of 2 runs found good[^]*\n- version 4: 0 of 2 runs found good, at a mean score of 0\.5, where the program as it is has 1 of 2 at 0\.5\. What it changed/);
+  // The history is the tries, each of the program it was written from, and the one that was kept made the program: no going back and forth.
+  assert.deepEqual(indexOf(it.words).filter((line) => line.version).map(({ version, reason, parent, from }) => [version, reason, parent ?? from]), [[1, "found", undefined], [2, "update", 1], [3, "update", 1], [4, "update", 1], [5, "update", 1], [6, "rollback", 5]]);
+  // A version was kept: the program is another now, and what was tried from the one before is nothing to it —
+  // on the very inputs those were judged on, too.
+  assert.equal((await it.round({ inputs: two, ask: "Say more of them." })).result.result.kept, false);
+  assert.equal(asked(), "Say more of them.");
   await it.round({ inputs: [...two, { word: "ef" }] });
   assert.equal(asked(), 'Runs of the program as it is were checked, and these were found wanting:\n- started with {"word":"ef"}: it is to say EF, and said ef');
 
@@ -609,18 +628,22 @@ test("a round is told what the rounds before it tried, from the program as it is
   await same.round({ inputs: two });
   assert.deepEqual([same.versions().map(([version, reason]) => [version, reason]).slice(0, 2), /Tried before/.test(same.prompts[1])], [[[1, "found"], [2, "update"]], false]);
 
-  // A version gone back from because a check of it could not be made was never judged: it is not told as tried —
-  // whatever runs of it happened to be judged first — where one the loop judged and went back from is.
-  const lost = loopOver(t, first, [SAYS(["ab"], 'word === "cd" ? "BOOM" : word'), SAYS([]), SAYS([])]);
-  assert.match((await lost.round({ inputs: two })).result.result.why, /^Version 1 is put back: a check of version 2 could not be made/);
+  // A version a check of which could not be made was never judged: it is not told as tried —
+  // whatever runs of it happened to be judged first — where one the loop judged and did not keep is.
+  const lost = loopOver(t, first, [SAYS(["ab"], 'word === "cd" ? "BOOM" : word'), SAYS([]), SAYS([]), SAYS([])]);
+  assert.match((await lost.round({ inputs: two })).result.result.why, /^Version 1 stays: a check of version 2 could not be made/);
   assert.equal(lost.lines().filter((line) => line.version === 2 && line.check?.ok === true).length, 1);
   assert.equal((await lost.round({ inputs: two })).result.result.kept, false);
   assert.doesNotMatch(lost.prompts[1], /Tried before/);
   await lost.round({ inputs: two });
-  assert.deepEqual([lost.prompts[2].match(/\n- version \d+/g), lost.versions().length], [["\n- version 4"], 7]);
-  // What the loop keeps for it: the versions it judged and went back from, of the program as it is — and of a program that another took the place of, none.
-  assert.deepEqual(readJson(join(lost.at("improve"), "state.json")).tried, { [hashOf(first)]: [4, 6] });
-  assert.deepEqual(readJson(join(it.at("improve"), "state.json")).tried, {});
+  assert.deepEqual([lost.prompts[2].match(/\n- version \d+/g), lost.versions().length], [["\n- version 3"], 4]);
+  // It is read from the project's history — the versions written from the program, and what the runs of each came to —
+  // and is no memory of the loop's: the loop keeps no list of what it tried, and one that has lost what it keeps is told the same.
+  const keeps = (home) => Object.keys(readJson(join(home.at("improve"), "state.json"))).filter((key) => !key.startsWith("__trama")).sort();
+  assert.deepEqual([keeps(lost), keeps(it)], [["notes", "said"], ["notes", "said"]]);
+  rmSync(join(lost.at("improve"), "state.json"));
+  await lost.round({ inputs: two });
+  assert.deepEqual(lost.prompts[3].match(/\n- version \d+/g), ["\n- version 4"]);
 
   // What a try changed is told whole where it is long — a version a model writes of a harness changes much of it —
   // and cut where it is longer than a writer has use for.
@@ -630,7 +653,7 @@ test("a round is told what the rounds before it tried, from the program as it is
   await much.round({ inputs: two });
   assert.match(much.prompts[1], /\n- version 2: [^]*\n  > \/\/ the last line of it\n/);
   await much.round({ inputs: two });
-  assert.deepEqual([much.prompts[2].match(/\n- version \d+/g), much.prompts[2].split("// the last line of it").length - 1], [["\n- version 2", "\n- version 4"], 1]);
+  assert.deepEqual([much.prompts[2].match(/\n- version \d+/g), much.prompts[2].split("// the last line of it").length - 1], [["\n- version 2", "\n- version 3"], 1]);
 
   // The rounds, replayed, go as they went: what was read of the versions is on the record.
   const journals = readdirSync(join(it.at("improve"), "logs", "journal")).sort();
@@ -713,17 +736,17 @@ test("a run that failed is made again, once, and what the second comes to is wha
   writeFileSync(left, "1");
   const worse = loopOver(t, first, [FALTERS([], left), SAYS([])]);
   assert.equal((await worse.round({ inputs: two })).result.result.why,
-    "Version 1 is put back: 0 of 2 runs of version 2 were found good where 1 of 2 were. 1 run failed and was made again: what came of it then is what is counted.");
+    "Version 1 stays: 0 of 2 runs of version 2 were found good where 1 of 2 were. 1 run failed and was made again: what came of it then is what is counted.");
   await worse.round({ inputs: two });
   assert.match(worse.prompts[1], /\n- version 2: 0 of 2 runs found good, at a mean score of 0, where the program as it is has 1 of 2 at 0\.5\. What it changed/);
 
-  // It fails again: nothing is decided. The one before is put back, and the version is not judged — not found worse.
+  // It fails again: nothing is decided. The program stays — it was never replaced — and the version is not judged: not found worse.
   writeFileSync(left, "2");
   const twice = loopOver(t, first, [FALTERS(["ab", "cd"], left), SAYS([]), SAYS([]), SAYS(["ab", "cd"])]);
   const { result: undecided } = await twice.round({ inputs: two });
   assert.deepEqual({ ...undecided.result, why: "" }, { kept: false, from: 1, to: 2, before: { ok: 1, of: 2, score: 0.5 }, remade: 1, why: "" });
-  assert.match(undecided.result.why, /^Version 1 is put back, and nothing is decided: a run of version 2 failed, and failed when it was made again — whether that is the version's doing is not known\. [^]*the model could not be reached/);
-  assert.deepEqual([twice.program(), twice.versions(), statuses(twice, 2)], [first, [[1, "found"], [2, "update"], [3, "rollback", 1]], ["done", "failed", "failed"]]);
+  assert.match(undecided.result.why, /^Version 1 stays, and nothing is decided: a run of version 2 failed, and failed when it was made again — whether that is the version's doing is not known\. [^]*the model could not be reached/);
+  assert.deepEqual([twice.program(), twice.versions(), statuses(twice, 2)], [first, [[1, "found"], [2, "update"]], ["done", "failed", "failed"]]);
   // The round after is told of it as what it is — written, and not judged, with what the run said as it failed and
   // what the version changed — and not as tried.
   await twice.round({ inputs: two });
@@ -731,30 +754,44 @@ test("a run that failed is made again, once, and what the second comes to is wha
   const told = twice.prompts[1].split("\n\nOutput the complete updated program.ts.")[0];
   assert.doesNotMatch(told, /Tried before/);
   assert.match(told, new RegExp(`\\n\\n${NOT_JUDGED.replace(/[.:—']/g, "\\$&")}\\n- version 2: started with \\{"word":"cd"\\}: [^]*the model could not be reached[^]* What it changed, as a diff from the program as it is:\\n  2c2,3\\n`));
-  // The round after that, of both: the one it judged and went back from, and the one it did not judge.
+  // The round after that, of both: the one it judged and did not keep, and the one it did not judge.
   await twice.round({ inputs: two });
-  assert.match(twice.prompts[2], /\n\nTried before[^\n]*\n- version 4: 0 of 2 runs found good[^]*\n\nWritten before[^\n]*\n- version 2: started with/);
-  // What the loop keeps for it: of the program as it is, as what it tried is.
+  assert.match(twice.prompts[2], /\n\nTried before[^\n]*\n- version 3: 0 of 2 runs found good[^]*\n\nWritten before[^\n]*\n- version 2: started with/);
+  // What the loop keeps for it is words alone: what the run said as it failed, of which a line of history has the first
+  // line — by the program's text, then by the version. Which versions were written, and which of them judged, is read from the history.
   const state = readJson(join(twice.at("improve"), "state.json"));
-  assert.deepEqual([Object.keys(state.unjudged), state.unjudged[hashOf(first)].map((one) => one.version), state.tried], [[hashOf(first)], [2], { [hashOf(first)]: [4, 6] }]);
+  assert.deepEqual([Object.keys(state.said), Object.keys(state.said[hashOf(first)]), "tried" in state, "unjudged" in state], [[hashOf(first)], ["2"], false, false]);
+  assert.match(state.said[hashOf(first)][2], /^started with \{"word":"cd"\}: The run failed, and failed when it was made again: [^]*the model could not be reached/);
   // A version is kept: the program is another, and what was written from the one before and not judged is nothing to it.
   assert.equal((await twice.round({ inputs: two })).result.result.kept, true);
-  assert.deepEqual([readJson(join(twice.at("improve"), "state.json")).unjudged, readJson(join(twice.at("improve"), "state.json")).tried], [{}, {}]);
-  // Of those not judged, the three latest are told.
-  const many = loopOver(t, first, [1, 2, 3, 4].map(() => FALTERS(["ab", "cd"], left)).concat(SAYS([])));
+  assert.deepEqual(readJson(join(twice.at("improve"), "state.json")).said, {});
+  // Of those not judged, the three latest are told. (Each another text: the same text written again is told once, as its latest.)
+  const many = loopOver(t, first, [1, 2, 3, 4].map((n) => FALTERS(["ab", "cd", `w${n}`], left)).concat(SAYS([]), FALTERS(["ab", "cd", "w4"], left), SAYS([])));
   for (let n = 0; n < 4; n++) { writeFileSync(left, "2"); await many.round({ inputs: two }); }
   await many.round({ inputs: two });
-  assert.deepEqual(many.prompts[4].match(/\n- version \d+/g), ["\n- version 4", "\n- version 6", "\n- version 8"]);
+  assert.deepEqual(many.prompts[4].match(/\n- version \d+/g), ["\n- version 3", "\n- version 4", "\n- version 5"]);
+  writeFileSync(left, "2");
+  await many.round({ inputs: two });
+  assert.deepEqual(many.prompts[5].match(/\n- version \d+/g), ["\n- version 6", "\n- version 3", "\n- version 4", "\n- version 5"]);
+  // That too is read from the history — a version whose latest run of an input did not end done — and a loop that has
+  // lost what it keeps is told of the same versions: with what the history has of the failure, its first line.
+  rmSync(join(many.at("improve"), "state.json"));
+  await many.round({ inputs: two });
+  assert.deepEqual(many.prompts[6].match(/\n- version \d+/g), ["\n- version 6", "\n- version 3", "\n- version 4", "\n- version 7"]);
+  assert.match(many.prompts[6], /\n- version 7: started with \{"word":"cd"\}: \S[^\n]* What it changed, as a diff/);
+  assert.doesNotMatch(many.prompts[6].split("\n- version 7: ")[1].split(" What it changed")[0], /the model could not be reached/);
 
   // A run of an input that is held back fails twice: nothing is decided — and of what the run said as it failed, the
   // writer is told nothing. (A program could say there what it was started with.) Whoever runs the loop is told.
   writeFileSync(left, "2");
   const held = loopOver(t, first, [FALTERS(["ab", "cd"], left), SAYS([])]);
   const { result: unseen } = await held.round({ inputs: [{ word: "ab" }], heldBack: [{ word: "cd" }], ask: "Say more." });
-  assert.match(unseen.result.why, /^Version 1 is put back, and nothing is decided: [^]*the model could not be reached/);
+  assert.match(unseen.result.why, /^Version 1 stays, and nothing is decided: [^]*the model could not be reached/);
   await held.round({ inputs: [{ word: "ab" }], heldBack: [{ word: "cd" }], ask: "Say more." });
   assert.match(held.prompts[1], /\n- version 2: a run of an input that is held back\. What it changed, as a diff/);
   assert.doesNotMatch(held.prompts[1].split("What it changed")[0], /could not be reached|"cd"/);
+  // (Nor does the loop keep it: what it does not have it cannot tell.)
+  assert.deepEqual(readJson(join(held.at("improve"), "state.json")).said, {});
 
   // The program as it is fails once: the run is made again, and it is judged by that. Twice: it is a run found
   // wanting, and the writer is told what it said as it failed — that is what there is to mend.

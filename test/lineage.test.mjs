@@ -4,7 +4,7 @@ import { createHash } from "crypto";
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
-import { replayProgram, rollbackTo, runProgram, validateProgram } from "../packages/runtime/dist/runner.js";
+import { installValidatedProgram, replayProgram, rollbackTo, runProgram, validateProgram } from "../packages/runtime/dist/runner.js";
 import { createBackend } from "../packages/runtime/dist/runner-backend.js";
 import { MAX_RUNS_FILE, readHistory } from "../packages/runtime/dist/history.js";
 import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, makeTempDir, runNodeCommand, withEnv, writeJson } from "./helpers.mjs";
@@ -133,6 +133,8 @@ await ctx.done({ ok: result.n < 5, score: result.n / 10, notes: "n".repeat(resul
   const [good, bad, long, unmade, unchecked] = linesOf(projectDir);
   // The verdict, and who gave it; what the run used in all — its checker's requests among it.
   assert.deepEqual([good.check, good.used], [{ ...by, ok: true, score: 0.2, notes: "nnn" }, { calls: 2, tokens: 800, cost: 0.8 }]);
+  // And by which model: here its checker's, the one there was. A run that asked no model says none.
+  assert.deepEqual([good.models, "models" in unchecked], [{ "p/m": { calls: 2, tokens: 800, cost: 0.8 } }, false]);
   assert.deepEqual(bad.check, { ...by, ok: false, score: 0.9, notes: "nnn" });
   // (A line is short: of long notes, and of why a check could not be made, it has the beginning.)
   assert.deepEqual([long.check.ok, long.check.notes], [true, `${"n".repeat(200)}…`]);
@@ -245,8 +247,9 @@ test("a history is read as it is on record: versions written before a version's 
   assert.deepEqual(history, {
     versions: [
       { version: 1, reason: "create", at: "2026-11-01T00:00:00.000Z", sha256: hashOf("// one"), detail: "make it" },
-      { version: 2, reason: "update", at: "2026-11-02T00:00:00.000Z", sha256: hashOf("// two"), detail: "make it better" },
-      { version: 3, reason: "repair", at: "2026-11-03T00:00:00.000Z", sha256: hashOf("// two"), detail: "its file is gone" },
+      // (Written before a version's line said which it was written from: an update and a fix are of the version before them.)
+      { version: 2, reason: "update", at: "2026-11-02T00:00:00.000Z", sha256: hashOf("// two"), detail: "make it better", parent: 1 },
+      { version: 3, reason: "repair", at: "2026-11-03T00:00:00.000Z", sha256: hashOf("// two"), detail: "its file is gone", parent: 2 },
     ],
     runs: [],
     current: 3,
@@ -358,4 +361,63 @@ test("trama history shows each version and how its runs went, the verdicts of ea
     assert.equal(refused.exitCode, 1, wrong);
     assert.match(refused.stderr, wrong === "9" ? /No version 9 is in the history of/ : /A version is named by its number: 1 and up\./);
   }
+});
+
+// --- the history as an archive: what a version was written from, and which model did a run's work ---
+
+test("a version says which it was written from, where that is known — an update and a fix: the version the program was — and says that it is not known, where the program was on no record", async (t) => {
+  const projectDir = project(t);
+  await run(projectDir);
+  installValidatedProgram(projectDir, { source: TWO }, "update", "make it two");
+  // Changed by hand since, and not run: the program an update is then written from is on no record.
+  writeFileSync(join(projectDir, "program.ts"), THREE);
+  installValidatedProgram(projectDir, { source: ONE }, "update", "make it one again");
+  rollbackTo(projectDir, 2);
+  assert.deepEqual(indexOf(projectDir).map(({ timestamp: _timestamp, sha256: _sha256, prompt: _prompt, ...line }) => line), [
+    { version: 1, reason: "found" },
+    { version: 2, reason: "update", parent: 1 },
+    { version: 3, reason: "update", parent: null },
+    // (A version gone back to is the text of one there is: it was written from nothing.)
+    { version: 4, reason: "rollback", from: 2 },
+  ]);
+  // Read back: the parent where there is one — and none where the line says there is none, which is not "the one before".
+  assert.deepEqual(readHistory(projectDir).versions.map((version) => [version.version, version.parent ?? null, "parent" in version]), [[1, null, false], [2, 1, true], [3, null, false], [4, null, false]]);
+
+  // A fix is written from the program that failed.
+  const BROKEN = ONE.replace("n: n ?? 1", "n: (n ?? 1).toFixd(0)");
+  const broken = project(t, BROKEN), fixer = project(t, `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ program: (ctx.input.args as any).program.replace("toFixd", "toFixed") });\n`);
+  await captureConsole("warn", () => run(broken, { repairWith: fixer, maxRepairAttempts: 2 }));
+  assert.deepEqual(indexOf(broken).map(({ version, reason, parent }) => [version, reason, parent]), [[1, "found", undefined], [2, "repair", 1]]);
+});
+
+test("a run's line says which models did its work: what each was asked and used, by the runner's count — the runs it asked for among it — and nothing of a call that named no model", async (t) => {
+  const original = { ...llm };
+  // (The model that serves a request is the one its last word names: none, where it names none.)
+  llm.complete = async (request, call) => {
+    const asked = JSON.stringify(request);
+    const named = ["big", "small", "none"].find((name) => asked.includes(`"${name}"`));
+    // (It says what it has used twice, as a backend does while a call lasts: each word of it replaces the last, and the call is one.)
+    for (const sofar of [40, 100]) call.used({ ...(named !== "none" && { model: `p/${named}` }), input: sofar, output: 0, cacheRead: 0, cacheWrite: 0, cost: sofar / 1000 });
+    return { role: "assistant", content: [{ type: "text", text: "ok" }], stopReason: "stop" };
+  };
+  t.after(() => { Object.assign(llm, original); });
+  const ASKS = `import { ctx, agent } from "@trama-dev/runtime";
+import { runProgram } from "@trama-dev/runtime/runner";
+const { models, then } = ctx.input.args as { models: string[]; then?: string };
+for (const model of models) await agent.complete({ messages: [{ role: "user", content: model }] });
+if (then) await runProgram({ projectDir: then, args: { models: ["small"] }, maxRepairAttempts: 0 });
+await ctx.done({});
+`;
+  const projectDir = project(t, ASKS), other = project(t, ASKS);
+  const went = await run(projectDir, { args: { models: ["big", "small", "big", "none"] } });
+  assert.equal(went.status, "done", went.reason);
+  await run(projectDir, { args: { models: ["big"], then: other } });
+  await run(projectDir, { args: { models: [] } });
+  const [mixed, asking, none] = linesOf(projectDir);
+  assert.deepEqual([mixed.used, mixed.models], [{ calls: 4, tokens: 400, cost: 0.4 }, { "p/big": { calls: 2, tokens: 200, cost: 0.2 }, "p/small": { calls: 1, tokens: 100, cost: 0.1 } }]);
+  // What a run it asked for used is its own too, as it is of its budget.
+  assert.deepEqual([asking.used.calls, asking.models], [2, { "p/big": { calls: 1, tokens: 100, cost: 0.1 }, "p/small": { calls: 1, tokens: 100, cost: 0.1 } }]);
+  assert.deepEqual(linesOf(other).map((line) => line.models), [{ "p/small": { calls: 1, tokens: 100, cost: 0.1 } }]);
+  assert.equal("models" in none, false);
+  assert.deepEqual(readHistory(projectDir).runs.map((line) => Object.keys(line.models ?? {})), [["p/big", "p/small"], ["p/big", "p/small"], []]);
 });

@@ -10,8 +10,9 @@ import { basename, join, dirname, relative, resolve } from "path";
 import { tmpdir } from "os";
 import { createHash, randomBytes } from "crypto";
 import type { OutsideAgent, ShellResult, Workspace } from "./types.js";
-import type { Check, MakeRequest, RunOptions, ProgramResult, ReplayAllResult, ReplayOptions, ReplayResult, RolledBack } from "./runner-types.js";
+import type { Check, MakeRequest, RunOptions, ProgramResult, ReplayAllResult, ReplayOptions, ReplayResult, RolledBack, VersionMade } from "./runner-types.js";
 import { readProjectMeta } from "./meta.js";
+import { describeProject, describeProjects, startedWith } from "./contract.js";
 import { createReplay, readRecording, runsToReplay, saysTheSame, type Recording, type Replay } from "./replay.js";
 import { onAbort, rejectOnAbort } from "./abort.js";
 import type { AgentUsage } from "./agent-backend.js";
@@ -31,7 +32,7 @@ import { journalEntriesOf, openJournal, type Journal } from "./journal.js";
 import { messageOf } from "./errors.js";
 import { checkedRepairAttempts, checkedTimeout, ensureProjectScaffold, loadProjectConfig, loadState, namesAPath, projectNamed, saveState } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
-import { copyToHistory, noteRun, programHashOf, readHistory, recordAsFound, recordVersion, textOfVersion, versionWith, versionsOf } from "./history.js";
+import { copyToHistory, fileOfVersionIn, noteRun, programHashOf, readHistory, recordAsFound, recordVersion, textOfVersion, versionWith, versionsOf } from "./history.js";
 
 /**
  * tsx lets node run program.ts. Resolved through the module system, so any
@@ -254,6 +255,8 @@ function copyProjectWith(projectDir: string, privateDir: string, program?: strin
 interface RunOnceOptions {
   /** The project to run. It is also where the program's agent calls work. */
   projectDir: string;
+  /** The program that is started, from the project: program.ts — or, of a run of another version, that version's file. */
+  entry?: string;
   backend: Backend;
   timeout: number;
   maxIterations: number;
@@ -444,7 +447,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     attempt,
     // Where it runs — a copy of the project, when a fix is being tried or a candidate validated.
     dir: projectDir,
-    program: fingerprint(guardPath(projectDir, "program.ts")),
+    program: fingerprint(guardPath(projectDir, options.entry ?? "program.ts")),
     iteration: ctx.iteration,
     resumed: ctx.resumed,
     // What it began from: a replay of the attempt begins there. (Last: it is the one field of no known size.)
@@ -539,6 +542,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     // What is read of a project's history is read here — in a validation too: it changes nothing.
     history: (dir, runs) => readHistory(dir, runs === undefined ? {} : { runs }),
     mark: inputMarkOf,
+    // And what a project says of itself — or every project of the user's: read here, and on the run's record.
+    describe: (named) => (named === undefined ? describeProjects() : describeProject(named)),
     // A replay the program asks for is made here, as a run it asks for is — and in a validation too: it
     // carries nothing out and uses nothing, so there is nothing of it to be kept from. It is the run's
     // own: stopped when the run ends or the program no longer wants it, and not over before it is; the
@@ -589,7 +594,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
         yieldReason: ctx.yieldReason,
       });
 
-      const program = spawn(process.execPath, ["--import", TSX_LOADER, guardPath(projectDir, "program.ts")], {
+      const program = spawn(process.execPath, ["--import", TSX_LOADER, guardPath(projectDir, options.entry ?? "program.ts")], {
         cwd: projectDir,
         env: { ...process.env, ...options.env, TRAMA_PORT: String(port), TRAMA_INIT: initFile },
         stdio: ["ignore", "pipe", "pipe"],
@@ -1322,7 +1327,7 @@ async function checkedBy(
         // And what the run had used of a model when its check began, by the runner's own count — the one a budget is
         // held by: a record may be cut short, or not kept at all, and what the check itself uses is no part of the work.
         args: {
-          result: result.result, args: { ...(readProjectMeta(projectDir).input.args ?? {}), ...run.args }, journal: journal.path, run: journal.run,
+          result: result.result, args: argumentsOf(projectDir, run.args), journal: journal.path, run: journal.run,
           used: { calls: before.calls, tokens: before.tokens, cost: before.cost },
           ...(run.workspaceDir !== undefined && { workspace: resolve(run.workspaceDir) }),
         },
@@ -1509,8 +1514,9 @@ export interface Prepared {
   keep(): { changed: string[]; unmerged: Unmerged[] };
 }
 
-export function prepareProject(projectDir: string, privateDir: string): Prepared {
-  const { copy, held, beside } = copyProjectWith(projectDir, privateDir);
+export function prepareProject(projectDir: string, privateDir: string, program?: string): Prepared {
+  // (With `program`: the copy's program is that text — a version of the project's that is to be written from, which is not the program as it is.)
+  const { copy, held, beside } = copyProjectWith(projectDir, privateDir, program);
   const before = readTree(copy);
   const intact = sameCopyAs(copy, before);
   const root = realRootOf(copy);
@@ -1636,24 +1642,63 @@ export function installValidatedProgram(
   validated: { source: string; repairedError?: string },
   reason: "create" | "update",
   prompt: string,
-): void {
+  /** The version an update was written from, where its caller knows: else it is the version the program is. */
+  parent?: number | null,
+): number {
   // Three steps, ordered so that a failure at any of them leaves the project
   // as it was: the new program is written beside the old one (nothing else is
   // touched if even that cannot be done), the version is recorded, and only
   // then does the new program take the old one's place — in one move, so
   // program.ts is never half-written, and never a program that is not on record.
+  // What an update is written from: the version the program is, while it is still that — or no version, where it is on no record.
+  const from = reason === "update" ? { parent: parent !== undefined ? parent : readHistory(projectDir).current ?? null } : {};
   const program = stageProgram(projectDir, validated.source);
   let unrecord = () => {};
   try {
     unrecord = recordVersion(projectDir, validated.source, reason, prompt, validated.repairedError
       ? [{ reason: `${reason}-repair`, timestamp: new Date().toISOString(), error: validated.repairedError }]
-      : []);
+      : [], from);
     program.commit();
   } catch (err) {
     unrecord();
     program.discard();
     throw err;
   }
+  return (unrecord as { version?: number }).version!;
+}
+
+/**
+ * Put a validated program on record as a version of the project, beside
+ * the program: program.ts is not touched, and nothing else of the project
+ * is. It is a version like any — it can be run by its number, and gone to
+ * — that the program was never made. Returns its number.
+ */
+export function keepBeside(
+  projectDir: string,
+  validated: { source: string; repairedError?: string },
+  detail: string | undefined,
+  parent: number | null,
+): number {
+  return recordVersion(projectDir, validated.source, "update", detail, validated.repairedError
+    ? [{ reason: "update-repair", timestamp: new Date().toISOString(), error: validated.repairedError }]
+    : [], { parent, aside: true }).version;
+}
+
+/**
+ * The version a new one is written from, where it is to be kept beside the
+ * program: the one that is named — which is to be there — or the program as
+ * it is, put on record first where it is not (nothing is lost by it).
+ */
+export function writtenFrom(projectDir: string, named?: number): number | null {
+  if (named === undefined) {
+    recordAsFound(projectDir);
+    return readHistory(projectDir).current ?? null;
+  }
+  if (typeof named !== "number" || !Number.isSafeInteger(named) || named < 1) throw new Error("A version is named by its number: 1 and up.");
+  if (!versionsOf(projectDir).some((one) => one.version === named)) {
+    throw new Error(`No version ${named} is in the history of ${projectDir}: \`trama history <name>\` shows those there are.`);
+  }
+  return named;
 }
 
 // --- Core execution ---
@@ -1679,7 +1724,7 @@ export interface AskedToMake extends Pick<AskedFor, "parent" | "started" | "abov
  * The runner is handed it by what starts runs (the runner surface): it is
  * that which knows how a program is written, and it stands on this.
  */
-export type Making = (request: MakeRequest, asked: AskedToMake) => Promise<RolledBack | void>;
+export type Making = (request: MakeRequest, asked: AskedToMake) => Promise<RolledBack | VersionMade | void>;
 
 /** What a run is told when a program asked for it, rather than a person or a host. */
 interface AskedFor {
@@ -1734,7 +1779,12 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
 
   const config = loadProjectConfig(projectDir);
   const timeout = checkedTimeout(options.timeout ?? config.defaultTimeout);
-  const maxRepairAttempts = checkedRepairAttempts(options.maxRepairAttempts ?? config.maxRepairAttempts);
+  // Of which version the run is, where it is not of the program as it is: one that is there. (Its text is found now —
+  // a run that could not be of the version it names is not begun.)
+  const ofVersion = options.version === undefined ? undefined : writtenFrom(projectDir, options.version)!;
+  if (ofVersion !== undefined) textOfVersion(projectDir, ofVersion);
+  // (Such a run is not fixed where it fails, whatever the run is allowed: a fix would be a version nobody asked for.)
+  const maxRepairAttempts = ofVersion !== undefined ? 0 : checkedRepairAttempts(options.maxRepairAttempts ?? config.maxRepairAttempts);
   const env = options.env == null ? undefined : checkedEnv(options.env);
   // Who is asked for a fix, where it is a project: found now, and not when the program has failed — a run that
   // could not have been fixed as it was to be is not begun. (Where no fix is to be asked for, nobody is looked for.)
@@ -1745,6 +1795,8 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   }
   // Who checks the run, where it is checked: found now as well — a run that could not be checked as it was to be is not begun.
   const checkWith = askedFor?.purpose === "check" ? undefined : checkerOf(options);
+  // Nor is one whose arguments do not fit what the project says it takes: asked now, before a program is started for it.
+  startedWith(projectDir, options.args);
   // Its own budget — the config's, for a run nobody's program asked for and that was given none — under the budgets above it.
   const budget = options.budget != null ? checkedBudget(options.budget) : askedFor ? undefined : config.budget;
   const meter = createMeter(budget, askedFor?.above);
@@ -1757,8 +1809,11 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   const startedAt = new Date(), clock = performance.now();
   let beganAs: string | undefined;
   try {
-    recordAsFound(projectDir);
-    beganAs = programHashOf(projectDir);
+    // (A run of another version is of a version on record already, and says nothing of the program.)
+    if (ofVersion === undefined) {
+      recordAsFound(projectDir);
+      beganAs = programHashOf(projectDir);
+    }
   } catch (err) {
     console.warn(tagged(options.label, `[trama] the program is not put on record as a version: ${messageOf(err)}`));
   }
@@ -1770,6 +1825,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
     depth,
     parent: askedFor?.parent,
     workspace: options.workspaceDir,
+    ...(ofVersion !== undefined && { version: ofVersion }),
     timeout,
     maxRepairAttempts,
     repairWith,
@@ -1790,6 +1846,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
       timeout,
       maxIterations: config.defaultMaxIterations,
       argsOverride: options.args,
+      ...(ofVersion !== undefined && { entry: fileOfVersionIn(ofVersion) }),
       workspaceDir: options.workspaceDir,
       depth,
       label: options.label,
@@ -1815,7 +1872,8 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
       const message = `Repair attempt ${repair.attempt}/${maxRepairAttempts}`;
       appendLogEntry(guardPath(projectDir, LATEST_LOG_PATH), message, { error: repair.error });
       console.log(tagged(options.label, `[trama] ${message}`));
-      copyToHistory(projectDir, "repair", repair.error);
+      // (Written from the program the run began as: the one that failed.)
+      copyToHistory(projectDir, "repair", repair.error, { parent: (beganAs === undefined ? undefined : versionWith(projectDir, beganAs)) ?? null });
     } catch (err) {
       console.warn(tagged(options.label, `[trama] repair bookkeeping failed: ${messageOf(err)}`));
     }
@@ -1825,9 +1883,10 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   try {
     const short = (text: string) => (text.length > 200 ? `${text.slice(0, 200)}…` : text);
     const endedAs = programHashOf(projectDir);
-    const version = beganAs === undefined ? undefined : versionWith(projectDir, beganAs);
-    const ended = endedAs === undefined || endedAs === beganAs ? undefined : versionWith(projectDir, endedAs);
+    const version = ofVersion ?? (beganAs === undefined ? undefined : versionWith(projectDir, beganAs));
+    const ended = ofVersion !== undefined || endedAs === undefined || endedAs === beganAs ? undefined : versionWith(projectDir, endedAs);
     const { calls, tokens, cost } = meter.counted();
+    const models = Object.fromEntries(Object.entries(meter.byModel()).map(([model, by]) => [model, { calls: by.calls, tokens: by.tokens, cost: by.cost }]));
     const { check } = result;
     noteRun(projectDir, {
       ...(journal.run && { run: journal.run }),
@@ -1839,6 +1898,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
       ...(repair && { repaired: repair.attempt }),
       ...(check && { check: { ...check, ...(check.notes !== undefined && { notes: short(check.notes) }), ...(check.error !== undefined && { error: short(check.error) }) } }),
       used: { calls, tokens, cost },
+      ...(Object.keys(models).length > 0 && { models }),
       ms: Math.round(performance.now() - clock),
       input: inputMarkOf(projectDir, options.args),
       ...(askedFor?.purpose && { for: askedFor.purpose }),
@@ -1857,6 +1917,15 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
  * project's own meta.json says: runs asked for with the same arguments are
  * runs of the same only while the project says the same.
  */
+/** What a run was started with, as its program had it: held to what the project takes, where the project still says what it said. */
+function argumentsOf(projectDir: string, args?: Record<string, unknown>): Record<string, unknown> {
+  try {
+    return startedWith(projectDir, args) ?? {};
+  } catch {
+    return { ...(readProjectMeta(projectDir).input.args ?? {}), ...args };
+  }
+}
+
 export function inputMarkOf(projectDir: string, args?: Record<string, unknown>): string {
   return inputMark({ ...(readProjectMeta(projectDir).input.args ?? {}), ...args });
 }

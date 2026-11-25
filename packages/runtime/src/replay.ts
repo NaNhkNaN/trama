@@ -223,7 +223,7 @@ export function firstDifference(asked: unknown, recorded: unknown, path = ""): s
 }
 
 /** The calls that last as long as what they ask for, and are named by the client so that they can be stopped: by an id made for the call. */
-const NAMED = ["/run/program", "/project/create", "/project/update", "/project/rollback", "/project/replay"];
+const NAMED = ["/run/program", "/project/create", "/project/update", "/project/version", "/project/rollback", "/project/replay"];
 
 /** A request as it is matched: without what is the client's own way of carrying a call, and no part of what the program asked. */
 function matched(endpoint: string, request: unknown): unknown {
