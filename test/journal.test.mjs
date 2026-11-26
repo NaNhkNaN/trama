@@ -1181,3 +1181,18 @@ await ctx.done({ failed, kept, neither, notAWord, typed, typedKept, wrong });`,
     wrong: 'Error: trama runtime error: Error: Schema validation failed: the list at "a" is written with 2 elements — it takes one, the shape of every item',
   });
 });
+
+test("journals are in the order they were opened in, by their names: one opened after another by the same runner is never named before it, however little time is between them", async (t) => {
+  const { openJournal } = await import("../packages/runtime/dist/journal.js");
+  const projectDir = makeTempDir("trama-journal-order-");
+  t.after(() => cleanupTempDir(projectDir));
+  // (As many as a millisecond has room for, and more: by the clock alone, those of one millisecond are in the order of their random ends.)
+  const opened = [];
+  for (let i = 0; i < 60; i += 1) { const journal = openJournal(projectDir, 100, { purpose: "test", n: i }); opened.push(journal.run); journal.close(); }
+  assert.deepEqual([...opened].sort(), opened);
+  assert.equal(new Set(opened.map((run) => run.slice(0, 24))).size, 60, "each by a time of its own");
+  // And each says when it was really begun: a name is put after the one before by no more than it has to be.
+  const first = Date.parse(JSON.parse(readFileSync(join(projectDir, "logs", "journal", `${opened[0]}.jsonl`), "utf-8").split("\n")[0]).started);
+  const last = Date.parse(JSON.parse(readFileSync(join(projectDir, "logs", "journal", `${opened.at(-1)}.jsonl`), "utf-8").split("\n")[0]).started);
+  assert.ok(last - first < 5_000, String(last - first));
+});

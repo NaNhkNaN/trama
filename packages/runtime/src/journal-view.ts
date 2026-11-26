@@ -243,6 +243,8 @@ function printJournal(path: string, records: JournalRecord[]): void {
         console.log(`${at}  the journal is full: calls from here on were not recorded`);
         break;
       case "end":
+        // (A journal of a writing alone is of one that came to nothing: why is all it has to say of how it went.)
+        if (head?.purpose === "write") console.log(`${at}  no program came of the writing: ${oneLine(record.result?.reason, 200)}`);
         console.log(`${at}  end: ${howEnded}${total && `  (${total})`}`);
         break;
     }

@@ -434,6 +434,9 @@ function makeRoom(dir: string, keep: number): void {
   }
 }
 
+/** The time the last journal this process opened was named by (see openJournal). */
+let namedBy = 0;
+
 /**
  * Start the journal of a run of `projectDir`, keeping the journals of at most
  * `keep` runs of it (0: record nothing). `about` is what is known at the start
@@ -450,7 +453,11 @@ export function openJournal(projectDir: string, keep: number, about: Record<stri
   if (keep <= 0) return noJournal();
 
   const started = new Date();
-  const run = `${started.toISOString().replace(/[:.]/g, "-")}-${randomBytes(3).toString("hex")}`;
+  // Named by a time that is after the one the journal before it was named by: journals are put in order by their
+  // names — which is the latest is read off them — and two that this runner opens within a millisecond would else
+  // be in the order of their random ends. (The record says when it was really begun: `started`.)
+  namedBy = Math.max(started.getTime(), namedBy + 1);
+  const run = `${new Date(namedBy).toISOString().replace(/[:.]/g, "-")}-${randomBytes(3).toString("hex")}`;
   const t0 = performance.now();
   let fd: number | null = null;
   let path = "";

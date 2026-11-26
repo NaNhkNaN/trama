@@ -1,5 +1,5 @@
 {
-  "description": "A checker: says whether a run's work is good by a command, run in a copy of the project as the run left it. Named as a run's checkWith.",
+  "description": "A checker: says whether a run's work is good by a command, run in a copy of where the run worked as the run left it — its project, or its workspace where it had one. Named as a run's checkWith.",
   "parameters": {
     "command?": "string: the command that says whether the work is good (npm test) — the checker's own, said in its meta.json",
     "seconds?": "number: how long the command may take (600) — the checker's own too",

@@ -411,3 +411,44 @@ test("the checker that is in the repository to begin from checks by a command: g
   const untold = await checkedBy({});
   assert.match(untold.check.error, /The project asked for the check failed: [^]*It is not said what command checks/);
 });
+
+test("the checker that is in the repository checks where the run worked: of a run that had a workspace, its command is run in a copy of that workspace as the run left it — not in the project, and not in the place itself, where a check changes nothing", async (t) => {
+  const EXAMPLE = join(REPO_ROOT, "examples", "check-by-command");
+  const projectDir = makeTempDir("trama-check-harness-"), checker = makeTempDir("trama-check-example-"), work = realpathSync(makeTempDir("trama-check-codebase-"));
+  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(checker); cleanupTempDir(work); });
+  // A harness: its work is in its run's workspace. (What it has in its project by the same name is no work of the run's.)
+  createProjectFixture(projectDir, { programSource: `import { ctx, tools, workspace } from "@trama-dev/runtime";
+const { does } = ctx.input.args as any;
+await tools.write("made.txt", "in the project");
+await workspace.write("made.txt", "in the workspace");
+await workspace.write("deep/down/it's here.txt", "and all of it");
+if (does === "leave") await workspace.shell("cd .. && mv " + JSON.stringify(ctx.input.args.name) + " gone-" + JSON.stringify(ctx.input.args.name));
+await ctx.done();` });
+  writeFileSync(join(work, "was-there.txt"), "before the run");
+  cpSync(EXAMPLE, checker, { recursive: true });
+  const meta = readJson(join(checker, "meta.json"));
+  assert.match(meta.description, /by a command, run in a copy of where the run worked as the run left it — its project, or its workspace where it had one\./);
+  const checkedBy = async (args, more = {}) => {
+    writeJson(join(checker, "meta.json"), { ...meta, input: { ...meta.input, args } });
+    return (await captureConsole("log", () => runProgram({ projectDir, workspaceDir: work, checkWith: checker, maxRepairAttempts: 0, timeout: 30_000, ...more }))).result;
+  };
+
+  const good = await checkedBy({ command: `cat made.txt was-there.txt "deep/down/it's here.txt"` });
+  assert.deepEqual([good.status, good.check.ok, good.check.notes], ["done", true, "in the workspacebefore the runand all of it"]);
+  // A copy: what the command makes or takes away is not made or taken away where the run worked — nor is the command run there.
+  const meddles = await checkedBy({ command: "echo put in > by-the-check.txt && rm was-there.txt && pwd -P" });
+  assert.equal(meddles.check.ok, true, meddles.check.notes ?? meddles.check.error);
+  assert.notEqual(meddles.check.notes.trim(), work);
+  assert.deepEqual(readdirSync(work).sort(), ["deep", "made.txt", "was-there.txt"]);
+  assert.equal(readFileSync(join(projectDir, "made.txt"), "utf-8"), "in the project");
+  assert.deepEqual(readdirSync(projectDir).filter((name) => name.startsWith(".work")), [], "and nothing of the copy is left in the project");
+  // Not good where the command does not end well there.
+  const bad = await checkedBy({ command: `test "$(cat made.txt)" = "in the project"` });
+  assert.deepEqual([bad.check.ok, bad.check.notes], [false, "exit code 1\n"]);
+  // And where the place the run worked is not there to be looked at, there is no verdict: the work is not found wanting for it.
+  const name = work.split("/").at(-1);
+  const left = await checkedBy({ command: "cat made.txt" }, { args: { does: "leave", name } });
+  t.after(() => cleanupTempDir(join(work, "..", `gone-${name}`)));
+  assert.equal(left.check.ok, undefined);
+  assert.match(left.check.error, /The project asked for the check failed: [^]*Where the run worked could not be copied, to be checked: /);
+});

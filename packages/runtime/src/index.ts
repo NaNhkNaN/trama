@@ -23,6 +23,7 @@ import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspac
 import { parentBridge, remoteWorkspace, withOptions, type Bridge } from "./bridge-client.js";
 import { guardPath, identityOf, sameProjectAs } from "./path-guard.js";
 import { printJournals, spentIn } from "./journal-view.js";
+import { openJournal } from "./journal.js";
 import { messageOf } from "./errors.js";
 
 export type { HistoryRun, HistoryVersion, ProjectHistory, RolledBack, VersionMade } from "./runner-types.js";
@@ -599,6 +600,23 @@ async function generateProgram(
 }
 
 /**
+ * Leave on a project's record what writing a program for it used, where
+ * nothing came of the writing — no program, or none that came to be
+ * validated — and why: a journal of its own (its purpose "write"), where a
+ * journal is looked for. What writing a candidate used is otherwise on
+ * record with the candidate's validation, and here there is none: it was
+ * said as it was spent, and was on no record. (A writing that used nothing
+ * leaves nothing.)
+ */
+function writtenForNothing(projectDir: string, config: TramaConfig, wrote: AgentUsage[], why: string, asked: Asked): void {
+  if (wrote.length === 0) return;
+  const journal = openJournal(projectDir, config.journalRuns, { purpose: "write", label: asked.label, parent: asked.parent });
+  for (const usage of wrote) journal.used("generate", usage);
+  journal.note("end", { result: { status: "failed", reason: why } });
+  journal.close();
+}
+
+/**
  * What a project is made or changed under where a run's program asked its
  * runner for that (see AskedToMake) — and nothing, where a person or a host
  * did: then it is nobody's but its own.
@@ -756,6 +774,8 @@ async function writeValidateInstall(projectDir: string, how: {
 }): Promise<number> {
   const { config, backend, stillTheProject, signal, asked } = how;
   const wrote: AgentUsage[] = [];
+  // Whether what the writing used is on record: with the candidate's validation, once there is one.
+  let onRecord = false;
   return withTempDir("trama-gen-", async (privateDir) => {
     const prepared = prepareProject(projectDir, privateDir, how.from?.text);
     if (how.says) prepared.says(how.says.text);
@@ -795,6 +815,7 @@ async function writeValidateInstall(projectDir: string, how: {
     }
 
     shownUnder(asked.label).log(how.validating);
+    onRecord = true;
     // (A version that is to be kept beside the program is the program's text and no more: it is validated in the
     // project as it is, where it will be run — not with what its writer made beside it, which is not kept.)
     const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, signal, asked, how.beside !== undefined, { meter: how.meter, ...(by && { writtenBy: by }), ...(how.says && { says: how.says.text }) });
@@ -803,6 +824,10 @@ async function writeValidateInstall(projectDir: string, how: {
     const version = installValidatedProgram(projectDir, validated, how.reason, how.prompt, how.from?.version, how.says);
     if (kept) keepPrepared(prepared, asked.label);
     return version;
+  }).catch((err) => {
+    // (Of a project that is being made there is no record to leave it on: where the making fails, the project is not.)
+    if (!onRecord && how.reason !== "create") writtenForNothing(projectDir, config, wrote, messageOf(err), asked);
+    throw err;
   });
 }
 

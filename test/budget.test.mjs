@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
-import { readdirSync, readFileSync } from "fs";
+import { existsSync as isThere, readdirSync, readFileSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import { checkedBudget, createMeter } from "../packages/runtime/dist/budget.js";
@@ -528,7 +528,7 @@ await ctx.done({ went: run.result.went });
   });
 });
 
-test("what writing a program used is said, and is on record with its validation; and writing and validating are held to the config's budget together", async (t) => {
+test("what writing a program used is said, and is on record with its validation — or, where nothing came of the writing, in a journal of its own that says why; and writing and validating are held to the config's budget together", async (t) => {
   const fakeHome = makeTempDir("trama-budget-home-");
   t.after(() => cleanupTempDir(fakeHome));
   const config = (more) => writeJson(join(fakeHome, ".trama", "config.json"), { maxRepairAttempts: 1, ...more });
@@ -585,7 +585,39 @@ await ctx.done({ said: await agent.instruct("a question of the program's") });
     const failed = await captureConsole("log", () => updateProject("made", "change it again").catch((err) => err));
     assert.match(failed.result.message, /the model is away/);
     assert.ok(failed.messages.includes("[trama] writing the program used 77 tokens  $0.0770"));
-    assert.equal(journalsOf(projectDir).length, 4, "no validation, no journal");
+    // And it is on the project's record all the same: in a journal of its own, which says why nothing came of the writing.
+    const forNothing = journalsOf(projectDir);
+    assert.equal(forNothing.length, 5);
+    assert.deepEqual(forNothing.at(-1).map((record) => [record.kind, record.purpose ?? record.for ?? record.result?.status, record.input]),
+      [["run", "write", undefined], ["usage", "generate", 77], ["end", "failed", undefined]]);
+    assert.match(forNothing.at(-1).at(-1).result.reason, /^the model is away$/);
+    const told = (await captureConsole("log", async () => printJournals(projectDir, "made", {}))).messages.join("\n");
+    assert.match(told, /^\S+  write  failed$/m);
+    assert.match(told, /^ +\d+\.\d+s  writing the program used 77 tokens  \$0\.0770$/m);
+    assert.match(told, /^ +\d+\.\d+s  no program came of the writing: the model is away$/m);
+    assert.match(told, /end: failed  \(77 tokens  \$0\.0770 in all\)$/m);
+
+    // So of an answer that says there is no program to be written: what it took to say so, and what it said.
+    standIn(t, { ask: async (_prompt, call) => { call.used(took(30)); call.used(took(3)); return "NO PROGRAM: what is asked goes against what the project says it gives."; } });
+    const saidNone = await captureConsole("log", () => updateProject("made", "give more than it says").catch((err) => err));
+    assert.match(saidNone.result.message, /It was said that there is none to be written: what is asked goes against/);
+    assert.deepEqual(journalsOf(projectDir).at(-1).map((record) => [record.kind, record.purpose ?? record.for ?? record.result?.reason, record.input]),
+      [["run", "write", undefined], ["usage", "generate", 30], ["usage", "generate", 3], ["end", "It was said that there is none to be written: what is asked goes against what the project says it gives.", undefined]]);
+    assert.equal(journalsOf(projectDir).length, 6);
+
+    // A writing that used nothing leaves nothing; and one that was validated is on record once, with its validation.
+    standIn(t, { ask: async () => "NO PROGRAM: again." });
+    await captureConsole("log", () => updateProject("made", "give more than it says").catch((err) => err));
+    assert.equal(journalsOf(projectDir).length, 6);
+    standIn(t, { ask: async (prompt, call) => { if (prompt.startsWith("a question")) return "an answer"; call.used(took(9)); return wrote + "// once more\n"; } });
+    await captureConsole("log", () => updateProject("made", "change it and be validated"));
+    assert.deepEqual(journalsOf(projectDir).slice(6).map((records) => [records[0].purpose, records.filter((record) => record.kind === "usage" && record.for === "generate").length]), [["validate", 1]]);
+
+    // A project that was not made has no record to keep it in: what it took is said where it was asked for, and no directory is left for it.
+    standIn(t, { ask: async (_prompt, call) => { call.used(took(11)); return "NO PROGRAM: nor this."; } });
+    const unmade = await captureConsole("log", () => createProject("never", "make what cannot be").catch((err) => err));
+    assert.ok(unmade.messages.includes("[trama] writing the program used 11 tokens  $0.0110"), unmade.messages.join("\n"));
+    assert.equal(isThere(join(fakeHome, ".trama", "projects", "never")), false);
   });
 
   // A writing that is stopped — by whoever asked for it, or by the budget — says what it took once its backend has let go of it.
