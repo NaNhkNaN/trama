@@ -68,6 +68,12 @@ export interface ToolsWithCleanup extends Tools {
   /** Carry such a call out (see outside-agent.ts). `said`: where what the agent says of itself as it works is written down. */
   askAgent(asked: AskedOfAgent, said?: Said): Promise<AgentResult>;
   /**
+   * The same, with the agent at work in `root` — or the directory of it the
+   * call names — and not in the project: a workspace's (see `workspace.agent`),
+   * as `shellIn` is a workspace's shell. The agent is these tools' to stop.
+   */
+  askAgentIn(root: string, asked: AskedOfAgent, said?: Said): Promise<AgentResult>;
+  /**
    * Stop every shell command still running, and anything they left in the
    * background — and every agent from outside that is at work, which is the
    * run's as a command is. Resolves when they are gone.
@@ -212,8 +218,10 @@ export function createTools(projectDir: string, signal?: AbortSignal, env?: Reco
 
     agentAsked: (prompt, options) => checkedAsk(prompt, options, agents),
 
-    async askAgent(asked, said) {
-      const cwd = asked.cwd ? guardPath(normalizedProjectDir, asked.cwd) : realRootOf(normalizedProjectDir);
+    askAgent: (asked, said) => made.askAgentIn(normalizedProjectDir, asked, said),
+
+    async askAgentIn(root, asked, said) {
+      const cwd = asked.cwd ? guardPath(root, asked.cwd) : realRootOf(root);
       return askOutside({ ...asked, cwd }, {
         env: shellEnv,
         signal,

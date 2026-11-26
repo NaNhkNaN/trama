@@ -9,7 +9,7 @@ import {
 import { basename, join, dirname, relative, resolve } from "path";
 import { tmpdir } from "os";
 import { createHash, randomBytes } from "crypto";
-import type { OutsideAgent, ShellResult, Workspace } from "./types.js";
+import type { OutsideAgent, ShellResult } from "./types.js";
 import type { Check, MakeRequest, RunOptions, ProgramResult, ReplayAllResult, ReplayOptions, ReplayResult, RolledBack, VersionMade } from "./runner-types.js";
 import { readProjectMeta } from "./meta.js";
 import { describeProject, describeProjects, fitted } from "./contract.js";
@@ -20,7 +20,7 @@ import { checkedBudget, createMeter, type Budget, type Meter } from "./budget.js
 import { LATEST_LOG_PATH, appendLogEntry, createContext } from "./context.js";
 import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
-import { createWorkspace } from "./workspace.js";
+import { createWorkspace, type WorkspaceWithAgents } from "./workspace.js";
 import { guardPath, identityOf, projectAt, realRootOf, sameProjectAs, wayTo } from "./path-guard.js";
 import { ITSELF, copyTree, differences, entryAt, pathAsListed, readTree, type Tree } from "./tree.js";
 import { mergeTree, type Unmerged } from "./merge.js";
@@ -539,11 +539,12 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     parent: { run: journal.run, journal: journal.path, seq },
     started: (run: string, path: string) => { if (run) journal.note("child", { seq, run, journal: path, ...(purpose && { purpose }) }); },
   });
-  const workspaces = new Map<string, Workspace>();
-  const workspaceAt = (dir: string): Workspace => {
+  const workspaces = new Map<string, WorkspaceWithAgents>();
+  const workspaceAt = (dir: string): WorkspaceWithAgents => {
     let workspace = workspaces.get(dir);
-    // (Its shell is this run's: what a command there starts is stopped with the run, and has the run's variables.)
-    if (!workspace) workspaces.set(dir, workspace = createWorkspace(dir, runEnded.signal, (root, command, given) => tools.shellIn(root, command, given)));
+    // (Its shell and its agents from outside are this run's: what is started there is stopped with the run, has the
+    // run's variables, and an agent named there is one the run's configuration names.)
+    if (!workspace) workspaces.set(dir, workspace = createWorkspace(dir, runEnded.signal, () => tools));
     return workspace;
   };
   // The workspace of the session this run is part of, if it is part of one.

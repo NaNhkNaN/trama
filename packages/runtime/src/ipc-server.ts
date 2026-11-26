@@ -5,7 +5,8 @@
 import { createServer, type Server } from "http";
 import type { AddressInfo } from "net";
 import { timingSafeEqual } from "crypto";
-import type { Tools, Workspace } from "./types.js";
+import type { Tools } from "./types.js";
+import type { WorkspaceWithAgents } from "./workspace.js";
 import type { ToolsWithCleanup } from "./tools.js";
 import type { Said } from "./outside-agent.js";
 import type { RunnerAgent } from "./agent.js";
@@ -217,9 +218,9 @@ export interface IpcBackends {
   agent: RunnerAgent;
   tools: Tools & Pick<ToolsWithCleanup, "agentAsked" | "askAgent">;
   /** The workspace of the session the program is running in — null when it is in none. */
-  workspace: Workspace | null;
+  workspace: WorkspaceWithAgents | null;
   /** A workspace by directory, for a program that created a session rather than joined one. */
-  workspaceAt(dir: string): Workspace;
+  workspaceAt(dir: string): WorkspaceWithAgents;
   /**
    * Run another project on the program's behalf, until it ends or `stop` says
    * to stop it. `seq` is the position of the call that asked for it.
@@ -316,7 +317,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, rep
   };
 
   /** The workspace a call is about: the directory it names, or else the one this run was started with. */
-  const workspaceOf = (dir: string | undefined): Workspace => {
+  const workspaceOf = (dir: string | undefined): WorkspaceWithAgents => {
     if (dir !== undefined) {
       if (dir === "") throw new BadRequest("Invalid field: dir (expected a directory path)");
       return workspaceAt(dir);
@@ -463,6 +464,14 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, rep
     "/workspace/shell": route(
       { command: "string", dir: "optional string", cwd: "optional string", timeout: "optional number", env: "optional object" },
       b => workspaceOf(b.dir).shell(b.command, { cwd: b.cwd, timeout: b.timeout, env: envOf(b.env) }),
+    ),
+    // An agent from outside, at work in the workspace (as "/tools/agent" is one at work in the project).
+    "/workspace/agent": route(
+      { prompt: "string", agent: "any", dir: "optional string", cwd: "optional string", timeout: "optional number", system: "optional string", model: "optional string", session: "optional string" },
+      ({ prompt, dir, ...options }, _closed, call) => {
+        const there = workspaceOf(dir);
+        return there.askAgent(asGiven(() => there.agentAsked(prompt, options)), saidUnder(call));
+      },
     ),
     "/workspace/observe": route(
       { pattern: "string", dir: "optional string", expect: "optional number", timeout: "optional number" },

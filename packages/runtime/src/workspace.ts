@@ -1,7 +1,8 @@
 import { readFileSync, mkdirSync, readdirSync, statSync } from "fs";
 import { resolve, relative, sep } from "path";
-import type { Workspace } from "./types.js";
+import type { OutsideAgent, Workspace } from "./types.js";
 import { createTools, type ToolsWithCleanup } from "./tools.js";
+import { checkedAsk } from "./outside-agent.js";
 import { onAbort } from "./abort.js";
 import { guardPath, realRootOf } from "./path-guard.js";
 import { isStagedName, stageFile } from "./replace-file.js";
@@ -157,14 +158,30 @@ export function ensureWorkspaceDir(workspaceDir: string): string {
 }
 
 /**
- * The workspace in a directory. `shellIn`: the shell its commands are run by
- * — a run's own, so that they are the run's to stop, and have its variables.
- * Without it the workspace has a shell of its own: commands it started end
- * with this process.
+ * A workspace, with what its runner asks of it beside what a program does: a
+ * call to an agent from outside read, and then carried out (as of a run's
+ * tools: see `ToolsWithCleanup`) — so that what the agent says of itself as
+ * it works can be put on record under the call.
  */
-export function createWorkspace(workspaceDir: string, signal?: AbortSignal, shellIn?: ToolsWithCleanup["shellIn"]): Workspace {
+export type WorkspaceWithAgents = Workspace & Pick<ToolsWithCleanup, "agentAsked" | "askAgent">;
+
+/**
+ * The workspace in a directory. `runs`: the tools its commands are run by,
+ * and its agents from outside asked — a run's own, so that they are the
+ * run's to stop, have its variables, and are the agents its configuration
+ * names. Without it the workspace has tools of its own: what it started ends
+ * with this process, and the agents it knows by name are those `agents` says
+ * (asked when one is named).
+ */
+export function createWorkspace(
+  workspaceDir: string,
+  signal?: AbortSignal,
+  runs?: () => Pick<ToolsWithCleanup, "shellIn" | "agentAsked" | "askAgentIn">,
+  agents?: () => Record<string, OutsideAgent> | undefined,
+): WorkspaceWithAgents {
   const root = ensureWorkspaceDir(workspaceDir);
-  let ownShell: ToolsWithCleanup | undefined;
+  let own: ToolsWithCleanup | undefined;
+  const its = (): Pick<ToolsWithCleanup, "shellIn" | "askAgentIn"> => runs?.() ?? (own ??= createTools(root, signal));
 
   /** All artifact paths matching a glob, sorted. */
   const listMatching = (pattern: string): string[] => {
@@ -183,7 +200,7 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal, shel
     }
   };
 
-  return {
+  const made: WorkspaceWithAgents = {
     async read(path) {
       const target = guardPath(root, path);
       try {
@@ -205,8 +222,15 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal, shel
     },
 
     async shell(command, options) {
-      return (shellIn ?? (ownShell ??= createTools(root, signal)).shellIn)(root, command, options);
+      return its().shellIn(root, command, options);
     },
+
+    // (What is wrong with the call is found before anything is started, as of `tools.agent`.)
+    agent: async (prompt, options) => made.askAgent(made.agentAsked(prompt, options)),
+
+    agentAsked: (prompt, options) => (runs ? runs().agentAsked(prompt, options) : checkedAsk(prompt, options, agents?.())),
+
+    askAgent: (asked, said) => its().askAgentIn(root, asked, said),
 
     async observe(pattern, options = {}) {
       const { expect, timeout } = options;
@@ -261,4 +285,5 @@ export function createWorkspace(workspaceDir: string, signal?: AbortSignal, shel
       }
     },
   };
+  return made;
 }

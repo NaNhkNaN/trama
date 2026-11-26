@@ -16,6 +16,7 @@ const told = JSON.parse(process.env.FAKE_ACP ?? "{}");
 // told.asks       the kinds of answer it offers when it asks permission, before it replies: ["allow_once", …]
 // told.wants      a method of the client's it asks for, before it replies: "fs/read_text_file"
 // told.tools      how many calls of tools it reports
+// told.writes     files it writes where it works, before it replies: { "made.txt": "what is in it" }
 // told.says       what it says, in pieces (["It is ", "done."]); "{…}" in a piece is filled in (see `filled`)
 // told.ids        which message each piece is of, by an id (["a", "a", "b"]): without it, none is said
 // told.between    true: it reports a call of a tool after the first piece of what it says
@@ -75,6 +76,7 @@ async function turn(id, { sessionId, prompt }) {
     const answer = await ask(told.wants, { sessionId, path: "/etc/hosts" });
     granted += ` [${told.wants}: ${answer.error?.code ?? "answered"}]`;
   }
+  for (const [path, text] of Object.entries(told.writes ?? {})) writeFileSync(path, text);
   const pieces = (told.says ?? ["It is done: {prompt}"]).map(filled);
   says(sessionId, pieces[0], told.ids?.[0]);
   if (told.between) {

@@ -143,5 +143,6 @@ export function remoteWorkspace(call: Bridge["call"], dir?: string): Workspace {
     list: (pattern) => call("/workspace/list", { dir, pattern }),
     observe: async (pattern, options) => call("/workspace/observe", withOptions({ dir, pattern }, options)),
     shell: async (command, options) => call("/workspace/shell", withOptions({ dir, command }, options)),
+    agent: async (prompt, options) => call("/workspace/agent", withOptions({ dir, prompt }, options)),
   };
 }

@@ -1,0 +1,22 @@
+{
+  "description": "A harness that is somebody else's: hands a task, whole, to an agent from outside — one the configuration names — at work in the run's workspace where it has one, or in the project, and says what the agent said and how its turn ended.",
+  "parameters": {
+    "task?": "string: what is to be done — where none is given, the project's own prompt",
+    "agent": "string: the agent that does the work, by its name in the configuration (\"agents\" in config.json) — said once in this project's own arguments, it is the agent of every run",
+    "model?": "string: a model, for an agent that has none of its own: the agent's own serves otherwise",
+    "system?": "string: standing instructions for the work, on top of the agent's own",
+    "seconds?": "number: how long the agent may take (600)"
+  },
+  "returns": {
+    "summary?": "string: the agent's answer — the last of what it said; absent where it said nothing",
+    "ok": "boolean: whether its turn ended as one does",
+    "stopReason?": "string: how the turn ended — end_turn, max_tokens, max_turn_requests, refusal, cancelled",
+    "session?": "string: the id of the conversation, as the agent has it",
+    "usage?": "json: what the agent said it used — its own account, not counted by trama"
+  },
+  "input": {
+    "prompt": "Say what is to be done: trama run <this project> --arg task=\"…\"",
+    "args": {}
+  },
+  "createdAt": "2026-11-25T00:00:00.000Z"
+}

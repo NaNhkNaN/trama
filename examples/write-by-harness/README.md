@@ -4,7 +4,7 @@ A writer of programs, written as a program: some seventy lines with their commen
 
 Where a project's program is to be written — its first (`trama create`, `createProject`) or its next (`trama update`, `updateProject`) — trama asks for it: of pi's agent, unless the call or the configuration names a project to ask instead. This is such a project. It writes nothing itself. It words what is asked, has a harness do the work in the copy of the project it was handed, and hands back `program.ts` as the harness left it.
 
-To use it, copy it among your projects with a harness (`examples/coding-harness` works in its run's workspace, which is what this needs), and name it:
+To use it, copy it among your projects with a harness (`examples/coding-harness` works in its run's workspace, which is what this needs — as `examples/harness-by-agent` does, which has an agent from outside do the writing), and name it:
 
 ```sh
 cp -R examples/write-by-harness ~/.trama/projects/write-by-harness

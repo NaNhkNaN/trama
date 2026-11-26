@@ -306,10 +306,15 @@ export async function showHistory(name: string, options: { runs?: boolean } = {}
   }
 }
 
-/** The shared workspace in a directory, created if it does not exist: read, write, list, observe. */
+/** The shared workspace in a directory, created if it does not exist: read, write, list, observe — and a shell, and agents from outside, at work in it. */
 export function createWorkspace(dir: string): Workspace {
   const bridge = parentBridge();
-  if (!bridge) return workspaceHere(dir);
+  if (!bridge) {
+    // (An agent it is asked for by name is one the configuration names — read when one is named. What a runner asks
+    // of a workspace beside is no part of what a host is handed.)
+    const { agentAsked: _asked, askAgent: _ask, ...workspace } = workspaceHere(dir, undefined, undefined, () => loadConfig().agents);
+    return workspace;
+  }
   const absolute = ensureWorkspaceDir(dir); // it exists from here on, as it does outside a program
   return remoteWorkspace(bridge.call, absolute);
 }

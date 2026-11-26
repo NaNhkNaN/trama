@@ -462,7 +462,8 @@ export interface Tools {
    *
    * `agent` names one of the configuration's (`agents` in config.json), or
    * is what starts one: `{ command, args?, env? }`. The runtime names none.
-   * `cwd` is where it works: the project, or a directory of it. `timeout`
+   * `cwd` is where it works: the project, or a directory of it (for work in
+   * the run's workspace there is `workspace.agent`). `timeout`
    * is in milliseconds (ten minutes, without it). `session` is the id an
    * earlier result gave: the conversation is gone on with.
    *
@@ -516,4 +517,23 @@ export interface Workspace {
     timeout?: number;
     env?: Record<string, string | undefined>;
   }): Promise<ShellResult>;
+  /**
+   * Have an agent from outside do a piece of work in the workspace: as
+   * `tools.agent` — the same options, the same result, as little held — but
+   * the agent works in the workspace's directory, or, with `cwd`, in a
+   * directory of it. For a program whose work is in a directory that is not
+   * its own: a harness pointed at a codebase, or handed a copy of a project
+   * to write in, can have somebody else's harness do that work, whole.
+   *
+   *   const done = await workspace.agent(task, { agent: "claude" });
+   *   if (!done.ok) throw new Error(done.failure?.message ?? done.stopReason);
+   */
+  agent(prompt: string, options: {
+    agent: string | OutsideAgent;
+    cwd?: string;
+    timeout?: number;
+    system?: string;
+    model?: string;
+    session?: string;
+  }): Promise<AgentResult>;
 }
