@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { existsSync, readdirSync, readFileSync } from "fs";
 import { join } from "path";
-import { describeProject, describeProjects, listProjects, replayProgram, runProgram } from "../packages/runtime/dist/index.js";
+import { addVersion, describeProject, describeProjects, listProjects, replayProgram, runProgram } from "../packages/runtime/dist/index.js";
+import { printJournals } from "../packages/runtime/dist/journal-view.js";
 import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson } from "./helpers.mjs";
 
 // What a project takes and gives: said in its meta.json, in the words a tool is declared in — description,
@@ -74,6 +75,7 @@ test("a run whose arguments do not fit what its project takes is not begun: no p
   assert.deepEqual(said.result.result.result, { args: { word: "a" }, kinds: { word: "string" } });
   assert.deepEqual(said.messages.filter((line) => /takes no argument/.test(line)), [`[trama] ${it.at("words")} takes no argument "time", "tims": left out. It takes: word, times?, loud?, more?.`]);
   assert.deepEqual(journalsOf(it.at("words")).at(-1).filter((record) => record.kind === "left-out").map((record) => record.args), [["time", "tims"]]);
+  assert.equal((await captureConsole("log", async () => printJournals(it.at("words"), "words", {}))).messages.filter((line) => /not taken, and left out of what the program was given: "time", "tims"/.test(line)).length, 1);
   // Runs asked with other arguments are other runs by their mark, whatever of them the program was given.
   assert.notEqual(linesOf(it.at("words")).at(-1).input, linesOf(it.at("words")).at(0).input);
   // A run a program asked for: on its record, and not said aloud — there is nobody there who typed it. And whoever
@@ -123,6 +125,45 @@ test("what a run gives is held to what its project says it gives: the declared f
   assert.match((await it.run("word", { args: { give: 3 } })).result.reason, /expected string, got 3/);
   // A project that says nothing of what it gives gives what its program does.
   assert.deepEqual((await it.run("free", { args: { give: { anything: [1, null] } } })).result.result, { anything: [1, null] });
+});
+
+test("what a run gives beside what its project says it gives is left out, and it is said — as of an argument the project does not take: on the run's record, and aloud to whoever started the run", async (t) => {
+  const returns = { said: "string", "times?": "number", lines: [{ n: "number" }], "any?": "json" };
+  const it = homeWith(t, {
+    gives: { program: GIVES, more: { returns } },
+    asks: { program: `import { ctx } from "@trama-dev/runtime";\nimport { resolveProject, runProgram } from "@trama-dev/runtime/runner";\nconst ran = await runProgram({ projectDir: resolveProject("gives"), args: ctx.input.args });\nawait ctx.done({ had: ran.result });\n` },
+  });
+  const heard = (fn) => withEnv({ HOME: it.fakeHome }, () => captureConsole("warn", () => captureConsole("log", fn))).then(({ result, messages }) => ({ result: result.result, warned: messages.filter((line) => /left out of what the run gave/.test(line)) }));
+  const noted = (name) => journalsOf(it.at(name)).at(-1).filter((record) => record.kind === "left-out").map(({ at: _at, kind: _kind, ...record }) => record);
+  const give = { said: "a", lines: [{ n: 1, extra: true }, { n: 2, extra: false, other: 0 }], also: "x", any: { whatever: { it: "holds" } } };
+
+  // The result is what the project says it gives — and what else the program handed over is named, by where it was: once for every item of a list.
+  const ran = await heard(() => runProgram({ projectDir: it.at("gives"), args: { give }, timeout: 30_000 }));
+  assert.deepEqual(ran.result, { status: "done", result: { said: "a", lines: [{ n: 1 }, { n: 2 }], any: { whatever: { it: "holds" } } } });
+  assert.deepEqual(ran.warned, [`[trama] the result has "lines[].extra", "lines[].other", "also", which the project does not say it gives: left out of what the run gave. It gives: said, times?, lines, any?.`]);
+  assert.deepEqual(noted("gives"), [{ result: ["lines[].extra", "lines[].other", "also"] }]);
+  // And it is shown with the run, call by call.
+  const shown = await captureConsole("log", async () => printJournals(it.at("gives"), "gives", {}));
+  assert.equal(shown.messages.filter((line) => /left out of what the run gave: "lines\[\]\.extra", "lines\[\]\.other", "also"/.test(line)).length, 1, shown.messages.join("\n"));
+
+  // Nothing left out, nothing said: of a result that is what was declared, of one that did not fit, of a project that says nothing of what it gives.
+  const whole = await heard(() => runProgram({ projectDir: it.at("gives"), args: { give: { said: "a", lines: [] } }, timeout: 30_000 }));
+  assert.deepEqual([whole.warned, noted("gives")], [[], []]);
+  const unfit = await heard(() => runProgram({ projectDir: it.at("gives"), args: { give: { said: 1, lines: [], also: "x" } }, timeout: 30_000 }));
+  assert.deepEqual([unfit.result.status, unfit.warned, noted("gives")], ["failed", [], []]);
+  // (A done that failed left nothing out: the one that settled the run says what it left out, and no other.)
+  const mended = await heard(() => runProgram({ projectDir: it.at("gives"), args: { give: { said: 1, also: "x" }, then: { said: "b", lines: [], later: 1 } }, timeout: 30_000 }));
+  assert.deepEqual([mended.result.status, noted("gives")], ["done", [{ result: ["later", "refused"] }]]);
+
+  // A run a program asked for: on its record, and not said aloud.
+  const asked = await heard(() => runProgram({ projectDir: it.at("asks"), args: { give }, timeout: 60_000 }));
+  assert.deepEqual([asked.result.result.had.said, asked.warned, noted("gives")], ["a", [], [{ result: ["lines[].extra", "lines[].other", "also"] }]]);
+
+  // And where a program is validated — a version put on record — whoever asked for that is told, as of a run: what the
+  // new program gives and the project does not say is the first thing they would want to know of it.
+  writeJson(join(it.at("gives"), "meta.json"), { ...readJson(join(it.at("gives"), "meta.json")), input: { prompt: "p", args: { give: { said: "a", lines: [] } } } });
+  const version = await heard(() => addVersion("gives", `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ said: "a", lines: [], letters: 1 });\n`));
+  assert.deepEqual([version.result, version.warned], [{ version: 2 }, [`[trama] the result has "letters", which the project does not say it gives: left out of what the run gave. It gives: said, times?, lines, any?.`]]);
 });
 
 test("what a project says it takes and gives is written as shapes are, or the project is refused by name — before a run of it is begun", async (t) => {

@@ -499,6 +499,13 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       readyTimer ??= setTimeout(() => validated.abort(), validating.readyGraceMs).unref();
     }),
     print: line => console.log(tagged(label, line)),
+    // What the result had and the project does not say it gives: on the run's record — and aloud where nobody's
+    // program asked for the run, as of an argument that is not taken. (There is someone there who asked for the
+    // field, or wrote its name wrongly.)
+    leftOut: (names, gives) => {
+      journal.note("left-out", { result: names });
+      if (options.depth === 0) console.warn(tagged(label, `[trama] the result has ${names.map((name) => JSON.stringify(name)).join(", ")}, which the project does not say it gives: left out of what the run gave. It gives: ${gives}.`));
+    },
   });
   journal.note("attempt", {
     attempt,

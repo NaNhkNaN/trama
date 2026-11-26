@@ -195,6 +195,13 @@ function printJournal(path: string, records: JournalRecord[]): void {
       case "budget":
         console.log(`${at}  ${oneLine(record.spent, 100)}`);
         break;
+      case "left-out": {
+        // (What the run was handed and its project does not take; what its result had and its project does not say it gives.)
+        const names = (of: unknown) => (Array.isArray(of) ? of.map((name) => JSON.stringify(name)).join(", ") : "");
+        if (record.args) console.log(`${at}  not taken, and left out of what the program was given: ${names(record.args)}`);
+        if (record.result) console.log(`${at}  not declared, and left out of what the run gave: ${names(record.result)}`);
+        break;
+      }
       case "child":
         // (A run a call of the program's started — or, for a fix, one the run itself started.)
         console.log(record.purpose === "fix"

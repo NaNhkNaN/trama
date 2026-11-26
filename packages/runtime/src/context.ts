@@ -63,6 +63,13 @@ export function createContext(
     onReady?: (data?: Record<string, unknown>) => void;
     /** Where the run's log lines are shown as they are written. Defaults to the console. */
     print?: (line: string) => void;
+    /**
+     * Told what the result that ended the run had beside what the project
+     * says it gives (see `heldResult`): the names, and what the project
+     * gives. Once, when the run is settled as done — and not at all where
+     * nothing was left out.
+     */
+    leftOut?: (names: string[], gives: string) => void;
   },
 ): RunContext {
   // Where the state and the log go is asked each time one is written, not once: the program
@@ -155,8 +162,12 @@ export function createContext(
 
     done(state, result) {
       // (Held before anything is settled: a result that does not fit is a done that failed, and the run is not over.)
-      const given = ended ? result : heldResult(projectDir, contract, result ?? undefined);
-      if (persist("done", state, { status: "done", result: given ?? undefined })) logEnding("done", given);
+      const { given, leftOut, gives } = ended ? { given: result, leftOut: [], gives: "" } : heldResult(projectDir, contract, result ?? undefined);
+      if (persist("done", state, { status: "done", result: given ?? undefined })) {
+        logEnding("done", given);
+        // (Saying it is no part of ending: it must not turn a run that is done into one that failed.)
+        if (leftOut.length > 0) { try { options?.leftOut?.(leftOut, gives ?? ""); } catch { /* best-effort */ } }
+      }
       return iteration;
     },
 

@@ -308,9 +308,10 @@ else await ctx.done({ sum: a + b });
   createProjectFixture(at("judge"), { programSource: `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ ok: false, notes: "never good enough" });\n` });
   const trama = (...args) => runNodeCommand([CLI_ENTRY, ...args], { cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome } });
 
-  // As it was, without it: what is said as the run goes, and of what the run came to nothing.
+  // Without it: what is said as the run goes — and then what the run gave, for whoever is looking on. (A run that gave nothing shows nothing more.)
   const plain = await trama("run", "sum", "--arg", "a=2", "--arg", "b=3");
-  assert.deepEqual([plain.exitCode, /adding/.test(plain.stdout), /"sum"/.test(plain.stdout + plain.stderr)], [0, true, false]);
+  assert.deepEqual([plain.exitCode, /\[trama\] adding\n[^]*\[trama\] done\n\{\n  "sum": 5\n\}\n$/.test(plain.stdout), plain.stderr], [0, true, ""]);
+  assert.match((await trama("run", "sum", "--arg", "a=-1")).stdout, /\[trama\] done\n$/);
 
   const ran = await trama("run", "sum", "--arg", "a=2", "--arg", "b=3", "--json");
   assert.equal(ran.exitCode, 0, ran.stderr);
@@ -335,5 +336,27 @@ else await ctx.done({ sum: a + b });
   const history = await trama("history", "sum", "--json");
   assert.equal(history.exitCode, 0, history.stderr);
   const { versions, runs, current } = JSON.parse(history.stdout);
-  assert.deepEqual([versions.map((version) => [version.version, version.reason]), runs.map((run) => run.status), current, runs.at(-1).check.ok], [[[1, "found"]], ["done", "done", "done", "done"], 1, false]);
+  assert.deepEqual([versions.map((version) => [version.version, version.reason]), runs.map((run) => run.status), current, runs.at(-1).check.ok], [[[1, "found"]], ["done", "done", "done", "done", "done"], 1, false]);
+});
+
+test("the command line says what a program is, for whoever writes one themselves: trama api — where a project is, how what it takes and gives is written, the runtime's API, programs to go by — and the help of create says how a contract is written and what a project is validated with", async (t) => {
+  const fakeHome = makeTempDir("trama-cli-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+  const trama = (...args) => runNodeCommand([CLI_ENTRY, ...args], { cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome } });
+  const api = await trama("api");
+  assert.equal(api.exitCode, 0, api.stderr);
+  // Where a project is, and what is in it; what a program has, takes and gives.
+  assert.ok(api.stdout.includes(`A project is a directory — ${join(fakeHome, ".trama", "projects")}/<name> — with its program (program.ts) and what it says of itself (meta.json).`), api.stdout.slice(0, 400));
+  assert.match(api.stdout, /imports from "@trama-dev\/runtime"[^\n]*ctx\.input\.args[^\n]*ctx\.done\(result\)/);
+  // How what a project takes and gives is written: in words, and once as it looks.
+  assert.match(api.stdout, /"string", "number", "boolean", "json" for any value[^\n]*a "\?" at the end of its name/);
+  assert.match(api.stdout, /\{ "description": "[^"]+", "parameters": \{ "text": "string: [^"]+", "loud\?": "boolean" \}, "returns": \{ "words": "number"/);
+  // The API as a writer is shown it, and programs to go by.
+  assert.match(api.stdout, /\nThe runtime's API:\n[^]*interface Ctx[^]*export declare const workspace: Workspace;[^]*\nPrograms, for what one looks like:\n\/\/ Example A: /);
+  // It is in the list of commands; and the help of create points to it, and says what a required parameter asks of --arg.
+  assert.match((await trama("--help")).stdout, /\n  api +Show what a program is/);
+  const create = (await trama("create", "--help")).stdout.replace(/\s+/g, " ");
+  assert.match(create, /--contract <file> What the project is to take and give: a file of JSON — \{"description": "…", "parameters": \{"text": "string: what it is", "n\?": "number"\}, "returns": \{"words": "number"\}\} — written as `trama api` says/);
+  assert.match(create, /--arg <key=value> An argument of the project's own \(repeatable\): what a run of it has where the run gives none — and what the new program is validated with, so a parameter the project requires is to be given here/);
+  assert.match((await trama("add-version", "--help")).stdout.replace(/\s+/g, " "), /it is validated, and not installed — and its number is said/);
 });

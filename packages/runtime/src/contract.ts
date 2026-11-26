@@ -127,13 +127,42 @@ export function fitted(projectDir: string, args?: Record<string, unknown>, meta:
 export const startedWith = (projectDir: string, args?: Record<string, unknown>, meta?: ProjectMeta): Record<string, unknown> | undefined =>
   fitted(projectDir, args, meta).args;
 
-/** What a run gives, held to what its project says it gives: the declared fields and no others. Throws where it does not fit. */
-export function heldResult(projectDir: string, contract: Contract, result: unknown): unknown {
-  if (!contract.returns) return result;
-  const { shape } = contract.returns;
+/**
+ * The fields a value has that its shape does not declare, by where they are
+ * ("also", "files.extra", "lines[].extra" — once for every item of a list):
+ * what holding it to the shape leaves out.
+ */
+function undeclared(value: unknown, shape: Shape, where = ""): string[] {
+  if (typeof shape === "string") return [];
+  if ("items" in shape) return Array.isArray(value) ? [...new Set(value.flatMap((item) => undeclared(item, shape.items, `${where}[]`)))] : [];
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
+  return Object.keys(value).flatMap((key) => {
+    const at = where === "" ? key : `${where}.${key}`;
+    const field = shape.fields.find(([has]) => has === key);
+    return field ? undeclared((value as Record<string, unknown>)[key], field[1], at) : [at];
+  });
+}
+
+/**
+ * What a run gives, held to what its project says it gives: the declared
+ * fields and no others (`given`). Throws where it does not fit.
+ *
+ * **What it had beside is left out, and not refused** — as an argument the
+ * project does not take is (see `fitted`) — and is named (`leftOut`), for
+ * whoever is to say so: a result that comes back short of what its program
+ * handed over, with nothing said, is what a field nobody declared looks like
+ * to whoever asked for it. `gives`: what the project says it gives, in a word
+ * for each field.
+ */
+export function heldResult(projectDir: string, contract: Contract, result: unknown): { given: unknown; leftOut: string[]; gives?: string } {
+  if (!contract.returns) return { given: result, leftOut: [] };
+  const { shape, declared } = contract.returns;
+  const fields = typeof shape !== "string" && "fields" in shape ? shape : undefined;
   try {
     // (An object is spoken of by its fields; anything else, as "it".)
-    return conform(result, shape, typeof shape !== "string" && "fields" in shape ? null : "it");
+    const given = conform(result, shape, fields ? null : "it");
+    const gives = fields ? fields.fields.map(([name]) => (fields.mayBeAbsent.includes(name) ? `${name}?` : name)).join(", ") || "nothing" : JSON.stringify(declared);
+    return { given, leftOut: undeclared(result, shape), gives };
   } catch (err) {
     throw new Error(`The result does not fit what ${projectDir} gives — ${why(err)}.`);
   }

@@ -14,6 +14,7 @@ import {
   rollbackProject,
   resolveProject,
   readHistory,
+  programGuide,
   addVersion,
   describeProject,
   describeProjects,
@@ -166,9 +167,9 @@ cli
   .command("create <name> <prompt>")
   .description("Generate a new program from a natural language prompt")
   .option("--model <model>", "LLM model to use")
-  .option("--arg <key=value>", "Pass argument to the program (repeatable)", collectArg, [])
+  .option("--arg <key=value>", "An argument of the project's own (repeatable): what a run of it has where the run gives none — and what the new program is validated with, so a parameter the project requires is to be given here", collectArg, [])
   .option("--with <project>", "Have a project write the program, and not pi's agent: its name, or a path")
-  .option("--contract <file>", "What the project is to take and give: a file of JSON with \"description\", \"parameters\", \"returns\" (what is not said there, whoever writes the program says)")
+  .option("--contract <file>", "What the project is to take and give: a file of JSON — {\"description\": \"…\", \"parameters\": {\"text\": \"string: what it is\", \"n?\": \"number\"}, \"returns\": {\"words\": \"number\"}} — written as `trama api` says (what is not said there, whoever writes the program says)")
   .action(command(async (name: string, prompt: string, opts: { model?: string; arg: string[]; with?: string; contract?: string }) => {
     const args = parseArgs(opts.arg);
     const says = opts.contract === undefined ? {} : contractIn(opts.contract);
@@ -203,7 +204,9 @@ cli
     // (With --json, from here on: a run that is not begun — no such project, arguments that do not fit — has no document.)
     const say = opts.json ? theResultAlone() : undefined;
     const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, checkWith: opts.check, ...(version !== undefined && { version }), signal }));
-    await say?.(result);
+    if (say) await say(result);
+    // (Without --json: what the run gave, after what was said as it went — for whoever is looking on.)
+    else if (result.status === "done" && result.result !== undefined) console.log(JSON.stringify(result.result, null, 2));
     // (A run that a signal stopped has failed, and is not reported as that: see `command`.)
     if (result.status === "failed") {
       throw new Error(failureOf(result.reason));
@@ -229,7 +232,7 @@ cli
 
 cli
   .command("add-version <name> <file>")
-  .description("Put a program you wrote yourself on record as a version of a project, beside its program: it is validated, and not installed (- for standard input)")
+  .description("Put a program you wrote yourself on record as a version of a project, beside its program: it is validated, and not installed — and its number is said (- for standard input; what a program is: trama api)")
   .option("--parent <number>", "The version it was written from: the program as it is, where none is named")
   .option("--detail <text>", "What it was made for, in words")
   .action(command(async (name: string, file: string, opts: { parent?: string; detail?: string }) => {
@@ -251,6 +254,11 @@ cli
       console.log(`${each.name} — ${each.description ?? "(it does not say what it is for)"}\n  takes: ${shape(each.parameters)}\n  gives: ${shape(each.returns)}`);
     }
   }));
+
+cli
+  .command("api")
+  .description("Show what a program is, for whoever writes one themselves: where a project is, how what it takes and gives is written, the runtime's API, and programs to go by")
+  .action(command(async () => { console.log(programGuide()); }));
 
 cli
   .command("list")

@@ -420,6 +420,25 @@ function getSystemPrompt(kept: boolean): string {
   );
 }
 
+/**
+ * What whoever writes a program themselves is to know, and a writer that is
+ * a model is told as it is asked: where a project is and what is in it, what
+ * a program has and how it takes and gives, how what a project takes and
+ * gives is written, the runtime's API, and programs to go by. (`trama api`.)
+ */
+export function programGuide(): string {
+  return (
+    `A project is a directory — ${projectsDir()}/<name> — with its program (program.ts) and what it says of itself (meta.json).\n\n` +
+    `A program is TypeScript, run as it is. What it has of the runtime it imports from "@trama-dev/runtime" (ctx, agent, tools, workspace): what a run was started with is ctx.input.args, and what the run gives is what the program hands to ctx.done(result), which ends it.\n\n` +
+    `What a project takes and gives is said in its meta.json — "description", "parameters", "returns" — and a run of it is held to that: arguments that do not fit are a run that is not begun, a result that does not fit is a done that failed, and what either has beside what was said is left out, and said. ` +
+    `It is written as a Schema is: a field by its kind — "string", "number", "boolean", "json" for any value — with what it is after a colon, an object by its fields, a list by the shape of its items in brackets, and a field that may be absent with a "?" at the end of its name:\n` +
+    `  { "description": "Counts the words of a text.", "parameters": { "text": "string: the text", "loud?": "boolean" }, "returns": { "words": "number", "lines": [{ "n": "number" }] } }\n` +
+    `It is the project's, and not its program's: an update of the program does not change it.\n\n` +
+    `The runtime's API:\n${RUNTIME_TYPES}\n\n` +
+    `Programs, for what one looks like:\n${EXAMPLE_PROGRAMS}`
+  );
+}
+
 /** What a project says of itself that is its contract: what it is for, what a run of it takes and gives. */
 const CONTRACT = ["description", "parameters", "returns"] as const;
 const WHAT_EACH_IS: Record<(typeof CONTRACT)[number], string> = {
