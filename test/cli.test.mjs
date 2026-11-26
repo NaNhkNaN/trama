@@ -348,6 +348,8 @@ test("the command line says what a program is, for whoever writes one themselves
   // Where a project is, and what is in it; what a program has, takes and gives.
   assert.ok(api.stdout.includes(`A project is a directory — ${join(fakeHome, ".trama", "projects")}/<name> — with its program (program.ts) and what it says of itself (meta.json).`), api.stdout.slice(0, 400));
   assert.match(api.stdout, /imports from "@trama-dev\/runtime"[^\n]*ctx\.input\.args[^\n]*ctx\.done\(result\)/);
+  // And that a run's arguments are laid over the project's own, so that what the project has one for is never missing.
+  assert.match(api.stdout, /What a run is given is laid over the project's own arguments — those it was made with \(trama create --arg; "input"\."args" in its meta\.json\), which it is also validated with: a parameter the project has an argument of its own for is never missing from a run of it, required or not\./);
   // How what a project takes and gives is written: in words, and once as it looks.
   assert.match(api.stdout, /"string", "number", "boolean", "json" for any value[^\n]*a "\?" at the end of its name/);
   assert.match(api.stdout, /\{ "description": "[^"]+", "parameters": \{ "text": "string: [^"]+", "loud\?": "boolean" \}, "returns": \{ "words": "number"/);

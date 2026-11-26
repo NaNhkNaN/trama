@@ -1059,6 +1059,43 @@ test("updateProject leaves the program as it is where the answer holds none", as
   assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), DEFAULT_PROGRAM);
 });
 
+test("an answer that says there is no program to be written is that, and no program: it is not tried as one, nobody is asked to mend it, and whoever asked is told why — an update leaves the program as it is, a making makes no project", async (t) => {
+  const fakeHome = makeTempDir("trama-home-");
+  const projectDir = join(fakeHome, ".trama", "projects", "kept");
+  createProjectFixture(projectDir);
+  const originalAsk = llm.ask, originalRepair = llm.repair;
+  let fixesAsked = 0, system;
+  // (Tried as a program, the answer would fail to be read as one, and this fix would be installed in its place.)
+  llm.repair = async () => { fixesAsked += 1; return DEFAULT_PROGRAM + "// mended\n"; };
+  t.after(() => { llm.ask = originalAsk; llm.repair = originalRepair; cleanupTempDir(fakeHome); });
+  const quietly = (fn) => withEnv({ HOME: fakeHome }, () => captureConsole("log", () => captureConsole("warn", () => captureConsole("error", fn))));
+
+  llm.ask = async (prompt, call) => { system = call.system; return "\n  NO PROGRAM: the project says it gives `greeting` alone,\nand `letters` would be left out of every run.\n"; };
+  await quietly(() => assert.rejects(() => updateProject("kept", "give the letters too"), (err) => {
+    assert.equal(err.message, "Update failed — the program is unchanged.\nIt was said that there is none to be written: the project says it gives `greeting` alone,\nand `letters` would be left out of every run.");
+    return true;
+  }));
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8"), DEFAULT_PROGRAM);
+  assert.equal(fixesAsked, 0);
+  // Whoever writes is told of this way out as it is asked.
+  assert.match(system, /then there is no program, and you are not to hand over one that does something else: answer instead with one line that begins "NO PROGRAM:" and says why\.\n/);
+
+  await quietly(() => assert.rejects(() => createProject("none", "make something"), /It was said that there is none to be written: the project says it gives `greeting` alone,\nand `letters` would be left out of every run\.$/));
+  assert.equal(existsSync(join(fakeHome, ".trama", "projects", "none")), false);
+  assert.equal(fixesAsked, 0);
+
+  // Said with no reason, it is still said.
+  llm.ask = async () => "NO PROGRAM:\n";
+  await quietly(() => assert.rejects(() => updateProject("kept", "give the letters too"), /\nIt was said that there is none to be written: no reason was given$/));
+
+  // And it is how an answer begins: a program that has the words in it is a program.
+  const speaksOfIt = DEFAULT_PROGRAM + "// NO PROGRAM: is how whoever writes says there is none.\n";
+  llm.ask = async () => speaksOfIt;
+  await quietly(() => updateProject("kept", "say how it is said"));
+  assert.equal(readFileSync(join(projectDir, "program.ts"), "utf-8").trim(), speaksOfIt.trim());
+  assert.equal(fixesAsked, 0);
+});
+
 test("createProject takes away only the directory it made: another that is at the name by then stays", async (t) => {
   const { renameSync } = await import("fs");
   const fakeHome = makeTempDir("trama-home-");

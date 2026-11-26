@@ -413,6 +413,14 @@ process.on("SIGINT", () => {
 
 await new Promise<void>(() => {});`;
 
+/**
+ * How whoever is asked for a program begins an answer that says there is
+ * none to be written — as whoever is asked for a fix says there is none to
+ * be had (the runner's "NO FIX:"). An answer, and no program: it is not
+ * tried as one.
+ */
+const NO_PROGRAM = "NO PROGRAM:";
+
 function getSystemPrompt(kept: boolean): string {
   return (
     `You are generating a TypeScript program for the trama runtime.\n\n` +
@@ -427,6 +435,8 @@ function getSystemPrompt(kept: boolean): string {
         `you can make here: it is kept, with the program, if the program then passes its validation. ` +
         `The program itself is what you answer with, whatever you wrote to program.ts here.\n\n`
       : `Nothing you write here is kept — only the program you answer with.\n\n`) +
+    `If the program cannot be written as it is asked for — what is asked goes against what the project says it takes and gives, or cannot be done with what there is — ` +
+    `then there is no program, and you are not to hand over one that does something else: answer instead with one line that begins "${NO_PROGRAM}" and says why.\n\n` +
     `Runtime API:\n${RUNTIME_TYPES}\n\n` +
     `Examples:\n${EXAMPLE_PROGRAMS}`
   );
@@ -443,6 +453,7 @@ export function programGuide(): string {
     `A project is a directory — ${projectsDir()}/<name> — with its program (program.ts) and what it says of itself (meta.json).\n\n` +
     `A program is TypeScript, run as it is. What it has of the runtime it imports from "@trama-dev/runtime" (ctx, agent, tools, workspace): what a run was started with is ctx.input.args, and what the run gives is what the program hands to ctx.done(result), which ends it.\n\n` +
     `What a project takes and gives is said in its meta.json — "description", "parameters", "returns" — and a run of it is held to that: arguments that do not fit are a run that is not begun, a result that does not fit is a done that failed, and what either has beside what was said is left out, and said. ` +
+    `What a run is given is laid over the project's own arguments — those it was made with (trama create --arg; "input"."args" in its meta.json), which it is also validated with: a parameter the project has an argument of its own for is never missing from a run of it, required or not. ` +
     `It is written as a Schema is: a field by its kind — "string", "number", "boolean", "json" for any value — with what it is after a colon, an object by its fields, a list by the shape of its items in brackets, and a field that may be absent with a "?" at the end of its name:\n` +
     `  { "description": "Counts the words of a text.", "parameters": { "text": "string: the text", "loud?": "boolean" }, "returns": { "words": "number", "lines": [{ "n": "number" }] } }\n` +
     `It is the project's, and not its program's: an update of the program does not change it — unless whoever asks for the update says what it is to be from then on (trama update --contract). A version is a program and what the project took and gave when it was made: trama rollback goes back to both, and a version is run by its number (--at-version) under its own.\n\n` +
@@ -559,7 +570,9 @@ export function resolveProject(name: string): string {
  * so that the agent can look at what the program is to work with and make
  * what it needs, and its tools do not write into the real one — and take
  * what comes back for a program only if something does: no program is not a
- * program that does nothing.
+ * program that does nothing. Nor is an answer that says there is none to be
+ * written (see NO_PROGRAM): whoever asked is told why, in its words, and
+ * nothing is validated, or mended into a program by whoever fixes.
  */
 async function generateProgram(
   backend: Backend, prepared: Prepared, prompt: string, system: string, wrote: AgentUsage[], signal?: AbortSignal,
@@ -576,6 +589,9 @@ async function generateProgram(
   }
   const program = stripCodeFences(reply);
   throwIfAborted(signal);
+  if (reply.trimStart().startsWith(NO_PROGRAM)) {
+    throw new Error(`It was said that there is none to be written: ${reply.trimStart().slice(NO_PROGRAM.length).trim() || "no reason was given"}`);
+  }
   if (program === "") throw new Error("The model answered with no program.");
   return program;
 }
