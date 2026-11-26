@@ -330,6 +330,19 @@ test("the loop stops without deciding where there is nothing to decide by — no
     assert.equal(refused.status, "failed", JSON.stringify(args));
     assert.match(journalsOf(never.at("improve")).at(-1).findLast((record) => record.kind === "exit").stderr, why, JSON.stringify(args));
   }
+  // And where the loop's project does not say what it takes — the program copied without its meta.json's word, or that
+  // word taken out — the program says that too: a round is begun, and fails for it, with nothing asked for or changed.
+  const bare = loopOver(t, SAYS(["a"]), []);
+  const { parameters, returns, ...unsaid } = readJson(join(bare.at("improve"), "meta.json"));
+  assert.ok(parameters);
+  writeJson(join(bare.at("improve"), "meta.json"), unsaid);
+  for (const args of [{ project: undefined }, { check: undefined }, { project: 1 }]) {
+    const { result: refused } = await bare.round({ inputs: [A], ...args });
+    assert.equal(refused.status, "failed", JSON.stringify(args));
+    assert.match(journalsOf(bare.at("improve")).at(-1).findLast((record) => record.kind === "exit").stderr, /It is not said which project to improve, or which checks it: "project" and "check", each by its name\./, JSON.stringify(args));
+  }
+  // (Nothing was asked of a model, and the project it was to improve was not so much as run: it has no history.)
+  assert.deepEqual([bare.prompts.length, existsSync(join(bare.words, "history", "index.jsonl")), bare.program()], [0, false, SAYS(["a"])]);
 });
 
 test("a verdict on record is taken where it is this judge's, as the judge is now: not another judge's at another place, and not this one's from before its program was changed", async (t) => {

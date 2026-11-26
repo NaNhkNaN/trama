@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, writeFileSync, symlinkSync, statSync, rmSync } from "fs";
 import { basename, join } from "path";
 import { tmpdir } from "os";
 import { execFileSync } from "child_process";
@@ -17,6 +17,13 @@ import {
   REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, readJson, startRunnerProcess, waitFor,
   withEnv, writeJson, writeText,
 } from "./helpers.mjs";
+
+// The copies a run makes are looked for in the temp directory (copiesInTemp). It is one of this file's own: what
+// another process makes meanwhile — a test file run beside this one, a run of trama's on the same machine — is made
+// elsewhere, and is not taken for a copy this file left behind.
+const ownTemp = mkdtempSync(join(tmpdir(), "trama-runner-temp-"));
+process.env.TMPDIR = ownTemp;
+test.after(() => cleanupTempDir(ownTemp));
 
 test("loadState returns an empty object when state.json is missing", (t) => {
   const projectDir = makeTempDir("trama-runner-");
