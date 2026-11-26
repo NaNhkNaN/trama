@@ -7,7 +7,7 @@ That a run ended as done is its program's own word. Where a run names a project 
 To use it, copy it among your projects and say what command checks:
 
 ```sh
-cp -R examples/check-by-command ~/.trama/projects/check-by-command
+trama examples check-by-command
 ```
 
 ```jsonc

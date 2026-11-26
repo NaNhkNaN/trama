@@ -457,6 +457,7 @@ export function programGuide(): string {
     `It is written as a Schema is: a field by its kind — "string", "number", "boolean", "json" for any value — with what it is after a colon, an object by its fields, a list by the shape of its items in brackets, and a field that may be absent with a "?" at the end of its name:\n` +
     `  { "description": "Counts the words of a text.", "parameters": { "text": "string: the text", "loud?": "boolean" }, "returns": { "words": "number", "lines": [{ "n": "number" }] } }\n` +
     `It is the project's, and not its program's: an update of the program does not change it — unless whoever asks for the update says what it is to be from then on (trama update --contract). A version is a program and what the project took and gave when it was made: trama rollback goes back to both, and a version is run by its number (--at-version) under its own.\n\n` +
+    `Whole programs to start from — a harness, the loop that improves a project, a judge of a run — come with the command line: trama examples.\n\n` +
     `The runtime's API:\n${RUNTIME_TYPES}\n\n` +
     `Programs, for what one looks like:\n${EXAMPLE_PROGRAMS}`
   );
@@ -540,7 +541,8 @@ function fitsItsOwn(projectDir: string, meta: ProjectMeta): void {
   }
 }
 
-function projectsDir(): string {
+/** Where a user's projects are: each a directory there, by its name. */
+export function projectsDir(): string {
   return join(homedir(), ".trama", "projects");
 }
 

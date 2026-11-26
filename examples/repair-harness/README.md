@@ -7,7 +7,7 @@ Where a run's program fails, trama asks for a fix — of pi's agent, unless the 
 To use it, copy it among your projects and name it:
 
 ```sh
-cp -R examples/repair-harness ~/.trama/projects/repair-harness
+trama examples repair-harness
 ```
 
 ```jsonc

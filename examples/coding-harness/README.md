@@ -7,11 +7,19 @@ It does what `agent.instruct` has pi's agent do — but the loop is here, in `pr
 To use it, make it the program of the project whose files are the work:
 
 ```sh
-cp examples/coding-harness/program.ts ~/.trama/projects/my-codebase/program.ts
+trama examples coding-harness
+cp ~/.trama/projects/coding-harness/program.ts ~/.trama/projects/my-codebase/program.ts
 trama run my-codebase --arg task="Make the failing tests pass. Do not change the tests."
 ```
 
 Or keep it a project of its own, and point a run of it at the codebase — its workspace:
+
+```sh
+trama examples coding-harness --as my-harness
+trama run my-harness --workspace /path/to/a/codebase --arg task="Make the failing tests pass."
+```
+
+From a program, the same:
 
 ```ts
 await runProgram({ projectDir: resolveProject("my-harness"), workspaceDir: "/path/to/a/codebase", args: { task: "Make the failing tests pass." } });

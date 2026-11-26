@@ -9,7 +9,7 @@ trama has the facts and the moves, and no opinion. Every run of a project leaves
 To use it, copy it among your projects, with a judge (see `examples/check-by-command`):
 
 ```sh
-cp -R examples/improve-by-check ~/.trama/projects/improve
+trama examples improve-by-check --as improve
 trama run improve --arg project=my-project --arg check=my-judge \
   --arg inputs='[{"word":"a"},{"word":"b"}]' --arg heldBack='[{"word":"c"}]' \
   --arg ask="Say every word in capitals."

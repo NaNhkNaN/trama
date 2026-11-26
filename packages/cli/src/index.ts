@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-import { readFileSync } from "node:fs";
+import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Command } from "commander";
 import {
   createProject,
@@ -19,6 +21,8 @@ import {
   describeProject,
   describeProjects,
   failureOf,
+  projectsDir,
+  validateProjectName,
 } from "@trama-dev/runtime/runner";
 
 // The trama command is always a runner of its own, even when a program starts
@@ -118,6 +122,34 @@ function contractIn(file: string): { description?: string; parameters?: Record<s
   return said as { description?: string; parameters?: Record<string, unknown>; returns?: unknown };
 }
 
+const isDirectory = (path: string): boolean => statSync(path, { throwIfNoEntry: false })?.isDirectory() === true;
+
+/**
+ * Where the programs that come with the command line are (`trama examples`):
+ * beside dist, where it is installed — they are packed with it — and at the
+ * repository's root where it is run from there. In that order: what is three
+ * directories above an installed command line is somebody else's.
+ */
+function examplesDir(): string {
+  for (const from of ["../examples", "../../../examples"]) {
+    const dir = fileURLToPath(new URL(from, import.meta.url));
+    if (isDirectory(dir)) return dir;
+  }
+  throw new Error("The examples are not where this command line is: they come with it, beside its dist.");
+}
+
+/** The examples there are, by name: each a directory that says of itself what a project does (meta.json). */
+function examplesIn(dir: string): Array<{ name: string; description?: string }> {
+  return readdirSync(dir).sort().flatMap((name) => {
+    try {
+      const { description } = JSON.parse(readFileSync(join(dir, name, "meta.json"), "utf-8")) as { description?: unknown };
+      return [{ name, ...(typeof description === "string" && { description }) }];
+    } catch {
+      return [];
+    }
+  });
+}
+
 /** A version, as an option names it: its number (as `trama history` shows it) — or none, where the option was not given. */
 function versionOf(option: string, given: string | undefined): number | undefined {
   if (given === undefined) return undefined;
@@ -184,8 +216,9 @@ cli
   .option("--budget <cap=number>", "Cap what the run may use of a model: cost (US dollars), tokens or calls (repeatable)", collectArg, [])
   .option("--check <project>", "Have the run checked, once it is done, by a project: its name, or a path")
   .option("--at-version <number>", "Run a version of the program from the project's history, and not the program as it is (see: trama history)")
+  .option("--workspace <dir>", "Where the run works, where that is not in its project: a directory the program has as its workspace (workspace.read, workspace.shell and the rest) — the codebase a harness is to work on, say. It is worked in as it is: nothing is copied")
   .option("--json", "Say what the run came to as JSON on standard output — its status, its result, its check — and nothing else there: what is said as the run goes is on standard error")
-  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[]; check?: string; atVersion?: string; json?: boolean }) => {
+  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[]; check?: string; atVersion?: string; workspace?: string; json?: boolean }) => {
     let timeout: number | undefined;
     if (opts.timeout !== undefined) {
       timeout = Number(opts.timeout);
@@ -201,9 +234,12 @@ cli
       version = Number(opts.atVersion);
       if (!Number.isSafeInteger(version) || version < 1) throw new Error(`--at-version takes a version's number: 1 and up (got "${opts.atVersion}")`);
     }
+    // (As it is given: from where the command is run. What is not there is not made — a run that was to work somewhere would then work in nothing.)
+    const workspaceDir = opts.workspace === undefined ? undefined : resolve(opts.workspace);
+    if (workspaceDir !== undefined && !isDirectory(workspaceDir)) throw new Error(`--workspace takes a directory, and there is none at ${workspaceDir}`);
     // (With --json, from here on: a run that is not begun — no such project, arguments that do not fit — has no document.)
     const say = opts.json ? theResultAlone() : undefined;
-    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, checkWith: opts.check, ...(version !== undefined && { version }), signal }));
+    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, checkWith: opts.check, ...(version !== undefined && { version }), ...(workspaceDir !== undefined && { workspaceDir }), signal }));
     if (say) await say(result);
     // (Without --json: what the run gave, after what was said as it went — for whoever is looking on.)
     else if (result.status === "done" && result.result !== undefined) console.log(JSON.stringify(result.result, null, 2));
@@ -263,6 +299,40 @@ cli
   .command("api")
   .description("Show what a program is, for whoever writes one themselves: where a project is, how what it takes and gives is written, the runtime's API, and programs to go by")
   .action(command(async () => { console.log(programGuide()); }));
+
+cli
+  .command("examples [name]")
+  .description("List the programs that come with trama — a harness, the loop, a judge, a fixer, a writer — or copy one among your projects, to read, run and change")
+  .option("--as <project>", "The name the copy has among your projects, where that is not the example's own")
+  .action(command(async (name: string | undefined, opts: { as?: string }) => {
+    const from = examplesDir(), there = examplesIn(from);
+    if (name === undefined) {
+      return console.log(
+        `Programs that come with trama — a harness, the loop, a judge, a fixer, a writer: each a project, to copy among your own, read, run and change.\n\n` +
+        there.map((each) => `  ${each.name} — ${each.description ?? "(it does not say what it is for)"}\n`).join("") +
+        `\nCopy one among your projects: trama examples <name> [--as <project>]`);
+    }
+    // (By its name among them, and by nothing else: a path is no name.)
+    if (!there.some((each) => each.name === name)) throw new Error(`There is no example named ${JSON.stringify(name)}: there are ${there.map((each) => each.name).join(", ")}.`);
+    const as = opts.as ?? name;
+    validateProjectName(as);
+    const to = join(projectsDir(), as);
+    mkdirSync(projectsDir(), { recursive: true });
+    // The name is taken by making its directory, which fails where anything is there: a copy is never laid over a project.
+    try {
+      mkdirSync(to);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      throw new Error(`There is a project named ${JSON.stringify(as)} already: give the copy another name (--as <project>).`);
+    }
+    try {
+      cpSync(join(from, name), to, { recursive: true });
+    } catch (err) {
+      rmSync(to, { recursive: true, force: true });
+      throw err;
+    }
+    console.log(`${name} is among your projects${as === name ? "" : ` as ${as}`}: ${to}\nIt is yours, to read and change: its README.md says how it is used, and trama describe ${as} what it takes and gives.`);
+  }));
 
 cli
   .command("list")

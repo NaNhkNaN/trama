@@ -13,7 +13,7 @@ A harness that is somebody else's, written as a program: some twenty lines, to b
 To use it, copy it among your projects and say which agent it is — once, in the project's own arguments, or run by run:
 
 ```sh
-cp -R examples/harness-by-agent ~/.trama/projects/by-claude
+trama examples harness-by-agent --as by-claude
 # in ~/.trama/projects/by-claude/meta.json:  "input": { …, "args": { "agent": "claude" } }
 ```
 

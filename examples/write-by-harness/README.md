@@ -7,8 +7,8 @@ Where a project's program is to be written — its first (`trama create`, `creat
 To use it, copy it among your projects with a harness (`examples/coding-harness` works in its run's workspace, which is what this needs — as `examples/harness-by-agent` does, which has an agent from outside do the writing), and name it:
 
 ```sh
-cp -R examples/write-by-harness ~/.trama/projects/write-by-harness
-cp -R examples/coding-harness ~/.trama/projects/coding-harness
+trama examples write-by-harness
+trama examples coding-harness
 
 trama create my-project "count the comments of each story" --with write-by-harness
 trama update my-project "also count the points" --with write-by-harness
