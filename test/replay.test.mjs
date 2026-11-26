@@ -6,7 +6,7 @@ import { createServer } from "http";
 import { llm } from "./fake-llm.mjs";
 import { replayAll, replayProgram, runProgram, validateProgram } from "../packages/runtime/dist/runner.js";
 import { createBackend } from "../packages/runtime/dist/runner-backend.js";
-import { REPO_ROOT, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, runNodeCommand } from "./helpers.mjs";
+import { REPO_ROOT, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, runNodeCommand, waitFor } from "./helpers.mjs";
 
 // A replay: a project's program run again with its calls answered from the record of an earlier run, and none of
 // them carried out. Nothing is asked of a model, nothing is written to the project, nothing is spent: what comes of
@@ -173,28 +173,35 @@ test("a program that was changed is answered as far as it asks what was asked: w
 test("nothing of a replayed run is carried out, wherever it had its effect: no command runs again, no request is sent again — and a request is known for the recorded one though its secrets are not on record", async (t) => {
   const outside = makeTempDir("trama-replay-outside-");
   t.after(() => cleanupTempDir(outside));
-  const marker = join(outside, "ran.txt");
+  const marker = join(outside, "ran.txt"), release = join(outside, "release");
   let hits = 0;
   const server = createServer((req, res) => { hits += 1; res.end(`hit ${hits}, ${req.headers.authorization === "Bearer s3cret" ? "let in" : "kept out"}`); });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   t.after(() => server.close());
   const url = `http://127.0.0.1:${server.address().port}/`;
   const projectDir = project(t, `import { ctx, tools } from "@trama-dev/runtime";
-const { marker, url } = ctx.input.args as any;
-const ran = await tools.shell("echo ran >> " + JSON.stringify(marker) + "; sleep 3; echo slept");
+const { marker, url, release } = ctx.input.args as any;
+const ran = await tools.shell("echo ran >> " + JSON.stringify(marker) + "; while [ ! -e " + JSON.stringify(release) + " ]; do sleep 0.05; done; echo let go");
 const got = await tools.fetch(url, { headers: { Authorization: "Bearer s3cret" } });
 await ctx.done({ ran: ran.stdout, got: got.body });
 `);
-  const first = await recorded(projectDir, {}, { args: { marker, url } });
-  assert.deepEqual(first, { status: "done", result: { ran: "slept\n", got: "hit 1, let in" } });
+  // The command ends when it is let go, and not before: by the test, once the command is seen to be at work.
+  const running = recorded(projectDir, {}, { args: { marker, url, release } });
+  await waitFor(() => existsSync(marker), "the command to be at work");
+  writeFileSync(release, "");
+  const first = await running;
+  assert.deepEqual(first, { status: "done", result: { ran: "let go\n", got: "hit 1, let in" } });
   assert.doesNotMatch(readFileSync(join(journalDir(projectDir), `${runsOf(projectDir)[0]}.jsonl`), "utf-8"), /s3cret/);
 
   // (With what the run was started with, which is on record: nothing is given to the replay.)
-  const began = Date.now(), again = await replay(projectDir);
+  // And in the replay nothing lets the command go: one that was run again — or waited for, in any way — would not
+  // end, and the replay would be stopped at its time with no result. (No clock is asked how long the replay took:
+  // that says how busy the machine is.)
+  rmSync(release);
+  const again = await replay(projectDir, { timeout: 20_000 });
   assert.deepEqual([again.answered, again.left, again.result, again.same], [2, undefined, first, true]);
   assert.equal(readFileSync(marker, "utf-8"), "ran\n", "the command ran once: when the run was recorded");
   assert.equal(hits, 1, "the request was sent once");
-  assert.ok(Date.now() - began < 2500, "and no time was waited that the command had taken");
 });
 
 test("a run that failed is replayed to its failure: that is its end, and the same one — in whatever words", async (t) => {

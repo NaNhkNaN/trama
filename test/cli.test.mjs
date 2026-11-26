@@ -359,4 +359,8 @@ test("the command line says what a program is, for whoever writes one themselves
   assert.match(create, /--contract <file> What the project is to take and give: a file of JSON — \{"description": "…", "parameters": \{"text": "string: what it is", "n\?": "number"\}, "returns": \{"words": "number"\}\} — written as `trama api` says/);
   assert.match(create, /--arg <key=value> An argument of the project's own \(repeatable\): what a run of it has where the run gives none — and what the new program is validated with, so a parameter the project requires is to be given here/);
   assert.match((await trama("add-version", "--help")).stdout.replace(/\s+/g, " "), /it is validated, and not installed — and its number is said/);
+  // And the help of update says when a contract is to be said with it, and how its file is laid over what the project says.
+  const update = (await trama("update", "--help")).stdout.replace(/\s+/g, " ");
+  assert.match(update, /--contract <file> What the project is to take and give from this version on, where that is to change — as it is to for a run to give a field more, or one fewer: what a run gives beside what its project says is left out\./);
+  assert.match(update, /A file of JSON as of create: each of "description", "parameters", "returns" that it says takes the place of the project's, whole, and what it does not say is as it is\. The program is validated under it, and the two are the project's together; trama rollback goes back to both/);
 });

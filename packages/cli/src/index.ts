@@ -223,7 +223,7 @@ cli
   .option("--from <number>", "Write it from that version of the program, and not from the program as it is (see: trama history)")
   .option("--beside", "Keep the new version beside the program, on record, and do not make it the program: run it with --at-version, go to it with rollback")
   .option("--with <project>", "Have a project write it, and not pi's agent: its name, or a path")
-  .option("--contract <file>", "What the project is to take and give from this version on, where that is to change: a file of JSON as of create (what is not said there is as it is). The program is validated under it, and the two are the project's together; trama rollback goes back to both")
+  .option("--contract <file>", "What the project is to take and give from this version on, where that is to change — as it is to for a run to give a field more, or one fewer: what a run gives beside what its project says is left out. A file of JSON as of create: each of \"description\", \"parameters\", \"returns\" that it says takes the place of the project's, whole, and what it does not say is as it is. The program is validated under it, and the two are the project's together; trama rollback goes back to both")
   .action(command(async (name: string, prompt: string, opts: { from?: string; beside?: boolean; with?: string; contract?: string }) => {
     const from = versionOf("--from", opts.from);
     const says = opts.contract === undefined ? {} : contractIn(opts.contract);
