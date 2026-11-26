@@ -290,3 +290,50 @@ test("CLI run says once that a program failed, whatever the reason says of itsel
   assert.match(result.stderr, /Program failed \(repair disabled\)/);
   assert.equal(result.stderr.match(/Program failed/g).length, 1, result.stderr);
 });
+
+test("trama run --json hands its caller what the run came to — status, result, check — and nothing else on standard output: what the program and its runner say as it goes is on standard error; and trama history --json is the project's history", async (t) => {
+  const fakeHome = makeTempDir("trama-cli-home-");
+  t.after(() => cleanupTempDir(fakeHome));
+  writeJson(join(fakeHome, ".trama", "config.json"), { maxRepairAttempts: 0 });
+  const at = (name) => join(fakeHome, ".trama", "projects", name);
+  createProjectFixture(at("sum"), { programSource: `import { ctx } from "@trama-dev/runtime";
+const { a = 0, b = 0 } = ctx.input.args as { a?: number; b?: number };
+await ctx.log("adding");
+console.log("the program's own word");
+if (a < 0) await ctx.done();
+else await ctx.done({ sum: a + b });
+` });
+  writeJson(join(at("sum"), "meta.json"), { description: "Adds two numbers.", parameters: { "a?": "number", "b?": "number" }, input: { prompt: "p", args: {} } });
+  createProjectFixture(at("fails"), { programSource: `throw new Error("it breaks");` });
+  createProjectFixture(at("judge"), { programSource: `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ ok: false, notes: "never good enough" });\n` });
+  const trama = (...args) => runNodeCommand([CLI_ENTRY, ...args], { cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome } });
+
+  // As it was, without it: what is said as the run goes, and of what the run came to nothing.
+  const plain = await trama("run", "sum", "--arg", "a=2", "--arg", "b=3");
+  assert.deepEqual([plain.exitCode, /adding/.test(plain.stdout), /"sum"/.test(plain.stdout + plain.stderr)], [0, true, false]);
+
+  const ran = await trama("run", "sum", "--arg", "a=2", "--arg", "b=3", "--json");
+  assert.equal(ran.exitCode, 0, ran.stderr);
+  assert.deepEqual(JSON.parse(ran.stdout), { status: "done", result: { sum: 5 } });
+  assert.deepEqual([/adding|the program's own word|\[trama\]/.test(ran.stdout), /\[trama\] adding/.test(ran.stderr), /the program's own word/.test(ran.stderr), ran.stdout.endsWith("}\n")], [false, true, true, true]);
+  // A run that gave nothing says so by having no result.
+  assert.deepEqual(JSON.parse((await trama("run", "sum", "--arg", "a=-1", "--json")).stdout), { status: "done" });
+
+  // A run that failed: the same document, with why — and the command fails as it does without it.
+  const failed = await trama("run", "fails", "--json");
+  const said = JSON.parse(failed.stdout);
+  assert.deepEqual([failed.exitCode, said.status, /it breaks/.test(said.reason), /^Error: /m.test(failed.stderr)], [1, "failed", true, true]);
+  // A run whose check says the work is not good: the verdict is in the document, and the command fails.
+  const checked = await trama("run", "sum", "--arg", "a=1", "--check", "judge", "--json");
+  const verdict = JSON.parse(checked.stdout);
+  assert.deepEqual([checked.exitCode, verdict.status, verdict.result, verdict.check.ok, verdict.check.notes], [1, "done", { sum: 1 }, false, "never good enough"]);
+  // A run that was not begun has no document: why is on standard error.
+  const unfit = await trama("run", "sum", "--arg", "a=two", "--json");
+  assert.deepEqual([unfit.exitCode, unfit.stdout, /The arguments do not fit/.test(unfit.stderr)], [1, "", true]);
+
+  // The history, for a reader that is a program: the versions, the runs, and which version is the program.
+  const history = await trama("history", "sum", "--json");
+  assert.equal(history.exitCode, 0, history.stderr);
+  const { versions, runs, current } = JSON.parse(history.stdout);
+  assert.deepEqual([versions.map((version) => [version.version, version.reason]), runs.map((run) => run.status), current, runs.at(-1).check.ok], [[[1, "found"]], ["done", "done", "done", "done"], 1, false]);
+});

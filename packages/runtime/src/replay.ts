@@ -56,6 +56,8 @@ export interface Recording {
   /** What the run was started with. */
   args?: Record<string, unknown>;
   workspace?: string;
+  /** The version the run was of, where it was of one that was named and not of the program as it was. */
+  version?: number;
   /** The state the attempt began from. */
   state: Record<string, unknown>;
   /** How the attempt ended: null, where it failed. Undefined where the record does not say. */
@@ -186,6 +188,7 @@ export function readRecording(projectDir: string, run?: string): Recording {
     ...(attempt.program?.sha256 && { program: String(attempt.program.sha256) }),
     ...(isJsonObject(head.args) && { args: head.args }),
     ...(typeof head.workspace === "string" && { workspace: head.workspace }),
+    ...(typeof head.version === "number" && { version: head.version }),
     state,
     // (An end that was too large to keep whole is not one another can be held against: the record then does not say.)
     ...(exit && !exit.cuts && !("error" in exit) && { outcome: (exit.outcome ?? null) as ProgramResult | null }),

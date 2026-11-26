@@ -153,8 +153,6 @@ export function versionsOf(projectDir: string): HistoryVersion[] {
   return versions;
 }
 
-/** Where the text of a version of a project's program is kept, from the project. */
-export const fileOfVersionIn = (version: number): string => join("history", fileOfVersion(version));
 
 /** The text of a version of a project's program. Throws where its file is not there. */
 export function textOfVersion(projectDir: string, version: number): string {

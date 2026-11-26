@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "crypto";
-import { existsSync, readdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
 import { addVersion, readHistory, replayProgram, rollbackProject, runProgram, updateProject } from "../packages/runtime/dist/index.js";
@@ -173,4 +173,46 @@ test("a program has versions made and run by its runner: on its run's record —
   const { result: replay } = await it.inHome(() => replayProgram({ projectDir: it.at("maker"), run }));
   assert.deepEqual([replay.same, replay.left ?? null], [true, null]);
   assert.deepEqual([it.index("words").length, it.lines("words").length, it.asked.length], before);
+});
+
+test("a version is run where its program runs: what is beside the program is beside it — a module its program imports by a relative path is found — and nothing of the run is left in the project; a replay of such a run is of that version", async (t) => {
+  const WITH = (more, last = "") => `import { ctx } from "@trama-dev/runtime";\nimport { word } from "./lib.ts";\n${last}await ctx.done({ word: word${more} });\n`;
+  const it = homeWith(t, { words: { program: WITH("") } });
+  const project = it.at("words");
+  writeFileSync(join(project, "lib.ts"), `export const word = "one";\n`);
+  const run = (options = {}) => it.inHome(() => runProgram({ projectDir: project, timeout: 30_000, ...options })).then(({ result }) => result);
+  assert.deepEqual(await run(), { status: "done", result: { word: "one" } });
+  // Versions beside the program: one that says where its own file is, one with a fault, one more.
+  const WHERE = `import { ctx } from "@trama-dev/runtime";\nimport { word } from "./lib.ts";\nawait ctx.done({ word: word + " more", at: new URL(".", import.meta.url).pathname });\n`;
+  const FAULTY = WITH("", `if ((ctx.input.args as any).fail) throw new Error("the version has a fault");\n`);
+  for (const [text, version] of [[WHERE, 2], [FAULTY, 3], [WITH(' + " again"'), 4]]) assert.deepEqual((await it.inHome(() => addVersion("words", text))).result, { version });
+  const there = () => readdirSync(project).sort();
+  const before = there();
+
+  // Each is run as the program is: from the project's own directory, with what is beside the program beside it.
+  assert.deepEqual(await run({ version: 2 }), { status: "done", result: { word: "one more", at: `${realpathSync(project)}/` } });
+  assert.deepEqual((await run({ version: 1 })).result, { word: "one" });
+  // Two at once, of two versions: each its own.
+  const both = await it.inHome(() => Promise.all([2, 4].map((version) => runProgram({ projectDir: project, version, timeout: 30_000 }))));
+  assert.deepEqual(both.result.map((ran) => ran.result.word), ["one more", "one again"]);
+  // One that fails is a run that failed, as it was.
+  const failed = await run({ version: 3, args: { fail: true } });
+  assert.equal(failed.status, "failed");
+  assert.match(failed.reason, /the version has a fault/);
+  // Nothing of any of those runs is left in the project, and its program is the one it was.
+  assert.deepEqual([there(), it.program("words"), readFileSync(join(project, "lib.ts"), "utf-8")], [before, WITH(""), `export const word = "one";\n`]);
+  // What is beside the program is the project's, as it is when the version is run: not what was there when the version was made.
+  writeFileSync(join(project, "lib.ts"), `export const word = "uno";\n`);
+  assert.deepEqual((await run({ version: 4 })).result, { word: "uno again" });
+
+  // A replay of a run that was of a version is of that version — whatever the program has been made since.
+  const ofFour = it.lines("words").at(-1);
+  assert.equal(ofFour.version, 4);
+  writeFileSync(join(project, "program.ts"), `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ word: "the program as it is now" });\n`);
+  const replayed = (await it.inHome(() => replayProgram({ projectDir: project, run: ofFour.run }))).result;
+  assert.deepEqual([replayed.sameProgram, replayed.result, replayed.recordedResult], [true, { status: "done", result: { word: "uno again" } }, { status: "done", result: { word: "uno again" } }]);
+  // (One that names a program to replay is of the program it names, as before.)
+  const named = (await it.inHome(() => replayProgram({ projectDir: project, run: ofFour.run, program: WITH(' + " named"') }))).result;
+  assert.deepEqual([named.sameProgram, named.result.result], [false, { word: "uno named" }]);
+  assert.deepEqual(there(), before);
 });

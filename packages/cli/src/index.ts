@@ -13,6 +13,7 @@ import {
   showHistory,
   rollbackProject,
   resolveProject,
+  readHistory,
   addVersion,
   describeProject,
   describeProjects,
@@ -124,6 +125,19 @@ function versionOf(option: string, given: string | undefined): number | undefine
   return version;
 }
 
+/**
+ * Have standard output be a document's alone (`--json`): from here on, what
+ * would be written there — what a program logs and prints, what its runner
+ * says as the run goes — is written to standard error. What is returned
+ * writes the document, as JSON, and is over when it has been handed on: a
+ * command that then fails does not cut it short.
+ */
+function theResultAlone(): (document: unknown) => Promise<void> {
+  const write = process.stdout.write.bind(process.stdout);
+  process.stdout.write = ((...given: Parameters<typeof process.stderr.write>) => process.stderr.write(...given)) as typeof process.stdout.write;
+  return (document) => new Promise((resolve) => { write(`${JSON.stringify(document, null, 2)}\n`, () => resolve()); });
+}
+
 /** Wrap a command so any failure is reported as a one-line error with a non-zero exit. */
 function command<A extends unknown[]>(run: (...args: A) => Promise<void>) {
   return async (...args: A) => {
@@ -169,7 +183,8 @@ cli
   .option("--budget <cap=number>", "Cap what the run may use of a model: cost (US dollars), tokens or calls (repeatable)", collectArg, [])
   .option("--check <project>", "Have the run checked, once it is done, by a project: its name, or a path")
   .option("--at-version <number>", "Run a version of the program from the project's history, and not the program as it is (see: trama history)")
-  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[]; check?: string; atVersion?: string }) => {
+  .option("--json", "Say what the run came to as JSON on standard output — its status, its result, its check — and nothing else there: what is said as the run goes is on standard error")
+  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[]; check?: string; atVersion?: string; json?: boolean }) => {
     let timeout: number | undefined;
     if (opts.timeout !== undefined) {
       timeout = Number(opts.timeout);
@@ -185,7 +200,10 @@ cli
       version = Number(opts.atVersion);
       if (!Number.isSafeInteger(version) || version < 1) throw new Error(`--at-version takes a version's number: 1 and up (got "${opts.atVersion}")`);
     }
+    // (With --json, from here on: a run that is not begun — no such project, arguments that do not fit — has no document.)
+    const say = opts.json ? theResultAlone() : undefined;
     const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, checkWith: opts.check, ...(version !== undefined && { version }), signal }));
+    await say?.(result);
     // (A run that a signal stopped has failed, and is not reported as that: see `command`.)
     if (result.status === "failed") {
       throw new Error(failureOf(result.reason));
@@ -267,7 +285,9 @@ cli
   .command("history <name>")
   .description("Show the versions a program has had, and how the runs of each went")
   .option("--runs", "List each run under its version")
-  .action(command(async (name: string, opts: { runs?: boolean }) => {
+  .option("--json", "As JSON: its versions, its runs, and which version is the program")
+  .action(command(async (name: string, opts: { runs?: boolean; json?: boolean }) => {
+    if (opts.json) return console.log(JSON.stringify(await readHistory(resolveProject(name)), null, 2));
     await showHistory(name, { runs: opts.runs });
   }));
 

@@ -32,7 +32,7 @@ import { journalEntriesOf, openJournal, type Journal } from "./journal.js";
 import { messageOf } from "./errors.js";
 import { checkedRepairAttempts, checkedTimeout, ensureProjectScaffold, loadProjectConfig, loadState, namesAPath, projectNamed, saveState } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
-import { copyToHistory, fileOfVersionIn, noteRun, programHashOf, readHistory, recordAsFound, recordVersion, textOfVersion, versionWith, versionsOf } from "./history.js";
+import { copyToHistory, noteRun, programHashOf, readHistory, recordAsFound, recordVersion, textOfVersion, versionWith, versionsOf } from "./history.js";
 
 /**
  * tsx lets node run program.ts. Resolved through the module system, so any
@@ -1509,7 +1509,13 @@ async function replayOf(recording: Recording, options: Omit<ReplayOptions, "run"
   const replay = createReplay(recording, { loose: options.loose, place });
 
   const { once, sameProgram } = await withTempDir("trama-replay-", async (privateDir) => {
-    const { copy } = copyProjectWith(projectDir, privateDir, options.program);
+    // A run that was of a version is replayed as that version, where no program is named: its text, as it is on record.
+    // (Where it is no longer to be had, the program as it is is replayed — and is said not to be the one recorded.)
+    let ofItsVersion: string | undefined;
+    if (options.program === undefined && recording.version !== undefined) {
+      try { ofItsVersion = textOfVersion(projectDir, recording.version); } catch { /* (Not to be had.) */ }
+    }
+    const { copy } = copyProjectWith(projectDir, privateDir, options.program ?? ofItsVersion);
     place.from = dirname(copy);
     if (programIn(copy) === null) throw new Error(`There is no program.ts in ${projectDir} to replay.`);
     // The state the recorded attempt began from, in the place of what the project's has come to since.
@@ -1810,6 +1816,26 @@ export function writtenFrom(projectDir: string, named?: number): number | null {
   return named;
 }
 
+/**
+ * The program of a run that is of a version: that version's text, in a file
+ * of the run's own in the project's directory — where the project's program
+ * is, so that what is beside the program is beside it: a module it imports
+ * by a relative path, a file it reads by where its own is. (Started from its
+ * file in the history, a version that had been found to work where the
+ * program is could not be run.) The project's program is not touched, and
+ * the file is taken away when the run is over: `remove`.
+ */
+function besideTheProgram(projectDir: string, version: number): { entry: string; remove(): void } {
+  const entry = `.trama-run-${randomBytes(6).toString("hex")}.ts`;
+  const place = guardPath(projectDir, entry);
+  try {
+    writeFileSync(place, textOfVersion(projectDir, version), { flag: "wx" });
+  } catch (err) {
+    throw new Error(`Version ${version} could not be put beside the program of ${projectDir} to be run: ${messageOf(err)}`);
+  }
+  return { entry, remove: () => rmSync(place, { force: true }) };
+}
+
 // --- Core execution ---
 
 /** How deep programs may run programs, and how many runs one runner carries at a time. */
@@ -2014,6 +2040,8 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   }
 
   const { result, repair } = await journalled(journal, backend, async (backend) => {
+    // A run of a version has that version's text for its program, where the program is (see `besideTheProgram`).
+    const beside = ofVersion === undefined ? undefined : besideTheProgram(projectDir, ofVersion);
     const execution = await executeProgram({
       projectDir,
       backend,
@@ -2023,7 +2051,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
       timeout,
       maxIterations: config.defaultMaxIterations,
       argsOverride: options.args,
-      ...(ofVersion !== undefined && { entry: fileOfVersionIn(ofVersion) }),
+      ...(beside && { entry: beside.entry }),
       workspaceDir: options.workspaceDir,
       depth,
       label: options.label,
@@ -2033,7 +2061,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
       repairWith,
       signal: options.signal,
       journal,
-    });
+    }).finally(() => beside?.remove());
     // A run that is done is checked, where it is to be: once its program has ended and what it did is the
     // project's — a fix that worked among it — and before the run's own end is written down. What the check
     // says is said beside how the run ended, and is no part of that: done is the program's word.
