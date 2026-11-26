@@ -4,10 +4,12 @@
 // that do not fit are a run that is not begun, and a result that does not
 // fit is a `done` that failed.
 //
-// It is the project's, and not its program's: an update writes program.ts
-// and nothing else, so what a program is held to is out of the reach of
-// whoever rewrites it — and every version of a project keeps one contract,
-// which is what lets two of them be held against each other at all.
+// It is the project's, and not its program's: whoever writes a program
+// writes program.ts and nothing else, so what a program is held to is out of
+// the reach of whoever rewrites it. It is changed by whoever asks — with an
+// update, or by hand — and a version is a program and what the project took
+// and gave when it was made (see history.ts): versions made under one mark
+// can be held against each other, and going back to one goes back to both.
 //
 // A project that says none of it is held to nothing, as it was.
 
@@ -167,6 +169,30 @@ export function heldResult(projectDir: string, contract: Contract, result: unkno
     throw new Error(`The result does not fit what ${projectDir} gives — ${why(err)}.`);
   }
 }
+
+/**
+ * What a project is held to, as it is written: `parameters` and `returns`.
+ * It is what a version is made under, and what a version's mark is of (see
+ * `contractMark`) — a version is a program and this. What the project is for
+ * (`description`) is no part of it: it is held to nothing.
+ */
+export interface Held { parameters?: Record<string, unknown>; returns?: unknown }
+
+/** What a meta.json says the project is held to — or what is written in the manner of one. */
+export const heldIn = (said: { parameters?: unknown; returns?: unknown }): Held => ({
+  ...(said.parameters !== undefined && { parameters: said.parameters as Record<string, unknown> }),
+  ...(said.returns !== undefined && { returns: said.returns }),
+});
+
+/** What a meta.json says, with `held` in the place of what it says the project takes and gives: nothing else of it is changed. */
+export function withHeld<Meta extends object>(meta: Meta, held: Held): Meta {
+  const { parameters: _parameters, returns: _returns, ...rest } = meta as Meta & Held;
+  return { ...rest, ...heldIn(held) } as Meta;
+}
+
+/** The mark of what a project is held to, as it is written (see `contractMark`). Throws where it is no shape. */
+export const markOfHeld = (projectDir: string, held: Held): string | undefined =>
+  contractMark(contractOf(projectDir, { input: {}, ...heldIn(held) } as ProjectMeta));
 
 /** A mark of a contract: the same for the same, and absent where the project says nothing of what it takes or gives. */
 export function contractMark(contract: Contract): string | undefined {

@@ -5,7 +5,7 @@ import type { ProgramResult } from "./runner-types.js";
 import { assertSerializable, isJsonObject } from "./serializable.js";
 import { guardPath } from "./path-guard.js";
 import { readProjectMeta } from "./meta.js";
-import { contractOf, heldResult, startedWith } from "./contract.js";
+import { contractOf, heldResult, startedWith, withHeld, type Held } from "./contract.js";
 import { saveState } from "./project.js";
 
 /** Where a project's structured run log lives, relative to the project root. */
@@ -70,6 +70,12 @@ export function createContext(
      * nothing was left out.
      */
     leftOut?: (names: string[], gives: string) => void;
+    /**
+     * What the run is held to, in the place of what the project's meta.json
+     * says it takes and gives: of a run of a version that was made under
+     * something else than the project says now (see `runProgram`'s `version`).
+     */
+    says?: Held;
   },
 ): RunContext {
   // Where the state and the log go is asked each time one is written, not once: the program
@@ -79,7 +85,7 @@ export function createContext(
   const statePath = () => guardPath(projectDir, "state.json");
   logsPath();
   statePath();
-  const meta = readProjectMeta(projectDir);
+  const meta = options?.says ? withHeld(readProjectMeta(projectDir), options.says) : readProjectMeta(projectDir);
   // What the project takes and gives, as it says it when the run begins: the run is held to that.
   const contract = contractOf(projectDir, meta);
 

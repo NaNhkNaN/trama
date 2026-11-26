@@ -277,9 +277,9 @@ export type RunRequest = Omit<RunOptions, "signal">;
 export type MakeRequest =
   | { kind: "create"; name: string; prompt: string; model?: string; args?: Record<string, unknown>; createWith?: string; description?: string; parameters?: Record<string, unknown>; returns?: unknown }
   /** An update: written from the program — or from a version of it that is named — and made the program, unless it is to be kept beside it. */
-  | { kind: "update"; name: string; prompt: string; from?: number; install?: boolean; updateWith?: string }
+  | { kind: "update"; name: string; prompt: string; from?: number; install?: boolean; updateWith?: string; description?: string; parameters?: Record<string, unknown>; returns?: unknown }
   /** A version handed over as a text, to be kept beside the program (see `addVersion`). */
-  | { kind: "version"; name: string; source: string; parent?: number; detail?: string }
+  | { kind: "version"; name: string; source: string; parent?: number; detail?: string; description?: string; parameters?: Record<string, unknown>; returns?: unknown }
   /** A project changed by going back to a version of its program (see `rollbackProject`). */
   | { kind: "rollback"; name: string; version: number };
 
@@ -287,7 +287,14 @@ export type MakeRequest =
 export interface VersionMade { version: number }
 
 /** What going back to a version came to: the new version it was made, and which it is of — or that the program was that already. */
-export type RolledBack = { version: number; from: number } | { unchanged: true; version: number };
+/**
+ * What a rollback came to: the version the program now is, and the one gone
+ * back to — or that the project was that already. `contract`: what the
+ * project takes and gives was put back with the program, to what the
+ * version was made under ("back") — or was not, that being on no record
+ * ("unknown"). Absent where it was what the project says already.
+ */
+export type RolledBack = { version: number; from: number; contract?: "back" | "unknown" } | { unchanged: true; version: number };
 
 export interface TramaConfig extends ModelConfig {
   maxRepairAttempts: number;

@@ -13,7 +13,8 @@ import { join } from "path";
 import { createHash } from "crypto";
 import { guardPath } from "./path-guard.js";
 import { isJsonObject } from "./serializable.js";
-import { contractMark, contractOf } from "./contract.js";
+import { heldIn, markOfHeld, type Held } from "./contract.js";
+import { readProjectMeta } from "./meta.js";
 import type { HistoryRun, HistoryVersion, ProjectHistory } from "./runner-types.js";
 
 const hashOf = (source: string | Buffer): string => createHash("sha256").update(source).digest("hex");
@@ -25,11 +26,55 @@ const WRITTEN_FROM = ["update", "repair"];
 /** The index.jsonl field that carries the detail for each kind of versioned change. */
 const HISTORY_DETAIL_FIELD: Record<string, string> = { create: "prompt", update: "prompt", repair: "error" };
 
+/** Where what versions were made under is kept, as it was written: each by its mark. */
+const CONTRACTS = join("history", "contracts");
+
+/** Keep what a version is made under, by its mark: once, and for good. (That it cannot be kept is no reason not to record the version: going back to it then says so.) */
+function keepHeld(projectDir: string, mark: string, held: Held): void {
+  try {
+    mkdirSync(guardPath(projectDir, CONTRACTS), { recursive: true });
+    writeFileSync(guardPath(projectDir, join(CONTRACTS, `${mark}.json`)), `${JSON.stringify(held, null, 2)}\n`, { flag: "wx" });
+  } catch { /* (There already — or not to be written.) */ }
+}
+
+/** What the project is held to as it is — its meta.json's `parameters` and `returns` — and the mark of that. Nothing, where its meta.json cannot be read so. */
+export function heldNow(projectDir: string): { mark?: string; held: Held } | undefined {
+  try {
+    const held = heldIn(readProjectMeta(projectDir));
+    return { mark: markOfHeld(projectDir, held), held };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * What a version was made under: its mark — none, where the project said
+ * nothing of what it took and gave — and the text of it (`held`), where that
+ * is on record: it is kept from when versions' were (a version recorded
+ * before has its mark alone).
+ */
+export function heldOfVersion(projectDir: string, version: number): { mark?: string; held?: Held } {
+  const mark = versionsOf(projectDir).find((one) => one.version === version)?.contract;
+  if (mark === undefined) return { held: {} };
+  try {
+    const kept: unknown = JSON.parse(readFileSync(guardPath(projectDir, join(CONTRACTS, `${mark}.json`)), "utf-8"));
+    // (What is kept under a mark is what the mark is of, or it is not what the version was made under.)
+    if (isJsonObject(kept) && markOfHeld(projectDir, heldIn(kept)) === mark) return { mark, held: heldIn(kept) };
+  } catch { /* (Not kept, or not to be read.) */ }
+  return { mark };
+}
+
 /**
  * Add a version to a project's history: its text as history/NNNN.ts, and a
  * line in index.jsonl saying why (after `notes`, lines that belong with it).
  * Either all of it is written or none of it. Returns how to take it back, for
  * a caller whose own next step may still fail.
+ *
+ * A version is its program and what the project took and gave when it was
+ * made: its line has the mark of that, and the text is kept by the mark.
+ * `under`: what it is made under, where that is not what the project says —
+ * a version kept beside the program, or one that is about to be the program
+ * together with what it is held to.
  */
 export function recordVersion(
   projectDir: string,
@@ -38,6 +83,7 @@ export function recordVersion(
   detail?: string,
   notes: Array<Record<string, unknown>> = [],
   more: Record<string, unknown> = {},
+  under?: Held,
 ): (() => void) & { version: number } {
   const historyDir = guardPath(projectDir, "history");
   const indexPath = guardPath(projectDir, join("history", "index.jsonl"));
@@ -67,7 +113,11 @@ export function recordVersion(
   // And with a mark of what the project took and gave when it was made, where the project says: versions made under
   // one contract can be held against each other, and a change of it is seen where it was made.)
   let contract: string | undefined;
-  try { contract = contractMark(contractOf(projectDir)); } catch { /* (A meta.json that cannot be read so: the version is one all the same.) */ }
+  try {
+    const held = under ?? heldIn(readProjectMeta(projectDir));
+    contract = markOfHeld(projectDir, held);
+    if (contract !== undefined) keepHeld(projectDir, contract, held);
+  } catch { /* (A meta.json that cannot be read so: the version is one all the same.) */ }
   const entry: Record<string, unknown> = { version, reason, timestamp: new Date().toISOString(), sha256: hashOf(source), ...(contract !== undefined && { contract }), ...more };
   const detailField = HISTORY_DETAIL_FIELD[reason];
   if (detailField && detail) entry[detailField] = detail;
@@ -178,10 +228,27 @@ export function versionWith(projectDir: string, sha256: string): number | undefi
 /** How long a claim to record a program as found is taken for somebody's who is still at it. */
 const STALE_CLAIM_MS = 60_000;
 
+/** Whether what the project is held to, as it is, is what a version of that mark was made under. (A meta.json that cannot be read says nothing against it.) */
+const heldAs = (projectDir: string, mark: string | undefined): boolean => {
+  const now = heldNow(projectDir);
+  return now === undefined || now.mark === mark;
+};
+
 /**
- * Put the program as it is on record as a version, where it is not the
- * latest one: changed by hand since, or never recorded — found so. From
- * then on every program that is run is a version, and can be gone back to.
+ * The version whose text the program is, where that is the latest the
+ * program was made — whatever the project takes and gives by now: what a
+ * program written from the program as it is, is written from.
+ */
+export function textIsOf(projectDir: string): number | undefined {
+  const latest = versionsOf(projectDir).filter((version) => !version.aside).at(-1);
+  return latest?.sha256 !== undefined && latest.sha256 === programHashOf(projectDir) ? latest.version : undefined;
+}
+
+/**
+ * Put the project as it is on record as a version, where it is not the
+ * latest one: its program changed by hand since, or what it takes and gives
+ * — a version is the two — or never recorded: found so. From then on every
+ * program that is run is a version, and can be gone back to.
  *
  * Runs of one project may begin at the same moment, each by a runner of its
  * own: the program is recorded by one of them. (Which is settled by a file
@@ -193,7 +260,10 @@ export function recordAsFound(projectDir: string): void {
   try { source = readFileSync(guardPath(projectDir, "program.ts")); } catch { return; } // (No program to record: its run will say so.)
   const sha256 = hashOf(source);
   // (The latest that the program was made: a version kept beside the program is no statement of what the program is.)
-  const isTheLatest = () => versionsOf(projectDir).filter((version) => !version.aside).at(-1)?.sha256 === sha256;
+  const isTheLatest = () => {
+    const latest = versionsOf(projectDir).filter((version) => !version.aside).at(-1);
+    return latest?.sha256 === sha256 && heldAs(projectDir, latest.contract);
+  };
   if (isTheLatest()) return;
   const historyDir = guardPath(projectDir, "history");
   mkdirSync(historyDir, { recursive: true });
@@ -262,7 +332,8 @@ export function readHistory(projectDir: string, options: { runs?: number } = {})
   const versions = versionsOf(projectDir);
   // What the program is: the latest version it was made — not one put on record beside it, which it never was.
   const latest = versions.filter((version) => !version.aside).at(-1);
-  const current = latest !== undefined && latest.sha256 !== undefined && latest.sha256 === programHashOf(projectDir) ? latest.version : undefined;
+  // (And made under what the project takes and gives now: one changed by hand since is a version when it is next run.)
+  const current = latest !== undefined && latest.sha256 !== undefined && latest.sha256 === programHashOf(projectDir) && heldAs(projectDir, latest.contract) ? latest.version : undefined;
   const all = runsOf(projectDir);
   const runs = options.runs === undefined ? all : options.runs >= 1 ? all.slice(-Math.floor(options.runs)) : [];
   return { versions, runs, ...(current !== undefined && { current }) };

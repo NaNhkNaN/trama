@@ -223,10 +223,12 @@ cli
   .option("--from <number>", "Write it from that version of the program, and not from the program as it is (see: trama history)")
   .option("--beside", "Keep the new version beside the program, on record, and do not make it the program: run it with --at-version, go to it with rollback")
   .option("--with <project>", "Have a project write it, and not pi's agent: its name, or a path")
-  .action(command(async (name: string, prompt: string, opts: { from?: string; beside?: boolean; with?: string }) => {
+  .option("--contract <file>", "What the project is to take and give from this version on, where that is to change: a file of JSON as of create (what is not said there is as it is). The program is validated under it, and the two are the project's together; trama rollback goes back to both")
+  .action(command(async (name: string, prompt: string, opts: { from?: string; beside?: boolean; with?: string; contract?: string }) => {
     const from = versionOf("--from", opts.from);
+    const says = opts.contract === undefined ? {} : contractIn(opts.contract);
     await stoppable((signal) => updateProject(name, prompt, {
-      ...(from !== undefined && { from }), ...(opts.beside && { install: false }), ...(opts.with !== undefined && { updateWith: opts.with }), signal,
+      ...(from !== undefined && { from }), ...(opts.beside && { install: false }), ...(opts.with !== undefined && { updateWith: opts.with }), ...says, signal,
     }));
   }));
 
@@ -235,10 +237,12 @@ cli
   .description("Put a program you wrote yourself on record as a version of a project, beside its program: it is validated, and not installed — and its number is said (- for standard input; what a program is: trama api)")
   .option("--parent <number>", "The version it was written from: the program as it is, where none is named")
   .option("--detail <text>", "What it was made for, in words")
-  .action(command(async (name: string, file: string, opts: { parent?: string; detail?: string }) => {
+  .option("--contract <file>", "What this version is made to take and give, where that is not what the project says: a file of JSON as of create. It is validated and run under it; the project's own is not touched until the version is gone to (trama rollback)")
+  .action(command(async (name: string, file: string, opts: { parent?: string; detail?: string; contract?: string }) => {
     const parent = versionOf("--parent", opts.parent);
+    const says = opts.contract === undefined ? {} : contractIn(opts.contract);
     const source = readFileSync(file === "-" ? 0 : file, "utf-8");
-    const { version } = await stoppable((signal) => addVersion(name, source, { ...(parent !== undefined && { parent }), ...(opts.detail !== undefined && { detail: opts.detail }), signal }));
+    const { version } = await stoppable((signal) => addVersion(name, source, { ...(parent !== undefined && { parent }), ...(opts.detail !== undefined && { detail: opts.detail }), ...says, signal }));
     console.log(`Version ${version} of ${name} is on record, beside its program. Run with: trama run ${name} --at-version ${version}`);
   }));
 

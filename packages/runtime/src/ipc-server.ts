@@ -410,12 +410,18 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, rep
       ({ id, ...asked }, connectionClosed, { seq }) => lasting(id, connectionClosed, stop => make({ kind: "create", ...asked }, stop, seq)),
     ),
     "/project/update": route(
-      { name: "string", prompt: "string", from: "optional number", install: "optional boolean", updateWith: "optional string", id: "optional string" },
+      {
+        name: "string", prompt: "string", from: "optional number", install: "optional boolean", updateWith: "optional string",
+        description: "optional string", parameters: "optional object", returns: "optional any", id: "optional string",
+      },
       ({ id, ...asked }, connectionClosed, { seq }) => lasting(id, connectionClosed, stop => make({ kind: "update", ...asked }, stop, seq)),
     ),
     // A version handed over as a text, to be kept beside the program: validated and put on record by the runner, as an update's is.
     "/project/version": route(
-      { name: "string", source: "string", parent: "optional number", detail: "optional string", id: "optional string" },
+      {
+        name: "string", source: "string", parent: "optional number", detail: "optional string",
+        description: "optional string", parameters: "optional object", returns: "optional any", id: "optional string",
+      },
       ({ id, ...asked }, connectionClosed, { seq }) => lasting(id, connectionClosed, stop => make({ kind: "version", ...asked }, stop, seq)),
     ),
     // A version gone back to is a project changed: by the runner, as an update is. (Nothing is run for it.)

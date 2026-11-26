@@ -261,7 +261,7 @@ await ctx.done({ went });
     assert.deepEqual(result.result.went, [
       "trama runtime error: Unknown field: bogus (this call takes: name, prompt, model, args, createWith, description, parameters, returns, id)",
       "name is what the call is made with, and cannot be given as an option",
-      "trama runtime error: Unknown field: model (this call takes: name, prompt, from, install, updateWith, id)",
+      "trama runtime error: Unknown field: model (this call takes: name, prompt, from, install, updateWith, description, parameters, returns, id)",
       "trama runtime error: Missing or invalid field: prompt (expected string)",
       'trama runtime error: Error: Invalid project name: "../x". Must be a simple directory name without path separators.',
     ]);

@@ -12,7 +12,7 @@ import { createHash, randomBytes } from "crypto";
 import type { OutsideAgent, ShellResult } from "./types.js";
 import type { Check, MakeRequest, RunOptions, ProgramResult, ReplayAllResult, ReplayOptions, ReplayResult, RolledBack, VersionMade } from "./runner-types.js";
 import { readProjectMeta } from "./meta.js";
-import { describeProject, describeProjects, fitted } from "./contract.js";
+import { describeProject, describeProjects, fitted, withHeld, type Held } from "./contract.js";
 import { createReplay, readRecording, runsToReplay, saysTheSame, type Recording, type Replay } from "./replay.js";
 import { onAbort, rejectOnAbort } from "./abort.js";
 import type { AgentUsage } from "./agent-backend.js";
@@ -32,7 +32,7 @@ import { journalEntriesOf, openJournal, type Journal } from "./journal.js";
 import { messageOf } from "./errors.js";
 import { checkedRepairAttempts, checkedTimeout, ensureProjectScaffold, loadProjectConfig, loadState, namesAPath, projectNamed, saveState } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
-import { copyToHistory, noteRun, programHashOf, readHistory, recordAsFound, recordVersion, textOfVersion, versionWith, versionsOf } from "./history.js";
+import { copyToHistory, heldNow, heldOfVersion, noteRun, programHashOf, readHistory, recordAsFound, recordVersion, textIsOf, textOfVersion, versionWith, versionsOf } from "./history.js";
 
 /**
  * tsx lets node run program.ts. Resolved through the module system, so any
@@ -314,6 +314,8 @@ interface RunOnceOptions {
   projectDir: string;
   /** The program that is started, from the project: program.ts — or, of a run of another version, that version's file. */
   entry?: string;
+  /** What the run is held to, in the place of what the project's meta.json says it takes and gives: of a run of a version made under something else. */
+  says?: Held;
   backend: Backend;
   timeout: number;
   maxIterations: number;
@@ -499,6 +501,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       readyTimer ??= setTimeout(() => validated.abort(), validating.readyGraceMs).unref();
     }),
     print: line => console.log(tagged(label, line)),
+    ...(options.says && { says: options.says }),
     // What the result had and the project does not say it gives: on the run's record — and aloud where nobody's
     // program asked for the run, as of an argument that is not taken. (There is someone there who asked for the
     // field, or wrote its name wrongly.)
@@ -1265,6 +1268,13 @@ export async function validateProgram(
     repairWith?: string; meter?: Meter;
     /** Who wrote the candidate, where a project did, and what that took: said on the validation's record, as what pi's agent took for it is. */
     writtenBy?: { by: string; used: { calls: number; tokens: number; cost: number } };
+    /**
+     * The project's meta.json as it is to be with the candidate, where
+     * whoever asked for it says what the project is to take and give from
+     * then on: the candidate is validated under that — the copy it is tried
+     * in has this for its meta.json — and not under what the project says yet.
+     */
+    says?: string;
   },
 ): Promise<{ source: string; repairedError?: string; alone?: string }> {
   const { journalRuns = 0, signal, as = projectDir, timeout, maxRepairAttempts, maxIterations, label, env, askedFor } = options;
@@ -1293,6 +1303,8 @@ export async function validateProgram(
       byItself(messageOf(err));
       return null;
     }
+    const { says } = options;
+    if (says !== undefined) inDirOfCopy(realRootOf(trialDir), () => stageFile(trialDir, "meta.json", says).commit());
 
     const execution = await executeProgram({
       ...limits,
@@ -1379,6 +1391,8 @@ async function checkedBy(
   run: {
     projectDir: string; args?: Record<string, unknown>; timeout: number; depth: number; label?: string;
     env?: Record<string, string>; signal?: AbortSignal; meter: Meter; journal: Journal;
+    /** What the run was held to, where that was not what the project says (see RunOnceOptions). */
+    says?: Held;
     /** The workspace the run worked in, where it had one. */
     workspaceDir?: string;
   },
@@ -1410,7 +1424,7 @@ async function checkedBy(
         // And what the run had used of a model when its check began, by the runner's own count — the one a budget is
         // held by: a record may be cut short, or not kept at all, and what the check itself uses is no part of the work.
         args: {
-          result: result.result, args: argumentsOf(projectDir, run.args), journal: journal.path, run: journal.run,
+          result: result.result, args: argumentsOf(projectDir, run.args, run.says), journal: journal.path, run: journal.run,
           used: { calls: before.calls, tokens: before.tokens, cost: before.cost },
           ...(run.workspaceDir !== undefined && { workspace: resolve(run.workspaceDir) }),
         },
@@ -1518,9 +1532,12 @@ async function replayOf(recording: Recording, options: Omit<ReplayOptions, "run"
   const { once, sameProgram } = await withTempDir("trama-replay-", async (privateDir) => {
     // A run that was of a version is replayed as that version, where no program is named: its text, as it is on record.
     // (Where it is no longer to be had, the program as it is is replayed — and is said not to be the one recorded.)
-    let ofItsVersion: string | undefined;
-    if (options.program === undefined && recording.version !== undefined) {
-      try { ofItsVersion = textOfVersion(projectDir, recording.version); } catch { /* (Not to be had.) */ }
+    // (And is held to what that version was made under, as the run was — whatever program is replayed.)
+    let ofItsVersion: string | undefined, says: Held | undefined;
+    if (recording.version !== undefined) {
+      if (options.program === undefined) { try { ofItsVersion = textOfVersion(projectDir, recording.version); } catch { /* (Not to be had.) */ } }
+      const madeUnder = heldOfVersion(projectDir, recording.version);
+      if (madeUnder.held !== undefined && heldNow(projectDir)?.mark !== madeUnder.mark) says = madeUnder.held;
     }
     const { copy } = copyProjectWith(projectDir, privateDir, options.program ?? ofItsVersion);
     place.from = dirname(copy);
@@ -1535,6 +1552,7 @@ async function replayOf(recording: Recording, options: Omit<ReplayOptions, "run"
       timeout,
       maxIterations: config.defaultMaxIterations,
       argsOverride: recording.args,
+      ...(says && { says }),
       workspaceDir: recording.workspace,
       depth: 0,
       // (What the program prints is shown as a replay's: it is not the output of a run, nor of the program that asked for it.)
@@ -1766,6 +1784,13 @@ export function installValidatedProgram(
   prompt: string,
   /** The version an update was written from, where its caller knows: else it is the version the program is. */
   parent?: number | null,
+  /**
+   * What the project is to take and give with this program, where whoever
+   * asked for the update says: its meta.json as it is then to be (`text`),
+   * and what of it a version is made under (`held`). The two are made the
+   * project's together, or neither is.
+   */
+  says?: { text: string; held: Held },
 ): number {
   // Three steps, ordered so that a failure at any of them leaves the project
   // as it was: the new program is written beside the old one (nothing else is
@@ -1773,17 +1798,29 @@ export function installValidatedProgram(
   // then does the new program take the old one's place — in one move, so
   // program.ts is never half-written, and never a program that is not on record.
   // What an update is written from: the version the program is, while it is still that — or no version, where it is on no record.
-  const from = reason === "update" ? { parent: parent !== undefined ? parent : readHistory(projectDir).current ?? null } : {};
+  // (Where what the project takes and gives is to be replaced, the project as it is, is put on record first, where it
+  // is not: what it took and gave may have been written by hand, and nothing is lost by it.)
+  if (says) recordAsFound(projectDir);
+  // (By its text: what a program was written from is a program, whatever the project took and gave.)
+  const from = reason === "update" ? { parent: parent !== undefined ? parent : textIsOf(projectDir) ?? null } : {};
   const program = stageProgram(projectDir, validated.source);
-  let unrecord = () => {};
+  let unrecord = () => {}, meta: StagedFile | undefined, was: Buffer | undefined, replaced = false;
   try {
+    if (says) {
+      was = readFileSync(guardPath(projectDir, "meta.json"));
+      meta = stageFileInProject(projectDir, "meta.json", says.text);
+    }
     unrecord = recordVersion(projectDir, validated.source, reason, prompt, validated.repairedError
       ? [{ reason: `${reason}-repair`, timestamp: new Date().toISOString(), error: validated.repairedError }]
-      : [], from);
+      : [], from, says?.held);
+    meta?.commit();
+    replaced = meta !== undefined;
     program.commit();
   } catch (err) {
     unrecord();
     program.discard();
+    // (What the project says is what it said, where its program is the one it was.)
+    if (replaced && was) { try { stageFileInProject(projectDir, "meta.json", was).commit(); } catch { /* (Not to be put back: said by what is thrown.) */ } } else meta?.discard();
     throw err;
   }
   return (unrecord as { version?: number }).version!;
@@ -1800,10 +1837,12 @@ export function keepBeside(
   validated: { source: string; repairedError?: string },
   detail: string | undefined,
   parent: number | null,
+  /** What it was made under, where that is not what the project says: it is on record under that, and the project's is not touched. */
+  under?: Held,
 ): number {
   return recordVersion(projectDir, validated.source, "update", detail, validated.repairedError
     ? [{ reason: "update-repair", timestamp: new Date().toISOString(), error: validated.repairedError }]
-    : [], { parent, aside: true }).version;
+    : [], { parent, aside: true }, under).version;
 }
 
 /**
@@ -2000,7 +2039,11 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   const checkWith = askedFor?.purpose === "check" ? undefined : checkerOf(options);
   // Nor is one whose arguments do not fit what the project says it takes: asked now, before a program is started for it.
   // (What it was handed and does not take is left out, and said below — once the run has a record to say it on.)
-  const { leftOut, takes } = fitted(projectDir, options.args);
+  // (A run of a version is held to what that version was made under, where that is on record and is not what the
+  // project says now: a version is a program and what it was written to.)
+  const madeUnder = ofVersion === undefined ? undefined : heldOfVersion(projectDir, ofVersion);
+  const says = madeUnder?.held !== undefined && heldNow(projectDir)?.mark !== madeUnder.mark ? madeUnder.held : undefined;
+  const { leftOut, takes } = fitted(projectDir, options.args, says && withHeld(readProjectMeta(projectDir), says));
   // Its own budget — the config's, for a run nobody's program asked for and that was given none — under the budgets above it.
   const budget = options.budget != null ? checkedBudget(options.budget) : askedFor ? undefined : config.budget;
   const meter = createMeter(budget, askedFor?.above);
@@ -2059,6 +2102,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
       maxIterations: config.defaultMaxIterations,
       argsOverride: options.args,
       ...(beside && { entry: beside.entry }),
+      ...(says && { says }),
       workspaceDir: options.workspaceDir,
       depth,
       label: options.label,
@@ -2073,7 +2117,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
     // project's — a fix that worked among it — and before the run's own end is written down. What the check
     // says is said beside how the run ended, and is no part of that: done is the program's word.
     if (checkWith === undefined || execution.result.status !== "done") return execution;
-    const check = await checkedBy(checkWith, execution.result, { projectDir, args: options.args, timeout, depth, label: options.label, env, signal: options.signal, meter, journal, workspaceDir: options.workspaceDir });
+    const check = await checkedBy(checkWith, execution.result, { projectDir, args: options.args, timeout, depth, label: options.label, env, signal: options.signal, meter, journal, workspaceDir: options.workspaceDir, says });
     return { ...execution, result: { ...execution.result, check } };
   });
 
@@ -2130,9 +2174,9 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
  * runs of the same only while the project says the same.
  */
 /** What a run was asked with, for whoever checks it: what its program was given, held as the program had it, and what was left out of that beside it. */
-function argumentsOf(projectDir: string, args?: Record<string, unknown>): Record<string, unknown> {
+function argumentsOf(projectDir: string, args?: Record<string, unknown>, says?: Held): Record<string, unknown> {
   try {
-    return fitted(projectDir, args).asked;
+    return fitted(projectDir, args, says && withHeld(readProjectMeta(projectDir), says)).asked;
   } catch {
     return { ...(readProjectMeta(projectDir).input.args ?? {}), ...args };
   }
@@ -2156,10 +2200,18 @@ function inputMark(args: Record<string, unknown> | undefined): string {
  * gone back on as anything can. The program as it is now is put on record
  * first where it is not: nothing is lost by it.
  *
+ * A version is a program and what the project took and gave when it was
+ * made: where that is not what the project says now, it is put back with
+ * the program (`contract: "back"`) — its meta.json's `parameters` and
+ * `returns`, and nothing else of the file — so that the program is held to
+ * what it was written to. Where it is on no record (a version from before
+ * such texts were kept), the program alone is gone back to, and that is
+ * said (`contract: "unknown"`).
+ *
  * Nothing is run, and nothing validated: a rollback has no effect but the
- * program's text, and costs nothing. Nor is anything else of the project
- * touched — its state, its files. (So the old program meets the project as
- * it is now, which its next run will show.)
+ * program's text and what it is held to, and costs nothing. Nor is anything
+ * else of the project touched — its state, its files. (So the old program
+ * meets the project as it is now, which its next run will show.)
  */
 export function rollbackTo(projectDir: string, version: number): RolledBack {
   if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 1) throw new Error("A version is named by its number: 1 and up.");
@@ -2171,21 +2223,32 @@ export function rollbackTo(projectDir: string, version: number): RolledBack {
     throw new Error(`No version ${version} is in the history of ${projectDir}: \`trama history <name>\` shows those there are.`);
   }
   const text = textOfVersion(projectDir, version);
-  // What is the program already is not gone back to.
-  if (programIn(projectDir) === text) return { unchanged: true, version: versionWith(projectDir, createHash("sha256").update(text).digest("hex")) ?? version };
+  // What it was made under: put back with it, where that is not what the project says now and is on record.
+  const now = heldNow(projectDir), then = heldOfVersion(projectDir, version);
+  const other = now !== undefined && now.mark !== then.mark;
+  const back = other ? then.held : undefined;
+  // What is the project already is not gone back to.
+  if (programIn(projectDir) === text && back === undefined) return { unchanged: true, version: versionWith(projectDir, createHash("sha256").update(text).digest("hex")) ?? version };
   // Asked before anything is put on record: where the program cannot be replaced, there is nothing to prepare for.
   const refusal = whyNotReplaceable(projectDir);
   if (refusal) throw new Error(refusal);
   recordAsFound(projectDir);
   const program = stageProgram(projectDir, text);
-  let recorded: (() => void) & { version?: number } = () => {};
+  let recorded: (() => void) & { version?: number } = () => {}, meta: StagedFile | undefined, was: Buffer | undefined, replaced = false;
   try {
-    recorded = recordVersion(projectDir, text, "rollback", undefined, [], { from: version });
+    if (back) {
+      was = readFileSync(guardPath(projectDir, "meta.json"));
+      meta = stageFileInProject(projectDir, "meta.json", JSON.stringify(withHeld(JSON.parse(was.toString("utf-8")) as Record<string, unknown>, back), null, 2));
+    }
+    recorded = recordVersion(projectDir, text, "rollback", undefined, [], { from: version }, back);
+    meta?.commit();
+    replaced = meta !== undefined;
     program.commit();
   } catch (err) {
     recorded();
     program.discard();
+    if (replaced && was) { try { stageFileInProject(projectDir, "meta.json", was).commit(); } catch { /* (Not to be put back: said by what is thrown.) */ } } else meta?.discard();
     throw err;
   }
-  return { version: recorded.version!, from: version };
+  return { version: recorded.version!, from: version, ...(other && { contract: back ? "back" as const : "unknown" as const }) };
 }
