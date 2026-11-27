@@ -178,7 +178,8 @@ async function verdicts(again = 0, tried?: number): Promise<Verdict[][]> {
       const work = `work/v${of ?? 0}-${n}-${found.length}${again > 0 ? `-again${again}` : ""}`;
       const make = async (work: string) => {
         const workspaceDir = await fresh(input, work);
-        const ran = await runProgram({ projectDir: dir, args: input, checkWith: judge, maxRepairAttempts: 0, ...(tried !== undefined && { version: tried }), ...(workspaceDir !== undefined && { workspaceDir }) });
+        // (A run that is judged is given no way to make projects, or change them: a version under judgment is not to go to itself, whatever is said of it.)
+        const ran = await runProgram({ projectDir: dir, args: input, checkWith: judge, maxRepairAttempts: 0, making: false, ...(tried !== undefined && { version: tried }), ...(workspaceDir !== undefined && { workspaceDir }) });
         // (The judge has seen it by now: a check is part of the run. The copy has done what it was for.)
         if (workspaceDir !== undefined) await tools.shell(`rm -rf ${quoted(work)}`, { timeout: 600_000 });
         return ran;

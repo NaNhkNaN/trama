@@ -124,11 +124,32 @@ export interface RunOptions {
    */
   checkWith?: string;
   /**
+   * `false`: the run is given no way to make projects, or change them —
+   * `createProject`, `updateProject`, `addVersion` and `rollbackProject`
+   * are refused in its program, and in every run it starts, whatever that
+   * is started with: a run is not given what its asker does not have. (A
+   * run that checks, fixes or writes is started so by the runner.) For a
+   * run whose work is to be judged beside others': what it is judged
+   * among is then as it was when it began.
+   *
+   * Whatever is said here, a run's makings never reach the project that
+   * checks it or the one that fixes it, nor those of a run it is part of:
+   * what judges a run is not that run's to change.
+   */
+  making?: boolean;
+  /**
    * Stops the run: its program is stopped, no repair is attempted, and the
    * run ends as failed. A fix that was being tried leaves no trace.
    */
   signal?: AbortSignal;
 }
+
+/**
+ * What is out of a run's reach, by its runner's own calls: the projects that
+ * check it and fix it, and those of every run it is part of — each by what
+ * it is (its `identityOf`), with what it does.
+ */
+export type Beyond = ReadonlyMap<string, "checks" | "fixes">;
 
 /** What a replay is asked with (see `replayProgram`). */
 export interface ReplayOptions {
@@ -223,7 +244,7 @@ export interface HistoryRun {
   at: string;
   /** The version its program was when it began. Absent where the program could not be put on record. */
   version?: number;
-  /** The version its program was when it ended, where that is another: a fix was installed. */
+  /** The version its program was when it ended, where that is another: a fix was installed (`repaired` says so) — or the program was changed while it ran, by itself through its runner or by somebody else. */
   ended?: number;
   status: ProgramResult["status"];
   /** Of a run that failed or yielded: the first line of why. */
@@ -275,7 +296,7 @@ export type RunRequest = Omit<RunOptions, "signal">;
 
 /** A project a program asks its runner to make, or to change (see createProject and updateProject). */
 export type MakeRequest =
-  | { kind: "create"; name: string; prompt: string; model?: string; args?: Record<string, unknown>; createWith?: string; description?: string; parameters?: Record<string, unknown>; returns?: unknown }
+  | { kind: "create"; name: string; prompt: string; model?: string; args?: Record<string, unknown>; createWith?: string; program?: string; description?: string; parameters?: Record<string, unknown>; returns?: unknown }
   /** An update: written from the program — or from a version of it that is named — and made the program, unless it is to be kept beside it. */
   | { kind: "update"; name: string; prompt: string; from?: number; install?: boolean; updateWith?: string; description?: string; parameters?: Record<string, unknown>; returns?: unknown }
   /** A version handed over as a text, to be kept beside the program (see `addVersion`). */

@@ -147,7 +147,7 @@ await ctx.done({ versions: history.versions.length, went });
     // Run by a runner that has no way to make or change a project, it is told so — and has read the history all the same.
     writeFileSync(join(at("asker"), "program.ts"), GOES_BACK);
     const { result } = await captureConsole("log", () => runWithoutMaking({ projectDir: at("asker"), timeout: 30_000, maxRepairAttempts: 0 }));
-    assert.deepEqual(result.result, { versions: 2, went: "trama runtime error: Error: This runner was not given a way to make projects, or change them: createProject, updateProject and rollbackProject are carried out where a run is started by way of @trama-dev/runtime/runner." });
+    assert.deepEqual(result.result, { versions: 2, went: "trama runtime error: Error: This run has no way to make projects, or change them: it was started without one — as a run that checks, fixes or writes is, and any run whose asker says so (making: false), or whose runner has none to give." });
     assert.equal(indexOf(target).length, 2);
   });
 });
@@ -236,6 +236,26 @@ test("the loop keeps a version that is found better: it runs the program on each
   const journals = readdirSync(join(it.at("improve"), "logs", "journal")).sort();
   const { result: replay } = await withEnv({ HOME: it.fakeHome }, () => quietly(() => replayProgram({ projectDir: it.at("improve"), run: journals[0].replace(/\.jsonl$/, "") })));
   assert.deepEqual([replay.same, replay.sameEnd, replay.left ?? null, it.lines().length, it.versions().length], [true, true, null, 8, 3]);
+});
+
+test("a version under judgment cannot go to itself: what the loop judges is run with no way to make projects, or change them", async (t) => {
+  // A candidate that says nothing in capitals — worse than the program — and asks its runner, as it runs, to be made the program.
+  const SELF_SEEKING = `import { ctx } from "@trama-dev/runtime";
+import { rollbackProject } from "@trama-dev/runtime/runner";
+import { appendFileSync } from "node:fs";
+const { word } = ctx.input.args as { word: string };
+const went = await rollbackProject("words", 2).then(() => "went to itself", (err: any) => String(err.message));
+appendFileSync(process.env.HOME + "/went.txt", went + "\\n");
+await ctx.done({ said: word });
+`;
+  const it = loopOver(t, SAYS(["a"]), [SELF_SEEKING]);
+  const { result: ran } = await it.round({ inputs: [A, B], ask: "Say every word in capitals." });
+  assert.deepEqual([ran.result.kept, ran.result.from, ran.result.after], [false, 1, { ok: 0, of: 2, score: 0 }]);
+  // Each of its judged runs asked, and was refused: the program is what it was, and no going-to is on record.
+  const went = readFileSync(join(it.fakeHome, "went.txt"), "utf-8").trim().split("\n");
+  assert.equal(went.length, 2);
+  for (const said of went) assert.match(said, /This run has no way to make projects, or change them: it was started without one/);
+  assert.deepEqual([it.program(), it.versions()], [SAYS(["a"]), [[1, "found"], [2, "update"]]]);
 });
 
 test("the program stays what it is where the new version is not found better: worse, or no better — and one that is as often good and better by its score is kept", async (t) => {

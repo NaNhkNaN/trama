@@ -18,6 +18,15 @@
 // conversation grows long. Each request to the model, and each thing a tool does, goes through
 // the runtime: the run's journal has all of it, one line after the other,
 // and its budget counts it.
+//
+// And, where the run asks for it (`programs`): the user's programs as tools.
+// A trama project is a program that is kept — with a name, what it is for,
+// what a run of it takes and gives, and every version it has had. The model
+// then lists them, looks at one, runs one, makes one of a program it wrote,
+// and changes one by a version more — this harness among them. So what an
+// agent works out while it works is a program that is there the next time.
+// (Not unless asked: with it, the reach of a run is no longer the codebase it
+// was pointed at, but every program the user has.)
 import { ctx, agent, tools, workspace, heldTo } from "@trama-dev/runtime";
 import type { AgentTool, ModelMessage, ShellResult, ToolCallPart } from "@trama-dev/runtime";
 
@@ -34,7 +43,9 @@ const codebase: Codebase = await workspace.shell("true").then(() => workspace, (
   throw err;
 });
 
-const given = ctx.input.args as { task?: string; turns?: string | number; forgetAt?: string | number; model?: string };
+const given = ctx.input.args as { task?: string; turns?: string | number; forgetAt?: string | number; model?: string; programs?: boolean | string };
+/** Whether the model has the user's programs as tools (see `programsAsTools`). */
+const PROGRAMS = given.programs === true || given.programs === "true";
 /** The model that does the work, where the run names one ("provider/model"): else the project's own. */
 const MODEL = typeof given.model === "string" && given.model !== "" ? { model: given.model } : {};
 const task = given.task ?? ctx.input.prompt;
@@ -51,9 +62,13 @@ const system = `You work on the codebase in the current directory, with the tool
 
 Look before you change anything: read what matters, run what tells you something. Make changes with edit where a file is long — it replaces one passage and leaves the rest — and with write where a file is new or short. Check your work by running it. When the task is done, call finish and say in a few words what you did. That ends your work.
 
-What tools said long ago is cut short as the conversation grows, and marked so; and where it outgrows that too, what came before its latest steps is summed up. Either way you are told which of the codebase's files are by then not as they were when you began: go by that, and not by memory, for what you have changed.`;
+What tools said long ago is cut short as the conversation grows, and marked so; and where it outgrows that too, what came before its latest steps is summed up. Either way you are told which of the codebase's files are by then not as they were when you began: go by that, and not by memory, for what you have changed.${PROGRAMS ? `
+
+You also have programs: trama projects — each a program that is kept, with a name, what it is for, and what a run of it takes and gives. programs lists them, program shows one, run_program runs one, where you work. Use one where it does what you need. And make one: where you work out something that will be wanted again, write it as a program (program_guide says how), try it, and make it a project with make_program — it is there from then on, for the next piece of work, yours or anybody's. A program that is there is changed by a version more: add_version puts one on record beside the program, validated; it is run by its number; and use_version makes it the program — as it makes any earlier version the program again. One of them is the harness you are at work in: it is changed in the same way, and a change of it is in force from the next run.` : ""}`;
 
 type Tool = Pick<AgentTool, "name" | "description" | "parameters"> & { run(given: any): unknown };
+/** The tools whose answer is handed over whole, however long. (By name: a tool has no field for it that a model's request takes.) */
+const WHOLE = new Set<string>();
 
 let finished: string | undefined;
 /** The longest a command may be given, in seconds; and how the runtime ends the stderr of one it stopped at its time. */
@@ -156,6 +171,150 @@ const mine: Tool[] = [
   },
 ];
 
+/**
+ * The user's programs, as tools — where the run asks for them (`programs`).
+ * Each is one call of the runner's (@trama-dev/runtime/runner) and no more:
+ * what it does is done by this run's runner — under the run's budget, on its
+ * record — and what the runner refuses (a run that was given no way to make
+ * projects; a change to the project that checks this run) is said to the
+ * model as the runner says it. A run started from here works where the
+ * harness works, and is not mended where it fails: the model is told how it
+ * failed, and is the one to mend it.
+ */
+async function programsAsTools(): Promise<Tool[]> {
+  const runner = await import("@trama-dev/runtime/runner");
+  const quoted = (text: string) => `'${text.replace(/'/g, `'\\''`)}'`;
+  /**
+   * Which of the user's projects this is the program of: the one of its
+   * directory's name, where that is this directory. (Tried in a copy — a
+   * candidate validated, a fix — it is none of them.)
+   */
+  const here = (await tools.shell("pwd -P")).stdout.trim(), named = here.split("/").at(-1) ?? "";
+  let own: string | undefined;
+  try { if ((await tools.shell(`cd ${quoted(runner.resolveProject(named))} && pwd -P`)).stdout.trim() === here) own = named; } catch { /* (None of that name.) */ }
+  const itself = (name: string) => name === own;
+  /** Where the work is done: a run that is started from here works there too. */
+  const where = codebase === workspace ? (await workspace.shell("pwd")).stdout.trim() : undefined;
+  /** A file the model wrote, by its path as its shell has it. */
+  const textIn = async (file: string) => {
+    const got = await codebase.shell(`cat -- ${quoted(file)}`, { timeout: 60_000 });
+    if (got.exitCode !== 0) throw new Error(`The file could not be read: ${got.stderr.trim() || file}`);
+    return got.stdout;
+  };
+  const shape = (said: unknown) => (said === undefined ? "(it does not say)" : JSON.stringify(said));
+  /**
+   * What a model gave for a field that is to be an object. A field of any
+   * kind ("json") is declared to a model with no kind at all, and a model
+   * then writes an object as its JSON text as often as not: that text is
+   * taken for the object. What is neither is refused here, in words the
+   * model can go by.
+   */
+  const objectOf = (given: unknown, what: string): Record<string, unknown> | undefined => {
+    if (given === undefined || given === null) return undefined;
+    let is = given;
+    if (typeof given === "string") { try { is = JSON.parse(given); } catch { /* (Text that is no JSON: said below.) */ } }
+    if (is === null || typeof is !== "object" || Array.isArray(is)) {
+      throw new Error(`${what} is to be an object — {"name": value} — and is ${typeof given === "string" ? `the text ${JSON.stringify(given.length > 80 ? `${given.slice(0, 80)}…` : given)}` : JSON.stringify(given)}.`);
+    }
+    return is as Record<string, unknown>;
+  };
+  /** What was said, of some things that may not have been. */
+  const said = (given: Record<string, unknown>) => Object.fromEntries(Object.entries(given).filter(([, value]) => value !== undefined));
+  return [
+    {
+      name: "programs", description: "List the programs there are: the name of each, and what it is for.",
+      run: async () => {
+        const all = (await runner.describeProjects()).sort((a, b) => (a.name < b.name ? -1 : 1));
+        return all.map((one) => `${one.name}${itself(one.name) ? " (the harness you are at work in)" : ""} — ${one.description ?? "(it does not say what it is for)"}`).join("\n") || "(none yet)";
+      },
+    },
+    {
+      name: "program", description: "Look at one program: what a run of it takes and gives, the versions it has had and how the runs of each went, and where its files are — to be read with the tools you have.",
+      parameters: { name: "string" },
+      run: async ({ name }) => {
+        const dir = runner.resolveProject(name), says = await runner.describeProject(name), history = await runner.readHistory(dir);
+        let its: unknown;
+        try { its = JSON.parse((await tools.shell(`cat -- ${quoted(`${dir}/meta.json`)}`)).stdout).input?.args; } catch { /* (Said as not said.) */ }
+        const runsOf = (version: number) => {
+          const of = history.runs.filter((run) => run.version === version), checked = of.filter((run) => run.check && run.check.error === undefined);
+          const ended = ["done", "yielded", "failed"].map((status) => [status, of.filter((run) => run.status === status).length] as const).filter(([, n]) => n > 0);
+          return of.length === 0 ? "no runs" : `${of.length} run${of.length === 1 ? "" : "s"}: ${ended.map(([status, n]) => `${n} ${status}`).join(", ")}${checked.length > 0 ? `; ${checked.filter((run) => run.check!.ok).length} of ${checked.length} that were checked found good` : ""}`;
+        };
+        const versions = history.versions.map((one) => `  v${one.version} ${one.reason}${one.parent !== undefined ? ` of v${one.parent}` : ""}${one.from !== undefined ? ` from v${one.from}` : ""}${one.aside ? ", beside the program" : ""}`
+          + `${one.detail ? `, ${JSON.stringify(one.detail.length > 80 ? `${one.detail.slice(0, 80)}…` : one.detail)}` : ""}${one.version === history.current ? " ← the program" : ""} — ${runsOf(one.version)}`);
+        return [
+          `${name}${itself(name) ? " (the harness you are at work in)" : ""} — ${says.description ?? "(it does not say what it is for)"}`,
+          `It takes: ${shape(says.parameters)}`, `It gives: ${shape(says.returns)}`, `Its own arguments, which a run has where it gives none: ${shape(its)}`,
+          `Its files are in ${dir}: program.ts is the program, and history/ has the text of each version (0001.ts, and so on).`,
+          versions.length === 0 ? "No version of it is on record yet: it has not been run." : `Its versions:\n${versions.join("\n")}`,
+        ].join("\n");
+      },
+    },
+    {
+      name: "program_guide",
+      description: "How a program is written: what it imports, how what it takes and gives is said, the whole of the runtime's API, and programs to go by. It is long: read it once, before you write one.",
+      run: () => { WHOLE.add("program_guide"); return runner.programGuide(); },
+    },
+    {
+      name: "run_program", description: "Run a program, where you work, and see what the run gave. A run that fails is not mended for you: you are told how it failed.",
+      parameters: {
+        name: "string", "args?": "json: what the run is given — an object, by the names of what the program takes",
+        "version?": "number: a version of it, by its number — where it is not the program as it is that is to run",
+        "check?": "string: a program that judges the run once it is done; its verdict comes with what the run gave",
+        "seconds?": "number: how long its program may take, where that is more than a few minutes",
+      },
+      run: async ({ name, version, check, seconds, ...more }) => {
+        const args = objectOf(more.args, "args");
+        const dir = runner.resolveProject(name), { parameters } = await runner.describeProject(name);
+        const takes = parameters === undefined ? undefined : Object.keys(parameters).map((key) => key.replace(/\?$/, ""));
+        const leftOut = takes === undefined || args === undefined ? [] : Object.keys(args).filter((key) => !takes.includes(key));
+        const ran = await runner.runProgram({ projectDir: dir, maxRepairAttempts: 0, ...said({ args, version, checkWith: check, workspaceDir: where, timeout: seconds === undefined ? undefined : seconds * 1000 }) });
+        if (ran.status === "failed") throw new Error(`The run failed: ${ran.reason}`);
+        const { check: verdict } = ran;
+        return (ran.status === "yielded" ? `The run yielded, to be run again: ${ran.reason}` : `The run is done. It gave: ${JSON.stringify(ran.result ?? null)}`)
+          + (verdict === undefined ? "" : `\nIts check: ${verdict.error !== undefined ? `could not be made — ${verdict.error}` : `${verdict.ok ? "found good" : "found wanting"}${verdict.score !== undefined ? `, score ${verdict.score}` : ""}${verdict.notes ? ` — ${verdict.notes}` : ""}`}`)
+          + (leftOut.length > 0 ? `\n(Left out of what it was given, since ${name} does not take it: ${leftOut.join(", ")}. It takes: ${takes!.join(", ") || "nothing"}.)` : "");
+      },
+    },
+    {
+      name: "make_program", description: "Make a project of a program you wrote: it is run once to be validated, as it is, and is among the programs from then on — or, where it does not run, is not made, and you are told why.",
+      parameters: {
+        name: "string: a name as a directory has one", description: "string: what it is for, in a sentence — whoever chooses among programs goes by it",
+        file: "string: the program, in a file you wrote — its path, as your shell has it",
+        "parameters?": "json: what a run of it takes, written as program_guide says", "returns?": "json: what a run of it gives, written the same way",
+        "args?": "json: arguments of the project's own — what a run has where it gives none, and what the program is validated with: so whatever it requires",
+      },
+      run: async ({ name, description, file, ...more }) => {
+        const says = said({ parameters: objectOf(more.parameters, "parameters"), returns: objectOf(more.returns, "returns"), args: objectOf(more.args, "args") });
+        await runner.createProject(name, description, { program: await textIn(file), description, ...says });
+        return `${name} is made, and is among the programs from here on: it is its version 1, and ran once to be validated, with the arguments it was made with.`;
+      },
+    },
+    {
+      name: "add_version", description: "Put a program you wrote on record as a version more of a program that is there: it is run once to be validated, and kept beside the program — which stays what it is until you make the version the program (use_version).",
+      parameters: {
+        name: "string", file: "string: the program's text, in a file you wrote — its path, as your shell has it", "detail?": "string: what it was made for, in a few words",
+        "parameters?": "json: what this version takes, where that is to be other than the project says", "returns?": "json: what it gives, where that is to be other than the project says",
+      },
+      run: async ({ name, file, detail, ...more }) => {
+        const { version } = await runner.addVersion(name, await textIn(file), said({ detail, parameters: objectOf(more.parameters, "parameters"), returns: objectOf(more.returns, "returns") }));
+        return `Version ${version} of ${name} is on record, beside its program: validated — it ran once, with the project's own arguments. Run it by its number (run_program with version ${version}); make it the program with use_version.`;
+      },
+    },
+    {
+      name: "use_version", description: "Make a version of a program its program: one you put on record, or any it has had — which is how a change is gone back from.",
+      parameters: { name: "string", version: "number" },
+      run: async ({ name, version }) => {
+        const went = await runner.rollbackProject(name, version);
+        if ("unchanged" in went) return `Version ${version} is what ${name}'s program is already.`;
+        return `${name} is at version ${version} again, as its version ${went.version}: that is its program from here on.${itself(name) ? " (It is the harness you are at work in: this run goes on as it began, and the next is of the new program.)" : ""}`;
+      },
+    },
+  ];
+}
+// (Before `finish`, which stays the last of the tools.)
+if (PROGRAMS) mine.splice(mine.length - 1, 0, ...(await programsAsTools()));
+
 /** A tool, run as the model called it: what it said — or how it failed, which the model reads as well, and may mend. */
 async function use(call: ToolCallPart): Promise<{ said: string; failed: boolean }> {
   try {
@@ -163,7 +322,7 @@ async function use(call: ToolCallPart): Promise<{ said: string; failed: boolean 
     if (!tool) throw new Error(`There is no tool "${call.name}". The tools: ${mine.map((one) => one.name).join(", ")}.`);
     if (call.argumentsError) throw new Error(`What ${call.name} was called with is not JSON: ${call.argumentsError}`);
     const said = String(await tool.run(heldTo(tool.parameters, call.arguments)));
-    return { said: said.length > MOST ? `${said.slice(0, MOST)}\n[… and ${said.length - MOST} characters more: ask for less at a time]` : said, failed: false };
+    return { said: said.length > MOST && !WHOLE.has(tool.name) ? `${said.slice(0, MOST)}\n[… and ${said.length - MOST} characters more: ask for less at a time]` : said, failed: false };
   } catch (err) {
     return { said: err instanceof Error ? err.message : String(err), failed: true };
   }

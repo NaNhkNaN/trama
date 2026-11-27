@@ -262,7 +262,7 @@ test("the examples say what they are for, take and give — those a runner start
     assert.ok(typeof said[name].description === "string" && said[name].description.length > 40, name);
     assert.equal(said[name].schema.returns.type, "object", name);
   }
-  assert.deepEqual(Object.keys(said["coding-harness"].parameters), ["task?", "turns?", "forgetAt?", "model?"]);
+  assert.deepEqual(Object.keys(said["coding-harness"].parameters), ["task?", "turns?", "forgetAt?", "model?", "programs?"]);
   assert.deepEqual([said["improve-by-check"].schema.parameters.required, Object.keys(said["improve-by-check"].parameters).length], [["project", "check"], 12]);
   // What a runner itself starts — a checker, a fixer — says what one is handed: what the runner hands beside that, one day, is left out and not refused.
   assert.deepEqual(said["repair-harness"].schema.parameters.required, ["program", "error"]);

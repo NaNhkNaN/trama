@@ -197,15 +197,17 @@ const cli = new Command()
 
 cli
   .command("create <name> <prompt>")
-  .description("Generate a new program from a natural language prompt")
+  .description("Make a project: have its program written from a prompt — or hand over one you wrote yourself (--program), with the prompt for what it is for")
   .option("--model <model>", "LLM model to use")
   .option("--arg <key=value>", "An argument of the project's own (repeatable): what a run of it has where the run gives none — and what the new program is validated with, so a parameter the project requires is to be given here", collectArg, [])
   .option("--with <project>", "Have a project write the program, and not pi's agent: its name, or a path")
   .option("--contract <file>", "What the project is to take and give: a file of JSON — {\"description\": \"…\", \"parameters\": {\"text\": \"string: what it is\", \"n?\": \"number\"}, \"returns\": {\"words\": \"number\"}} — written as `trama api` says (what is not said there, whoever writes the program says)")
-  .action(command(async (name: string, prompt: string, opts: { model?: string; arg: string[]; with?: string; contract?: string }) => {
+  .option("--program <file>", "Make the project of a program you wrote yourself, and ask nobody to write one: it is validated as it is, and is the project's first version — or, where it does not run, no project is made (- for standard input; what a program is: trama api)")
+  .action(command(async (name: string, prompt: string, opts: { model?: string; arg: string[]; with?: string; contract?: string; program?: string }) => {
     const args = parseArgs(opts.arg);
     const says = opts.contract === undefined ? {} : contractIn(opts.contract);
-    await stoppable((signal) => createProject(name, prompt, { model: opts.model, args, ...(opts.with !== undefined && { createWith: opts.with }), ...says, signal }));
+    const program = opts.program === undefined ? undefined : readFileSync(opts.program === "-" ? 0 : opts.program, "utf-8");
+    await stoppable((signal) => createProject(name, prompt, { model: opts.model, args, ...(opts.with !== undefined && { createWith: opts.with }), ...(program !== undefined && { program }), ...says, signal }));
   }));
 
 cli
@@ -217,8 +219,9 @@ cli
   .option("--check <project>", "Have the run checked, once it is done, by a project: its name, or a path")
   .option("--at-version <number>", "Run a version of the program from the project's history, and not the program as it is (see: trama history)")
   .option("--workspace <dir>", "Where the run works, where that is not in its project: a directory the program has as its workspace (workspace.read, workspace.shell and the rest) — the codebase a harness is to work on, say. It is worked in as it is: nothing is copied")
+  .option("--no-making", "Give the run no way to make projects, or change them — nor any run it starts: for a run whose program, or the model at work in it, is not to touch what else there is")
   .option("--json", "Say what the run came to as JSON on standard output — its status, its result, its check — and nothing else there: what is said as the run goes is on standard error")
-  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[]; check?: string; atVersion?: string; workspace?: string; json?: boolean }) => {
+  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[]; check?: string; atVersion?: string; workspace?: string; making: boolean; json?: boolean }) => {
     let timeout: number | undefined;
     if (opts.timeout !== undefined) {
       timeout = Number(opts.timeout);
@@ -239,7 +242,7 @@ cli
     if (workspaceDir !== undefined && !isDirectory(workspaceDir)) throw new Error(`--workspace takes a directory, and there is none at ${workspaceDir}`);
     // (With --json, from here on: a run that is not begun — no such project, arguments that do not fit — has no document.)
     const say = opts.json ? theResultAlone() : undefined;
-    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, checkWith: opts.check, ...(version !== undefined && { version }), ...(workspaceDir !== undefined && { workspaceDir }), signal }));
+    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, checkWith: opts.check, ...(version !== undefined && { version }), ...(workspaceDir !== undefined && { workspaceDir }), ...(opts.making === false && { making: false }), signal }));
     if (say) await say(result);
     // (Without --json: what the run gave, after what was said as it went — for whoever is looking on.)
     else if (result.status === "done" && result.result !== undefined) console.log(JSON.stringify(result.result, null, 2));

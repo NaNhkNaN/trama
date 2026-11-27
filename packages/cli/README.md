@@ -33,14 +33,14 @@ trama examples check-by-command
 trama run my-harness --workspace ./code --arg task="make the failing test pass" --check check-by-command
 ```
 
-The last line has a harness work on a codebase, and its work judged by a command (`npm test`, unless the judge is told another) in a copy of what it left.
+The last line has a harness work on a codebase, and its work judged by a command (`npm test`, unless the judge is told another) in a copy of what it left. With `--arg programs=true` the model at work in the harness has your projects as tools too: it runs them, makes one of a program it wrote, and changes one — the harness itself among them — by a version more.
 
 ## Commands
 
 | | |
 |---|---|
-| `create <name> <prompt>` | Have a program written from a prompt: `--with <project>` says who writes it, `--contract <file>` what it is to take and give, `--arg` its own arguments. |
-| `run <name>` | Run it: `--arg`, `--workspace <dir>`, `--budget cost=2` (or `tokens=`, `calls=`), `--check <project>`, `--at-version <n>`, `--timeout <ms>`, `--json`. |
+| `create <name> <prompt>` | Have a program written from a prompt — or make the project of one you wrote (`--program <file>`): `--with <project>` says who writes it, `--contract <file>` what it is to take and give, `--arg` its own arguments. |
+| `run <name>` | Run it: `--arg`, `--workspace <dir>`, `--budget cost=2` (or `tokens=`, `calls=`), `--check <project>`, `--at-version <n>`, `--no-making`, `--timeout <ms>`, `--json`. |
 | `update <name> <prompt>` | Have it rewritten: `--from <n>`, `--beside` (kept as a version, not installed), `--with`, `--contract`. |
 | `add-version <name> <file>` | Put a program you wrote yourself on record as a version: validated, not installed. |
 | `history <name>` | Its versions, and how the runs of each went (`--runs`, `--json`). |

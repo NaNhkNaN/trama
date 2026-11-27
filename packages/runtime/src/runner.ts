@@ -10,7 +10,7 @@ import { basename, join, dirname, relative, resolve } from "path";
 import { tmpdir } from "os";
 import { createHash, randomBytes } from "crypto";
 import type { OutsideAgent, ShellResult } from "./types.js";
-import type { Check, MakeRequest, RunOptions, ProgramResult, ReplayAllResult, ReplayOptions, ReplayResult, RolledBack, VersionMade } from "./runner-types.js";
+import type { Beyond, Check, MakeRequest, RunOptions, ProgramResult, ReplayAllResult, ReplayOptions, ReplayResult, RolledBack, VersionMade } from "./runner-types.js";
 import { readProjectMeta } from "./meta.js";
 import { describeProject, describeProjects, fitted, withHeld, type Held } from "./contract.js";
 import { createReplay, readRecording, runsToReplay, saysTheSame, type Recording, type Replay } from "./replay.js";
@@ -343,6 +343,8 @@ interface RunOnceOptions {
   meter?: Meter;
   /** How a project is made or changed where the run's program asks for that (see Making). Without it, nothing is. */
   making?: Making;
+  /** What no making of the run's reaches (see Beyond). */
+  beyond?: Beyond;
   /** Stops the run. */
   signal?: AbortSignal;
   /** Where the run is written down. One journal covers every attempt of a run. */
@@ -582,14 +584,14 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     make: (request, stop, seq) => {
       if (validating) return handOff("has a project made or changed", stop);
       if (!options.making) {
-        throw new Error("This runner was not given a way to make projects, or change them: createProject, updateProject and rollbackProject are carried out where a run is started by way of @trama-dev/runtime/runner.");
+        throw new Error("This run has no way to make projects, or change them: it was started without one — as a run that checks, fixes or writes is, and any run whose asker says so (making: false), or whose runner has none to give.");
       }
       // The run's own, as a run it asks for is: under its budget, with its variables, stopped when it
       // ends or when the program no longer wants it, and not over before this is. (But the program's
       // clock goes on: what it has made is its own work, with no timeout but the program's.)
       // (What it starts is a validation: of the program the project is made with.)
       return notOverBefore(options.making(request, {
-        ...itsOwn(seq, stop, "validate"), label, env: options.env, depth: options.depth,
+        ...itsOwn(seq, stop, "validate"), label, env: options.env, depth: options.depth, beyond: options.beyond,
         writing: (run, path) => { if (run) journal.note("child", { seq, run, journal: path, purpose: request.kind === "create" ? "create" : "update" }); },
       }));
     },
@@ -602,7 +604,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
       // What this run was started with, the run it asks for has too — and what it is given besides.
       const env = options.env || request.env ? { ...options.env, ...request.env } : undefined;
       const { signal, ...asked } = itsOwn(seq, stop);
-      return notOverBefore(runProgram({ ...request, env, signal }, { depth: options.depth + 1, ...asked }, options.making).finally(release));
+      return notOverBefore(runProgram({ ...request, env, signal }, { depth: options.depth + 1, ...asked, beyond: options.beyond }, options.making).finally(release));
     },
     // What is read of a project's history is read here — in a validation too: it changes nothing.
     history: (dir, runs) => readHistory(dir, runs === undefined ? {} : { runs }),
@@ -1891,6 +1893,8 @@ export interface AskedToMake extends Pick<AskedFor, "parent" | "started" | "abov
   env?: Record<string, string>;
   /** How many runs deep the run that asked is. */
   depth?: number;
+  /** What is out of the asking run's reach: no project of these is made, or changed, for it. */
+  beyond?: Beyond;
   /** Called once a project that writes the program (see `writtenBy`) has a journal of its own: the asking run's record says what it started. */
   writing?(run: string, journal: string): void;
 }
@@ -1914,6 +1918,8 @@ interface AskedFor {
   above?: Meter;
   /** What the runner made the run for, where it made it itself: a fix asked of a project, a check, the writing of a project's first program or of an update. (A check is not checked in its turn, whatever its project says.) */
   purpose?: "fix" | "check" | "create" | "update";
+  /** What is out of the reach of the run that asked: it is out of this one's too. */
+  beyond?: Beyond;
 }
 
 /**
@@ -1994,7 +2000,8 @@ export async function runProgram(options: RunOptions, askedFor?: AskedFor, makin
   }
   runsInFlight += 1;
   try {
-    return await runProject(options, depth, askedFor, making);
+    // (A run that is to have no way to make projects is given none: and so none is there for what it starts.)
+    return await runProject(options, depth, askedFor, options.making === false ? undefined : making);
   } finally {
     runsInFlight -= 1;
   }
@@ -2028,6 +2035,13 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   }
   // Who checks the run, where it is checked: found now as well — a run that could not be checked as it was to be is not begun.
   const checkWith = askedFor?.purpose === "check" ? undefined : checkerOf(options);
+  // What is out of the run's reach, by its runner: who checks it and who fixes it — and whatever was out of the
+  // reach of the run that asked for it. What judges a run is not that run's to change.
+  const beyond = new Map(askedFor?.beyond);
+  for (const [dir, does] of [[checkWith, "checks"], [repairWith, "fixes"]] as const) {
+    const id = dir === undefined ? undefined : identityOf(realRootOf(dir));
+    if (id !== undefined && !beyond.has(id)) beyond.set(id, does);
+  }
   // Nor is one whose arguments do not fit what the project says it takes: asked now, before a program is started for it.
   // (What it was handed and does not take is left out, and said below — once the run has a record to say it on.)
   // (A run of a version is held to what that version was made under, where that is on record and is not what the
@@ -2067,6 +2081,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
     timeout,
     maxRepairAttempts,
     repairWith,
+    ...(options.making === false && { making: false }),
     budget,
     // (The names: what the variables hold is not for a journal.)
     env: env && Object.keys(env),
@@ -2088,6 +2103,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
       backend,
       meter,
       making,
+      beyond,
       maxRepairAttempts,
       timeout,
       argsOverride: options.args,

@@ -393,7 +393,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, rep
         projectDir: "string", args: "optional object", version: "optional number",
         timeout: "optional number", maxRepairAttempts: "optional number",
         id: "optional string", label: "optional string", workspaceDir: "optional string", env: "optional object",
-        budget: "optional object", repairWith: "optional string", checkWith: "optional string",
+        budget: "optional object", repairWith: "optional string", checkWith: "optional string", making: "optional boolean",
       },
       async ({ id, env, budget, timeout, maxRepairAttempts, ...asked }, connectionClosed, { seq }) => {
         const request: RunRequest = { ...asked, timeout: timeoutOf(timeout), maxRepairAttempts: attemptsOf(maxRepairAttempts), env: envOf(env), budget: budgetOf(budget) };
@@ -404,7 +404,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, rep
     // run's budget, on its record, and stopped with it.
     "/project/create": route(
       {
-        name: "string", prompt: "string", model: "optional string", args: "optional object", createWith: "optional string",
+        name: "string", prompt: "string", model: "optional string", args: "optional object", createWith: "optional string", program: "optional string",
         description: "optional string", parameters: "optional object", returns: "optional any", id: "optional string",
       },
       ({ id, ...asked }, connectionClosed, { seq }) => lasting(id, connectionClosed, stop => make({ kind: "create", ...asked }, stop, seq)),

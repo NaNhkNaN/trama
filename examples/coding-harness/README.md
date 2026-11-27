@@ -29,6 +29,18 @@ await runProgram({ projectDir: resolveProject("my-harness"), workspaceDir: "/pat
 
 Where a run has a workspace the work is done there, and the project the harness is the program of is left as it is. One harness then does many pieces of work; each is a run of *it*, on its record and of one of its versions — which is what lets it be held against another version of itself, on the same pieces of work (`examples/improve-by-check`, with `from`).
 
+## With the programs there are
+
+```sh
+trama run my-harness --workspace /path/to/a/codebase --arg programs=true --arg task="…"
+```
+
+With `programs`, the model has your trama projects as tools beside the codebase's: it lists them (`programs`), looks at one (`program`: what a run takes and gives, its versions and how their runs went), and runs one where it works (`run_program`). And it makes them: a program it wrote becomes a project (`make_program`, by the runner's `createProject` with the program handed over), one that is there is given a version more (`add_version`) — validated, kept beside the program, run by its number — and that version is made the program (`use_version`), as any earlier one is again. `program_guide` tells it how a program is written. So what the model works out while it works is a program that is there the next time, with what it takes and gives said, and every version to go back to.
+
+The harness itself is one of those programs, and the model is told which: it changes the harness it is at work in by the same moves, and the change is in force from the next run.
+
+Each of these tools is one call of the runner's, carried out by the run's own runner: under the run's budget and on its record (`trama journal`). What the runner refuses, the model is told in the runner's words — a run started with `--no-making` has the programs to look at and run and no way to make or change one, and no run can change the project that checks it. It is off unless a run asks for it: with it, what a run can reach is no longer the codebase it was pointed at, but every program you have.
+
 What it did is in the run's journal — `trama journal my-codebase` — a line for each request to the model and for each thing a tool did, and what each request used.
 
 It is a starting point, not the best harness there is. What it does about a long conversation, once a request has read more than it is to (`--arg forgetAt=…`, in tokens):

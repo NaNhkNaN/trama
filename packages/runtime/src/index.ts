@@ -21,13 +21,13 @@ import {
 } from "./runner.js";
 import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspace.js";
 import { parentBridge, remoteWorkspace, withOptions, type Bridge } from "./bridge-client.js";
-import { guardPath, identityOf, sameProjectAs } from "./path-guard.js";
+import { guardPath, identityOf, realRootOf, sameProjectAs } from "./path-guard.js";
 import { printJournals, spentIn } from "./journal-view.js";
 import { openJournal } from "./journal.js";
 import { messageOf } from "./errors.js";
 
 export type { HistoryRun, HistoryVersion, ProjectHistory, RolledBack, VersionMade } from "./runner-types.js";
-import type { ProjectHistory, RolledBack, VersionMade } from "./runner-types.js";
+import type { MakeRequest, ProjectHistory, RolledBack, VersionMade } from "./runner-types.js";
 import { heldNow, readHistory as historyHere, textIsOf, textOfVersion } from "./history.js";
 import { isDeepStrictEqual } from "util";
 import { contractOf, fitted, heldIn, markOfHeld, describeProject as describeHere, describeProjects as describeAllHere, type Held } from "./contract.js";
@@ -69,14 +69,28 @@ async function overBridge<T>(bridge: Bridge, endpoint: string, asked: Record<str
 }
 
 /** How this runner makes or changes a project for a program that asks it to (see Making). */
+/**
+ * Refuse a making that names what is out of the asking run's reach (see
+ * `Beyond`): the project that checks that run, or fixes it, or a run it is
+ * part of. (A name that is no project's is said to be none by what is asked
+ * for.)
+ */
+function withinReach(request: MakeRequest, asked: AskedToMake): void {
+  if (!asked.beyond?.size) return;
+  let id: string | undefined;
+  try { id = identityOf(realRootOf(resolveProject(request.name))); } catch { return; }
+  const does = id === undefined ? undefined : asked.beyond.get(id);
+  if (does) throw new Error(`Project ${JSON.stringify(request.name)} is the one that ${does} this run, or a run it is part of: what checks a run, or fixes it, is not that run's to change.`);
+}
+
 const making: Making = async (request, asked) =>
-  request.kind === "rollback" ? rollbackHere(request.name, request.version, asked)
+  (withinReach(request, asked), request.kind === "rollback") ? rollbackHere(request.name, request.version, asked)
     : request.kind === "version" ? addVersionHere(request.name, request.source, {
       parent: request.parent, detail: request.detail, description: request.description, parameters: request.parameters, returns: request.returns, signal: asked.signal,
     }, asked)
     : request.kind === "create"
       ? createHere(request.name, request.prompt, {
-        model: request.model, args: request.args, createWith: request.createWith,
+        model: request.model, args: request.args, createWith: request.createWith, program: request.program,
         description: request.description, parameters: request.parameters, returns: request.returns, signal: asked.signal,
       }, asked)
       : updateHere(request.name, request.prompt, {
@@ -289,8 +303,9 @@ export async function showHistory(name: string, options: { runs?: boolean } = {}
     }
     if (!options.runs) return;
     for (const run of of) {
+      // (A run whose program was another when it ended: a fix was installed — or it was changed while it ran, by itself through its runner, or by somebody.)
       console.log(`      ${[run.run ?? when(run.at), run.status, run.check && said(run.check), seconds(run.ms ?? 0),
-        run.used?.calls > 0 && `${run.used.tokens} tokens $${run.used.cost.toFixed(4)}`, run.ended !== undefined && `fixed: v${run.ended} since`, run.reason && oneLine(run.reason, 100)].filter(Boolean).join("  ")}`);
+        run.used?.calls > 0 && `${run.used.tokens} tokens $${run.used.cost.toFixed(4)}`, run.ended !== undefined && (run.repaired !== undefined ? `fixed: v${run.ended} since` : `the program was changed while it ran: v${run.ended} since`), run.reason && oneLine(run.reason, 100)].filter(Boolean).join("  ")}`);
     }
   };
 
@@ -459,6 +474,7 @@ export function programGuide(): string {
     `It is written as a Schema is: a field by its kind — "string", "number", "boolean", "json" for any value — with what it is after a colon, an object by its fields, a list by the shape of its items in brackets, and a field that may be absent with a "?" at the end of its name:\n` +
     `  { "description": "Counts the words of a text.", "parameters": { "text": "string: the text", "loud?": "boolean" }, "returns": { "words": "number", "lines": [{ "n": "number" }] } }\n` +
     `It is the project's, and not its program's: an update of the program does not change it — unless whoever asks for the update says what it is to be from then on (trama update --contract). A version is a program and what the project took and gave when it was made: trama rollback goes back to both, and a version is run by its number (--at-version) under its own.\n\n` +
+    `A program you wrote yourself is made a project by trama create <name> "<what it is for>" --program <file> (with --contract and --arg, as it needs them): it is validated as it is, and is the project's first version — and one that is there is given a version more by trama add-version <name> <file>. A program does the same of its runner: createProject(name, prompt, { program }), addVersion(name, source).\n\n` +
     `Whole programs to start from — a harness, the loop that improves a project, a judge of a run — come with the command line: trama examples.\n\n` +
     `The runtime's API:\n${RUNTIME_TYPES}\n\n` +
     `Programs, for what one looks like:\n${EXAMPLE_PROGRAMS}`
@@ -687,7 +703,7 @@ function keepPrepared(prepared: Prepared, label?: string): void {
 async function validateCandidate(
   projectDir: string, backend: Backend, candidate: string, config: TramaConfig, prepared: Prepared,
   wrote: AgentUsage[], signal: AbortSignal | undefined, asked: Asked, byItself = false,
-  more: { meter?: Meter; writtenBy?: { by: string; used: { calls: number; tokens: number; cost: number } }; says?: string } = {},
+  more: { meter?: Meter; writtenBy?: { by: string; used: { calls: number; tokens: number; cost: number } }; says?: string; maxRepairAttempts?: number } = {},
 ): Promise<{ validated: Awaited<ReturnType<typeof validateProgram>>; kept: boolean }> {
   let as: string | undefined, alone: string | undefined;
   if (config.agentChanges === "keep" && !byItself) {
@@ -757,6 +773,13 @@ async function writeValidateInstall(projectDir: string, how: {
   /** The project that writes the program, in the place of pi's agent — and, of an update, the program it writes from (see `writtenBy`). */
   writer?: { project: string; program?: string };
   /**
+   * Of a making: the program, where whoever asks for the project hands it
+   * over (see `createProject`'s `program`). Nobody is asked to write, and
+   * nobody to mend it where it does not run: it is the project's as it was
+   * handed over, or there is no project.
+   */
+  handed?: string;
+  /**
    * Of an update: what the project is to take and give with the new program,
    * where whoever asked says (see `saidFor`). Whoever writes finds it in the
    * meta.json of its copy and cannot change it; the candidate is validated
@@ -781,7 +804,8 @@ async function writeValidateInstall(projectDir: string, how: {
     if (how.says) prepared.says(how.says.text);
     // Who writes: a project, where one is named — or pi's agent, at work in the copy with its own tools.
     let candidate: string, by: { by: string; used: { calls: number; tokens: number; cost: number } } | undefined;
-    if (how.writer) {
+    if (how.handed !== undefined) candidate = how.handed;
+    else if (how.writer) {
       const meter = how.meter ?? meterFor(config, asked), before = meter.counted();
       // (What it makes beside the program is kept where an agent's would be: not of a version that is kept beside the program.)
       candidate = await writtenBy(how.writer.project, {
@@ -818,7 +842,7 @@ async function writeValidateInstall(projectDir: string, how: {
     onRecord = true;
     // (A version that is to be kept beside the program is the program's text and no more: it is validated in the
     // project as it is, where it will be run — not with what its writer made beside it, which is not kept.)
-    const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, signal, asked, how.beside !== undefined, { meter: how.meter, ...(by && { writtenBy: by }), ...(how.says && { says: how.says.text }) });
+    const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, signal, asked, how.beside !== undefined, { meter: how.meter, ...(by && { writtenBy: by }), ...(how.says && { says: how.says.text }), ...(how.handed !== undefined && { maxRepairAttempts: 0 }) });
     stillTheProject();
     if (how.beside) return keepBeside(projectDir, validated, how.prompt, how.beside.parent, how.says?.held);
     const version = installValidatedProgram(projectDir, validated, how.reason, how.prompt, how.from?.version, how.says);
@@ -859,7 +883,7 @@ export async function createProject(
   name: string,
   prompt: string,
   options?: {
-    model?: string; args?: Record<string, unknown>; createWith?: string;
+    model?: string; args?: Record<string, unknown>; createWith?: string; program?: string;
     description?: string; parameters?: Record<string, unknown>; returns?: unknown; signal?: AbortSignal;
   },
 ): Promise<void> {
@@ -972,7 +996,7 @@ async function createHere(
   name: string,
   prompt: string,
   options?: {
-    model?: string; args?: Record<string, unknown>; createWith?: string;
+    model?: string; args?: Record<string, unknown>; createWith?: string; program?: string;
     description?: string; parameters?: Record<string, unknown>; returns?: unknown; signal?: AbortSignal;
   },
   asked: Asked = {},
@@ -982,6 +1006,12 @@ async function createHere(
   // (Asked before a project is made: what is no name of a model would be written down as the project's, and no run of it could read that.)
   if (options?.model !== undefined && typeof options.model !== "string") {
     throw new Error(`Invalid model: ${JSON.stringify(options.model)}. A model is named in text.`);
+  }
+  // The program, where whoever asks hands it over: a text — and then nobody is asked to write one.
+  const handed = options?.program ?? undefined;
+  if (handed !== undefined && (typeof handed !== "string" || handed.trim() === "")) throw new Error("A project is made of a program's text, and this is none.");
+  if (handed !== undefined && options?.createWith != null) {
+    throw new Error(`Project ${JSON.stringify(name)} is made of the program that is handed over, or by whoever is asked to write one (createWith): not both.`);
   }
   throwIfAborted(options?.signal);
   const projectDir = join(projectsDir(), name);
@@ -1024,11 +1054,12 @@ async function createHere(
     const meter = meterFor(config, asked);
     const backend = backendFor(config, asked, meter);
     // Who writes it: the project the call names, or the configuration — or, with neither, pi's agent.
-    const named = options?.createWith ?? config.createWith;
+    // (Nobody, where the program is handed over — whoever the configuration names.)
+    const named = handed !== undefined ? undefined : options?.createWith ?? config.createWith;
     const writer = named === undefined ? undefined : projectNamed(named);
     if (writer !== undefined && !existsSync(join(writer, "meta.json"))) throw new Error(`createWith names no project: there is none at ${writer}`);
 
-    say.log(`Generating program for "${name}"...`);
+    say.log(handed === undefined ? `Generating program for "${name}"...` : `Making "${name}" of the program that was handed over...`);
     // (What the agent is given to look at is the project made here, and no other directory that is at its path by now.)
     stillTheProject();
     await writeValidateInstall(projectDir, {
@@ -1039,9 +1070,12 @@ async function createHere(
       validating: "Validating program...",
       config, backend, stillTheProject, signal: options?.signal, asked, meter,
       ...(writer !== undefined && { writer: { project: writer } }),
+      // (Of a program that is handed over nothing is proposed — what the project takes and gives is what whoever asks says —
+      // and nothing is kept of a project it does not make: its author has the text.)
+      ...(handed !== undefined ? { handed } : {
       // What whoever writes says the project takes and gives, of what was not said by whoever asked: the project's from here on.
       proposes,
-      said: (proposal) => {
+      said: (proposal: Record<string, unknown>) => {
         const says = { ...meta, ...proposal } as ProjectMeta;
         contractOf(projectDir, says, "What was said, in meta.json, of what the project takes and gives cannot be read");
         fitsItsOwn(projectDir, says);
@@ -1051,10 +1085,11 @@ async function createHere(
       },
       // From here on the project is kept even if validation fails, so the
       // generated program can be inspected and fixed by hand.
-      written: (candidate) => {
+      written: (candidate: string) => {
         writeFileSync(guardPath(projectDir, "program.ts"), candidate);
         keepProjectOnFailure = true;
       },
+      }),
     });
 
     say.log(`Created ${name}. Run with: trama run ${name}`);

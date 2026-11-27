@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, readdirSync, readFileSync } from "fs";
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { llm } from "./fake-llm.mjs";
-import { createProject, runProgram, updateProject } from "../packages/runtime/dist/index.js";
+import { createProject, readHistory, runProgram, showHistory, updateProject } from "../packages/runtime/dist/index.js";
 import { runProgram as runWithoutMaking, validateProgram } from "../packages/runtime/dist/runner.js";
 import { createBackend } from "../packages/runtime/dist/runner-backend.js";
 import { printJournals } from "../packages/runtime/dist/journal-view.js";
-import { captureConsole, cleanupTempDir, createProjectFixture, makeTempDir, waitFor, withEnv, writeJson } from "./helpers.mjs";
+import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, makeTempDir, readJson, runNodeCommand, waitFor, withEnv, writeJson } from "./helpers.mjs";
 
 // A program asks its runner for a project to be made or changed, as it asks it for a run: nothing of
 // that is done in the program's own process. (Which these tests can tell at a glance: the model is a
@@ -259,7 +259,7 @@ await ctx.done({ went });
   await withEnv({ HOME: fakeHome }, async () => {
     const { result } = await captureConsole("log", () => runProgram({ projectDir: makerDir, timeout: 30_000 }));
     assert.deepEqual(result.result.went, [
-      "trama runtime error: Unknown field: bogus (this call takes: name, prompt, model, args, createWith, description, parameters, returns, id)",
+      "trama runtime error: Unknown field: bogus (this call takes: name, prompt, model, args, createWith, program, description, parameters, returns, id)",
       "name is what the call is made with, and cannot be given as an option",
       "trama runtime error: Unknown field: model (this call takes: name, prompt, from, install, updateWith, description, parameters, returns, id)",
       "trama runtime error: Missing or invalid field: prompt (expected string)",
@@ -269,8 +269,104 @@ await ctx.done({ went });
 
     // (The runner as it is by itself, not by way of the surface that knows how a program is written.)
     const bare = await runWithoutMaking({ projectDir: makerDir, timeout: 30_000 });
-    assert.match(bare.result.went[4], /This runner was not given a way to make projects/);
+    assert.match(bare.result.went[4], /This run has no way to make projects, or change them: it was started without one/);
   });
+});
+
+test("a run whose program was changed while it ran is said to be that, in the project's history — and fixed, only where a fix was installed", async (t) => {
+  // A program that puts a version of itself on record and goes to it, through its runner: nothing fails, and nothing is fixed.
+  const { fakeHome, projects, makerDir } = homeWith(t, `import { ctx } from "@trama-dev/runtime";
+import { addVersion, rollbackProject } from "@trama-dev/runtime/runner";
+import { readFileSync } from "fs";
+const { version } = await addVersion("maker", readFileSync("program.ts", "utf-8") + "// and a line more\\n");
+await rollbackProject("maker", version);
+await ctx.done({ version });
+`, { maxRepairAttempts: 1 });
+  createProjectFixture(join(projects, "broken"), { programSource: `throw new Error("it does not work");` });
+  standIn(t, { repair: async () => WRITES("mended") });
+
+  await withEnv({ HOME: fakeHome }, async () => {
+    const shown = async (name) => (await captureConsole("log", () => showHistory(name, { runs: true }))).messages.join("\n");
+    const { result } = await captureConsole("log", () => runProgram({ projectDir: makerDir, timeout: 30_000 }));
+    assert.deepEqual(result, { status: "done", result: { version: 2 } });
+    const itself = await shown("maker");
+    assert.match(itself, /done .*the program was changed while it ran: v3 since/);
+    assert.doesNotMatch(itself, /fixed/);
+
+    await captureConsole("error", () => captureConsole("log", () => runProgram({ projectDir: join(projects, "broken"), timeout: 30_000 })));
+    const mended = await shown("broken");
+    assert.match(mended, /done .*fixed: v2 since/);
+    assert.doesNotMatch(mended, /changed while it ran/);
+  });
+});
+
+test("a project is made of a program that is handed over: validated, and the project's first version — with nobody asked to write or to mend, and nothing left of one that does not run", async (t) => {
+  const COUNTS = `import { ctx } from "@trama-dev/runtime";
+const { text } = ctx.input.args as { text: string };
+await ctx.done({ words: text.split(" ").filter(Boolean).length });
+`;
+  const says = { description: "Counts the words of a text.", parameters: { text: "string: the text" }, returns: { words: "number" } };
+  const { fakeHome, projects, makerDir } = homeWith(t, `import { ctx } from "@trama-dev/runtime";
+import { createProject, runProgram, resolveProject } from "@trama-dev/runtime/runner";
+const told = (err: any) => String(err.message);
+const made = await createProject("inside", "Counts words, made by a program.", { program: ${JSON.stringify(COUNTS)}, args: { text: "one" }, ...${JSON.stringify(says)} }).then(() => "created", told);
+const unfit = await createProject("unfit", "p", { program: ${JSON.stringify(COUNTS.replace("words:", "letters:"))}, args: { text: "one" }, ...${JSON.stringify(says)} }).then(() => "created", told);
+const ran = await runProgram({ projectDir: resolveProject("inside"), args: { text: "low tide at six" }, maxRepairAttempts: 0, timeout: 20000 });
+await ctx.done({ made, unfit, ran });
+`, { maxRepairAttempts: 2, createWith: "a-writer-that-is-not-there" });
+  // (Whoever would be asked to write, or to mend what was handed over, is not — nor looked for, whoever the
+  // configuration names to write: it is as it was handed over, or not at all.)
+  let asked = 0;
+  standIn(t, { ask: async () => { asked += 1; return COUNTS; }, repair: async () => { asked += 1; return COUNTS; } });
+
+  await withEnv({ HOME: fakeHome }, async () => {
+    const quietly = (fn) => captureConsole("error", () => captureConsole("warn", () => captureConsole("log", fn))).then((said) => said.result.result.result);
+    const { messages } = await captureConsole("log", () => createProject("counts", "Counts words.", { program: COUNTS, args: { text: "a b" }, ...says }));
+    assert.deepEqual(messages.filter((line) => /Generating/.test(line)), []);
+    assert.ok(messages.includes("Created counts. Run with: trama run counts"), messages.join("\n"));
+    const counts = join(projects, "counts");
+    assert.equal(readFileSync(join(counts, "program.ts"), "utf-8"), COUNTS);
+    const meta = readJson(join(counts, "meta.json"));
+    assert.deepEqual([meta.description, meta.parameters, meta.returns, meta.input], [says.description, says.parameters, says.returns, { prompt: "Counts words.", args: { text: "a b" } }]);
+    // Its first version, as a making — what it was made for with it, and one validation on record.
+    assert.deepEqual((await readHistory(counts)).versions.map(({ version, reason, detail }) => [version, reason, detail]), [[1, "create", "Counts words."]]);
+    assert.deepEqual(journalsOf(counts).map((journal) => journal[0].purpose), ["validate"]);
+    assert.deepEqual(await quietly(() => runProgram({ projectDir: counts, args: { text: "the heron waits" }, timeout: 20_000 })), { status: "done", result: { words: 3 } });
+
+    // One that does not run, or does not give what it is said to, is no project: nothing of it is left.
+    await assert.rejects(quietly(() => createProject("broken", "p", { program: `throw new Error("it does not work");` })), /it does not work/);
+    await assert.rejects(quietly(() => createProject("unfit", "p", { program: COUNTS.replace("words:", "letters:"), args: { text: "a" }, ...says })), /The result does not fit/);
+    assert.deepEqual([existsSync(join(projects, "broken")), existsSync(join(projects, "unfit"))], [false, false]);
+    // What is no text is refused, and so is asking for a writer too — before anything is made.
+    await assert.rejects(createProject("none", "p", { program: "  " }), /A project is made of a program's text, and this is none/);
+    await assert.rejects(createProject("none", "p", { program: 7 }), /A project is made of a program's text, and this is none/);
+    await assert.rejects(createProject("none", "p", { program: COUNTS, createWith: "maker" }), /is made of the program that is handed over, or by whoever is asked to write one \(createWith\): not both/);
+    assert.equal(existsSync(join(projects, "none")), false);
+    await assert.rejects(createProject("counts", "p", { program: COUNTS, args: { text: "a" } }), /Project "counts" already exists/);
+
+    // A program has it done by its runner, as any making: on its record, and what the making started with it.
+    const result = await quietly(() => runProgram({ projectDir: makerDir, timeout: 30_000 }));
+    assert.equal(result.result.made, "created", JSON.stringify(result));
+    assert.match(result.result.unfit, /The result does not fit/);
+    assert.deepEqual(result.result.ran, { status: "done", result: { words: 4 } });
+    assert.equal(existsSync(join(projects, "unfit")), false);
+    const record = journalsOf(makerDir).at(-1);
+    const call = record.find((line) => line.kind === "call" && line.endpoint === "/project/create");
+    assert.deepEqual([call.request.name, call.request.program], ["inside", COUNTS]);
+    assert.deepEqual(record.filter((line) => line.kind === "child" && line.seq === call.seq).map((line) => line.purpose), ["validate"]);
+    assert.equal(asked, 0, "nobody was asked to write, or to mend");
+  });
+
+  // And the command line: a file, or standard input.
+  const file = join(fakeHome, "hello.ts");
+  writeFileSync(file, `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ said: "hello" });\n`);
+  const cli = (...args) => runNodeCommand([join(REPO_ROOT, "packages", "cli", "dist", "index.js"), ...args], { cwd: REPO_ROOT, env: { ...process.env, HOME: fakeHome } });
+  const made = await cli("create", "hello", "Says hello.", "--program", file);
+  assert.equal(made.exitCode, 0, made.stderr);
+  assert.deepEqual(JSON.parse((await cli("run", "hello", "--json")).stdout), { status: "done", result: { said: "hello" } });
+  assert.match((await cli("create", "--help")).stdout, /--program <file>\s+Make the project of a program you wrote yourself/);
+  const both = await cli("create", "hello2", "p", "--program", file, "--with", "maker");
+  assert.deepEqual([both.exitCode, /not both/.test(both.stderr), existsSync(join(projects, "hello2"))], [1, true, false]);
 });
 
 test("outside a program a project is made, and changed, where it is asked for — as it always was", async (t) => {
