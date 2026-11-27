@@ -309,8 +309,18 @@ else await ctx.done({ sum: a + b });
 
   // Without it: what is said as the run goes — and then what the run gave, for whoever is looking on. (A run that gave nothing shows nothing more.)
   const plain = await trama("run", "sum", "--arg", "a=2", "--arg", "b=3");
-  assert.deepEqual([plain.exitCode, /\[trama\] adding\n[^]*\[trama\] done\n\{\n  "sum": 5\n\}\n$/.test(plain.stdout), plain.stderr], [0, true, ""]);
-  assert.match((await trama("run", "sum", "--arg", "a=-1")).stdout, /\[trama\] done\n$/);
+  assert.deepEqual([plain.exitCode, plain.stderr], [0, ""]);
+  // (What a program prints itself and what it says through its runner come by two ways — a pipe, and the bridge —
+  // and which of two such lines is shown first is not held: on a busy machine the program's own has come after the
+  // runner's "done". What the run gave is after all of it: the run is over, and its output read to the end, before
+  // it is shown.)
+  const gave = '{\n  "sum": 5\n}\n';
+  assert.ok(plain.stdout.endsWith(gave), plain.stdout);
+  const asItWent = plain.stdout.slice(0, -gave.length);
+  assert.deepEqual(asItWent.split("\n").filter(Boolean).sort(), ["[trama] adding", "[trama] done", "the program's own word"], plain.stdout);
+  assert.ok(asItWent.indexOf("[trama] adding") < asItWent.indexOf("[trama] done"), plain.stdout);
+  const nothing = await trama("run", "sum", "--arg", "a=-1");
+  assert.deepEqual(nothing.stdout.split("\n").filter(Boolean).sort(), ["[trama] adding", "[trama] done", "the program's own word"], nothing.stdout);
 
   const ran = await trama("run", "sum", "--arg", "a=2", "--arg", "b=3", "--json");
   assert.equal(ran.exitCode, 0, ran.stderr);
