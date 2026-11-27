@@ -362,7 +362,7 @@ test("the command line says what a program is, for whoever writes one themselves
   // And nothing of what an earlier trama had and this one has not: a count of iterations and a bound on them, a session.
   assert.doesNotMatch(api.stdout, /maxIterations|ctx\.iteration|\biteration: number|in a session|session layer/);
   // How what a project takes and gives is written: in words, and once as it looks.
-  assert.match(api.stdout, /"string", "number", "boolean", "json" for any value[^\n]*a "\?" at the end of its name/);
+  assert.match(api.stdout, /"string", "number", "boolean", "object" for an object whatever its fields, "json" for any value[^\n]*a "\?" at the end of its name/);
   assert.match(api.stdout, /\{ "description": "[^"]+", "parameters": \{ "text": "string: [^"]+", "loud\?": "boolean" \}, "returns": \{ "words": "number"/);
   // The API as a writer is shown it, and programs to go by.
   assert.match(api.stdout, /\nThe runtime's API:\n[^]*interface Ctx[^]*export declare const workspace: Workspace;[^]*\nPrograms, for what one looks like:\n\/\/ Example A: /);

@@ -30,7 +30,7 @@
     },
     "each?": [
       {
-        "input": "json: what its runs were started with",
+        "input": "object: what its runs were started with",
         "heldBack": "boolean: whether it was held back from whoever writes",
         "before": {
           "ok": "number: how many runs were found good",

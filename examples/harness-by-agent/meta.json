@@ -12,7 +12,7 @@
     "ok": "boolean: whether its turn ended as one does",
     "stopReason?": "string: how the turn ended — end_turn, max_tokens, max_turn_requests, refusal, cancelled",
     "session?": "string: the id of the conversation, as the agent has it",
-    "usage?": "json: what the agent said it used — its own account, not counted by trama"
+    "usage?": "object: what the agent said it used — its own account, not counted by trama"
   },
   "input": {
     "prompt": "Say what is to be done: trama run <this project> --arg task=\"…\"",

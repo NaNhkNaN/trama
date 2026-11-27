@@ -461,13 +461,17 @@ test("stripCodeFences leaves a program the fences it wrote down itself", async (
 
 test("createAgent generate takes a field's type from words, and nothing else for words", async () => {
   const agent = createAgent({ async ask() { return '{"a": "x"}'; } }, "/work");
-  for (const type of [7, null, true, "string[]", "list", "object", "String", ""]) {
+  for (const type of [7, null, true, "string[]", "list", "Object", "any", "String", ""]) {
     await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: type } }), /unsupported schema type/, JSON.stringify(type));
   }
   assert.deepEqual(await agent.generate({ prompt: "p", schema: { a: "string: any text" } }), { a: "x" });
-  // (A list and an object are not words: each is written as what it holds, and means that.)
+  // (A list is no word, nor an object by its fields: each is written as what it holds, and means that.)
   await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: ["string"] } }), /a: expected a list, got string/);
   await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: { type: "string" } } }), /a: expected an object, got string/);
+  // (An object whatever its fields is a word — "object" — and an answer is held to it as to any kind: text is none.)
+  await assert.rejects(() => agent.generate({ prompt: "p", schema: { a: "object: whatever was found" } }), /a: expected an object, got string/);
+  const found = createAgent({ async ask() { return '{"a": {"any": [1, {"deep": null}]}, "b": 1}'; } }, "/work");
+  assert.deepEqual(await found.generate({ prompt: "p", schema: { a: "object: whatever was found" } }), { a: { any: [1, { deep: null }] } });
 });
 
 // --- What a call asks of its backend, and what it is told the call used ---

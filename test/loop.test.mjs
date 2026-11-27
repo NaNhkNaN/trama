@@ -325,7 +325,7 @@ test("a round says how each input went, beside what decided: in the order they w
     { input: C, heldBack: true, before: not, after: good },
   ]);
   // It is in what the loop says it gives (its meta.json): held to that, it is not left out — and no writer was told it.
-  assert.deepEqual(LOOP_SAYS.returns["each?"], [{ input: "json: what its runs were started with", heldBack: "boolean: whether it was held back from whoever writes", before: LOOP_SAYS.returns["before?"], "after?": LOOP_SAYS.returns["after?"] }]);
+  assert.deepEqual(LOOP_SAYS.returns["each?"], [{ input: "object: what its runs were started with", heldBack: "boolean: whether it was held back from whoever writes", before: LOOP_SAYS.returns["before?"], "after?": LOOP_SAYS.returns["after?"] }]);
   assert.doesNotMatch(it.prompts[0], /heldBack|"word":"c"/);
 
   // A round that asks for nothing says it too, of the program as it is: from the record, with no run made.

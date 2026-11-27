@@ -4,8 +4,8 @@ import { createAgent } from "../packages/runtime/dist/agent.js";
 import { argumentsOf, conform, hasList, heldTo, shapeOf } from "../packages/runtime/dist/schema.js";
 
 // The notation shapes are written in — a typed answer's, a tool's parameters, what a project takes and gives —
-// has two words beside the kinds, the fields and the lists: a field that may be absent, written with a "?" at
-// the end of its name, and "json", which is any value.
+// has three words beside the kinds, the fields and the lists: a field that may be absent, written with a "?" at
+// the end of its name; "json", which is any value; and "object", which is an object whatever its fields.
 
 test("a field written with a ? at the end of its name may be absent: held where it is there, left out where it is not — and told as a field that is not required", () => {
   const declared = { task: "string: what is to be done", "model?": "string: provider/model", "turns?": "number", "more?": { "deep?": "boolean", tags: ["string"] } };
@@ -59,6 +59,32 @@ test("\"json\" is any value: what is there is held as it is — a string, a numb
   // The kinds are these, still: a word that is none of them is said back.
   assert.throws(() => shapeOf({ a: "any" }), /unsupported schema type "any" for key "a"/);
   assert.deepEqual(conform({ a: 1, b: 2 }, shapeOf({ a: "json" })), { a: 1 });
+});
+
+test("\"object\" is an object, whatever its fields: held as it is, all of it — and nothing else is one: not a list, not null, not text — and told as that kind", () => {
+  const declared = { args: "object: what a run is given", "more?": "object", each: ["object"] };
+  // What is there is held as it is: every field of it, however deep — none is declared, so none is left out.
+  const given = { args: { text: "a b", n: 1, deep: { list: [1, null, { x: true }] } }, each: [{}, { a: 1 }] };
+  assert.deepEqual(heldTo(declared, given), given);
+  assert.deepEqual(heldTo(declared, { args: {}, more: { any: "thing" }, each: [] }), { args: {}, more: { any: "thing" }, each: [] });
+  // (May be absent, as any field may: and a null there is its absence.)
+  assert.deepEqual(heldTo(declared, { args: {}, more: null, each: [] }), { args: {}, each: [] });
+  // Nothing else is an object — least of all the text of one: said in the words any mismatch is said in.
+  for (const [value, got] of [['{"text": "a b"}', "string"], [[1], "a list"], [null, "null"], [7, "7"], [true, "boolean"]]) {
+    assert.throws(() => heldTo(declared, { args: value, each: [] }), new RegExp(`^Error: Schema validation failed: args: expected an object, got ${got}$`), JSON.stringify(value));
+  }
+  assert.throws(() => heldTo(declared, { args: {}, each: [{}, "x"] }), /each\[1\]: expected an object, got string/);
+  assert.throws(() => heldTo(declared, { each: [] }), /missing key: args/);
+  // As JSON Schema, which is how a model is told: the kind is said — an object — and nothing of its fields.
+  assert.deepEqual(argumentsOf(declared).schema, {
+    type: "object",
+    properties: { args: { type: "object", description: "what a run is given" }, more: { type: "object" }, each: { type: "array", items: { type: "object" } } },
+    required: ["args", "each"], additionalProperties: false,
+  });
+  // It is a kind, and no list: and the words there were say what they said.
+  assert.deepEqual([shapeOf({ a: "object: of anything" }), hasList(shapeOf({ a: "object" }))], [{ fields: [["a", "object"]], mayBeAbsent: [] }, false]);
+  assert.deepEqual(argumentsOf({ a: "json", b: {} }).schema.properties, { a: {}, b: { type: "object", properties: {}, required: [], additionalProperties: false } });
+  assert.deepEqual(heldTo({ b: {} }, { b: { dropped: 1 } }), { b: {} });
 });
 
 test("a typed answer may leave out a field written with a ?: the model is told so, where there is one — and an answer without it is the answer", async () => {

@@ -104,6 +104,32 @@ try {
 }
 `;
 
+test("an argument written as text where an object or a list is declared is read as the one it writes, as a number is: from a command line every argument is text", async (t) => {
+  const TAKES_THESE = { "opts?": "object: whatever is set", "list?": ["number"], "pair?": { a: "number", "b?": "string" }, "any?": "json", "word?": "string" };
+  const it = homeWith(t, { takes: { program: ECHOES, more: { description: "Takes an object, a list and a pair.", parameters: TAKES_THESE } } });
+  const given = async (args) => (await it.run("takes", { args })).result.result.args;
+  // The text of each is read as what it writes — and held as that: a pair to its fields, a list to its items.
+  assert.deepEqual(await given({ opts: '{"deep": {"n": [1, null]}, "s": "x"}', list: " [1, 2] ", pair: '{"a": 1, "c": true}' }), { opts: { deep: { n: [1, null] }, s: "x" }, list: [1, 2], pair: { a: 1 } });
+  // What is given as what it is, is that — and where any value is taken, or text, text is text: nothing is read out of it.
+  assert.deepEqual(await given({ opts: { k: 1 }, list: [], any: '{"a": 1}', word: "[1]" }), { opts: { k: 1 }, list: [], any: '{"a": 1}', word: "[1]" });
+  // Text that does not write the kind that is declared stays the text it is, and is refused as that.
+  for (const [args, why] of [
+    [{ opts: "not json" }, /takes — opts: expected an object, got string\./],
+    [{ opts: "[1]" }, /opts: expected an object, got string\./],
+    [{ opts: "null" }, /opts: expected an object, got string\./],
+    [{ opts: [1] }, /opts: expected an object, got a list\./],
+    [{ list: '{"a": 1}' }, /list: expected a list, got string\./],
+    [{ list: '["one"]' }, /list\[0\]: expected number, got string\./],
+    [{ pair: "[]" }, /pair: expected an object, got string\./],
+    [{ pair: '{"b": "x"}' }, /missing key: pair\.a/],
+    // (Each argument is read by itself: one that writes nothing does not keep the next from being read, and held — here, found wanting.)
+    [{ pair: "nope", list: '["one"]' }, /takes — list\[0\]: expected number, got string\./],
+  ]) await assert.rejects(it.run("takes", { args }), why, JSON.stringify(args));
+  // To whoever chooses the project it is told as an object: by its kind.
+  const said = await withEnv({ HOME: it.fakeHome }, () => describeProject("takes"));
+  assert.deepEqual(said.schema.parameters.properties.opts, { type: "object", description: "whatever is set" });
+});
+
 test("what a run gives is held to what its project says it gives: the declared fields and no others — and a result that does not fit fails the call, so a run that ends there has failed", async (t) => {
   const returns = { said: "string", "times?": "number", lines: [{ n: "number" }] };
   const it = homeWith(t, { gives: { program: GIVES, more: { returns } }, word: { program: GIVES, more: { returns: "string" } }, free: { program: GIVES } });

@@ -97,6 +97,10 @@ const why = (err: unknown): string => {
  *
  * An argument written as text where a number or a boolean is declared is
  * read as the one it writes: from a command line every argument is text.
+ * So where an object or a list is declared — by its fields, by its items,
+ * or as an object whatever its fields: text that is the JSON of one is read
+ * as it. (Text that writes nothing of the kind stays the text it is, and is
+ * refused as that; and where text or any value is declared, text is text.)
  *
  * `asked`: the arguments as they were asked — those left out among them —
  * with what was held in the place of what it was held from: what a checker
@@ -115,6 +119,12 @@ export function fitted(projectDir: string, args?: Record<string, unknown>, meta:
     if (typeof value !== "string") continue;
     if (field[1] === "number" && value.trim() !== "" && Number.isFinite(Number(value))) read[name] = Number(value);
     if (field[1] === "boolean" && (value === "true" || value === "false")) read[name] = value === "true";
+    if (field[1] === "object" || typeof field[1] !== "string") {
+      const list = typeof field[1] !== "string" && "items" in field[1];
+      let written: unknown;
+      try { written = JSON.parse(value); } catch { continue; }
+      if (list ? Array.isArray(written) : isJsonObject(written)) read[name] = written;
+    }
   }
   try {
     const held = conform(read, parameters.shape) as Record<string, unknown>;

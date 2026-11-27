@@ -3,9 +3,15 @@
 // a word, an object by its fields, a list by the shape of its items — read
 // once into a shape, which a value is then held to.
 //
-// Two words beside those. A field that may be absent is written with a "?" at
-// the end of its name: { "model?": "string" } — its name is `model`. And
-// "json" is any value: what is there is held as it is.
+// Three words beside those. A field that may be absent is written with a "?"
+// at the end of its name: { "model?": "string" } — its name is `model`. "json"
+// is any value: what is there is held as it is. And "object" is an object,
+// whatever its fields: so is it told to a model, by its kind — where of any
+// value no kind is told at all, and a model given no kind for what is to be
+// an object writes the text of one as often as not.
+//
+// These are JSON's kinds, and the notation says no more than a kind: nothing
+// that narrows a value within one (not which words, not how large a number).
 
 import { isJsonObject } from "./serializable.js";
 
@@ -14,13 +20,15 @@ type SchemaPrimitive = (typeof PRIMITIVES)[number];
 const isPrimitive = (named: string): named is SchemaPrimitive => (PRIMITIVES as readonly string[]).includes(named);
 /** Any value at all: nothing is asked of it but that it be there. */
 const ANY = "json";
+/** An object, whatever its fields: none of them is declared, so all of them are what it is. */
+const OBJECT = "object";
 
 /**
  * What a schema says a value is to be: a primitive by its name — or any
  * value — an object by its fields (and which of them may be absent), a list
  * by the one shape all its items have.
  */
-export type Shape = SchemaPrimitive | typeof ANY | { fields: Array<[string, Shape]>; mayBeAbsent: string[] } | { items: Shape };
+export type Shape = SchemaPrimitive | typeof ANY | typeof OBJECT | { fields: Array<[string, Shape]>; mayBeAbsent: string[] } | { items: Shape };
 
 /** A field as it is written: its name, and whether it may be absent — a "?" at the end of what it is written under says so. */
 const written = (key: string): { name: string; optional: boolean } =>
@@ -66,7 +74,7 @@ export function shapeOf(declared: unknown, where: Where = null): Shape {
   }
   // (Anything else says nothing that is supported — and is said back as JSON would write it, which is no word for a kind.)
   const named = typeof declared === "string" ? worded(declared).kind : JSON.stringify(declared);
-  if (named === ANY) return ANY;
+  if (named === ANY || named === OBJECT) return named;
   if (!isPrimitive(named)) {
     throw new Error(`Schema validation failed: unsupported schema type "${named}" for key "${where}" (${HOW_WRITTEN})`);
   }
@@ -76,7 +84,8 @@ export function shapeOf(declared: unknown, where: Where = null): Shape {
 /**
  * A schema as JSON Schema says it: every field there but those that may be
  * absent, and no other; what follows a ":" in a field's word describes it.
- * (Of any value no kind is said.)
+ * (Of any value no kind is said; of an object whatever its fields, that it
+ * is an object, and nothing of its fields.)
  */
 export function jsonSchemaOf(declared: unknown): Record<string, unknown> {
   if (Array.isArray(declared)) return { type: "array", items: jsonSchemaOf(declared[0]) };
@@ -137,6 +146,10 @@ const said = (value: unknown): string =>
 export function conform(value: unknown, shape: Shape, where: Where = null): unknown {
   const mismatch = (expected: string) => new Error(`Schema validation failed: ${where}: expected ${expected}, got ${said(value)}`);
   if (shape === ANY) return value;
+  if (shape === OBJECT) {
+    if (!isJsonObject(value)) throw mismatch("an object");
+    return value;
+  }
   if (typeof shape === "string") {
     if (typeof value !== shape || (shape === "number" && !Number.isFinite(value))) throw mismatch(shape);
     return value;

@@ -177,9 +177,13 @@ const mine: Tool[] = [
  * what it does is done by this run's runner — under the run's budget, on its
  * record — and what the runner refuses (a run that was given no way to make
  * projects; a change to the project that checks this run) is said to the
- * model as the runner says it. A run started from here works where the
- * harness works, and is not mended where it fails: the model is told how it
- * failed, and is the one to mend it.
+ * model as the runner says it. What a tool takes that is an object is
+ * declared as one ("object"): a model is then told its kind — where, told
+ * no kind, it wrote the text of an object in the object's place. (A program
+ * made here gives an object, as `ctx.done` hands one over: what else a
+ * project may say it gives, a list or a word, is not for these tools.) A run
+ * started from here works where the harness works, and is not mended where
+ * it fails: the model is told how it failed, and is the one to mend it.
  */
 async function programsAsTools(): Promise<Tool[]> {
   const runner = await import("@trama-dev/runtime/runner");
@@ -202,22 +206,6 @@ async function programsAsTools(): Promise<Tool[]> {
     return got.stdout;
   };
   const shape = (said: unknown) => (said === undefined ? "(it does not say)" : JSON.stringify(said));
-  /**
-   * What a model gave for a field that is to be an object. A field of any
-   * kind ("json") is declared to a model with no kind at all, and a model
-   * then writes an object as its JSON text as often as not: that text is
-   * taken for the object. What is neither is refused here, in words the
-   * model can go by.
-   */
-  const objectOf = (given: unknown, what: string): Record<string, unknown> | undefined => {
-    if (given === undefined || given === null) return undefined;
-    let is = given;
-    if (typeof given === "string") { try { is = JSON.parse(given); } catch { /* (Text that is no JSON: said below.) */ } }
-    if (is === null || typeof is !== "object" || Array.isArray(is)) {
-      throw new Error(`${what} is to be an object — {"name": value} — and is ${typeof given === "string" ? `the text ${JSON.stringify(given.length > 80 ? `${given.slice(0, 80)}…` : given)}` : JSON.stringify(given)}.`);
-    }
-    return is as Record<string, unknown>;
-  };
   /** What was said, of some things that may not have been. */
   const said = (given: Record<string, unknown>) => Object.fromEntries(Object.entries(given).filter(([, value]) => value !== undefined));
   return [
@@ -258,13 +246,12 @@ async function programsAsTools(): Promise<Tool[]> {
     {
       name: "run_program", description: "Run a program, where you work, and see what the run gave. A run that fails is not mended for you: you are told how it failed.",
       parameters: {
-        name: "string", "args?": "json: what the run is given — an object, by the names of what the program takes",
+        name: "string", "args?": "object: what the run is given, by the names of what the program takes",
         "version?": "number: a version of it, by its number — where it is not the program as it is that is to run",
         "check?": "string: a program that judges the run once it is done; its verdict comes with what the run gave",
         "seconds?": "number: how long its program may take, where that is more than a few minutes",
       },
-      run: async ({ name, version, check, seconds, ...more }) => {
-        const args = objectOf(more.args, "args");
+      run: async ({ name, args, version, check, seconds }) => {
         const dir = runner.resolveProject(name), { parameters } = await runner.describeProject(name);
         const takes = parameters === undefined ? undefined : Object.keys(parameters).map((key) => key.replace(/\?$/, ""));
         const leftOut = takes === undefined || args === undefined ? [] : Object.keys(args).filter((key) => !takes.includes(key));
@@ -281,12 +268,11 @@ async function programsAsTools(): Promise<Tool[]> {
       parameters: {
         name: "string: a name as a directory has one", description: "string: what it is for, in a sentence — whoever chooses among programs goes by it",
         file: "string: the program, in a file you wrote — its path, as your shell has it",
-        "parameters?": "json: what a run of it takes, written as program_guide says", "returns?": "json: what a run of it gives, written the same way",
-        "args?": "json: arguments of the project's own — what a run has where it gives none, and what the program is validated with: so whatever it requires",
+        "parameters?": "object: what a run of it takes, written as program_guide says", "returns?": "object: what a run of it gives, written the same way",
+        "args?": "object: arguments of the project's own — what a run has where it gives none, and what the program is validated with: so whatever it requires",
       },
-      run: async ({ name, description, file, ...more }) => {
-        const says = said({ parameters: objectOf(more.parameters, "parameters"), returns: objectOf(more.returns, "returns"), args: objectOf(more.args, "args") });
-        await runner.createProject(name, description, { program: await textIn(file), description, ...says });
+      run: async ({ name, description, file, parameters, returns, args }) => {
+        await runner.createProject(name, description, { program: await textIn(file), description, ...said({ parameters, returns, args }) });
         return `${name} is made, and is among the programs from here on: it is its version 1, and ran once to be validated, with the arguments it was made with.`;
       },
     },
@@ -294,10 +280,10 @@ async function programsAsTools(): Promise<Tool[]> {
       name: "add_version", description: "Put a program you wrote on record as a version more of a program that is there: it is run once to be validated, and kept beside the program — which stays what it is until you make the version the program (use_version).",
       parameters: {
         name: "string", file: "string: the program's text, in a file you wrote — its path, as your shell has it", "detail?": "string: what it was made for, in a few words",
-        "parameters?": "json: what this version takes, where that is to be other than the project says", "returns?": "json: what it gives, where that is to be other than the project says",
+        "parameters?": "object: what this version takes, where that is to be other than the project says", "returns?": "object: what it gives, where that is to be other than the project says",
       },
-      run: async ({ name, file, detail, ...more }) => {
-        const { version } = await runner.addVersion(name, await textIn(file), said({ detail, parameters: objectOf(more.parameters, "parameters"), returns: objectOf(more.returns, "returns") }));
+      run: async ({ name, file, detail, parameters, returns }) => {
+        const { version } = await runner.addVersion(name, await textIn(file), said({ detail, parameters, returns }));
         return `Version ${version} of ${name} is on record, beside its program: validated — it ran once, with the project's own arguments. Run it by its number (run_program with version ${version}); make it the program with use_version.`;
       },
     },

@@ -4,10 +4,10 @@
     "command?": "string: the command that says whether the work is good (npm test) — the checker's own, said in its meta.json",
     "seconds?": "number: how long the command may take (600) — the checker's own too",
     "result?": "json: what the run ended with — handed by the runner to whoever checks a run, as all that follows is",
-    "args?": "json: what the run was asked with",
+    "args?": "object: what the run was asked with",
     "journal?": "string: the path of the run's record",
     "run?": "string: the run's id",
-    "used?": "json: what the run had used of a model when its check began: { calls, tokens, cost }",
+    "used?": "object: what the run had used of a model when its check began: { calls, tokens, cost }",
     "workspace?": "string: where the run worked, where that was not its project"
   },
   "returns": {

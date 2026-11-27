@@ -150,32 +150,32 @@ test("asked to, the harness hands its model the user's programs: to list, look a
   assert.deepEqual([...new Set(runs.map((request) => request.maxRepairAttempts))], [0]);
 });
 
-test("what a model gives as JSON text, for a field that is an object, is taken for the object: a model told no kind for a field writes it so", async (t) => {
-  // (As a model did, the first time one had these tools — 2026-11-26: every object it gave was text, and every one was refused.)
-  const BOTH = COUNTS.replace("{ words:", "{ letters: text.replace(/ /g, \"\").length, words:");
+test("what a tool of the programs' takes as an object is declared as one — a model is told its kind — and what is given for it and is none is said so, in words to try again by", async (t) => {
+  // (The first model to have these tools — 2026-11-26 — was told no kind for these fields, and wrote every object as
+  // its JSON text: eighteen times of eighteen. A field that is an object says so now.)
   const script = [
     { name: "write", args: { path: "count.ts", content: COUNTS } },
-    { name: "make_program", args: { name: "wordcount", description: "Counts the words of a text.", file: "count.ts", parameters: '{"text": "string: the text"}', returns: '{"words": "number"}', args: '{"text": "one two three"}' } },
-    { name: "run_program", args: { name: "wordcount", args: '{"text": "the heron waits at low tide"}' } },
-    { name: "write", args: { path: "both.ts", content: BOTH } },
-    { name: "add_version", args: { name: "wordcount", file: "both.ts", returns: '{"words": "number", "letters": "number"}' } },
-    { name: "run_program", args: { name: "wordcount", version: 2, args: '{"text": "low tide"}' } },
-    { name: "run_program", args: { name: "wordcount", args: "the heron" } },             // text that is no object: said, in words a model can go by
-    { name: "make_program", args: { name: "other", description: "p", file: "count.ts", parameters: "text and words" } },
+    { name: "run_program", args: { name: "greet", args: '{"name": "Ada"}' } },
+    { name: "make_program", args: { name: "wordcount", description: "Counts.", file: "count.ts", parameters: '{"text": "string"}' } },
+    { name: "add_version", args: { name: "greet", file: "count.ts", returns: ["words"] } },
+    { name: "make_program", args: { name: "wordcount", description: "Counts the words of a text.", file: "count.ts", parameters: { text: "string: the text" }, returns: { words: "number" }, args: { text: "one two three" } } },
     { name: "finish", args: { summary: "made it" } },
   ];
   const it = await scene(t, (_request, n) => script[n - 1] ?? "there is nothing more in the script");
   const ran = await it.run({ programs: true });
   assert.equal(ran.status, "done", ran.reason);
+  const declared = Object.fromEntries(it.requests[0].tools.map((tool) => [tool.function.name, tool.function.parameters.properties]));
+  assert.deepEqual(
+    [declared.run_program.args.type, declared.make_program.parameters.type, declared.make_program.returns.type, declared.make_program.args.type, declared.add_version.parameters.type, declared.add_version.returns.type],
+    ["object", "object", "object", "object", "object", "object"]);
   const said = saidByTools(it.requests.at(-1));
-  assert.match(said[1], /^wordcount is made/);
-  assert.equal(said[2], 'The run is done. It gave: {"words":6}');
-  assert.match(said[4], /^Version 2 of wordcount is on record/);
-  assert.equal(said[5], 'The run is done. It gave: {"words":2,"letters":7}');
-  assert.equal(said[6], 'args is to be an object — {"name": value} — and is the text "the heron".');
-  assert.equal(said[7], 'parameters is to be an object — {"name": value} — and is the text "text and words".');
+  assert.equal(said[1], "Schema validation failed: args: expected an object, got string");
+  assert.equal(said[2], "Schema validation failed: parameters: expected an object, got string");
+  assert.equal(said[3], "Schema validation failed: returns: expected an object, got a list");
+  assert.match(said[4], /^wordcount is made/);
   const made = readJson(join(it.at("wordcount"), "meta.json"));
-  assert.deepEqual([made.parameters, made.returns, made.input.args, existsSync(it.at("other"))], [{ text: "string: the text" }, { words: "number" }, { text: "one two three" }, false]);
+  assert.deepEqual([made.parameters, made.returns, made.input.args], [{ text: "string: the text" }, { words: "number" }, { text: "one two three" }]);
+  assert.deepEqual((await it.history("greet")).versions.length, 0);
 });
 
 test("not asked to, the harness is as it was: the tools it had, and nothing said of programs", async (t) => {
