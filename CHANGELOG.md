@@ -1,8 +1,8 @@
 # Changelog
 
-All three packages (`@trama-dev/runtime`, `@trama-dev/session`, `@trama-dev/cli`) are released together under one version.
+Both packages (`@trama-dev/runtime`, `@trama-dev/cli`) are released together under one version. (Through 0.8.0 there was a third with them, `@trama-dev/session`: see what 0.9.0 removed.)
 
-## Unreleased
+## 0.9.0 — 2026-11-26
 
 ### Added
 
