@@ -22,7 +22,7 @@ import { createAgent, stripCodeFences } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace, type WorkspaceWithAgents } from "./workspace.js";
 import { guardPath, identityOf, projectAt, realRootOf, sameProjectAs, wayTo } from "./path-guard.js";
-import { ITSELF, copyTree, differences, entryAt, pathAsListed, readTree, type Tree } from "./tree.js";
+import { ITSELF, copyTree, differences, entryAt, pathAsListed, readTree, thingOf, type Thing, type Tree } from "./tree.js";
 import { mergeTree, type Unmerged } from "./merge.js";
 import { stageFile, stageFileInProject, type StagedFile } from "./replace-file.js";
 import { checkedEnv, createAllowance, superviseChild, type ChildExit } from "./child-process.js";
@@ -177,10 +177,7 @@ function metaHeld(copy: string): { read(): string | null; putBack(): boolean; ho
  * file — each by what it is (see Entry), which is asked of the place,
  * whatever its directory lists or allows.
  */
-const programParts = (dir: string): string[] => wayTo(dir, "program.ts").flatMap((place) => {
-  const entry = entryAt(place);
-  return entry && entry.kind !== "other" ? [entry.id] : [];
-});
+const programParts = (dir: string): Thing[] => wayTo(dir, "program.ts").flatMap((place) => thingOf(entryAt(place)) ?? []);
 
 /**
  * Have what is beside a project be beside a copy of it: for each name in the
@@ -822,7 +819,7 @@ interface Staged {
    * project's program in the project — as it is and as the copy listed it,
    * and what the file allowed.
    */
-  program: { parts: string[]; place: string; listed: string | undefined; allowed: number };
+  program: { parts: Thing[]; place: string; listed: string | undefined; allowed: number };
   /** The program that is to be tried, as the copy has it when the trial begins (see fixIn). */
   fix: FixInPlace;
   /** The paths, beside the program's own place, at which the copy is other than it was once the agent has worked in it and its fix is in place. */
@@ -834,7 +831,7 @@ interface Staged {
  * name its directory lists for program.ts, what the file allows, and all
  * that makes program.ts lead to it (see programParts).
  */
-interface FixInPlace { root: string; name: string; allowed: number; parts: string[] }
+interface FixInPlace { root: string; name: string; allowed: number; parts: Thing[] }
 function fixIn(copy: string): FixInPlace {
   const root = realRootOf(copy);
   return {
@@ -1054,7 +1051,7 @@ async function tryFix(options: ExecuteOptions, staged: Staged, fixed: string, at
   // back where the run ended (the name itself, not what the link leads to).
   // A run that left something there that cannot be read as a program has
   // not left a project that has one, and was no fix.
-  let is: string[];
+  let is: Thing[];
   try {
     if (statSync(join(copyRoot, itsName), { throwIfNoEntry: false })) {
       programIn(stagedProject);
@@ -1097,7 +1094,7 @@ async function tryFix(options: ExecuteOptions, staged: Staged, fixed: string, at
   // (What it was before the agent worked is named too: that is the file the reading the merge compares with has
   // at the program's place, and by it that place is known for a part where the run removed what was there.)
   const unmerged = [
-    ...mergeTree(stagedProject, projectDir, before, held, [[...new Set([...staged.program.parts, ...was, ...is])]]),
+    ...mergeTree(stagedProject, projectDir, before, held, [[...staged.program.parts, ...was, ...is]]),
     // (Of a program that is only being validated nothing is told here: the copy it is validated in goes, with all of this.)
     ...(options.validating ? [] : strandedBeside(stagedProject, staged.beside)),
   ];

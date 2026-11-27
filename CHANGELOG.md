@@ -2,6 +2,16 @@
 
 Both packages (`@trama-dev/runtime`, `@trama-dev/cli`) are released together under one version. (Through 0.8.0 there was a third with them, `@trama-dev/session`: see what 0.9.0 removed.)
 
+## Unreleased
+
+### Fixed
+
+- **What a fix's run made is no longer taken for something it removed, where the file system gives a number again.** The merge that carries a fix's work from its copy into the project knows a file, a directory or a link by the system's numbers for it — and ext4 gives a number again as soon as it is free, to what is made next. A file the run made after it removed another was then that other one, to the merge: moved, so that what the run removed stayed in the project where what it made did not arrive; or, where the run had removed its program's file, a part of the program, and held back with it (a file the run wrote did not reach the project: seen now and then on Linux with other processes at work on the same file system, never on macOS, where APFS does not give a number again). The two readings of the copy, before the run and after it, now tell such things apart by when each was born: what has the number of something the first reading had, and was born later, is another thing. Only where the system is seen to tell a birth from a change — where it says nothing of births, or gives the time of the last change for one (a `statx` that is refused), everything is as it was. What a thing is anywhere else — a project's directory, a journal — is its numbers, as before.
+
+### Changed
+
+- The READMEs of the two packages say what trama is now: programs that are kept, checked and gone back from, the programs that come with it, every command — and no longer a session layer, or six commands.
+
 ## 0.9.0 — 2026-11-26
 
 ### Added

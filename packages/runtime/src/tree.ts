@@ -19,16 +19,19 @@ import { identityIn, identityOf, linksOf, linkText, realRootOf, utf8Text } from 
 /**
  * What is at one path. `id` says which file, directory or link it is: it
  * stays the same through being written to, renamed, or given other
- * permissions, and nothing else has it. (It is the system's numbers for it —
- * its device's, and its own on that — and a file system may give a number
- * again once what had it is gone: what was removed can so be taken for what
- * was made after it.)
+ * permissions, and nothing else has it while the thing is there. (It is the
+ * system's numbers for it — its device's, and its own on that — and a file
+ * system may give a number again once what had it is gone. Two readings of
+ * a directory tell such things apart by when each was born: see `toldApart`.)
+ * `born` is when the system says the thing came to be — 0 where it does not
+ * say — and `changed` when it was last changed, in what it holds or in what
+ * it allows.
  */
 export type Entry =
   /** `stamp` is different after any change to the file — to what it holds or to what it allows — and cannot be set by a program. */
-  | { kind: "file"; mode: number; size: number; stamp: string; id: string }
-  | { kind: "dir"; mode: number; id: string }
-  | { kind: "link"; text: string; id: string }
+  | { kind: "file"; mode: number; size: number; stamp: string; id: string; born: bigint; changed: bigint }
+  | { kind: "dir"; mode: number; id: string; born: bigint; changed: bigint }
+  | { kind: "link"; text: string; id: string; born: bigint; changed: bigint }
   /** A pipe, a socket, a device, a link that says nothing a path can be made of: one end of something else, not content. */
   | { kind: "other" };
 
@@ -54,13 +57,13 @@ export function entryAt(path: string): Entry | undefined {
     const stat = lstatSync(path, { bigint: true, throwIfNoEntry: false });
     if (!stat) return undefined;
     const mode = Number(stat.mode & 0o7777n);
-    const id = identityIn(stat);
+    const id = identityIn(stat), born = stat.birthtimeNs, changed = stat.ctimeNs;
     if (stat.isFile()) {
       // The time of the last change is the system's own: it moves when the file is written, replaced, or
       // has its permissions changed, and no program can put it back. (The time of the last write can be.)
-      return { kind: "file", mode, size: Number(stat.size), stamp: `${id}:${stat.ctimeNs}:${stat.size}`, id };
+      return { kind: "file", mode, size: Number(stat.size), stamp: `${id}:${changed}:${stat.size}`, id, born, changed };
     }
-    if (stat.isDirectory()) return { kind: "dir", mode, id };
+    if (stat.isDirectory()) return { kind: "dir", mode, id, born, changed };
     if (!stat.isSymbolicLink()) return NOT_CONTENT;
     let text;
     try {
@@ -72,7 +75,7 @@ export function entryAt(path: string): Entry | undefined {
       if ((code === "ENOENT" || code === "EINVAL") && looked < LOOKS) continue;
       throw err;
     }
-    return text === undefined ? NOT_CONTENT : { kind: "link", text, id };
+    return text === undefined ? NOT_CONTENT : { kind: "link", text, id, born, changed };
   }
 }
 
@@ -98,6 +101,73 @@ export function same(a: Entry | undefined, b: Entry | undefined): boolean {
   if (a.kind === "dir" && b.kind === "dir") return a.mode === b.mode;
   if (a.kind === "link" && b.kind === "link") return a.text === b.text;
   return false;
+}
+
+/**
+ * Which thing something is, as whoever names it to the reader of a directory
+ * says it — of a look of their own at it, between two readings: its number,
+ * and when it was born (see `toldApart`).
+ */
+export interface Thing { id: string; born: bigint }
+
+/** An entry as the thing it is — undefined of what is none. */
+export const thingOf = (entry: Entry | undefined): Thing | undefined => (entry === undefined || entry.kind === "other" ? undefined : { id: entry.id, born: entry.born });
+
+/**
+ * The second of two readings of one directory, with what has a number of
+ * the first's and is another thing than had it there told apart from that:
+ * under an id of its own.
+ *
+ * A file system may give a number again as soon as what had it is gone
+ * (ext4 does: to what is made next). By its number, what a run made after
+ * it removed something is then the thing it removed — moved, to whoever
+ * compares the readings, and a part of whatever that was a part of. It is
+ * not that thing if it was born after it: a thing is born once.
+ *
+ * Only a later birth says so. An earlier one does not: there are systems
+ * where a thing's birth is moved back (macOS, where its time of writing is
+ * set to before it), and none was found where it moves on. And a birth is
+ * gone by only where the readings show that the system tells a birth from a
+ * change: where something in them was changed at another time than it was
+ * born. Where nothing was, it may be the time of the last change that is
+ * given for a birth (as Node gives it on Linux where the call that says
+ * births is refused) — by which all that a run wrote to would be another
+ * thing than it was. And where a run removed something, the directory that
+ * was in was changed after it was born: a system that tells the two shows
+ * it there. Without that, the reading is as it was read, by numbers. (So
+ * it is where the system says nothing of births: each is 0, and none later
+ * than another.)
+ *
+ * `idOf` is the id, in the two readings, of a thing as somebody names it
+ * who looked at it in between (see Thing): of what the first reading had,
+ * of what the second has — or undefined, of what is in neither: it came
+ * and went between them, its number given on.
+ */
+export function toldApart(before: Tree, after: Tree): { after: Tree; idOf(thing: Thing): string | undefined } {
+  const births = [...before.values(), ...after.values()].some((entry) => entry.kind !== "other" && entry.born !== entry.changed);
+  /** When what has each number in a reading was born. (A file with several names is one thing, born once.) */
+  const bornIn = (tree: Tree) => {
+    const born = new Map<string, bigint>();
+    for (const entry of tree.values()) if (entry.kind !== "other") born.set(entry.id, entry.born);
+    return born;
+  };
+  const was = bornIn(before), is = bornIn(after);
+  const another = (id: string) => {
+    const then = was.get(id), now = is.get(id);
+    return births && then !== undefined && now !== undefined && now > then;
+  };
+  const anew = (id: string) => `${id}, born ${is.get(id)}`;
+  const apart: Tree = new Map();
+  for (const [path, entry] of after) apart.set(path, entry.kind !== "other" && another(entry.id) ? { ...entry, id: anew(entry.id) } : entry);
+  return {
+    after: apart,
+    idOf: ({ id, born }) => {
+      const then = was.get(id), now = is.get(id);
+      if (!births || (then !== undefined && born <= then)) return id;
+      if (now !== undefined && now <= born) return another(id) ? anew(id) : id;
+      return undefined;
+    },
+  };
 }
 
 /** The paths at which two readings of a directory differ, a path before every path under it. */

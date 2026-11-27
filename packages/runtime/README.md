@@ -2,11 +2,11 @@
 
 > Agents don't need frameworks. They need a runtime.
 
-The runtime behind [trama](https://github.com/NaNhkNaN/trama) — execution, state persistence, auto-repair, and version history for agent-authored programs.
+The runtime of [trama](https://github.com/NaNhkNaN/trama): what runs an agent's programs, and what a program imports. The command line is [`@trama-dev/cli`](https://www.npmjs.com/package/@trama-dev/cli).
 
 ## Two surfaces
 
-**Client** — what trama programs import. Four objects: `ctx`, `agent`, `tools`, and — inside a session — `workspace`.
+**What a program imports** — `@trama-dev/runtime`:
 
 ```typescript
 import { ctx, agent, tools } from "@trama-dev/runtime";
@@ -14,31 +14,44 @@ import { ctx, agent, tools } from "@trama-dev/runtime";
 const data = await tools.read("input.csv");
 const report = await agent.instruct(`Analyze this:\n${data}`);
 await tools.write("report.md", report);
-await ctx.done();
+await ctx.done({ words: report.split(/\s+/).length });
 ```
 
-`ctx` manages lifecycle and persistent state. `agent` makes LLM calls (including autonomous tool use via pi-coding-agent). `tools` handles file I/O, shell commands, and HTTP requests. `workspace` reads, writes and observes artifacts shared between the programs of a session.
+- `ctx` is the run: its arguments (`ctx.input.args`), a state that is kept from one run to the next (`ctx.state`, `checkpoint`), how it ends (`done` with a result, or `yield`), `log`, `ready`.
+- `agent` is a model. `instruct` and `generate` have pi's agent do a piece of work, with the model, the thinking and the tools the call names — functions of the program's own among them. `complete` is one request to a model and one reply: a program that loops on it is a harness of its own.
+- `tools` is the project's directory and the world: `read`, `write`, `shell`, `fetch` — and `agent`, which hands a task to an agent from outside, over ACP.
+- `workspace` is a directory the run is given to work in beside its project — a codebase, or what several runs share: `read`, `write`, `list`, `observe`, `shell`, `agent`.
 
-**Runner** — what the CLI and programmatic callers use to create and execute programs.
+`trama api` prints the whole of it, with what each call takes and gives.
+
+**What runs programs** — `@trama-dev/runtime/runner`:
 
 ```typescript
-import { createProject, runProgram, updateProject } from "@trama-dev/runtime/runner";
+import { runProgram, resolveProject } from "@trama-dev/runtime/runner";
+
+const result = await runProgram({
+  projectDir: resolveProject("my-harness"),
+  workspaceDir: "/path/to/code",
+  args: { task: "make the failing test pass" },
+  budget: { cost: 2 },
+  checkWith: "check-by-command",
+});
 ```
 
-## What the runtime provides
+Beside it: `createProject`, `updateProject`, `addVersion`, `rollbackProject`, `readHistory`, `describeProjects`, `replayProgram`, `createWorkspace`. A program may import these too. Its calls are then carried out by the runner of its own run: under that run's budget, and on its record.
 
-The runtime is what makes agent programs **self-contained and shareable**:
+## What the runtime does
 
-- **Execution** — child process spawning, streaming output, timeout management, watchdog-backed background process cleanup.
-- **IPC bridge** — a local HTTP server that every `ctx`, `agent`, `tools`, `workspace`, and nested run call goes through: one point where a single runner validates each request, records the tree of runs, and cancels work in flight when a run ends.
-- **Run journal** — an append-only per-run record (`logs/journal/*.jsonl`, viewable via `trama journal`) of every bridge call, attempt, repair, and exit.
-- **State persistence** — `ctx.state` survives across runs. Programs can be long-running, interruptible, and resumable.
-- **Auto-repair** — on crash, the runtime gets an LLM fix and tries it on a private copy of the project, installing it only if it works. Up to 3 attempts.
-- **Version history** — every create, update, and repair saves a snapshot to `history/`.
-- **Scaffolding** — package.json, module symlinks, gitignore, logs. `git clone && trama run` just works.
+It gives mechanisms, and decides for no use of them.
 
-## Self-orchestration
+- **A run.** A program is a process of its own. Every call it makes on `ctx`, `agent`, `tools` and `workspace`, and every run it asks for, crosses one bridge to the one runner, which carries it out.
+- **A record.** Each call, with what it was asked and what it answered, is in the run's journal (`logs/journal/`, `trama journal`). A recorded run can be replayed: the program is run again and its calls are answered from the record.
+- **A budget.** A run is held to a cost, a number of tokens or a number of calls to a model — and so is everything it starts.
+- **A contract.** A project says what a run of it takes and gives (`description`, `parameters`, `returns` in its `meta.json`). Arguments and results are held to it, and it is what another program, or an agent, chooses the project by.
+- **A check.** A project can judge the work of a run (`checkWith`): in a copy, out of the reach of the program it judges.
+- **Versions.** Every program a project has had is in its `history/`, with the contract it was made under and how its runs went. A version can be run as it was, kept beside the program without being installed, and gone back to.
+- **Repair.** A program that crashes is fixed, the fix tried in a copy of the project, and installed only if it works.
 
-trama programs can coordinate other trama programs — through `@trama-dev/session` (carried over the parent runner's bridge with a shared workspace and structured lifecycle) or through `tools.shell("trama ...")` for standalone CLI invocations. The generated program becomes the orchestrator — decomposing tasks, spawning sub-programs, and synthesizing results. No orchestration framework needed. trama is the scheduler.
+What has a policy is a program, and can be another: who fixes (`repairWith`), who writes (`createWith`, `updateWith`), who judges (`checkWith`), the harness a model works in, the loop that improves a program. One of each comes with the command line: `trama examples`.
 
-See the [main README](https://github.com/NaNhkNaN/trama) for examples, the full API reference, and design philosophy.
+Node 22.19 or later, on macOS or Linux. Models are asked through [pi](https://github.com/earendil-works/pi).

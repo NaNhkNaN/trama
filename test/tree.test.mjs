@@ -2023,7 +2023,7 @@ test("a copy allows what the directory allows, and a tree says what that is", { 
     chmodSync(real, mode);
     const held = copyTree(real, copy);
     assert.equal(allowedBy(copy), mode);
-    assert.deepEqual({ ...held.get("."), id: undefined }, { kind: "dir", mode, id: undefined });
+    assert.deepEqual({ ...held.get("."), id: undefined, born: undefined, changed: undefined }, { kind: "dir", mode, id: undefined, born: undefined, changed: undefined });
     assert.equal(readTree(copy).get(".").mode, mode);
     assert.equal(readFileSync(join(copy, "f"), "utf-8"), "F");
   }
@@ -2145,7 +2145,7 @@ test("a directory somebody gave other permissions meanwhile is theirs — the di
  * then, and again when what is returned is called, of what is there now.
  */
 const oneThing = (copy, paths) => {
-  const whatIs = () => paths.flatMap((path) => identityOf(join(copy, path)) ?? []);
+  const whatIs = () => paths.flatMap((path) => tree.thingOf(entryAt(join(copy, path))) ?? []);
   const was = whatIs();
   return () => [[...was, ...whatIs()]];
 };
@@ -2427,7 +2427,7 @@ test("a chain of things, each one thing with the next through a directory, is fo
   for (let n = 0; n < links; n++) chmodSync(join(real, `d${n}`), 0o755);
   const held = tree.copyTree(real, copy);
   const before = tree.readTree(copy);
-  const what = (path) => identityOf(join(copy, path));
+  const what = (path) => tree.thingOf(entryAt(join(copy, path)));
   const things = [[what("x"), what("d0")]];
   for (let n = 1; n < links; n++) things.push([what(`d${n - 1}`), what(`d${n}`)]);
   writeFileSync(join(copy, "x"), "NEW");
@@ -2459,7 +2459,7 @@ test("a path under one that is told of is told of all the same where there is mo
   const held = copyTree(real, copy);
   const before = readTree(copy);
   mkdirSync(join(copy, "b")); writeFileSync(join(copy, "b", "a"), "NEW"); writeFileSync(join(copy, "z"), "NEW");
-  const what = (path) => identityOf(join(copy, path));
+  const what = (path) => tree.thingOf(entryAt(join(copy, path)));
   // The system will not have the last part made — nor, then, the file that was put before it taken away again.
   const unmerged = withTheSystemRefusing(
     (call, place) => (call === "copyFileSync" && place === join(real, "z")) || (call === "unlinkSync" && place === join(real, "b", "a")),
@@ -2475,7 +2475,7 @@ test("where things that did not arrive for different reasons have a path and its
   const held = copyTree(real, copy);
   const before = readTree(copy);
   mkdirSync(join(copy, "b")); writeFileSync(join(copy, "b", "a"), "NEW"); writeFileSync(join(copy, "x"), "NEW"); writeFileSync(join(copy, "y"), "NEW");
-  const what = (path) => identityOf(join(copy, path));
+  const what = (path) => tree.thingOf(entryAt(join(copy, path)));
   // The file is one thing with x, its directory with y: each thing does not arrive for a part of its own.
   const things = [[what("x"), what("b/a")], [what("y"), what("b")]];
   writeFileSync(join(real, "x"), "THEIRS"); writeFileSync(join(real, "y"), "THEIRS");
@@ -2495,7 +2495,7 @@ test("where two things that did not arrive have a path and its directory between
     const held = copyTree(real, copy);
     const before = readTree(copy);
     mkdirSync(join(copy, "b")); writeFileSync(join(copy, "b", "a"), "NEW"); writeFileSync(join(copy, "x"), "NEW");
-    const what = (path) => identityOf(join(copy, path));
+    const what = (path) => tree.thingOf(entryAt(join(copy, path)));
     const things = [[what("x"), what("b/a")], [what("x"), what("b"), what("b/a")]];
     writeFileSync(join(real, "x"), "THEIRS");
     const unmerged = mergeTree(copy, real, before, held, order ? things.reverse() : things);
@@ -2894,3 +2894,79 @@ test("a copy on a file system that tells letters apart has each link lead where 
     assert.equal(readFileSync(join(copy, name), "utf-8"), content, name);
   }
 });
+
+// --- A number given again ---
+
+/**
+ * A file system may give a thing's number again once the thing is gone: ext4
+ * does as soon as the number is free — what is made next in the directory has
+ * it — and APFS and btrfs never do. Here it is made out to have done so,
+ * wherever the tests run: the reading before the run is told that what it
+ * had at a path had the number of something the run then made. (When it was
+ * born is left as the system said it: before what the run made.)
+ */
+const givenAgain = (before, path, to) => {
+  const was = before.get(path);
+  before.set(path, { ...was, id: to.id, ...(was.kind === "file" && { stamp: was.stamp.replace(was.id, to.id) }) });
+};
+
+test("what a run made is not what it removed, though the file system gave it that one's number: what was removed goes, whatever becomes of what was made", (t) => {
+  const real = scratch(t), copy = scratch(t);
+  writeFileSync(join(real, "old.txt"), "what old.txt held"); writeFileSync(join(real, "kept.txt"), "K");
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  rmSync(join(copy, "old.txt")); mkdirSync(join(copy, "box")); writeFileSync(join(copy, "box", "new.txt"), "made by the run");
+  givenAgain(before, "old.txt", entryAt(join(copy, "box", "new.txt")));
+  writeFileSync(join(real, "box"), "THEIRS"); // meanwhile: what the run made cannot arrive
+  const unmerged = mergeTree(copy, real, before, held);
+  // (Taken for one thing, the two were a file the run had moved: and what is moved stays where it was if it does not arrive.)
+  assert.deepEqual(unmerged.filter((it) => /moved/.test(it.why)), []);
+  assert.deepEqual(unmerged.map((it) => it.path).filter((path) => !atOrUnder(path, "box")), []);
+  assert.deepEqual(describe(real), { "box": 'file 644 "THEIRS"', "kept.txt": 'file 644 "K"' });
+});
+
+test("what a run made is no part of a thing for having the number of a part the run removed: it arrives, where the thing does not", (t) => {
+  const real = scratch(t), copy = scratch(t);
+  writeFileSync(join(real, "main.ts"), "AS IT RAN"); writeFileSync(join(real, "old.txt"), "no part of anything");
+  const held = copyTree(real, copy);
+  const before = readTree(copy);
+  unlinkSync(join(copy, "main.ts")); writeFileSync(join(copy, "state.txt"), "written by the run"); unlinkSync(join(copy, "old.txt"));
+  mkdirSync(join(copy, "lib")); writeFileSync(join(copy, "lib", "main.ts"), "WHAT IT MADE OF ITSELF"); symlinkSync("lib/main.ts", join(copy, "main.ts"));
+  givenAgain(before, "main.ts", entryAt(join(copy, "state.txt")));
+  // And the other way about: a part the run made has the number of something it removed that is no part. That stays none.
+  givenAgain(before, "old.txt", entryAt(join(copy, "lib", "main.ts")));
+  // The thing, as its caller names it: what main.ts was, and what it and its way are now — each by what it is.
+  const asOne = [[before.get("main.ts"), ...["main.ts", "lib", "lib/main.ts"].map((path) => entryAt(join(copy, path)))].map(tree.thingOf)];
+  writeFileSync(join(real, "lib"), "THEIRS"); // meanwhile: what the link leads to cannot arrive
+  const unmerged = mergeTree(copy, real, before, held, asOne);
+  assert.deepEqual(unmerged.map((it) => it.path).sort(), ["lib", "main.ts"]);
+  assert.deepEqual(describe(real), { "lib": 'file 644 "THEIRS"', "main.ts": 'file 644 "AS IT RAN"', "state.txt": 'file 644 "written by the run"' });
+});
+
+test("two readings tell apart what has one number only by a birth that is later, and only where the system is seen to tell a birth from a change", () => {
+  const file = (id, born, changed = born) => ({ kind: "file", mode: 0o644, size: 1, stamp: `${id}:${changed}:1`, id, born, changed });
+  const dir = (id, born, changed) => ({ kind: "dir", mode: 0o755, id, born, changed });
+  const readings = (before, after) => tree.toldApart(new Map(Object.entries(before)), new Map(Object.entries(after)));
+  const N = "1:7";
+
+  // The directory was changed after it was born — the run removed and made in it — so births are told here.
+  const told = readings({ ".": dir("1:1", 10n, 20n), "old": file(N, 10n), "stays": file("1:8", 10n) }, { ".": dir("1:1", 10n, 90n), "new": file(N, 80n), "stays": file("1:8", 10n, 85n) });
+  const anew = told.after.get("new").id;
+  assert.notEqual(anew, N);
+  assert.deepEqual([told.after.get(".").id, told.after.get("stays").id, told.after.get("new").born], ["1:1", "1:8", 80n]);
+  // What a caller names by what it is, is what the first reading had, or what the second has — or something that
+  // was there in between and is in neither: made after the first reading, gone before the second, its number given on.
+  assert.deepEqual([{ id: N, born: 10n }, { id: N, born: 80n }, { id: N, born: 40n }, { id: "1:8", born: 10n }, { id: "9:9", born: 3n }].map(told.idOf), [N, anew, undefined, "1:8", undefined]);
+
+  // Moved, not made: born when what the first reading had was born.
+  assert.equal(readings({ ".": dir("1:1", 10n, 20n), "old": file(N, 10n) }, { ".": dir("1:1", 10n, 90n), "new": file(N, 10n, 80n) }).after.get("new").id, N);
+  // Born earlier than what the first reading had: a birth that was moved back (macOS does, where a file's time of writing is set to before it), not another thing.
+  assert.equal(readings({ ".": dir("1:1", 10n, 20n), "f": file(N, 10n) }, { ".": dir("1:1", 10n, 90n), "f": file(N, 2n, 80n) }).after.get("f").id, N);
+  // No birth is told from a change — where the system gives the time of the last change for it (a statx that is refused), every thing that
+  // was changed is "born later" — so none is gone by: and a caller's name is the number, as it always was.
+  const untold = readings({ ".": dir("1:1", 20n, 20n), "f": file(N, 10n) }, { ".": dir("1:1", 90n, 90n), "f": file(N, 80n) });
+  assert.deepEqual([untold.after.get("f").id, untold.idOf({ id: N, born: 40n })], [N, N]);
+  // Nor where the system says nothing of births at all.
+  assert.equal(readings({ ".": dir("1:1", 0n, 20n), "f": file(N, 0n, 10n) }, { ".": dir("1:1", 0n, 90n), "g": file(N, 0n, 80n) }).after.get("g").id, N);
+});
+

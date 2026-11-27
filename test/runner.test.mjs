@@ -2787,6 +2787,26 @@ fs.writeFileSync("state.txt", "written by the run");`)()).trimEnd();
   assert.match(again.reason, /EEXIST|ENOTDIR/);
 });
 
+test("what a fix's run made is not taken for the program it removed, where the file system gives the program's number to what is made next: it arrives, though what the run made of the program does not", async (t) => {
+  const projectDir = projectWith(BOOM);
+  // As the test above, but for the order: the run removes its program and makes state.txt next. Where a file
+  // system gives a number again as soon as it is free (ext4, to what is made next in the directory), state.txt
+  // has the number the program had; where it never does (APFS, btrfs) this is the test above.
+  const fix = (await fixThat(`fs.writeFileSync(${JSON.stringify(join(projectDir, "sub"))}, "THEIRS");
+fs.unlinkSync("program.ts"); fs.writeFileSync("state.txt", "written by the run");
+fs.mkdirSync("sub"); fs.writeFileSync("sub/main.ts", ${JSON.stringify(SELF)}); fs.symlinkSync("sub/main.ts", "program.ts");`)()).trimEnd();
+  const originalRepair = llm.repair;
+  llm.repair = async () => fix;
+  t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
+
+  const { result, messages } = await captureConsole("warn", () => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 20_000 }));
+  assert.equal(result.status, "done");
+  assert.deepEqual(shapeOf(projectDir, ["program.ts", "sub", "state.txt"]), {
+    "program.ts": `file 600 ${JSON.stringify(fix)}`, "sub": 'file 644 "THEIRS"', "state.txt": 'file 644 "written by the run"',
+  });
+  assert.ok(messages.some(line => /program\.ts — it is one thing with sub(\/main\.ts)?, which did not arrive/.test(line)), messages.join("\n"));
+});
+
 test("a fix that removes what its program.ts led to, where the file put in the link's place does not arrive: what the link leads to stays", async (t) => {
   const projectDir = projectWith(BOOM, { linked: true });
   const link = JSON.stringify(join(projectDir, "program.ts"));

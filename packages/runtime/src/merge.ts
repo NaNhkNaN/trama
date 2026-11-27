@@ -14,7 +14,7 @@
 import { chmodSync } from "fs";
 import { realRootOf } from "./path-guard.js";
 import { messageOf } from "./errors.js";
-import { ITSELF, entryAt, walk, type Tree } from "./tree.js";
+import { ITSELF, entryAt, toldApart, walk, type Thing, type Tree } from "./tree.js";
 import { changesOf, leftBy, opening, telling, type Given } from "./merge-shared.js";
 import { deedsOf } from "./merge-deeds.js";
 import { followingUp } from "./merge-settle.js";
@@ -31,7 +31,7 @@ export interface Unmerged { path: string; why: string }
  * @param before - the copy as it was before the run (readTree)
  * @param seed - the real directory as it was when the copy was made (copyTree)
  * @param together - things that are one thing to the caller: each list the
- *   `id`s (see Entry) of the files, links and directories that are one
+ *   files, links and directories (each as what it is: see Thing) that are one
  *
  * What the run did is where the copy differs from what it was: a file, a
  * directory or a link made, removed, changed, or put where something of
@@ -56,8 +56,10 @@ export interface Unmerged { path: string; why: string }
  * directory stays whole. What the run moved — a file, a link, a directory —
  * goes from where it was only if it arrives where the run moved it: what it
  * holds is not to be in neither place. (What was moved is known by its `id`,
- * see Entry. What the run copied and then removed is a new file, and is not
- * known to be the old one's.) And what the caller says is one thing — a
+ * see Entry — and what the run made is not taken for what it removed, where
+ * the file system gave it that one's number: see `toldApart`. What the run
+ * copied and then removed is a new file, and is not known to be the old
+ * one's.) And what the caller says is one thing — a
  * link, say, with the file that makes it lead somewhere: the things in one
  * list of `together`, each known by what it is, at every path where the copy
  * had it before the run or has it now — arrives together or not at all: if
@@ -166,10 +168,10 @@ export interface Unmerged { path: string; why: string }
  * off as one whose work did. Under a path that did not arrive, what was not
  * looked at for that reason is not listed: it is as it was, with the path.
  */
-export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed: Tree, together: string[][] = []): Unmerged[] {
+export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed: Tree, together: Thing[][] = []): Unmerged[] {
   let copy: string;
   let real: string;
-  const after: Tree = new Map();
+  const read: Tree = new Map();
   try {
     real = realRootOf(realDir);
     // The directory is the one that was copied — which the seed knows by what it is. Where it is gone, or another
@@ -185,15 +187,18 @@ export function mergeTree(stagedDir: string, realDir: string, before: Tree, seed
   try {
     copy = realRootOf(stagedDir);
     walk(copy, (path, entry, at) => {
-      after.set(path, entry); // as the run left it
+      read.set(path, entry); // as the run left it
       if (entry.kind === "dir" && (entry.mode & 0o500) !== 0o500) chmodSync(at, entry.mode | 0o500);
     });
   } catch (err) {
     // What the run left cannot be told. Nothing is merged — least of all as a removal of what cannot be seen.
     return [{ path: ITSELF, why: `what the run left could not be read (${messageOf(err)}); none of it was merged` }];
   }
+  // What the run left, with what it made told from what it removed where the two have one number — in the
+  // reading, and in what the caller names: everything below goes by the ids of that.
+  const { after, idOf } = toldApart(before, read);
   const given: Given = { copy, real, before, after, seed };
-  const changes = changesOf(before, after, together);
+  const changes = changesOf(before, after, together.map((things) => things.flatMap((thing) => idOf(thing) ?? [])));
   const told = telling();
   const left = leftBy(given);
   const doors = opening(real);
