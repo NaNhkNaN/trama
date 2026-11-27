@@ -60,6 +60,8 @@ export const RUNTIME_TYPES = [
     "export declare const workspace: Workspace;",
     "/** What a model called a tool with, held to the parameters the tool declared (see AgentTool): the declared fields and no others — or it throws what is wrong, in words the model can be handed. */",
     "export declare function heldTo(parameters: Schema | undefined, given: unknown): Record<string, unknown>;",
+    "/** The program in a model's reply, where the reply was to be a program and nothing else: what stands in its fences, where it is fenced — else the reply as it is. For a program that asks its agent for one. */",
+    "export declare function stripCodeFences(reply: string): string;",
   ].join("\n"),
 ].join("\n\n");
 
@@ -574,7 +576,8 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   const server = createIPCServer({
     token,
     ctx,
-    agent: createAgent(backend, projectDir, runEnded.signal),
+    // (Its agent works in the project — or, where a call says so, in the workspace the run was given.)
+    agent: createAgent(backend, projectDir, runEnded.signal, workspaceDir ? resolve(workspaceDir) : undefined),
     tools,
     workspace: sessionWorkspace,
     workspaceAt,
@@ -1937,7 +1940,12 @@ interface AskedFor {
  * It is handed the least: what is asked (`prompt`), the program it writes
  * from, whether what it makes beside the program is kept, the API as a
  * program's author is shown it, and where its workspace is (`copy`: for a
- * run it asks for to be given it). Not where the project is, nor its
+ * run it asks for to be given it).
+ *
+ * **It may answer that there is none to be written** — `{ unwritable }`,
+ * why — as whoever fixes says there is no fix: an answer, and no program.
+ * Whoever asked is told why, in its words; nothing is validated, and nobody
+ * is asked to mend it into a program. Not where the project is, nor its
  * history, nor its records: what more a writer is to see, whoever asks for
  * the update says in the prompt.
  *
@@ -1972,9 +1980,12 @@ export async function writtenBy(
   if (result.status !== "done") {
     throw new Error(`The project asked for the ${asking} ${result.status === "failed" ? "failed" : "did not end its work"}: ${result.reason ?? result.status}`);
   }
-  const { program } = (result.result ?? {}) as { program?: unknown };
+  const { program, unwritable } = (result.result ?? {}) as { program?: unknown; unwritable?: unknown };
+  if (typeof unwritable === "string" && program === undefined) {
+    throw new Error(`It was said that there is none to be written: ${unwritable.trim() || "no reason was given"}`);
+  }
   if (typeof program !== "string" || program.trim() === "") {
-    throw new Error(`The project asked for the ${asking} answered with no program: its result is to be { program }, the whole of the ${what === "create" ? "" : "new "}program.`);
+    throw new Error(`The project asked for the ${asking} answered with no program: its result is to be { program }, the whole of the ${what === "create" ? "" : "new "}program — or { unwritable }, why there is none to be written.`);
   }
   return program;
 }

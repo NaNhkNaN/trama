@@ -215,3 +215,4 @@ export const workspace: Workspace = remoteWorkspace((endpoint, body) => {
 });
 
 export { heldTo } from "./schema.js";
+export { stripCodeFences } from "./code-fences.js";

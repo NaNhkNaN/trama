@@ -760,9 +760,9 @@ await ctx.done({ went });
     "trama runtime error: Invalid field: templates (expected boolean or strings or undefined)",
     "trama runtime error: Invalid field: extensions (expected boolean or string or undefined)",
     "trama runtime error: Invalid field: extensions (expected boolean or string or undefined)",
-    "trama runtime error: Unknown field: skill (this call takes: prompt, system, model, thinking, tools, skills, extensions, cutOff, templates)",
+    "trama runtime error: Unknown field: skill (this call takes: prompt, system, model, thinking, tools, skills, extensions, cutOff, workspace, templates)",
     "trama runtime error: Invalid field: skills (expected boolean or strings or undefined)",
-    "trama runtime error: Unknown field: templates (this call takes: prompt, schema, system, model, thinking, tools, skills, extensions, cutOff)",
+    "trama runtime error: Unknown field: templates (this call takes: prompt, schema, system, model, thinking, tools, skills, extensions, cutOff, workspace)",
   ]);
   // The journal has a call as it was made.
   const [records] = journalsOf(projectDir);

@@ -1,0 +1,19 @@
+{
+  "description": "A writer: asks the runtime's own agent, once, for a project's program — its first, or its next — in the copy of the project it is handed, in the words trama itself has for it. Named as a making's createWith, or an update's updateWith.",
+  "parameters": {
+    "prompt?": "string: what is asked of the program — handed by the runner to whoever writes one, as the three that follow are",
+    "program?": "string: the program it is written from, whole (it is program.ts in the copy, too) — none, at a project's making",
+    "kept?": "boolean: whether what is made beside the program, in the copy, is kept with it",
+    "types?": "string: the API a program has, as its author is shown it"
+  },
+  "returns": {
+    "program?": "string: the whole of the program",
+    "unwritable?": "string: why there is no program, where the model says there is none to be written",
+    "nothing?": "string: why nothing was written, where it was run with nothing to write"
+  },
+  "input": {
+    "prompt": "A writer of programs: named where a project is made or updated (createWith, updateWith).",
+    "args": {}
+  },
+  "createdAt": "2026-11-27T00:00:00.000Z"
+}

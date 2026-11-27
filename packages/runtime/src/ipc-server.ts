@@ -203,6 +203,8 @@ const saidUnder = (call: RecordedCall): Said => ({
 const HOW_SERVED = {
   system: "optional string", model: "optional string", thinking: "optional string", tools: "optional strings or tools",
   skills: "optional boolean or strings", extensions: "optional boolean or string", cutOff: "optional string",
+  // Whether the agent works in the run's workspace, and not in the project.
+  workspace: "optional boolean",
   // Where the program waits to be asked for the tools of its own that the call has (see own-tools.ts).
   toolsId: "optional string",
 } as const satisfies Fields;

@@ -1,0 +1,20 @@
+{
+  "description": "A fixer: asks the runtime's own agent, once, for a fix of a program that failed, in the copy of the failing project it is handed, in the words trama itself has for it. Named as a run's repairWith.",
+  "parameters": {
+    "program?": "string: the program that failed, whole — handed by the runner to whoever is asked for a fix, as all of these are",
+    "error?": "string: what it failed with",
+    "journal?": "string: the path of the failed run's record, a line of JSON for each call",
+    "kept?": "boolean: whether what is changed beside the program, in the copy that is the workspace, is kept with the fix",
+    "types?": "string: the API a program has, as its author is shown it"
+  },
+  "returns": {
+    "program?": "string: the program, fixed",
+    "unfixable?": "string: why there is no fix, where the model says there is none",
+    "nothing?": "string: why nothing was fixed, where it was run with nothing to fix"
+  },
+  "input": {
+    "prompt": "A fixer of programs: asked for a fix where a run names this project as repairWith.",
+    "args": {}
+  },
+  "createdAt": "2026-11-27T00:00:00.000Z"
+}

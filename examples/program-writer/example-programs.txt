@@ -1,0 +1,80 @@
+// Example A: Simple — one-shot action, no LLM needed.
+import { ctx, tools } from "@trama-dev/runtime";
+
+const content = "# Hello World\nGenerated at " + new Date().toISOString();
+await tools.write("hello.md", content);
+await ctx.log("wrote hello.md");
+await ctx.done();
+
+// Example B: Medium — use the LLM once to process data, write the result.
+import { ctx, agent, tools } from "@trama-dev/runtime";
+
+const data = await tools.read(ctx.input.args.file as string);
+const summary = await agent.instruct("Summarize this data concisely:\n" + data);
+await tools.write("summary.md", summary);
+await ctx.done({ summaryLength: summary.length });
+
+// Example C: Iterative optimization loop.
+// Pattern: propose a change via LLM, evaluate it with a deterministic script,
+// keep the change only if it improves the metric, repeat.
+// ctx.state persists across runs, so the loop keeps there how far it is and can resume after interruption.
+import { ctx, agent, tools } from "@trama-dev/runtime";
+
+let code = (ctx.state.code as string | undefined) ?? await tools.read("target.ts");
+let bestMetric = (ctx.state.bestMetric as number | undefined) ?? Infinity;
+const ROUNDS = 20;
+
+for (let i = (ctx.state.round as number | undefined) ?? 0; i < ROUNDS; i++) {
+  const proposal = await agent.generate<{ reasoning: string; newCode: string }>({
+    prompt: "Analyze this code and propose ONE specific improvement:\n" + code,
+    schema: { reasoning: "string: why this change helps", newCode: "string: complete improved code" },
+  });
+
+  await tools.write("candidate.ts", proposal.newCode);
+  const bench = await tools.shell("node benchmark.mjs candidate.ts");
+
+  if (bench.exitCode !== 0) {
+    await ctx.log("benchmark failed", { stderr: bench.stderr });
+    continue;
+  }
+
+  const metric = parseFloat(bench.stdout.trim());
+  if (metric < bestMetric) {
+    code = proposal.newCode;
+    bestMetric = metric;
+    await ctx.log("improved", { round: i, metric, reasoning: proposal.reasoning });
+  }
+  ctx.state = { code, bestMetric, round: i + 1 };
+  await ctx.checkpoint();
+}
+
+await tools.write("target.ts", code);
+await ctx.done({ finalMetric: Number.isFinite(bestMetric) ? bestMetric : null });
+
+// Example D: Long-running server.
+// Call ctx.ready() only after the server is actually listening.
+// Handle SIGTERM/SIGINT so smoke validation can shut it down cleanly.
+import { ctx } from "@trama-dev/runtime";
+import { createServer } from "node:http";
+
+const server = createServer((_req, res) => {
+  res.end("ok");
+});
+
+await new Promise<void>((resolve, reject) => {
+  server.once("error", reject);
+  server.listen(3000, "127.0.0.1", () => resolve());
+});
+
+await ctx.ready({ url: "http://127.0.0.1:3000" });
+
+process.on("SIGTERM", () => {
+  server.close();
+  process.exit(0);
+});
+process.on("SIGINT", () => {
+  server.close();
+  process.exit(0);
+});
+
+await new Promise<void>(() => {});

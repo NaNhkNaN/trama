@@ -474,6 +474,29 @@ test("createAgent generate takes a field's type from words, and nothing else for
   assert.deepEqual(await found.generate({ prompt: "p", schema: { a: "object: whatever was found" } }), { a: { any: [1, { deep: null }] } });
 });
 
+test("createAgent serves a call in the run's workspace where the call says so, and in the project otherwise — and says that there is none where the run has none", async () => {
+  const calls = [];
+  const backend = { async ask(prompt, call) { calls.push(call.cwd); return '{"a": "x"}'; } };
+  const agent = createAgent(backend, "/work", undefined, "/space");
+  await agent.instruct("p", { workspace: true });
+  await agent.instruct("p", { workspace: false });
+  await agent.instruct("p");
+  await agent.generate({ prompt: "p", schema: { a: "string" }, workspace: true });
+  await agent.generate({ prompt: "p", schema: { a: "string" } });
+  assert.deepEqual(calls, ["/space", "/work", "/work", "/space", "/work"]);
+  // (Nothing of it is handed on to the backend: where the agent works is all it says.)
+  const handed = [];
+  await createAgent({ async ask(prompt, call) { handed.push(Object.keys(call).sort()); return "x"; } }, "/work", undefined, "/space").instruct("p", { workspace: true });
+  assert.deepEqual(handed, [["cwd", "signal", "system"]]);
+  const none = createAgent(backend, "/work");
+  const NONE = /^Error: This run has no workspace for its agent to work in: one is there where a run is given one \(trama run --workspace <dir>, or workspaceDir\)$/;
+  await assert.rejects(() => none.instruct("p", { workspace: true }), NONE);
+  await assert.rejects(() => none.generate({ prompt: "p", schema: { a: "string" }, workspace: true }), NONE);
+  await none.instruct("p", { workspace: false });
+  for (const odd of ["yes", 1, null]) await assert.rejects(() => agent.instruct("p", { workspace: odd }), /^Error: workspace is true or false, not /, JSON.stringify(odd));
+  assert.equal(calls.length, 6);
+});
+
 // --- What a call asks of its backend, and what it is told the call used ---
 
 test("createAgent hands the backend what a call asks for and nothing it did not, and passes on what it used", async () => {

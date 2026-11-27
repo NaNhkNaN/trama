@@ -155,7 +155,7 @@ await ctx.done({
     namesBeside: 'answered: [["read","read"],1]',
     none: "answered: [[],0]",
     toolsId: "trama runtime error: Invalid field: toolsId (the call has no tools of the program's own)",
-    misspelt: "trama runtime error: Unknown field: tool (this call takes: prompt, system, model, thinking, tools, skills, extensions, cutOff, templates)",
+    misspelt: "trama runtime error: Unknown field: tool (this call takes: prompt, system, model, thinking, tools, skills, extensions, cutOff, workspace, templates)",
   });
   assert.equal(asked, 3);
 });

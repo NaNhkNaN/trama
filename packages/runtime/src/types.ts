@@ -167,6 +167,14 @@ export interface AgentOptions {
    */
   extensions?: boolean | "project";
   /**
+   * Where the agent works: `true` for the run's workspace, in the place of
+   * the project — for a program whose work is in a directory that is not its
+   * own: one handed a copy of a project to write a program in, say. A run
+   * that was given no workspace has none for its agent, and the call fails.
+   * (An agent from outside is asked there by `workspace.agent`.)
+   */
+  workspace?: boolean;
+  /**
    * What to make of an answer that was cut off at the model's output limit.
    * "fail", as it is without this: the call fails — the answer is not whole.
    * "keep": the call returns what there was of it, as if it were the answer

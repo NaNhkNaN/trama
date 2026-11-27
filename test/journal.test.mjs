@@ -934,8 +934,8 @@ await ctx.done({ first, second, third, fourth, fifth, sixth, seventh, eighth, ni
     sixth: "Error: trama runtime error: Invalid field: thinking (expected string or undefined)",
     seventh: "answer to seventh",
     // An option that is none — misspelt, or not this call's — is not passed over: the program would think it had been taken.
-    eighth: "Error: trama runtime error: Unknown field: tool (this call takes: prompt, system, model, thinking, tools, skills, extensions, cutOff, templates)",
-    ninth: "Error: trama runtime error: Unknown field: tool (this call takes: prompt, schema, system, model, thinking, tools, skills, extensions, cutOff)",
+    eighth: "Error: trama runtime error: Unknown field: tool (this call takes: prompt, system, model, thinking, tools, skills, extensions, cutOff, workspace, templates)",
+    ninth: "Error: trama runtime error: Unknown field: tool (this call takes: prompt, schema, system, model, thinking, tools, skills, extensions, cutOff, workspace)",
   });
   assert.deepEqual(asked, [
     { prompt: "first", system: "s", model: "p/m", thinking: "high", tools: ["read"] },

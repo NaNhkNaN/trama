@@ -131,7 +131,7 @@ test("the project that writes is named for a call, or in the configuration — a
 test("what comes back that is no update is said as none: a writer that failed, no program, a program that does not run — the project is as it was, and what writes is not itself fixed", async (t) => {
   for (const [how, why] of [
     ["fail", /Update failed — the program is unchanged\.\nThe project asked for the update failed: [^]*the writer has a fault of its own/],
-    ["say nothing", /The project asked for the update answered with no program: its result is to be \{ program \}, the whole of the new program\./],
+    ["say nothing", /The project asked for the update answered with no program: its result is to be \{ program \}, the whole of the new program — or \{ unwritable \}, why there is none to be written\./],
     ["broken", /Update failed — the program is unchanged\.[^]*no program at all/],
   ]) {
     const it = homeWith(t, { words: { program: ONE, how }, writer: { program: WRITER } }, { maxRepairAttempts: how === "fail" ? 1 : 0 });
