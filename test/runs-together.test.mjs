@@ -1,19 +1,27 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { existsSync, readFileSync } from "fs";
+import { existsSync, readFileSync, readdirSync } from "fs";
 import { join } from "path";
 import { runProgram } from "../packages/runtime/dist/runner.js";
-import { Session } from "../packages/session/dist/index.js";
+import { createWorkspace } from "../packages/runtime/dist/index.js";
 import { pathToFileURL } from "url";
 import {
   REPO_ROOT, cleanupTempDir, createProjectFixture, isAlive, makeTempDir, pidIn, runNodeCommand, startRunnerProcess,
-  waitFor, withEnv,
+  waitFor,
 } from "./helpers.mjs";
+
+// Runs that work together: several runs of one runner that share a workspace, started by a host or — through its
+// runner — by a program. There is no layer for it: a run is given the workspace and a name (runProgram's
+// workspaceDir and label), and whoever started it has the workspace by its directory (createWorkspace). What a
+// program then makes of several such runs is the program's.
+
+/** A run among others: given the workspace they share, and a name. */
+const start = (name, workspaceDir, options) => runProgram({ ...options, workspaceDir, label: name });
 
 /** The runner as a program reaches it: the public surface, not the module the tests call directly. */
 const RUNNER_SURFACE_URL = pathToFileURL(join(REPO_ROOT, "packages", "runtime", "dist", "index.js")).href;
 
-test("Session.spawn returns done ProgramResult", async (t) => {
+test("a run among others ends as any run does: done, with what it gave", async (t) => {
   const projectDir = makeTempDir("trama-session-");
   const wsDir = makeTempDir("trama-ws-");
   t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
@@ -23,15 +31,13 @@ await ctx.done({ ok: true });
 `,
   });
 
-  const session = await Session.create({ workspace: wsDir });
-  const handle = session.spawn("test-agent", { projectDir, maxRepairAttempts: 0, timeout: 5_000 });
-  const result = await handle.wait();
+  const result = await start("test-agent", wsDir, { projectDir, maxRepairAttempts: 0, timeout: 5_000 });
 
   assert.equal(result.status, "done");
   assert.deepEqual(result.result, { ok: true });
 });
 
-test("Session.spawn returns yielded ProgramResult", async (t) => {
+test("a run among others that yields ends as yielded, with its reason", async (t) => {
   const projectDir = makeTempDir("trama-session-");
   const wsDir = makeTempDir("trama-ws-");
   t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
@@ -41,15 +47,13 @@ await ctx.yield("waiting");
 `,
   });
 
-  const session = await Session.create({ workspace: wsDir });
-  const handle = session.spawn("test-agent", { projectDir, maxRepairAttempts: 0, timeout: 5_000 });
-  const result = await handle.wait();
+  const result = await start("test-agent", wsDir, { projectDir, maxRepairAttempts: 0, timeout: 5_000 });
 
   assert.equal(result.status, "yielded");
   assert.equal(result.reason, "waiting");
 });
 
-test("Session.spawn returns failed ProgramResult (not throw)", async (t) => {
+test("a run among others that fails ends as failed: a result, and nothing thrown", async (t) => {
   const projectDir = makeTempDir("trama-session-");
   const wsDir = makeTempDir("trama-ws-");
   t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
@@ -57,15 +61,13 @@ test("Session.spawn returns failed ProgramResult (not throw)", async (t) => {
     programSource: `throw new Error("boom");`,
   });
 
-  const session = await Session.create({ workspace: wsDir });
-  const handle = session.spawn("test-agent", { projectDir, maxRepairAttempts: 0, timeout: 5_000 });
-  const result = await handle.wait();
+  const result = await start("test-agent", wsDir, { projectDir, maxRepairAttempts: 0, timeout: 5_000 });
 
   assert.equal(result.status, "failed");
   assert.match(result.reason, /boom/);
 });
 
-test("ParticipantHandle.resume works after yield", async (t) => {
+test("a run that yielded is taken up by running it again: it has its state, and the workspace as it was left", async (t) => {
   const projectDir = makeTempDir("trama-session-");
   const wsDir = makeTempDir("trama-ws-");
   t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
@@ -80,14 +82,10 @@ await ctx.done();
 `,
   });
 
-  const session = await Session.create({ workspace: wsDir });
-  const handle = session.spawn("test-agent", { projectDir, maxRepairAttempts: 0, timeout: 5_000 });
-
-  const first = await handle.wait();
+  const first = await start("test-agent", wsDir, { projectDir, maxRepairAttempts: 0, timeout: 5_000 });
   assert.equal(first.status, "yielded");
 
-  await handle.resume();
-  const second = await handle.wait();
+  const second = await start("test-agent", wsDir, { projectDir, maxRepairAttempts: 0, timeout: 5_000 });
   assert.equal(second.status, "done");
 
   // Verify workspace artifact was written during resumed run
@@ -95,74 +93,7 @@ await ctx.done();
   assert.equal(readFileSync(join(wsDir, "result.txt"), "utf-8"), "step=1");
 });
 
-test("ParticipantHandle.resume rejects when participant is done", async (t) => {
-  const projectDir = makeTempDir("trama-session-");
-  const wsDir = makeTempDir("trama-ws-");
-  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
-  createProjectFixture(projectDir, {
-    programSource: `import { ctx } from "@trama-dev/runtime";
-await ctx.done();
-`,
-  });
-
-  const session = await Session.create({ workspace: wsDir });
-  const handle = session.spawn("test-agent", { projectDir, maxRepairAttempts: 0, timeout: 5_000 });
-
-  await handle.wait();
-
-  await assert.rejects(
-    () => handle.resume(),
-    /Cannot resume.*expected state "yielded" but got "done"/,
-  );
-});
-
-test("ParticipantHandle.resume rejects when participant is failed", async (t) => {
-  const projectDir = makeTempDir("trama-session-");
-  const wsDir = makeTempDir("trama-ws-");
-  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
-  createProjectFixture(projectDir, {
-    programSource: `throw new Error("broken");`,
-  });
-
-  const session = await Session.create({ workspace: wsDir });
-  const handle = session.spawn("test-agent", { projectDir, maxRepairAttempts: 0, timeout: 5_000 });
-
-  await handle.wait();
-
-  await assert.rejects(
-    () => handle.resume(),
-    /Cannot resume.*expected state "yielded" but got "failed"/,
-  );
-});
-
-test("ParticipantHandle.resume rejects immediately when participant is still running", async (t) => {
-  const projectDir = makeTempDir("trama-session-");
-  const wsDir = makeTempDir("trama-ws-");
-  t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
-  createProjectFixture(projectDir, {
-    programSource: `import { ctx, tools } from "@trama-dev/runtime";
-await tools.shell("sleep 5");
-await ctx.done();
-`,
-  });
-
-  const session = await Session.create({ workspace: wsDir });
-  const handle = session.spawn("test-agent", { projectDir, maxRepairAttempts: 0, timeout: 10_000 });
-
-  // resume() should reject immediately without blocking on the running program
-  const start = Date.now();
-  await assert.rejects(
-    () => handle.resume(),
-    /Cannot resume.*expected state "yielded" but got "running"/,
-  );
-  const elapsed = Date.now() - start;
-  assert.ok(elapsed < 1_000, `resume() should be fail-fast, took ${elapsed}ms`);
-
-  // Clean up: wait for the spawned run to finish
-  await handle.wait();
-});
-
-test("Session.spawn shares workspace between participants", async (t) => {
+test("runs given one workspace share it: what one writes there the next reads", async (t) => {
   const projectDir1 = makeTempDir("trama-session-");
   const projectDir2 = makeTempDir("trama-session-");
   const wsDir = makeTempDir("trama-ws-");
@@ -186,22 +117,18 @@ await ctx.done();
 `,
   });
 
-  const session = await Session.create({ workspace: wsDir });
-
   // Agent 1 writes to workspace
-  const handle1 = session.spawn("agent1", { projectDir: projectDir1, maxRepairAttempts: 0, timeout: 5_000 });
-  await handle1.wait();
+  await start("agent1", wsDir, { projectDir: projectDir1, maxRepairAttempts: 0, timeout: 5_000 });
 
   // Agent 2 reads from workspace
-  const handle2 = session.spawn("agent2", { projectDir: projectDir2, maxRepairAttempts: 0, timeout: 5_000 });
-  const result2 = await handle2.wait();
+  const result2 = await start("agent2", wsDir, { projectDir: projectDir2, maxRepairAttempts: 0, timeout: 5_000 });
   assert.equal(result2.status, "done");
 
   const { readFileSync } = await import("fs");
   assert.equal(readFileSync(join(wsDir, "from-agent2.txt"), "utf-8"), "got: hello from agent 1");
 });
 
-test("Session.workspace lets the session's creator exchange artifacts with participants", async (t) => {
+test("whoever starts a run has its workspace by the directory, and exchanges artifacts with the run as it goes", async (t) => {
   const projectDir = makeTempDir("trama-session-");
   const wsDir = makeTempDir("trama-session-ws-");
   t.after(() => { cleanupTempDir(projectDir); cleanupTempDir(wsDir); });
@@ -213,48 +140,24 @@ await workspace.write("answer.txt", question.toUpperCase());
 await ctx.done();`,
   });
 
-  const session = await Session.create({ workspace: wsDir });
-  assert.equal(session.workspaceDir, wsDir);
-
-  const handle = session.spawn("echo", { projectDir, maxRepairAttempts: 0, timeout: 10_000 });
-  await session.workspace.write("question.txt", "hello");
-  const answer = await session.workspace.observe("answer.txt", { timeout: 10_000 });
+  const shared = createWorkspace(wsDir);
+  const run = start("echo", wsDir, { projectDir, maxRepairAttempts: 0, timeout: 10_000 });
+  await shared.write("question.txt", "hello");
+  const answer = await shared.observe("answer.txt", { timeout: 10_000 });
 
   assert.equal(answer, "HELLO");
-  assert.equal((await handle.wait()).status, "done");
-  assert.deepEqual(await session.workspace.list("*.txt"), ["answer.txt", "question.txt"]);
+  assert.equal((await run).status, "done");
+  assert.deepEqual(await shared.list("*.txt"), ["answer.txt", "question.txt"]);
 });
 
-test("Session expands a leading ~ in projectDir and workspace", async (t) => {
-  const fakeHome = makeTempDir("trama-session-home-");
-  t.after(() => cleanupTempDir(fakeHome));
-
-  createProjectFixture(join(fakeHome, "projects", "tilde"), {
-    programSource: `import { ctx, workspace } from "@trama-dev/runtime";
-await workspace.write("seen.txt", "ok");
-await ctx.done();`,
-  });
-
-  await withEnv({ HOME: fakeHome }, async () => {
-    const session = await Session.create({ workspace: "~/shared" });
-    assert.equal(session.workspaceDir, join(fakeHome, "shared"));
-
-    const result = await session
-      .spawn("tilde", { projectDir: "~/projects/tilde", maxRepairAttempts: 0, timeout: 10_000 })
-      .wait();
-    assert.equal(result.status, "done");
-    assert.equal(readFileSync(join(fakeHome, "shared", "seen.txt"), "utf-8"), "ok");
-  });
-});
-
-test("a program run by the runner can create a session and coordinate participants", async (t) => {
+test("a program has several runs work together through its runner: each given a workspace and a name, the workspace its own by the directory — and no layer of trama's for it", async (t) => {
   const entryDir = makeTempDir("trama-session-entry-");
   const workerDir = makeTempDir("trama-session-worker-");
-  let sessionWorkspace;
+  let sharedDir;
   t.after(() => {
     cleanupTempDir(entryDir);
     cleanupTempDir(workerDir);
-    if (sessionWorkspace) cleanupTempDir(sessionWorkspace);
+    if (sharedDir) cleanupTempDir(sharedDir);
   });
 
   // The participant: reads the brief, writes its finding.
@@ -265,25 +168,31 @@ await workspace.write("findings/" + ctx.input.args.check + ".txt", ctx.input.arg
 await ctx.done();`,
   });
 
-  // The entry program: an ordinary program.ts that imports the session layer,
-  // fans out to participants, and gathers what they wrote — no host code involved.
+  // The entry program: an ordinary program.ts that asks its runner for the runs,
+  // fans out to them, and gathers what they wrote — no host code involved.
   createProjectFixture(entryDir, {
     scaffold: false,
     programSource: `import { ctx } from "@trama-dev/runtime";
-import { Session } from "@trama-dev/session";
+import { createWorkspace, runProgram } from "@trama-dev/runtime/runner";
+import { mkdtempSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 
-const session = await Session.createTemp();
+const workspaceDir = mkdtempSync(join(tmpdir(), "trama-together-"));
+const shared = createWorkspace(workspaceDir);
 const checks = ["sql", "xss"];
-const handles = checks.map(check => session.spawn(check, {
+const runs = checks.map(check => runProgram({
   projectDir: ctx.input.args.workerDir,
+  workspaceDir,
+  label: check,
   args: { check },
   maxRepairAttempts: 0,
   timeout: 20000,
 }));
-await session.workspace.write("brief.txt", "diff-42");
-const findings = await session.workspace.observe("findings/*.txt", { expect: checks.length, timeout: 20000 });
-const statuses = (await Promise.all(handles.map(h => h.wait()))).map(r => r.status);
-await ctx.done({ workspaceDir: session.workspaceDir, statuses, findings });`,
+await shared.write("brief.txt", "diff-42");
+const findings = await shared.observe("findings/*.txt", { expect: checks.length, timeout: 20000 });
+const statuses = (await Promise.all(runs)).map(r => r.status);
+await ctx.done({ workspaceDir, statuses, findings });`,
   });
 
   const result = await runProgram({
@@ -291,13 +200,14 @@ await ctx.done({ workspaceDir: session.workspaceDir, statuses, findings });`,
   });
 
   assert.equal(result.status, "done", result.reason);
-  sessionWorkspace = result.result.workspaceDir;
+  sharedDir = result.result.workspaceDir;
   assert.deepEqual(result.result.statuses, ["done", "done"]);
   assert.deepEqual(result.result.findings, [
     { path: "findings/sql.txt", content: "sql checked: diff-42" },
     { path: "findings/xss.txt", content: "xss checked: diff-42" },
   ]);
-  assert.equal(existsSync(join(entryDir, "node_modules", "@trama-dev", "session")), true);
+  // What a project is linked to, for its program to import, is the runtime — and nothing else of trama's.
+  assert.deepEqual(readdirSync(join(entryDir, "node_modules", "@trama-dev")), ["runtime"]);
 });
 
 test("a program is not timed out for the time its participant takes", async (t) => {
@@ -315,9 +225,8 @@ await ctx.done({ worked: true });`,
   createProjectFixture(entryDir, {
     scaffold: false,
     programSource: `import { ctx } from "@trama-dev/runtime";
-import { Session } from "@trama-dev/session";
-const session = await Session.create({ workspace: ${JSON.stringify(wsDir)} });
-const worker = await session.spawn("worker", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 30000 }).wait();
+import { runProgram } from "@trama-dev/runtime/runner";
+const worker = await runProgram({ projectDir: ${JSON.stringify(workerDir)}, workspaceDir: ${JSON.stringify(wsDir)}, label: "worker", maxRepairAttempts: 0, timeout: 30000 });
 await ctx.done({ worker: worker.status });`,
   });
 
@@ -345,9 +254,8 @@ await tools.shell("echo $$ > ${join(signalDir, "shell.pid")}; sleep 60", { timeo
   createProjectFixture(entryDir, {
     scaffold: false,
     programSource: `import { existsSync } from "fs";
-import { Session } from "@trama-dev/session";
-const session = await Session.create({ workspace: ${JSON.stringify(join(signalDir, "workspace"))} });
-session.spawn("worker", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 60000 });
+import { runProgram } from "@trama-dev/runtime/runner";
+void runProgram({ projectDir: ${JSON.stringify(workerDir)}, workspaceDir: ${JSON.stringify(join(signalDir, "workspace"))}, label: "worker", maxRepairAttempts: 0, timeout: 60000 }).catch(() => {});
 while (!existsSync(${JSON.stringify(join(signalDir, "shell.pid"))})) await new Promise(resolve => setTimeout(resolve, 25));
 throw new Error("the entry program crashes");`,
   });
@@ -379,10 +287,9 @@ await tools.shell("echo $$ > ${join(signalDir, "shell.pid")}; sleep 60", { timeo
     scaffold: false,
     programSource: `import { ctx } from "@trama-dev/runtime";
 import { writeFileSync } from "fs";
-import { Session } from "@trama-dev/session";
+import { runProgram } from "@trama-dev/runtime/runner";
 writeFileSync(${JSON.stringify(join(signalDir, "entry.pid"))}, String(process.pid));
-const session = await Session.create({ workspace: ${JSON.stringify(join(signalDir, "workspace"))} });
-await session.spawn("worker", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 60000 }).wait();
+await runProgram({ projectDir: ${JSON.stringify(workerDir)}, workspaceDir: ${JSON.stringify(join(signalDir, "workspace"))}, label: "worker", maxRepairAttempts: 0, timeout: 60000 });
 await ctx.done();`,
   });
 
@@ -420,11 +327,10 @@ await tools.shell("echo $$ > ${join(signalDir, "shell.pid")}; sleep 60", { timeo
   createProjectFixture(entryDir, {
     scaffold: false,
     programSource: `import { existsSync, writeFileSync } from "fs";
-import { Session } from "@trama-dev/session";
+import { runProgram } from "@trama-dev/runtime/runner";
 process.on("SIGTERM", () => {});
 writeFileSync(${JSON.stringify(join(signalDir, "entry.pid"))}, String(process.pid));
-const session = await Session.create({ workspace: ${JSON.stringify(join(signalDir, "workspace"))} });
-session.spawn("worker", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 60000 });
+void runProgram({ projectDir: ${JSON.stringify(workerDir)}, workspaceDir: ${JSON.stringify(join(signalDir, "workspace"))}, label: "worker", maxRepairAttempts: 0, timeout: 60000 }).catch(() => {});
 while (!existsSync(${JSON.stringify(join(signalDir, "shell.pid"))})) await new Promise(resolve => setTimeout(resolve, 20));
 writeFileSync(${JSON.stringify(join(signalDir, "entry-is-stuck"))}, "");
 while (true) {}`,
@@ -523,8 +429,8 @@ test("a field a program leaves out by giving null is left out, inside a program 
   // workspace.* must stay unavailable: null is not a workspace.
   createProjectFixture(workerDir, {
     programSource: `import { ctx, workspace } from "@trama-dev/runtime";
-const inSession = await workspace.list("*").then(() => true, () => false);
-await ctx.done({ args: ctx.input.args, inSession });`,
+const hasWorkspace = await workspace.list("*").then(() => true, () => false);
+await ctx.done({ args: ctx.input.args, hasWorkspace });`,
   });
   createProjectFixture(entryDir, {
     programSource: `import { ctx } from "@trama-dev/runtime";
@@ -539,7 +445,7 @@ await ctx.done(result);`,
   const options = { maxRepairAttempts: 0, timeout: 30_000 };
   const outside = await runProgram({ projectDir: workerDir, ...options, label: null, workspaceDir: null, args: null });
   const inside = await runProgram({ projectDir: entryDir, ...options });
-  assert.deepEqual(outside, { status: "done", result: { args: {}, inSession: false } });
+  assert.deepEqual(outside, { status: "done", result: { args: {}, hasWorkspace: false } });
   assert.deepEqual(inside, { status: "done", result: outside });
 });
 
@@ -560,9 +466,8 @@ await ctx.done();`,
   // The program that spawned it fails afterwards — so what it is reported to have printed can be checked.
   createProjectFixture(entryDir, {
     scaffold: false,
-    programSource: `import { Session } from "@trama-dev/session";
-const session = await Session.create({ workspace: ${JSON.stringify(wsDir)} });
-await session.spawn("scout", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 20000 }).wait();
+    programSource: `import { runProgram } from "@trama-dev/runtime/runner";
+await runProgram({ projectDir: ${JSON.stringify(workerDir)}, workspaceDir: ${JSON.stringify(wsDir)}, label: "scout", maxRepairAttempts: 0, timeout: 20000 });
 console.log("the entry program's own line");
 throw new Error("the entry program fails");`,
   });
@@ -583,7 +488,7 @@ console.log("REASON " + JSON.stringify(result.reason));`,
   assert.doesNotMatch(reason, /hello from the participant/, "a participant's output must not be reported as its parent's");
 });
 
-test("inside a program, a session is what it is outside one", { timeout: 40_000 }, async (t) => {
+test("inside a program, a workspace and a run are what they are outside one", { timeout: 40_000 }, async (t) => {
   const entryDir = makeTempDir("trama-session-entry-");
   const workerDir = makeTempDir("trama-session-worker-");
   const signalDir = makeTempDir("trama-session-signal-");
@@ -596,17 +501,16 @@ setInterval(() => {}, 1000);
 await new Promise(() => {});`,
   });
   // Two things a program may rely on, which now happen through its runner:
-  // the workspace directory exists as soon as the session does, and stopping
+  // the workspace's directory exists as soon as the program has the workspace, and stopping
   // a run with a signal ends in a result — once the run is really over.
   createProjectFixture(entryDir, {
     scaffold: false,
     programSource: `import { ctx } from "@trama-dev/runtime";
-import { runProgram } from "@trama-dev/runtime/runner";
-import { Session } from "@trama-dev/session";
+import { createWorkspace, runProgram } from "@trama-dev/runtime/runner";
 import { existsSync, readFileSync } from "fs";
-const workspace = ${JSON.stringify(join(signalDir, "ws", "nested"))};
-const session = await Session.create({ workspace });
-const workspaceExists = existsSync(session.workspaceDir);
+const workspaceDir = ${JSON.stringify(join(signalDir, "ws", "nested"))};
+createWorkspace(workspaceDir);
+const workspaceExists = existsSync(workspaceDir);
 
 const workerPid = ${JSON.stringify(join(signalDir, "worker.pid"))};
 const stop = new AbortController();
@@ -632,63 +536,25 @@ await ctx.done({ workspaceExists, stopped, workerAlive, alreadyStopped });`,
   });
 });
 
-test("Session.createTemp stays inside tmpdir for an empty prefix and rejects traversal or separator prefixes", async (t) => {
-  const { tmpdir } = await import("os");
-  const { dirname, resolve } = await import("path");
-
-  const emptyPrefixSession = await Session.createTemp("");
-  t.after(() => cleanupTempDir(emptyPrefixSession.workspaceDir));
-  assert.equal(dirname(emptyPrefixSession.workspaceDir), resolve(tmpdir()));
-
-  for (const bad of [".", "..", "nested/prefix", "nested\\prefix", "bad\0name"]) {
-    await assert.rejects(() => Session.createTemp(bad), /createTemp prefix/);
-  }
-});
-
-test("a participant is given variables as any run is: its program has them, and the commands it runs", async (t) => {
-  const workerDir = makeTempDir("trama-session-worker-");
-  const session = await Session.createTemp();
-  t.after(() => { cleanupTempDir(workerDir); cleanupTempDir(session.workspaceDir); });
+test("a run among others is given variables as any run is: its program has them, and the commands it runs — and what is given for them and is none is the run's failing to start, not thrown at whoever asked", async (t) => {
+  const workerDir = makeTempDir("trama-session-worker-"), wsDir = makeTempDir("trama-session-ws-");
+  t.after(() => { cleanupTempDir(workerDir); cleanupTempDir(wsDir); });
   createProjectFixture(workerDir, {
     programSource: `import { ctx, tools } from "@trama-dev/runtime";
 const said = await tools.shell('printf %s "$ROLE"');
 await ctx.done({ own: process.env.ROLE ?? null, command: said.stdout });`,
   });
 
-  const given = await session.spawn("reviewer", { projectDir: workerDir, env: { ROLE: "reviewer" }, maxRepairAttempts: 0, timeout: 20_000 }).wait();
+  const given = await start("reviewer", wsDir, { projectDir: workerDir, env: { ROLE: "reviewer" }, maxRepairAttempts: 0, timeout: 20_000 });
   assert.deepEqual(given, { status: "done", result: { own: "reviewer", command: "reviewer" } });
-  const plain = await session.spawn("nobody", { projectDir: workerDir, maxRepairAttempts: 0, timeout: 20_000 }).wait();
+  const plain = await start("nobody", wsDir, { projectDir: workerDir, maxRepairAttempts: 0, timeout: 20_000 });
   assert.deepEqual(plain, { status: "done", result: { own: null, command: "" } });
-});
-
-test("a participant that is resumed has the variables it was spawned with, whatever has become of the object they were given in", async (t) => {
-  const workerDir = makeTempDir("trama-session-worker-");
-  const session = await Session.createTemp();
-  t.after(() => { cleanupTempDir(workerDir); cleanupTempDir(session.workspaceDir); });
-  createProjectFixture(workerDir, {
-    programSource: `import { ctx } from "@trama-dev/runtime";
-if (!ctx.resumed) await ctx.yield("once");
-await ctx.done({ role: process.env.ROLE });`,
-  });
-
-  const env = { ROLE: "as spawned" };
-  const handle = session.spawn("worker", { projectDir: workerDir, env, maxRepairAttempts: 0, timeout: 20_000 });
-  assert.equal((await handle.wait()).status, "yielded");
-  env.ROLE = "changed between the yield and the resume";
-  assert.deepEqual(await (await handle.resume()).wait(), { status: "done", result: { role: "as spawned" } });
-  // ...and whatever kind of object that was: process.env — what is most often given — is no plain one.
-  const held = Object.assign(Object.create({ inherited: "not a variable of its own" }), { ROLE: "as spawned, from an object that is no plain one" });
-  const other = session.spawn("worker", { projectDir: workerDir, env: held, maxRepairAttempts: 0, timeout: 20_000 });
-  assert.equal((await other.wait()).status, "yielded");
-  held.ROLE = "changed between the yield and the resume";
-  assert.deepEqual(await (await other.resume()).wait(), { status: "done", result: { role: "as spawned, from an object that is no plain one" } });
 
   // What is given for variables and is no object of them is refused for what it is, not taken apart into some.
-  for (const given of [["ROLE=x"], "ab", 5]) {
-    await assert.rejects(() => session.spawn("worker", { projectDir: workerDir, env: given, maxRepairAttempts: 0, timeout: 20_000 }).wait(), /env is an object of variables/);
+  for (const env of [["ROLE=x"], "ab", 5]) {
+    await assert.rejects(() => start("worker", wsDir, { projectDir: workerDir, env, maxRepairAttempts: 0, timeout: 20_000 }), /env is an object of variables/);
   }
-  // And what cannot be read at all is the participant's failure to start, told by its wait() as any is — not thrown at whoever spawns.
+  // And what cannot be read at all is told the same way: by the run's promise, as any failing to start is.
   const unreadable = { get ROLE() { throw new Error("thrown by the caller's getter"); } };
-  const refused = session.spawn("worker", { projectDir: workerDir, env: unreadable, maxRepairAttempts: 0, timeout: 20_000 });
-  await assert.rejects(() => refused.wait(), /thrown by the caller's getter/);
+  await assert.rejects(() => start("worker", wsDir, { projectDir: workerDir, env: unreadable, maxRepairAttempts: 0, timeout: 20_000 }), /thrown by the caller's getter/);
 });

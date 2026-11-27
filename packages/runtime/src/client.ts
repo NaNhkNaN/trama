@@ -36,8 +36,6 @@ const { init: initData, call } = openBridge(PORT, INIT_PATH);
 export const ctx: Ctx = {
   input: initData.input,
   state: initData.state,
-  iteration: initData.iteration,
-  maxIterations: initData.maxIterations,
   resumed: initData.resumed,
   yieldReason: initData.yieldReason,
 
@@ -49,12 +47,12 @@ export const ctx: Ctx = {
   },
   async checkpoint() {
     assertSerializable(ctx.state, "ctx.state");
-    ctx.iteration = await call("/ctx/checkpoint", { state: ctx.state });
+    await call("/ctx/checkpoint", { state: ctx.state });
   },
   async done(result) {
     assertSerializable(ctx.state, "ctx.state");
     if (result !== undefined) assertSerializable(result, "ctx.done(result)");
-    ctx.iteration = await call("/ctx/done", { state: ctx.state, result });
+    await call("/ctx/done", { state: ctx.state, result });
   },
   async yield(reason) {
     assertSerializable(ctx.state, "ctx.state");
@@ -208,10 +206,10 @@ export const tools: Tools = {
   agent: async (prompt, opts) => call("/tools/agent", withOptions({ prompt }, opts)),
 };
 
-/** workspace.* exists only inside a session — everywhere else it fails clearly, without a round trip. */
+/** workspace.* is there where the run was given a workspace — everywhere else it fails clearly, without a round trip. */
 export const workspace: Workspace = remoteWorkspace((endpoint, body) => {
-  if (!initData.inSession) {
-    return Promise.reject(new Error("workspace is only available when running in a session"));
+  if (!initData.hasWorkspace) {
+    return Promise.reject(new Error("This run has no workspace: workspace.* is there where a run is given one (trama run --workspace <dir>, or workspaceDir)"));
   }
   return call(endpoint, body);
 });

@@ -108,7 +108,7 @@ test("a run is replayed from its record: every call answered as it was and none 
   const original = { ...llm };
   Object.assign(llm, model);
   try {
-    await validateProgram(projectDir, createBackend({ provider: "fake", model: "plain" }), WORKS, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10, journalRuns: 20 });
+    await validateProgram(projectDir, createBackend({ provider: "fake", model: "plain" }), WORKS, { timeout: 20_000, maxRepairAttempts: 0, journalRuns: 20 });
   } finally {
     Object.assign(llm, original);
   }
@@ -348,7 +348,7 @@ test("a run begins from the state it began from: that is on record with it, and 
   for (const n of [1, 2, 3]) assert.deepEqual((await recorded(projectDir, model)).result, { n, said: `said to: It is run ${n}` });
   const [one, two, three] = runsOf(projectDir);
   const beganWith = (run) => recordsOf(projectDir, run).find((record) => record.kind === "attempt").state;
-  assert.deepEqual([one, two, three].map(beganWith), [{}, { n: 1, __trama_iteration: 1 }, { n: 2, __trama_iteration: 2 }]);
+  assert.deepEqual([one, two, three].map(beganWith), [{}, { n: 1 }, { n: 2 }]);
 
   const before = held(projectDir);
   for (const [run, n] of [[one, 1], [two, 2], [three, 3]]) {
@@ -358,12 +358,13 @@ test("a run begins from the state it began from: that is on record with it, and 
   assert.deepEqual(held(projectDir), before);
   assert.equal(JSON.parse(readFileSync(join(projectDir, "state.json"), "utf-8")).n, 3);
 
-  // A record made before the state was kept with it: of a run that began with none, that is known all the same...
-  const without = (records) => records.map(({ state: _state, ...record }) => record);
-  rewrite(projectDir, one, without);
+  // A record made before the state was kept with it (0.8.0 and before: its attempt has, in the state's place, how
+  // often the state had been kept — `iteration`): of a run that began with none, that is known all the same...
+  const asItWas = (iteration) => (records) => records.map(({ state: _state, ...record }) => (record.kind === "attempt" ? { ...record, iteration } : record));
+  rewrite(projectDir, one, asItWas(0));
   assert.equal((await replay(projectDir, { run: one })).same, true);
   // ...and of any other it is not, and nothing is replayed from a state made up.
-  rewrite(projectDir, two, without);
+  rewrite(projectDir, two, asItWas(1));
   await assert.rejects(replay(projectDir, { run: two }), /The record of run \S+ does not say what state it began from \(it was made before that was kept\)/);
 });
 
@@ -490,7 +491,7 @@ test("a program is held to every run on record: each is replayed by itself, one 
   const original = { ...llm };
   Object.assign(llm, model);
   try {
-    await validateProgram(projectDir, createBackend({ provider: "fake", model: "plain" }), KEEPS, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10, journalRuns: 20 });
+    await validateProgram(projectDir, createBackend({ provider: "fake", model: "plain" }), KEEPS, { timeout: 20_000, maxRepairAttempts: 0, journalRuns: 20 });
   } finally {
     Object.assign(llm, original);
   }
@@ -613,7 +614,7 @@ await ctx.done({ same, other, loose, all, none, both });
   assert.deepEqual([calls[0].request.projectDir.endsWith("/target"), calls[3].request.all, calls[1].request.run], [true, true, run]);
 
   // A validation makes it for real: it costs nothing and does nothing, and is no hand-off.
-  await validateProgram(asker, createBackend({ provider: "fake", model: "plain" }), ASKER, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10, journalRuns: 20 });
+  await validateProgram(asker, createBackend({ provider: "fake", model: "plain" }), ASKER, { timeout: 20_000, maxRepairAttempts: 0, journalRuns: 20 });
   const validation = recordsOf(asker);
   assert.equal(validation[0].purpose, "validate");
   assert.deepEqual([validation.filter((record) => record.kind === "result" && record.ok).length, validation.find((record) => record.kind === "exit").validated], [5, undefined]);

@@ -236,7 +236,6 @@ test("createProject accepts long-running server programs during smoke validation
     model: "test-model",
     maxRepairAttempts: 0,
     defaultTimeout: 10_000,
-    defaultMaxIterations: 100,
   });
 
   const originalAsk = llm.ask;
@@ -298,7 +297,6 @@ test("createProject times out long-running server programs that never call ctx.r
     model: "test-model",
     maxRepairAttempts: 0,
     defaultTimeout: 1_000,
-    defaultMaxIterations: 100,
   });
 
   const originalAsk = llm.ask;
@@ -354,7 +352,6 @@ test("createProject detects server crash during smoke grace period after ctx.rea
     model: "test-model",
     maxRepairAttempts: 0,
     defaultTimeout: 10_000,
-    defaultMaxIterations: 100,
   });
 
   const originalAsk = llm.ask;

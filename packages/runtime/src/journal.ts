@@ -423,7 +423,7 @@ export function stillBeingWritten(path: string): boolean {
  * Remove the oldest journals of a project so that, with one more, at most
  * `keep` remain — but never one that is still being written, by this process
  * or by another runner: a run of the same project may be going on right now
- * (two participants of a session, or a program that runs its own project).
+ * (two runs that work together, or a program that runs its own project).
  * Such journals stay, and the project holds more than `keep` for a while.
  */
 function makeRoom(dir: string, keep: number): void {

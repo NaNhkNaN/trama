@@ -83,7 +83,7 @@ test("a program has a shell in its workspace by the bridge, on record as one —
   createProjectFixture(alone, { programSource: `import { ctx, workspace } from "@trama-dev/runtime";
 await ctx.done({ said: await workspace.shell("pwd").catch((err) => String(err.message)) });
 ` });
-  assert.deepEqual((await runProgram({ projectDir: alone, maxRepairAttempts: 0, timeout: 30_000 })).result, { said: "workspace is only available when running in a session" });
+  assert.deepEqual((await runProgram({ projectDir: alone, maxRepairAttempts: 0, timeout: 30_000 })).result, { said: "This run has no workspace: workspace.* is there where a run is given one (trama run --workspace <dir>, or workspaceDir)" });
 });
 
 test("what a model calls a tool with is held to what the tool declared: the declared fields come back, and what is wrong is said in words for the model", () => {

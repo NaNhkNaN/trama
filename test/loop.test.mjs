@@ -135,7 +135,7 @@ await ctx.done({ versions: history.versions.length, went });
     await quietly(() => runProgram({ projectDir: target, timeout: 30_000 }));
 
     const { messages } = await captureConsole("log", () =>
-      validateProgram(at("asker"), createBackend({ provider: "fake", model: "plain" }), GOES_BACK, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10, journalRuns: 20 }));
+      validateProgram(at("asker"), createBackend({ provider: "fake", model: "plain" }), GOES_BACK, { timeout: 20_000, maxRepairAttempts: 0, journalRuns: 20 }));
     assert.ok(messages.includes("[trama] validated up to where it has a project made or changed"), messages.join("\n"));
     const validation = journalsOf(at("asker")).at(-1);
     // (The history was read, and answered; the going back was asked, and is where the validation ended: never answered.)

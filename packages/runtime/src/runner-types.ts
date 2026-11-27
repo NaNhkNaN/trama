@@ -61,14 +61,14 @@ export interface RunOptions {
   /**
    * Per-phase limit in ms on the program's own time, for each run and each
    * repair attempt. Time during which a run the program started with
-   * runProgram() — a session participant — is in flight is not counted: that
+   * runProgram() is in flight is not counted: that
    * run has a timeout of its own.
    */
   timeout?: number;
   args?: Record<string, unknown>;
   /** Shared workspace directory. When set, workspace.* API is enabled for the program. */
   workspaceDir?: string;
-  /** A name for this run — a participant's, say. Its output is shown under it. */
+  /** A name for this run — one among several that work together, say. Its output is shown under it. */
   label?: string;
   /**
    * Variables for the run, over the runner's own: its program has them, and
@@ -299,7 +299,6 @@ export type RolledBack = { version: number; from: number; contract?: "back" | "u
 export interface TramaConfig extends ModelConfig {
   maxRepairAttempts: number;
   defaultTimeout: number;
-  defaultMaxIterations: number;
   /** How many runs of a project keep their journal. 0 records nothing. */
   journalRuns: number;
   /**

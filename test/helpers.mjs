@@ -10,8 +10,8 @@ export const REPO_ROOT = dirname(TEST_DIR);
 
 export const DEFAULT_PROGRAM = `import { ctx, tools } from "@trama-dev/runtime";
 
-await tools.write("output.txt", \`iteration:\${ctx.iteration}\`);
-await ctx.log("ran", { iteration: ctx.iteration });
+await tools.write("output.txt", "ran");
+await ctx.log("ran", { resumed: ctx.resumed });
 ctx.state.status = "ok";
 await ctx.done({ final: "ok" });
 `;

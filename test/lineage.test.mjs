@@ -166,7 +166,7 @@ test("only a run leaves a line: not a validation, not a replay — and a run tha
   const projectDir = project(t);
   await run(projectDir);
   const before = readFileSync(join(projectDir, "history", "runs.jsonl"), "utf-8");
-  await validateProgram(projectDir, createBackend({ provider: "fake", model: "plain" }), TWO, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10, journalRuns: 20 });
+  await validateProgram(projectDir, createBackend({ provider: "fake", model: "plain" }), TWO, { timeout: 20_000, maxRepairAttempts: 0, journalRuns: 20 });
   assert.equal((await replayProgram({ projectDir })).same, true);
   assert.equal(readFileSync(join(projectDir, "history", "runs.jsonl"), "utf-8"), before);
   assert.deepEqual(readdirSync(join(projectDir, "history")).sort(), ["0001.ts", "index.jsonl", "runs.jsonl"]);

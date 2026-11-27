@@ -210,7 +210,7 @@ await ctx.done({ made: "inner" });
   for (const call of [`createProject("another", "p")`, `updateProject("maker", "p")`]) {
     const candidate = `import { ctx } from "@trama-dev/runtime";\nimport { createProject, updateProject } from "@trama-dev/runtime/runner";\nawait ${call};\nawait ctx.done();\n`;
     const { messages } = await withEnv({ HOME: fakeHome }, () => captureConsole("log", () =>
-      validateProgram(projectDir, createBackend({ provider: "fake", model: "plain" }), candidate, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10 })));
+      validateProgram(projectDir, createBackend({ provider: "fake", model: "plain" }), candidate, { timeout: 20_000, maxRepairAttempts: 0 })));
     assert.ok(messages.includes("[trama] validated up to where it has a project made or changed"), call);
   }
   assert.equal(existsSync(join(projects, "another")), false);

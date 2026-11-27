@@ -24,21 +24,15 @@ import { messageOf } from "./errors.js";
 const RUNTIME_PACKAGE_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 
 /**
- * The @trama-dev packages a program.ts can import, and where they are installed.
- * The runtime always; the session layer when it is installed alongside (as it
- * is with the CLI). The runtime never imports the session layer itself — it
- * only makes it reachable from projects.
+ * The @trama-dev packages a program.ts can import, and where they are
+ * installed: the runtime.
  */
 const IMPORTABLE_PACKAGES: Record<string, string> = { runtime: RUNTIME_PACKAGE_DIR };
-try {
-  // Resolves to <package>/dist/index.js
-  IMPORTABLE_PACKAGES.session = dirname(dirname(fileURLToPath(import.meta.resolve("@trama-dev/session"))));
-} catch { /* not installed — programs simply cannot import it */ }
 
 // --- Project scaffolding ---
 //
-// A project is not one runner's alone: runs of it begin together — a
-// session's participants, a loop that starts several — and each runner makes
+// A project is not one runner's alone: runs of it begin together — runs that
+// work together, a loop that starts several — and each runner makes
 // ready what a run needs. So nothing here is made in steps another could come
 // between, or see half done. Each thing is looked at once; where it is not as
 // it should be, what should be there is made whole beside it and put in its
@@ -182,7 +176,6 @@ export function loadConfig(): TramaConfig {
     model: "claude-opus-5-5",
     maxRepairAttempts: 3,
     defaultTimeout: 300_000,
-    defaultMaxIterations: 100,
     journalRuns: 20,
     agentChanges: "keep",
   };
@@ -215,13 +208,11 @@ export function loadConfig(): TramaConfig {
 /** A config that holds what the runtime can work with — or an error naming what does not, and where it came from. */
 function checkedConfig(merged: TramaConfig, source: string): TramaConfig {
   const s = (v: unknown) => typeof v === "string" && v.length > 0;
-  const pint = (v: unknown) => Number.isInteger(v) && (v as number) > 0;
   const checks: Array<[boolean, string]> = [
     [s(merged.provider), `"provider" must be a non-empty string (got ${JSON.stringify(merged.provider)})`],
     [s(merged.model), `"model" must be a non-empty string (got ${JSON.stringify(merged.model)})`],
     [Number.isInteger(merged.maxRepairAttempts) && merged.maxRepairAttempts >= 0, `"maxRepairAttempts" must be a non-negative integer (got ${merged.maxRepairAttempts})`],
     [Number.isFinite(merged.defaultTimeout) && merged.defaultTimeout > 0, `"defaultTimeout" must be a positive number (got ${merged.defaultTimeout})`],
-    [pint(merged.defaultMaxIterations), `"defaultMaxIterations" must be a positive integer (got ${merged.defaultMaxIterations})`],
     [Number.isInteger(merged.journalRuns) && merged.journalRuns >= 0, `"journalRuns" must be a non-negative integer (got ${merged.journalRuns})`],
     [merged.agentChanges === "keep" || merged.agentChanges === "discard", `"agentChanges" must be "keep" or "discard" (got ${JSON.stringify(merged.agentChanges)})`],
   ];

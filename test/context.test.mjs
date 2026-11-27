@@ -6,21 +6,20 @@ import { createContext } from "../packages/runtime/dist/context.js";
 import { toLogData } from "../packages/runtime/dist/serializable.js";
 import { cleanupTempDir, createProjectFixture, makeTempDir, readJson, readText } from "./helpers.mjs";
 
-test("createContext checkpoint persists state and increments iteration", async (t) => {
+test("createContext checkpoint persists the state as the program has it, and nothing of the runner's with it: no count of how often it was kept", async (t) => {
   const projectDir = makeTempDir("trama-context-");
   t.after(() => cleanupTempDir(projectDir));
   createProjectFixture(projectDir);
 
-  const ctx = createContext(projectDir, { counter: 1 }, { maxIterations: 7 });
+  const ctx = createContext(projectDir, { counter: 1 });
 
-  assert.equal(ctx.checkpoint({ counter: 1, extra: { nested: true } }), 1);
+  assert.equal(ctx.checkpoint({ counter: 1, extra: { nested: true } }), undefined);
 
-  assert.equal(ctx.iteration, 1);
-  assert.equal(ctx.maxIterations, 7);
+  // (How often to go round, and where a loop takes up again, are the program's own to keep: in its state.)
+  assert.deepEqual(["iteration" in ctx, "maxIterations" in ctx], [false, false]);
   assert.deepEqual(readJson(join(projectDir, "state.json")), {
     counter: 1,
     extra: { nested: true },
-    __trama_iteration: 1,
   });
 });
 
@@ -32,15 +31,15 @@ test("createContext done logs once and is idempotent", async (t) => {
   const ctx = createContext(projectDir, {});
 
   assert.equal(ctx.ended, null);
-  assert.equal(ctx.done({ kept: true }, { result: "ok" }), 1);
+  assert.equal(ctx.done({ kept: true }, { result: "ok" }), undefined);
   // Said again, it does nothing: not to the state, the log, or how the run ended.
-  assert.equal(ctx.done({ kept: false }, { result: "ignored" }), 1);
+  ctx.done({ kept: false }, { result: "ignored" });
 
   const lines = readJsonLines(join(projectDir, "logs", "latest.jsonl"));
   assert.equal(lines.length, 1);
   assert.equal(lines[0].message, "done");
   assert.deepEqual(lines[0].data, { result: "ok" });
-  assert.deepEqual(readJson(join(projectDir, "state.json")), { kept: true, __trama_iteration: 1 });
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { kept: true });
   assert.deepEqual(ctx.ended, { status: "done", result: { result: "ok" } });
 });
 
@@ -56,7 +55,7 @@ test("createContext done logs completion even when no result is provided", async
   assert.equal(lines.length, 1);
   assert.equal(lines[0].message, "done");
   assert.equal(lines[0].data, null);
-  assert.equal(readJson(join(projectDir, "state.json")).__trama_iteration, 1);
+  assert.deepEqual(readJson(join(projectDir, "state.json")), {});
 });
 
 test("createContext ready logs once, triggers onReady once, and does not checkpoint", async (t) => {
@@ -79,7 +78,6 @@ test("createContext ready logs once, triggers onReady once, and does not checkpo
   assert.equal(lines[0].message, "ready");
   assert.deepEqual(lines[0].data, { url: "http://127.0.0.1:3000" });
   assert.deepEqual(readyEvents, [{ url: "http://127.0.0.1:3000" }]);
-  assert.equal(ctx.iteration, 0);
   assert.equal(existsSync(join(projectDir, "state.json")), false);
 });
 
@@ -109,7 +107,6 @@ test("createContext allows shared object references that are not circular", asyn
   assert.deepEqual(readJson(join(projectDir, "state.json")), {
     left: { value: 42 },
     right: { value: 42 },
-    __trama_iteration: 1,
   });
 });
 
@@ -147,31 +144,20 @@ test("createContext checkpoint rejects NaN and Infinity", async (t) => {
   }
 });
 
-test("createContext ignores polluted __trama_iteration (non-number)", async (t) => {
+test("a count an earlier trama kept in the state file is taken out when the state is next kept: the file holds the program's own keys, and the mark of a yield where there is one", async (t) => {
   const projectDir = makeTempDir("trama-context-");
   t.after(() => cleanupTempDir(projectDir));
   createProjectFixture(projectDir);
 
-  for (const bad of ["oops", null, true, undefined]) {
-    const ctx = createContext(projectDir, { __trama_iteration: bad });
-    assert.equal(ctx.iteration, 0, `should reset to 0 for ${JSON.stringify(bad)}`);
+  // (The program was handed the state with the count in it, and hands it back so: whatever the count was.)
+  for (const was of [5, 0, -1, "oops", null]) {
+    const state = { __trama_iteration: was, data: "kept" };
+    createContext(projectDir, state, { print() {} }).checkpoint(state);
+    assert.deepEqual(readJson(join(projectDir, "state.json")), { data: "kept" }, JSON.stringify(was));
   }
-});
-
-test("createContext resumes iteration from persisted __trama_iteration", async (t) => {
-  const projectDir = makeTempDir("trama-context-");
-  t.after(() => cleanupTempDir(projectDir));
-  createProjectFixture(projectDir);
-
-  const ctx = createContext(projectDir, { __trama_iteration: 5, data: "kept" });
-  assert.equal(ctx.iteration, 5);
-
-  ctx.checkpoint({ __trama_iteration: 5, data: "kept" });
-  assert.equal(ctx.iteration, 6);
-
-  const saved = readJson(join(projectDir, "state.json"));
-  assert.equal(saved.__trama_iteration, 6);
-  assert.equal(saved.data, "kept");
+  const state = { __trama_iteration: 2, n: 1 };
+  createContext(projectDir, state, { print() {} }).yield(state, "later");
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { n: 1, __trama_yield: { reason: "later" } });
 });
 
 test("createContext extracts input from meta.json", async (t) => {
@@ -193,21 +179,6 @@ test("createContext argsOverride merges with meta.json args", async (t) => {
   assert.equal(ctx.input.args.existing, "kept");
   assert.equal(ctx.input.args.overridden, "new");
   assert.equal(ctx.input.args.added, "extra");
-});
-
-test("createContext resets negative and fractional __trama_iteration to zero", async (t) => {
-  const projectDir = makeTempDir("trama-context-");
-  t.after(() => cleanupTempDir(projectDir));
-  createProjectFixture(projectDir);
-
-  for (const bad of [-1, -3.5, 0.5]) {
-    const ctx = createContext(projectDir, { __trama_iteration: bad });
-    assert.equal(ctx.iteration, 0, `should reset to 0 for ${bad}`);
-  }
-
-  // Positive integers should still be accepted
-  const ctx = createContext(projectDir, { __trama_iteration: 3 });
-  assert.equal(ctx.iteration, 3);
 });
 
 test("createContext done retries after checkpoint failure", async (t) => {
@@ -277,13 +248,12 @@ test("createContext: a state that could not be written settles nothing", (t) => 
   mkdirSync(join(projectDir, "state.json"));
   assert.throws(() => ctx.checkpoint(state));
   assert.throws(() => ctx.done(state, "result"));
-  assert.equal(ctx.iteration, 0);
   // The run can still end either way.
   assert.equal(ctx.ended, null);
 
   rmSync(join(projectDir, "state.json"), { recursive: true });
   ctx.yield(state, "later");
-  assert.deepEqual(readJson(join(projectDir, "state.json")), { __trama_yield: { reason: "later" }, n: 1, __trama_iteration: 1 });
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { __trama_yield: { reason: "later" }, n: 1 });
   assert.deepEqual(ctx.ended, { status: "yielded", reason: "later" });
 });
 
@@ -307,7 +277,6 @@ test("createContext: once a run has ended its state is settled — nothing more 
     ctx[end]({ n: 4 }, "again");
 
     assert.deepEqual(readJson(join(projectDir, "state.json")), settled);
-    assert.equal(ctx.iteration, 1);
     assert.equal(readText(join(projectDir, "logs", "latest.jsonl")).trim().split("\n").length, 1);
   }
 });
@@ -337,14 +306,14 @@ test("createContext: a state is put in the place of the last, whole — it is no
   // of the project starts from that; stopped in the middle of the second, it leaves the state before.)
   linkSync(join(projectDir, "state.json"), join(projectDir, "as-it-was.json"));
   ctx.checkpoint({ n: 2 });
-  assert.deepEqual(readJson(join(projectDir, "as-it-was.json")), { n: 1, __trama_iteration: 1 });
-  assert.deepEqual(readJson(join(projectDir, "state.json")), { n: 2, __trama_iteration: 2 });
+  assert.deepEqual(readJson(join(projectDir, "as-it-was.json")), { n: 1 });
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { n: 2 });
   assert.deepEqual(readdirSync(projectDir).filter((name) => name.includes("trama-tmp")), [], "and nothing is left beside it");
 
   // A state file its owner made read-only is not replaced, as it was not written into: its owner's say.
   chmodSync(join(projectDir, "state.json"), 0o444);
   assert.throws(() => ctx.checkpoint({ n: 3 }), { code: "EACCES" });
-  assert.deepEqual(readJson(join(projectDir, "state.json")), { n: 2, __trama_iteration: 2 });
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { n: 2 });
   assert.deepEqual(readdirSync(projectDir).filter((name) => name.includes("trama-tmp")), []);
   chmodSync(join(projectDir, "state.json"), 0o644);
 

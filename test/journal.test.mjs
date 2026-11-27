@@ -166,10 +166,10 @@ await ctx.done();`,
   createProjectFixture(entryDir, {
     scaffold: false,
     programSource: `import { ctx } from "@trama-dev/runtime";
-import { Session } from "@trama-dev/session";
-const session = await Session.create({ workspace: ${JSON.stringify(wsDir)} });
-const result = await session.spawn("scout", { projectDir: ${JSON.stringify(workerDir)}, maxRepairAttempts: 0, timeout: 20000 }).wait();
-const seen = await session.workspace.read("from-worker.txt");
+import { createWorkspace, runProgram } from "@trama-dev/runtime/runner";
+const shared = createWorkspace(${JSON.stringify(wsDir)});
+const result = await runProgram({ projectDir: ${JSON.stringify(workerDir)}, workspaceDir: ${JSON.stringify(wsDir)}, label: "scout", maxRepairAttempts: 0, timeout: 20000 });
+const seen = await shared.read("from-worker.txt");
 await ctx.done({ worker: result.status, seen });`,
   });
 
@@ -194,7 +194,7 @@ await ctx.done({ worker: result.status, seen });`,
   });
   assert.equal(child[0].label, "scout");
   assert.equal(child[0].depth, 1);
-  // The program that created the session reaches its workspace through the bridge, so that is on record too.
+  // A program that has a workspace by its directory reaches it through the bridge, so that is on record too.
   const read = parent.find(record => record.kind === "call" && record.endpoint === "/workspace/read");
   assert.deepEqual(read.request, { dir: wsDir, path: "from-worker.txt" });
 });
@@ -498,7 +498,7 @@ test("a validation is recorded with the project, though it runs in a copy that i
 await tools.write("made-while-validating.txt", "x");
 await ctx.done();`;
   await validateProgram(projectDir, createBackend(loadConfig()), candidate, {
-    timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10, journalRuns: 5,
+    timeout: 20_000, maxRepairAttempts: 0, journalRuns: 5,
   });
 
   const records = onlyJournal(projectDir);
@@ -520,7 +520,7 @@ writeFileSync("state.json", "{ not json");
 process.exit(3);`;
   await assert.rejects(
     validateProgram(projectDir, createBackend(loadConfig()), candidate, {
-      timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10, journalRuns: 5,
+      timeout: 20_000, maxRepairAttempts: 0, journalRuns: 5,
     }),
     /Corrupt state\.json/,
   );
@@ -541,11 +541,11 @@ test("a validation that ends at a hand-off is on record as that: the call, never
   createProjectFixture(projectDir, { scaffold: false });
   createProjectFixture(participantDir, { scaffold: false });
 
-  const candidate = `import { Session } from "@trama-dev/session";
-const session = await Session.create({ workspace: "./workspace" });
-await session.spawn("p", { projectDir: ${JSON.stringify(participantDir)} }).wait();`;
+  const candidate = `import { runProgram } from "@trama-dev/runtime/runner";
+import { resolve } from "path";
+await runProgram({ projectDir: ${JSON.stringify(participantDir)}, workspaceDir: resolve("workspace"), label: "p" });`;
   await validateProgram(projectDir, createBackend(loadConfig()), candidate, {
-    timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10, journalRuns: 5,
+    timeout: 20_000, maxRepairAttempts: 0, journalRuns: 5,
   });
 
   const records = onlyJournal(projectDir);

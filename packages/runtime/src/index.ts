@@ -353,13 +353,14 @@ await ctx.done({ summaryLength: summary.length });
 // Example C: Iterative optimization loop.
 // Pattern: propose a change via LLM, evaluate it with a deterministic script,
 // keep the change only if it improves the metric, repeat.
-// ctx.state and ctx.iteration persist across runs so the loop can resume after interruption.
+// ctx.state persists across runs, so the loop keeps there how far it is and can resume after interruption.
 import { ctx, agent, tools } from "@trama-dev/runtime";
 
 let code = (ctx.state.code as string | undefined) ?? await tools.read("target.ts");
 let bestMetric = (ctx.state.bestMetric as number | undefined) ?? Infinity;
+const ROUNDS = 20;
 
-for (let i = ctx.iteration; i < ctx.maxIterations; i++) {
+for (let i = (ctx.state.round as number | undefined) ?? 0; i < ROUNDS; i++) {
   const proposal = await agent.generate<{ reasoning: string; newCode: string }>({
     prompt: "Analyze this code and propose ONE specific improvement:\\n" + code,
     schema: { reasoning: "string: why this change helps", newCode: "string: complete improved code" },
@@ -377,10 +378,10 @@ for (let i = ctx.iteration; i < ctx.maxIterations; i++) {
   if (metric < bestMetric) {
     code = proposal.newCode;
     bestMetric = metric;
-    await ctx.log("improved", { iteration: i, metric, reasoning: proposal.reasoning });
-    ctx.state = { code, bestMetric };
-    await ctx.checkpoint();
+    await ctx.log("improved", { round: i, metric, reasoning: proposal.reasoning });
   }
+  ctx.state = { code, bestMetric, round: i + 1 };
+  await ctx.checkpoint();
 }
 
 await tools.write("target.ts", code);
@@ -426,7 +427,7 @@ function getSystemPrompt(kept: boolean): string {
   return (
     `You are generating a TypeScript program for the trama runtime.\n\n` +
     `If the program is long-running (for example an HTTP server), call ctx.ready(...) after startup completes and handle SIGTERM/SIGINT for clean shutdown.\n\n` +
-    `The workspace object is available when running in a session (shared artifact I/O between agents). ` +
+    `The workspace object is there where a run is given a directory to work in beside its project (a codebase, or what several runs share): workspace.read, write, list, shell. ` +
     `ctx.yield(reason) suspends the program cooperatively — persists state and exits. ` +
     `ctx.resumed is true if this run follows a yield; ctx.yieldReason has the reason.\n\n` +
     `You are working in a copy of the project's directory, which is where the program will run: ` +
@@ -700,7 +701,6 @@ async function validateCandidate(
   const validated = await validateProgram(projectDir, backend, candidate, {
     timeout: config.defaultTimeout,
     maxRepairAttempts: config.maxRepairAttempts,
-    maxIterations: config.defaultMaxIterations,
     journalRuns: config.journalRuns,
     agents: config.agents,
     signal,
@@ -951,7 +951,6 @@ async function addVersionHere(
       timeout: config.defaultTimeout,
       // (As it was handed over, or not at all: a fix would be another text than the one its writer answers for.)
       maxRepairAttempts: 0,
-      maxIterations: config.defaultMaxIterations,
       journalRuns: config.journalRuns,
       agents: config.agents,
       signal: options?.signal,

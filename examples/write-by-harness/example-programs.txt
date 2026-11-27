@@ -17,13 +17,14 @@ await ctx.done({ summaryLength: summary.length });
 // Example C: Iterative optimization loop.
 // Pattern: propose a change via LLM, evaluate it with a deterministic script,
 // keep the change only if it improves the metric, repeat.
-// ctx.state and ctx.iteration persist across runs so the loop can resume after interruption.
+// ctx.state persists across runs, so the loop keeps there how far it is and can resume after interruption.
 import { ctx, agent, tools } from "@trama-dev/runtime";
 
 let code = (ctx.state.code as string | undefined) ?? await tools.read("target.ts");
 let bestMetric = (ctx.state.bestMetric as number | undefined) ?? Infinity;
+const ROUNDS = 20;
 
-for (let i = ctx.iteration; i < ctx.maxIterations; i++) {
+for (let i = (ctx.state.round as number | undefined) ?? 0; i < ROUNDS; i++) {
   const proposal = await agent.generate<{ reasoning: string; newCode: string }>({
     prompt: "Analyze this code and propose ONE specific improvement:\n" + code,
     schema: { reasoning: "string: why this change helps", newCode: "string: complete improved code" },
@@ -41,10 +42,10 @@ for (let i = ctx.iteration; i < ctx.maxIterations; i++) {
   if (metric < bestMetric) {
     code = proposal.newCode;
     bestMetric = metric;
-    await ctx.log("improved", { iteration: i, metric, reasoning: proposal.reasoning });
-    ctx.state = { code, bestMetric };
-    await ctx.checkpoint();
+    await ctx.log("improved", { round: i, metric, reasoning: proposal.reasoning });
   }
+  ctx.state = { code, bestMetric, round: i + 1 };
+  await ctx.checkpoint();
 }
 
 await tools.write("target.ts", code);

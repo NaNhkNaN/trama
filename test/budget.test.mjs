@@ -10,7 +10,6 @@ import { loadConfig } from "../packages/runtime/dist/project.js";
 import { createProject, updateProject } from "../packages/runtime/dist/index.js";
 import { printJournals } from "../packages/runtime/dist/journal-view.js";
 import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
-import { Session } from "../packages/session/dist/index.js";
 import {
   REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, makeTempDir, readJson, runNodeCommand, withEnv, writeJson,
 } from "./helpers.mjs";
@@ -643,7 +642,7 @@ await ctx.done({ said: await agent.instruct("a question of the program's") });
 
   // A validation asked for directly says what it is told was used, and no more.
   const { messages } = await captureConsole("log", () => validateProgram(projectDir, createBackend({ provider: "fake", model: "plain" }), `import { ctx } from "@trama-dev/runtime";\nawait ctx.done();\n`, {
-    timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10, journalRuns: 20, budget: {}, wrote: [took(5), took(6)],
+    timeout: 20_000, maxRepairAttempts: 0, journalRuns: 20, budget: {}, wrote: [took(5), took(6)],
   }));
   assert.deepEqual(messages.filter((line) => /used/.test(line)), []);
   const last = journalsOf(projectDir).at(-1);
@@ -651,10 +650,10 @@ await ctx.done({ said: await agent.instruct("a question of the program's") });
   assert.deepEqual(last[0].budget, {}, "a budget is written down as it was given: one with no caps says that none was set");
 });
 
-test("a participant of a session is given a budget as it is spawned, and has that each time it is run", async (t) => {
-  const workerDir = makeTempDir("trama-budget-");
-  const session = await Session.createTemp("trama-budget-session-");
-  t.after(() => { cleanupTempDir(workerDir); cleanupTempDir(session.workspaceDir); });
+test("a run among others is given a budget as it is started, and one that is taken up again is held to what it is given then", async (t) => {
+  const workerDir = makeTempDir("trama-budget-"), sharedDir = makeTempDir("trama-budget-shared-");
+  t.after(() => { cleanupTempDir(workerDir); cleanupTempDir(sharedDir); });
+  const start = (budget) => runProgram({ projectDir: workerDir, workspaceDir: sharedDir, label: "worker", budget, maxRepairAttempts: 0, timeout: 20_000 });
   createProjectFixture(workerDir, {
     programSource: `import { ctx, agent } from "@trama-dev/runtime";
 const went = [];
@@ -665,18 +664,13 @@ await ctx.done({ first: ctx.state.first, again: went });
   });
   standIn(t, { ask: async (_prompt, call) => { call.used(took(1)); return "an answer"; } });
 
-  const budget = { calls: 1 };
-  const handle = session.spawn("worker", { projectDir: workerDir, budget, maxRepairAttempts: 0, timeout: 20_000 });
-  // (What becomes of the object after the participant is spawned is not the participant's budget.)
-  budget.calls = 100;
   await captureConsole("warn", async () => {
-    assert.equal((await handle.wait()).status, "yielded");
-    const resumed = await (await handle.resume()).wait();
+    assert.equal((await start({ calls: 1 })).status, "yielded");
+    const resumed = await start({ calls: 1 });
     assert.deepEqual(resumed.result, { first: ["answered", "refused"], again: ["answered", "refused"] });
   });
-  await assert.rejects(() => session.spawn("worker", { projectDir: workerDir, budget: "lots", maxRepairAttempts: 0, timeout: 20_000 }).wait(), /budget is an object of caps/);
-  // (What is no plain object is handed on as it is, to be refused for what it is: a copy of it would be a budget of no caps.)
-  await assert.rejects(() => session.spawn("worker", { projectDir: workerDir, budget: new Map([["calls", 1]]), maxRepairAttempts: 0, timeout: 20_000 }).wait(), /got an object that is not a plain one/);
+  await assert.rejects(() => start("lots"), /budget is an object of caps/);
+  await assert.rejects(() => start(new Map([["calls", 1]])), /got an object that is not a plain one/);
 });
 
 test("trama run takes a budget from its command line, and holds the run to it", async (t) => {

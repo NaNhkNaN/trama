@@ -14,9 +14,7 @@ function runtimeEnv(initOverrides = {}) {
   writeFileSync(initFile, JSON.stringify({
     input: { prompt: "test prompt", args: {} },
     state: {},
-    iteration: 0,
-    maxIterations: 100,
-    inSession: false,
+    hasWorkspace: false,
     resumed: false,
     yieldReason: null,
     ...initOverrides,
@@ -32,8 +30,8 @@ function runtimeEnv(initOverrides = {}) {
   };
 }
 
-test("client.ts workspace throws when not in a session (workspace=null)", async () => {
-  const { env, initDir } = runtimeEnv({ inSession: false });
+test("client.ts workspace throws where the run was given no workspace", async () => {
+  const { env, initDir } = runtimeEnv({ hasWorkspace: false });
   try {
     const result = await runNodeCommand(
       [
@@ -52,14 +50,14 @@ try {
     );
 
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.match(result.stdout, /only available when running in a session/);
+    assert.match(result.stdout, /This run has no workspace/);
   } finally {
     try { rmSync(initDir, { recursive: true, force: true }); } catch {}
   }
 });
 
-test("client.ts workspace.write throws when not in a session", async () => {
-  const { env, initDir } = runtimeEnv({ inSession: false });
+test("client.ts workspace.write throws where the run was given no workspace", async () => {
+  const { env, initDir } = runtimeEnv({ hasWorkspace: false });
   try {
     const result = await runNodeCommand(
       [
@@ -78,14 +76,14 @@ try {
     );
 
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.match(result.stdout, /only available when running in a session/);
+    assert.match(result.stdout, /This run has no workspace/);
   } finally {
     try { rmSync(initDir, { recursive: true, force: true }); } catch {}
   }
 });
 
-test("client.ts workspace.list throws when not in a session", async () => {
-  const { env, initDir } = runtimeEnv({ inSession: false });
+test("client.ts workspace.list throws where the run was given no workspace", async () => {
+  const { env, initDir } = runtimeEnv({ hasWorkspace: false });
   try {
     const result = await runNodeCommand(
       [
@@ -104,14 +102,14 @@ try {
     );
 
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.match(result.stdout, /only available when running in a session/);
+    assert.match(result.stdout, /This run has no workspace/);
   } finally {
     try { rmSync(initDir, { recursive: true, force: true }); } catch {}
   }
 });
 
-test("client.ts workspace.observe throws when not in a session", async () => {
-  const { env, initDir } = runtimeEnv({ inSession: false });
+test("client.ts workspace.observe throws where the run was given no workspace", async () => {
+  const { env, initDir } = runtimeEnv({ hasWorkspace: false });
   try {
     const result = await runNodeCommand(
       [
@@ -130,7 +128,7 @@ try {
     );
 
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.match(result.stdout, /only available when running in a session/);
+    assert.match(result.stdout, /This run has no workspace/);
   } finally {
     try { rmSync(initDir, { recursive: true, force: true }); } catch {}
   }

@@ -25,7 +25,7 @@ const { task = ctx.input.prompt, agent, model, system, seconds } = ctx.input.arg
 // The run's workspace, where it has one; else the project this is the program of. (A run that has none is told so
 // when it asks for it — and only that is taken for having none.)
 const there = await workspace.shell("true").then(() => workspace, (err: unknown) => {
-  if (/only available when running in a session/.test(String((err as Error)?.message))) return tools;
+  if (/This run has no workspace/.test(String((err as Error)?.message))) return tools;
   throw err;
 });
 

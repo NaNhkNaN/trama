@@ -29,36 +29,35 @@ export function appendLogEntry(logsPath: string, message: string, data?: unknown
  */
 export interface RunContext {
   readonly input: Ctx["input"];
-  readonly maxIterations: number;
   /** Whether this run takes up from a yield, and the reason that yield gave. */
   readonly resumed: boolean;
   readonly yieldReason: string | null;
-  /** How many times the state has been persisted — in this run and the ones before it. */
-  readonly iteration: number;
   /** How the program ended the run: null until it has called done() or yield(). */
   readonly ended: ProgramResult | null;
 
   log(message: string, data?: unknown): void;
   /** The first call is logged and passed on to `onReady`; any other does nothing. */
   ready(data?: Record<string, unknown>): void;
-  /** Persist the program's state as it is now. Returns the iteration that makes it. */
-  checkpoint(state: Record<string, unknown>): number;
-  /** Persist the state and end the run as done. Returns the iteration it ended on. */
-  done(state: Record<string, unknown>, result?: unknown): number;
+  /** Persist the program's state as it is now. */
+  checkpoint(state: Record<string, unknown>): void;
+  /** Persist the state and end the run as done. */
+  done(state: Record<string, unknown>, result?: unknown): void;
   /** Persist the state, with the mark the next run resumes from, and end the run as yielded. */
   yield(state: Record<string, unknown>, reason: string): void;
 }
 
 /**
- * Bookkeeping lives in the state file under reserved `__trama_*` keys:
- * `__trama_iteration` (progress counter) and `__trama_yield` (set while the
- * program is suspended, cleared when it next advances).
+ * The state file is the program's state, and one thing of the runner's
+ * under a reserved key: `__trama_yield`, there while the program is
+ * suspended and gone when it next advances. (An earlier trama kept a count
+ * there too, `__trama_iteration`: a file that has one loses it when the
+ * state is next kept — how often a loop went round is the program's own to
+ * keep, in its state.)
  */
 export function createContext(
   projectDir: string,
   initialState: Record<string, unknown>,
   options?: {
-    maxIterations?: number;
     argsOverride?: Record<string, unknown>;
     onReady?: (data?: Record<string, unknown>) => void;
     /** Where the run's log lines are shown as they are written. Defaults to the console. */
@@ -100,10 +99,6 @@ export function createContext(
   // A yield marker left by the previous run means this run is its resumption.
   const rawYield = initialState.__trama_yield;
   const yieldMarker = isJsonObject(rawYield) && typeof rawYield.reason === "string" ? { reason: rawYield.reason } : null;
-  const savedIteration = initialState.__trama_iteration;
-
-  let iteration = typeof savedIteration === "number" && Number.isInteger(savedIteration) && savedIteration >= 0
-    ? savedIteration : 0;
   let readyCalled = false;
   let ended: ProgramResult | null = null;
 
@@ -129,12 +124,11 @@ export function createContext(
       throw new Error(`Cannot call ctx.${call}() after ctx.${endedBy}() — the run has ended, and its state is settled.`);
     }
     assertSerializable(state, "ctx.state");
-    const record: Record<string, unknown> = { ...state, __trama_iteration: iteration + 1 };
+    const { __trama_iteration: _counted, ...record }: Record<string, unknown> = state;
     if (ending?.status === "yielded") record.__trama_yield = { reason: ending.reason };
     else delete record.__trama_yield; // the program has moved on from its last yield
     saveState(projectDir, record);
     // Settled only once persisted: a call that failed leaves every call open.
-    iteration += 1;
     ended = ending ?? null;
     return true;
   };
@@ -146,10 +140,8 @@ export function createContext(
 
   return {
     input,
-    maxIterations: options?.maxIterations ?? 100,
     resumed: yieldMarker != null,
     yieldReason: yieldMarker?.reason ?? null,
-    get iteration() { return iteration; },
     get ended() { return ended; },
 
     log: writeLog,
@@ -163,7 +155,6 @@ export function createContext(
 
     checkpoint(state) {
       persist("checkpoint", state);
-      return iteration;
     },
 
     done(state, result) {
@@ -174,7 +165,6 @@ export function createContext(
         // (Saying it is no part of ending: it must not turn a run that is done into one that failed.)
         if (leftOut.length > 0) { try { options?.leftOut?.(leftOut, gives ?? ""); } catch { /* best-effort */ } }
       }
-      return iteration;
     },
 
     // Exiting is the program's job: this returns so that the call can be answered first.

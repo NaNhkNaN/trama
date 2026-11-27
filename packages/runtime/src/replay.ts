@@ -141,7 +141,8 @@ export function readRecording(projectDir: string, run?: string): Recording {
   if (head.cuts || attempt.cuts) throw new Error(`The record of run ${run} does not have whole what it began from: it was too large to keep.`);
   let state: unknown = attempt.state;
   if (state === undefined) {
-    // (Made before the state was kept with the attempt. A run that had been through no iteration and resumed nothing began with none.)
+    // (Made before the state was kept with the attempt: by 0.8.0 or before, which wrote down in its place how often the
+    // state had been kept — `iteration`. A run that had kept none and resumed nothing began with none.)
     if (attempt.iteration !== 0 || attempt.resumed) throw new Error(`The record of run ${run} does not say what state it began from (it was made before that was kept): it cannot be replayed.`);
     state = {};
   }

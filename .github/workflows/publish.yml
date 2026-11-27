@@ -33,19 +33,13 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
           RT_VER=$(node -p "require('./packages/runtime/package.json').version")
-          SS_VER=$(node -p "require('./packages/session/package.json').version")
           CLI_VER=$(node -p "require('./packages/cli/package.json').version")
           CLI_DEP=$(node -p "require('./packages/cli/package.json').dependencies['@trama-dev/runtime']")
-          SS_DEP=$(node -p "require('./packages/session/package.json').dependencies['@trama-dev/runtime']")
-          CLI_SS_DEP=$(node -p "require('./packages/cli/package.json').dependencies['@trama-dev/session']")
-          echo "tag=$TAG runtime=$RT_VER session=$SS_VER cli=$CLI_VER cli->runtime=$CLI_DEP cli->session=$CLI_SS_DEP session->runtime=$SS_DEP"
+          echo "tag=$TAG runtime=$RT_VER cli=$CLI_VER cli->runtime=$CLI_DEP"
           FAIL=0
           [ "$RT_VER" != "$TAG" ] && echo "::error::runtime version $RT_VER != tag $TAG" && FAIL=1
-          [ "$SS_VER" != "$TAG" ] && echo "::error::session version $SS_VER != tag $TAG" && FAIL=1
           [ "$CLI_VER" != "$TAG" ] && echo "::error::cli version $CLI_VER != tag $TAG" && FAIL=1
           [ "$CLI_DEP" != "$TAG" ] && echo "::error::cli depends on runtime $CLI_DEP != tag $TAG" && FAIL=1
-          [ "$SS_DEP" != "$TAG" ] && echo "::error::session depends on runtime $SS_DEP != tag $TAG" && FAIL=1
-          [ "$CLI_SS_DEP" != "$TAG" ] && echo "::error::cli depends on session $CLI_SS_DEP != tag $TAG" && FAIL=1
           exit $FAIL
 
       # Dependencies' install scripts are not needed and are not run.
@@ -56,10 +50,16 @@ jobs:
       # execute the whole dependency tree; whatever they do after this point
       # cannot change what gets published. If they fail, this job fails and the
       # publish job never starts.
+      #
+      # The packages' own pack scripts are run: the command line's copies the
+      # examples in to be packed, and takes them away again (see its
+      # package.json). They are this repository's, and run nothing from
+      # node_modules. Packed with --ignore-scripts, the command line is
+      # published without its examples.
       - name: Pack
         run: |
           mkdir -p "$RUNNER_TEMP/tarballs"
-          npm pack --workspaces --ignore-scripts --pack-destination "$RUNNER_TEMP/tarballs"
+          npm pack --workspaces --pack-destination "$RUNNER_TEMP/tarballs"
           ls -l "$RUNNER_TEMP/tarballs"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -102,7 +102,7 @@ jobs:
         run: |
           VERSION="${GITHUB_REF#refs/tags/v}"
           npm --version
-          for PKG in runtime session cli; do
+          for PKG in runtime cli; do
             if npm view "@trama-dev/$PKG@$VERSION" version >/dev/null 2>&1; then
               echo "@trama-dev/$PKG@$VERSION is already published — skipping"
               continue

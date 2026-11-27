@@ -19,8 +19,6 @@ function runtimeEnv() {
   writeFileSync(initFile, JSON.stringify({
     input: { prompt: "test prompt", args: {} },
     state: {},
-    iteration: 0,
-    maxIterations: 100,
   }));
   return {
     env: {
@@ -123,8 +121,6 @@ const initFile = join(initDir, "init.json");
 writeFileSync(initFile, JSON.stringify({
   input: { prompt: "test prompt", args: {} },
   state: {},
-  iteration: 0,
-  maxIterations: 100,
 }));
 
 process.env.TRAMA_PORT = String(addr.port);

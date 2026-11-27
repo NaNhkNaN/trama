@@ -99,7 +99,6 @@ test("runProgram clears stale yield marker on natural success without terminal s
 `,
     // Pre-seed state with a stale yield marker
     state: {
-      __trama_iteration: 1,
       __trama_yield: { reason: "stale" },
     },
   });
@@ -199,7 +198,7 @@ try {
 
   const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
   assert.equal(result.status, "done");
-  assert.match(result.result.error, /only available when running in a session/);
+  assert.match(result.result.error, /This run has no workspace/);
 });
 
 test("runProgram yield then done mutual exclusivity works end-to-end", async (t) => {
@@ -263,7 +262,7 @@ try {
 } catch (err) {
   verdict = err.message;
 }
-await tools.write("verdict.txt", verdict + " / iteration " + ctx.iteration);
+await tools.write("verdict.txt", verdict);
 `,
   });
 
@@ -271,32 +270,34 @@ await tools.write("verdict.txt", verdict + " / iteration " + ctx.iteration);
   assert.equal(result.status, "done");
   assert.match(
     readFileSync(join(projectDir, "verdict.txt"), "utf-8"),
-    /Cannot call ctx\.checkpoint\(\) after ctx\.done\(\).* \/ iteration 1$/,
+    /Cannot call ctx\.checkpoint\(\) after ctx\.done\(\)/,
   );
-  assert.deepEqual(readJson(join(projectDir, "state.json")), { answer: 1, __trama_iteration: 1 });
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { answer: 1 });
 });
 
-test("runProgram keeps the program's ctx.iteration in step with the runner", async (t) => {
+test("a program's ctx has no count of iterations and no bound on them — a loop's are its own, in its state — and its state is kept as it has it, however often", async (t) => {
   const projectDir = makeTempDir("trama-result-");
   t.after(() => cleanupTempDir(projectDir));
   createProjectFixture(projectDir, {
-    state: { __trama_iteration: 5 },
+    state: { __trama_iteration: 5, round: 2 },
     programSource: `import { ctx, tools } from "@trama-dev/runtime";
-const seen = [ctx.iteration];
-await ctx.checkpoint(); seen.push(ctx.iteration);
-await ctx.checkpoint(); seen.push(ctx.iteration);
-await ctx.done();       seen.push(ctx.iteration);
-// A repeated done() is a no-op: it must not advance the counter again.
-await ctx.done();       seen.push(ctx.iteration);
+const has = Object.keys(ctx).filter((name) => typeof (ctx as any)[name] !== "function").sort();
+const began = { ...ctx.state };
+const gave = [await ctx.checkpoint()];
+ctx.state.round = (ctx.state.round as number) + 1;
+gave.push(await ctx.checkpoint(), await ctx.done());
+// A repeated done() is a no-op.
+gave.push(await ctx.done());
 await Promise.all([ctx.ready(), ctx.ready()]);
-await tools.write("iterations.txt", seen.join(","));
+await tools.write("seen.json", JSON.stringify({ has, began, gave: gave.map((each) => each ?? null) }));
 `,
   });
 
   const result = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
   assert.equal(result.status, "done");
-  assert.equal(readFileSync(join(projectDir, "iterations.txt"), "utf-8"), "5,6,7,8,8");
-  assert.equal(readJson(join(projectDir, "state.json")).__trama_iteration, 8);
+  // (What an earlier trama counted in the state file is handed to the program once more, as the file has it, and is not kept again.)
+  assert.deepEqual(readJson(join(projectDir, "seen.json")), { has: ["input", "resumed", "state", "yieldReason"], began: { __trama_iteration: 5, round: 2 }, gave: [null, null, null, null] });
+  assert.deepEqual(readJson(join(projectDir, "state.json")), { round: 3 });
   const readyLogs = readFileSync(join(projectDir, "logs", "latest.jsonl"), "utf-8")
     .trim().split("\n").map(line => JSON.parse(line)).filter(entry => entry.message === "ready");
   assert.equal(readyLogs.length, 1, "ready must be recorded once however often it is called");

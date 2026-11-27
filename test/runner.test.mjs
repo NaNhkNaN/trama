@@ -134,15 +134,14 @@ test("runProgram scaffolds and executes a minimal shared project", async (t) => 
 
   await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
 
-  assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "iteration:0");
+  assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "ran");
   assert.deepEqual(readJson(join(projectDir, "package.json")), { type: "module" });
   assert.equal(existsSync(join(projectDir, ".gitignore")), true);
   assert.equal(existsSync(join(projectDir, "logs", "latest.jsonl")), true);
   assert.equal(existsSync(join(projectDir, "history")), true);
 
   const state = readJson(join(projectDir, "state.json"));
-  assert.equal(state.status, "ok");
-  assert.equal(state.__trama_iteration, 1);
+  assert.deepEqual(state, { status: "ok" });
 
   const logs = readFileSync(join(projectDir, "logs", "latest.jsonl"), "utf-8")
     .trim()
@@ -393,7 +392,7 @@ test("runProgram replaces a stale symlink with the correct target", async (t) =>
   symlinkSync("/tmp/nonexistent-old-trama", join(linkDir, "runtime"), "dir");
 
   await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 5_000 });
-  assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "iteration:0");
+  assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "ran");
 });
 
 test("runProgram rejects symlinked meta.json that points outside the project", async (t) => {
@@ -456,13 +455,11 @@ test("loadState rejects non-object JSON values (string, array, null)", (t) => {
   }
 });
 
-test("loadConfig rejects invalid field values", (t) => {
+test("loadConfig rejects invalid field values", async (t) => {
   const fakeHome = makeTempDir("trama-home-");
   t.after(() => cleanupTempDir(fakeHome));
 
   const cases = [
-    [{ defaultMaxIterations: -1 }, /defaultMaxIterations/],
-    [{ defaultMaxIterations: 0 }, /defaultMaxIterations/],
     [{ defaultTimeout: 0 }, /defaultTimeout/],
     [{ defaultTimeout: -100 }, /defaultTimeout/],
     [{ provider: 123 }, /provider/],
@@ -473,10 +470,13 @@ test("loadConfig rejects invalid field values", (t) => {
 
   for (const [override, pattern] of cases) {
     writeJson(join(fakeHome, ".trama", "config.json"), override);
-    withEnv({ HOME: fakeHome }, () => {
+    await withEnv({ HOME: fakeHome }, () => {
       assert.throws(() => loadConfig(), pattern, `should reject ${JSON.stringify(override)}`);
     });
   }
+  // A field an earlier trama had and this one has not is passed over, whatever it holds: a configuration written for that one still loads.
+  writeJson(join(fakeHome, ".trama", "config.json"), { defaultMaxIterations: -1, defaultTimeout: 1234 });
+  assert.equal((await withEnv({ HOME: fakeHome }, () => loadConfig())).defaultTimeout, 1234);
 });
 
 test("runProgram does not trigger repair when program succeeds", async (t) => {
@@ -494,7 +494,7 @@ test("runProgram does not trigger repair when program succeeds", async (t) => {
   try {
     await runProgram({ projectDir, maxRepairAttempts: 3, timeout: 5_000 });
     assert.equal(repairCalled, false, "repair should not be called when program succeeds");
-    assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "iteration:0");
+    assert.equal(readFileSync(join(projectDir, "output.txt"), "utf-8"), "ran");
   } finally {
     llm.repair = originalRepair;
   }
@@ -714,13 +714,13 @@ await ctx.done();
   }
 });
 
-test("loadConfig rejects non-object JSON values (array, string, number, null)", (t) => {
+test("loadConfig rejects non-object JSON values (array, string, number, null)", async (t) => {
   const fakeHome = makeTempDir("trama-home-");
   t.after(() => cleanupTempDir(fakeHome));
 
   for (const [label, content] of [["array", "[]"], ["string", '"openai"'], ["number", "42"], ["null", "null"]]) {
     writeText(join(fakeHome, ".trama", "config.json"), content);
-    withEnv({ HOME: fakeHome }, () => {
+    await withEnv({ HOME: fakeHome }, () => {
       assert.throws(
         () => loadConfig(),
         /Malformed config.*expected a JSON object/,
@@ -1197,7 +1197,7 @@ setInterval(() => {}, 1000);
 await new Promise(() => {});`;
 
   const validated = await validateProgram(projectDir, createBackend(loadConfig()), candidate, {
-    timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10,
+    timeout: 20_000, maxRepairAttempts: 0,
   });
   assert.equal(validated.source, candidate);
 });
@@ -1221,19 +1221,20 @@ throw new Error("the participant is broken");`,
   // once — one that exists, one named by a path that does not resolve from
   // where it is being validated — and would fail outright after that.
   const candidate = `import { tools } from "@trama-dev/runtime";
-import { Session } from "@trama-dev/session";
+import { runProgram } from "@trama-dev/runtime/runner";
+import { resolve } from "path";
 await tools.write("own-work.txt", "done before the hand-off");
-const session = await Session.create({ workspace: "./workspace" });
-const real = session.spawn("real", { projectDir: ${JSON.stringify(participantDir)} });
-const elsewhere = session.spawn("elsewhere", { projectDir: "../not-next-to-the-copy" });
-await Promise.all([real.wait(), elsewhere.wait()]);
+const workspaceDir = resolve("workspace");
+const real = runProgram({ projectDir: ${JSON.stringify(participantDir)}, workspaceDir, label: "real" });
+const elsewhere = runProgram({ projectDir: resolve("../not-next-to-the-copy"), workspaceDir, label: "elsewhere" });
+await Promise.all([real, elsewhere]);
 throw new Error("reached only when the program is run for real");`;
 
   const originalRepair = llm.repair;
   llm.repair = async () => { throw new Error("nothing should have been sent for repair"); };
   try {
     const validated = await validateProgram(projectDir, createBackend(loadConfig()), candidate, {
-      timeout: 20_000, maxRepairAttempts: 1, maxIterations: 10,
+      timeout: 20_000, maxRepairAttempts: 1,
     });
     assert.equal(validated.source, candidate);
     assert.equal(validated.repairedError, undefined);
@@ -1256,14 +1257,14 @@ test("how a program goes down when a validation cuts it off at a hand-off does n
   // participant. In a validation the participant was never started, so the
   // wait cannot end, and the program has to be killed. It is still a valid
   // program: it got as far as a validation goes.
-  const candidate = `import { Session } from "@trama-dev/session";
-const session = await Session.create({ workspace: "./workspace" });
-const participant = session.spawn("p", { projectDir: ${JSON.stringify(participantDir)} });
-process.on("SIGTERM", async () => { await participant.wait().catch(() => {}); process.exit(0); });
-await participant.wait();`;
+  const candidate = `import { runProgram } from "@trama-dev/runtime/runner";
+import { resolve } from "path";
+const participant = runProgram({ projectDir: ${JSON.stringify(participantDir)}, workspaceDir: resolve("workspace"), label: "p" });
+process.on("SIGTERM", async () => { await participant.catch(() => {}); process.exit(0); });
+await participant;`;
 
   const validated = await validateProgram(projectDir, createBackend(loadConfig()), candidate, {
-    timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10,
+    timeout: 20_000, maxRepairAttempts: 0,
   });
   assert.equal(validated.source, candidate);
 });
@@ -1771,7 +1772,7 @@ test("a candidate is validated, and repaired, in a copy of a project whose own p
 
   // What the project's program may have done to it is said of the project. The copy's is the copy's own.
   const validated = await validateProgram(projectDir, createBackend(loadConfig()), 'throw new Error("the candidate fails");', {
-    timeout: 20_000, maxRepairAttempts: 1, maxIterations: 10,
+    timeout: 20_000, maxRepairAttempts: 1,
   });
   assert.equal(validated.source, fixed.trim());
   assert.match(validated.repairedError, /the candidate fails/);
@@ -2004,7 +2005,7 @@ rmSync("program.ts");
 await ctx.done();`;
 
   const validated = await validateProgram(projectDir, createBackend(loadConfig()), candidate, {
-    timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10,
+    timeout: 20_000, maxRepairAttempts: 0,
   });
   assert.equal(validated.source, candidate);
 });
@@ -2027,7 +2028,7 @@ test("a pipe or a socket left in a project is no part of its copies: the program
   if (!listening) t.diagnostic("no socket could be made here (the path is too long for one): only the pipe is tested");
 
   const validated = await validateProgram(projectDir, createBackend(loadConfig()), fixed, {
-    timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10,
+    timeout: 20_000, maxRepairAttempts: 0,
   });
   assert.equal(validated.source, fixed); // as given: a candidate is not a model's reply, and is not trimmed
 
@@ -2559,7 +2560,7 @@ test("a program that reads through a link out of its project and back in is the 
   const direct = await runProgram({ projectDir, maxRepairAttempts: 0, timeout: 20_000 });
   assert.deepEqual(direct.result, { read: "X" });
   // The copy is somewhere else, where "../my-proj" is nothing.
-  const validated = await validateProgram(projectDir, createBackend(loadConfig()), viaLink, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 });
+  const validated = await validateProgram(projectDir, createBackend(loadConfig()), viaLink, { timeout: 20_000, maxRepairAttempts: 0 });
   assert.equal(validated.source, viaLink);
 });
 
@@ -2574,7 +2575,7 @@ test("a project with a directory that cannot be looked into is not copied withou
   // Before any journal has been written for the project, and after: the answer is the same.
   for (let again = 0; again < 2; again++) {
     await assert.rejects(
-      validateProgram(projectDir, createBackend(loadConfig()), lists, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5, journalRuns: again }),
+      validateProgram(projectDir, createBackend(loadConfig()), lists, { timeout: 20_000, maxRepairAttempts: 0, journalRuns: again }),
       { code: "EACCES" });
   }
 });
@@ -2888,7 +2889,7 @@ test("a project whose directory somebody moved away while a fix was tried is not
   assert.deepEqual(readdirSync(parent), ["proj.moved"]);
   // Nor is a candidate tried, or its trial written down, where the project was: a journal makes no directory for one.
   await assert.rejects(
-    validateProgram(projectDir, createBackend(loadConfig()), SELF, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5, journalRuns: 5 }),
+    validateProgram(projectDir, createBackend(loadConfig()), SELF, { timeout: 20_000, maxRepairAttempts: 0, journalRuns: 5 }),
     /There is no project at /);
   assert.deepEqual(readdirSync(parent), ["proj.moved"]);
 });
@@ -3091,7 +3092,7 @@ test("in a project whose own directory may not be written to, a repaired run's w
 
 test("in a copy of a project whose own directory may not be written to, a program can do no more than in the project", { skip: process.getuid?.() === 0 }, async (t) => {
   const projectDir = await closedProject(t, BOOM, { "notes.txt": "old" });
-  const limits = { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 };
+  const limits = { timeout: 20_000, maxRepairAttempts: 0 };
   // What the project's directory forbids fails in the copy, as it would in the project.
   await assert.rejects(validateProgram(projectDir, createBackend(loadConfig()), MAKES_A_FILE, limits), /EACCES: permission denied, open 'new-file\.txt'/);
   // And what it allows — writing into a file that is there — passes.
@@ -3108,7 +3109,7 @@ test("a program is tried in a copy whatever the directory it goes in allows; whe
   ensureProjectScaffold(projectDir);
   chmodSync(projectDir, 0o555);
   t.after(() => { chmodSync(projectDir, 0o755); cleanupTempDir(projectDir); });
-  const limits = { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 };
+  const limits = { timeout: 20_000, maxRepairAttempts: 0 };
 
   const validated = await validateProgram(projectDir, createBackend(loadConfig()), WRITES_INTO_WHAT_IS_THERE, limits);
   assert.equal(validated.source, WRITES_INTO_WHAT_IS_THERE);
@@ -3127,7 +3128,7 @@ test("a program is tried in a copy also where program.ts leads into a directory 
   chmodSync(projectDir, 0o555);
   t.after(() => { chmodSync(projectDir, 0o755); cleanupTempDir(projectDir); });
 
-  const validated = await validateProgram(projectDir, createBackend(loadConfig()), SELF, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 });
+  const validated = await validateProgram(projectDir, createBackend(loadConfig()), SELF, { timeout: 20_000, maxRepairAttempts: 0 });
   assert.equal(validated.source, SELF);
   assert.equal(existsSync(join(projectDir, "not-yet")), false);
 });
@@ -3175,7 +3176,7 @@ test("a directory where a project's program should be is no program, and is said
   assert.equal(asked, 0);
   // Nor is a candidate tried: there is no place for it in a copy of this, as there is none in the project.
   await assert.rejects(
-    validateProgram(projectDir, createBackend(loadConfig()), SELF, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 }),
+    validateProgram(projectDir, createBackend(loadConfig()), SELF, { timeout: 20_000, maxRepairAttempts: 0 }),
     /No program can be tried in a copy of .*: its program\.ts is a directory\./);
   assert.throws(() => installValidatedProgram(projectDir, { source: SELF }, "update", "p"), /The program cannot be replaced: .*program\.ts is a directory\./);
   assert.deepEqual(readdirSync(join(projectDir, "program.ts")), []);
@@ -3222,7 +3223,7 @@ test("a candidate that fails is refused for how it failed, whatever it left wher
   const projectDir = makeTempDir("trama-runner-");
   t.after(() => cleanupTempDir(projectDir));
   createProjectFixture(projectDir, { programSource: `// the program there is\n` });
-  const validate = (candidate) => validateProgram(projectDir, createBackend(loadConfig()), candidate, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 });
+  const validate = (candidate) => validateProgram(projectDir, createBackend(loadConfig()), candidate, { timeout: 20_000, maxRepairAttempts: 0 });
   const makesItselfADirectory = `import * as fs from "fs";\nfs.rmSync("program.ts");\nfs.mkdirSync("program.ts");\n`;
 
   await assert.rejects(validate(`${makesItselfADirectory}console.error("no good");\nprocess.exit(3);\n`), (err) => {
@@ -3417,7 +3418,7 @@ fs.writeFileSync("../notes.txt", "another, in its place");`);
   // And a candidate for such a project can be validated at all — which is what an update needs. Nothing is told of what it does beside its copy: that goes.
   const candidate = reaches(`fs.writeFileSync("../made-in-a-validation.txt", "x");`);
   const quiet = await captureConsole("warn", () =>
-    validateProgram(projectDir, createBackend(loadConfig()), candidate, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 5 }));
+    validateProgram(projectDir, createBackend(loadConfig()), candidate, { timeout: 20_000, maxRepairAttempts: 0 }));
   assert.equal(quiet.result.source, candidate);
   assert.deepEqual(quiet.messages, []);
   assert.deepEqual(readdirSync(home).sort(), ["lib", "notes.txt", "shared.json", "the-project"]);
@@ -3575,7 +3576,7 @@ test("while a candidate is validated a fix is the program alone: nothing else of
   t.after(() => { llm.repair = originalRepair; cleanupTempDir(projectDir); });
   const before = readdirSync(projectDir).sort();
   const validate = () => captureConsole("warn", () => captureConsole("log", () =>
-    validateProgram(projectDir, createBackend(loadConfig()), NEEDS, { timeout: 20_000, maxRepairAttempts: 1, maxIterations: 5 }).then(() => "passed", (err) => err.message)));
+    validateProgram(projectDir, createBackend(loadConfig()), NEEDS, { timeout: 20_000, maxRepairAttempts: 1 }).then(() => "passed", (err) => err.message)));
 
   // The agent puts the project right, where it works, and answers with the program as it was: no fix, here.
   llm.repair = async (prompt, call) => {

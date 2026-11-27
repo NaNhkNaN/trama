@@ -217,9 +217,9 @@ export interface IpcBackends {
   ctx: RunContext;
   agent: RunnerAgent;
   tools: Tools & Pick<ToolsWithCleanup, "agentAsked" | "askAgent">;
-  /** The workspace of the session the program is running in — null when it is in none. */
+  /** The workspace the run was given — null where it was given none. */
   workspace: WorkspaceWithAgents | null;
-  /** A workspace by directory, for a program that created a session rather than joined one. */
+  /** A workspace by directory, for a program that has one by where it is rather than by being given it. */
   workspaceAt(dir: string): WorkspaceWithAgents;
   /**
    * Run another project on the program's behalf, until it ends or `stop` says
@@ -322,7 +322,7 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, rep
       if (dir === "") throw new BadRequest("Invalid field: dir (expected a directory path)");
       return workspaceAt(dir);
     }
-    if (!workspace) throw new BadRequest("Workspace is only available when running in a session");
+    if (!workspace) throw new BadRequest("This run has no workspace: workspace.* is there where a run is given one (trama run --workspace <dir>, or workspaceDir)");
     return workspace;
   };
 

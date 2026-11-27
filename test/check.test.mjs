@@ -185,7 +185,7 @@ test("only a run that is done is checked: not one that failed or yielded, not a 
   const meta = readJson(join(it.projectDir, "meta.json"));
   writeJson(join(it.projectDir, "meta.json"), { ...meta, checkWith: it.checker });
   await withEnv({ SEEN_BY_CHECKER: it.seenAt }, () =>
-    validateProgram(it.projectDir, createBackend({ provider: "fake", model: "plain" }), WORKS, { timeout: 20_000, maxRepairAttempts: 0, maxIterations: 10, journalRuns: 20 }));
+    validateProgram(it.projectDir, createBackend({ provider: "fake", model: "plain" }), WORKS, { timeout: 20_000, maxRepairAttempts: 0, journalRuns: 20 }));
   assert.deepEqual([it.seen(), journalsOf(it.projectDir).length], [[], 1]);
   // Run, it is checked — the project's own word is enough...
   const { result } = await it.run({ checkWith: undefined });

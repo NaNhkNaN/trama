@@ -14,15 +14,6 @@ export interface Ctx {
    */
   state: Record<string, unknown>;
 
-  /**
-   * Current iteration counter (starts at 0).
-   * Advances only when checkpoint(), yield() or done() is called.
-   */
-  iteration: number;
-
-  /** Max iterations hint. Not enforced by runtime. */
-  maxIterations: number;
-
   /** True if this run follows a yield (read-only, set by runtime on startup). */
   readonly resumed: boolean;
 
@@ -56,7 +47,7 @@ export interface Ctx {
 
   /**
    * Cooperative suspension. Persists ctx.state with a yield marker and exits (logging is best-effort).
-   * The session layer (or manual `trama run`) re-runs the program when ready.
+   * Whoever started the run (a program, or `trama run` by hand) runs the program again when ready.
    * The program resumes by reading its own ctx.state.
    * Mutually exclusive with done() — throws if done() was already called.
    * A done() or yield() that fails (e.g. on unserializable state) settles nothing:

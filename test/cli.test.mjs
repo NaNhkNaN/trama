@@ -73,7 +73,6 @@ test("CLI create honors the configured default model when --model is omitted", a
     model: "configured-model",
     maxRepairAttempts: 3,
     defaultTimeout: 300000,
-    defaultMaxIterations: 100,
   });
 
   const observedModelPath = join(fakeHome, "observed-model.txt");
@@ -350,6 +349,8 @@ test("the command line says what a program is, for whoever writes one themselves
   assert.match(api.stdout, /imports from "@trama-dev\/runtime"[^\n]*ctx\.input\.args[^\n]*ctx\.done\(result\)/);
   // And that a run's arguments are laid over the project's own, so that what the project has one for is never missing.
   assert.match(api.stdout, /What a run is given is laid over the project's own arguments — those it was made with \(trama create --arg; "input"\."args" in its meta\.json\), which it is also validated with: a parameter the project has an argument of its own for is never missing from a run of it, required or not\./);
+  // And nothing of what an earlier trama had and this one has not: a count of iterations and a bound on them, a session.
+  assert.doesNotMatch(api.stdout, /maxIterations|ctx\.iteration|\biteration: number|in a session|session layer/);
   // How what a project takes and gives is written: in words, and once as it looks.
   assert.match(api.stdout, /"string", "number", "boolean", "json" for any value[^\n]*a "\?" at the end of its name/);
   assert.match(api.stdout, /\{ "description": "[^"]+", "parameters": \{ "text": "string: [^"]+", "loud\?": "boolean" \}, "returns": \{ "words": "number"/);
@@ -490,6 +491,22 @@ test("the examples go where the command line goes: they are in what is packed of
   assert.ok(inIt.includes("dist/index.js"));
   assert.equal(existsSync(join(packed, "examples")), false, "what was copied in to be packed is taken away again");
 
+  // And as a release packs it: by the very line of the workflow that publishes, into the tarball that is then
+  // installed. (Packed with the packages' own scripts left out, the examples are not copied in: the command line
+  // was published without them, and `trama examples` found none.)
+  const packs = readFileSync(join(REPO_ROOT, ".github", "workflows", "publish.yml"), "utf-8").split("\n").map((line) => line.trim()).filter((line) => line.startsWith("npm pack "));
+  assert.equal(packs.length, 1, "the workflow packs in one place");
+  writeJson(join(apart, "repo", "package.json"), { name: "repo", private: true, workspaces: ["packages/*"] });
+  mkdirSync(join(apart, "tarballs"));
+  const sh = (command, args, cwd) => new Promise((resolve, reject) => execFile(command, args, { cwd, env: { ...process.env, RUNNER_TEMP: apart }, encoding: "utf-8" }, (err, stdout, stderr) => (err ? reject(new Error(`${err.message}\n${stderr}`)) : resolve(stdout))));
+  await sh("sh", ["-c", packs[0]], join(apart, "repo"));
+  const tarballs = readdirSync(join(apart, "tarballs"));
+  assert.equal(tarballs.length, 1, tarballs.join(", "));
+  const released = (await sh("tar", ["-tzf", join(apart, "tarballs", tarballs[0])], apart)).trim().split("\n").map((path) => path.replace(/^package\//, ""));
+  assert.deepEqual(released.filter((path) => path.startsWith("examples/")).sort(), expected);
+  assert.ok(released.includes("dist/index.js"));
+  assert.equal(existsSync(join(packed, "examples")), false);
+
   // Installed: the examples are beside dist, and those are the ones it has — whatever is three directories up.
   const installed = join(apart, "node_modules", "@trama-dev", "cli");
   mkdirSync(installed, { recursive: true });
@@ -517,4 +534,13 @@ test("the examples go where the command line goes: they are in what is packed of
   assert.match(half.stderr, /^Error: .*EACCES/);
   assert.deepEqual(readdirSync(join(fakeHome, ".trama", "projects")), ["only-here"]);
   assert.equal((await trama("examples", "notes")).exitCode, 1);
+});
+
+test("what goes with the command line is the runtime, and nothing else of trama's: there is no session layer — not among the packages, not in what the command line depends on, not in what is built, published, or shown to whoever writes a program", async () => {
+  assert.deepEqual(readdirSync(join(REPO_ROOT, "packages")).filter((name) => !name.startsWith(".")).sort(), ["cli", "runtime"]);
+  const own = (file) => Object.keys(JSON.parse(readFileSync(join(REPO_ROOT, file), "utf-8")).dependencies ?? {}).filter((name) => name.startsWith("@trama-dev/"));
+  assert.deepEqual([own("packages/cli/package.json"), own("packages/runtime/package.json")], [["@trama-dev/runtime"], []]);
+  for (const file of ["package.json", "package-lock.json", ".github/workflows/publish.yml", "examples/write-by-harness/example-programs.txt"]) {
+    assert.doesNotMatch(readFileSync(join(REPO_ROOT, file), "utf-8"), /@trama-dev\/session|packages\/session|\bsession\b.*\bcli\b|maxIterations|ctx\.iteration/, file);
+  }
 });

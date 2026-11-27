@@ -142,7 +142,7 @@ test("a program has an agent from outside work in its workspace, by the bridge: 
 
   // A run that has no workspace is told so, as it is of the workspace's shell.
   createProjectFixture(projectDir, { programSource: NO_WORKSPACE });
-  assert.match((await run({})).result.said, /only available when running in a session/);
+  assert.match((await run({})).result.said, /This run has no workspace/);
 
   // And a run that is ended ends the agent it was waiting on in its workspace: it is the run's, as a command there is.
   createProjectFixture(projectDir, { programSource: WAITS });

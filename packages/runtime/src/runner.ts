@@ -318,7 +318,6 @@ interface RunOnceOptions {
   says?: Held;
   backend: Backend;
   timeout: number;
-  maxIterations: number;
   argsOverride?: Record<string, unknown>;
   /**
    * The run is a validation: it only has to show that the program works, and
@@ -479,7 +478,7 @@ function settle(projectDir: string, child: ShellResult, ended: ProgramResult | n
  * (bad project, server or spawn failure) or left state.json unreadable.
  */
 async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
-  const { projectDir, backend, timeout, maxIterations, argsOverride, validating, workspaceDir, label, signal, journal } = options;
+  const { projectDir, backend, timeout, argsOverride, validating, workspaceDir, label, signal, journal } = options;
   const attempt = options.attempt ?? 0;
 
   requireWatchdog();
@@ -495,7 +494,6 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
   // runner sees it again only as the program hands it over to be persisted.
   const state = loadState(projectDir);
   const ctx = createContext(projectDir, state, {
-    maxIterations,
     argsOverride,
     onReady: validating && (() => {
       readyTimer ??= setTimeout(() => validated.abort(), validating.readyGraceMs).unref();
@@ -515,7 +513,6 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     // Where it runs — a copy of the project, when a fix is being tried or a candidate validated.
     dir: projectDir,
     program: fingerprint(guardPath(projectDir, options.entry ?? "program.ts")),
-    iteration: ctx.iteration,
     resumed: ctx.resumed,
     // What it began from: a replay of the attempt begins there. (Last: it is the one field of no known size.)
     state,
@@ -631,7 +628,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
     },
   });
 
-  // A participant's output is shown under its name. It is not its parent's
+  // The output of a run that has a name is shown under it. It is not its parent's
   // output: the runner writes it out itself, wherever in the tree it runs.
   const out = label ? labelled(label, text => process.stdout.write(text)) : null;
   const err = label ? labelled(label, text => process.stderr.write(text)) : null;
@@ -658,9 +655,7 @@ async function runProgramOnce(options: RunOnceOptions): Promise<RunOnceResult> {
         token,
         input: ctx.input,
         state,
-        iteration: ctx.iteration,
-        maxIterations: ctx.maxIterations,
-        inSession: Boolean(workspaceDir),
+        hasWorkspace: Boolean(workspaceDir),
         resumed: ctx.resumed,
         yieldReason: ctx.yieldReason,
       });
@@ -1025,7 +1020,7 @@ async function fixedBy(
  * becomes, its program — and its other files, besides, by an agent whose fix
  * then ran.
  *
- * The shared workspace is not copied. It is how the participants of a session
+ * The shared workspace is not copied. It is how runs that work together
  * talk to each other, and a program that is being fixed still has to be heard
  * and answered — a fix that wrote its requests where nobody could see them
  * would wait for replies forever. So what a fix writes there is written,
@@ -1258,7 +1253,7 @@ export async function validateProgram(
   backend: Backend,
   candidate: string,
   options: {
-    timeout: number; maxRepairAttempts: number; maxIterations: number; journalRuns?: number; signal?: AbortSignal;
+    timeout: number; maxRepairAttempts: number; journalRuns?: number; signal?: AbortSignal;
     as?: string; alone?: string; budget?: Budget; wrote?: AgentUsage[];
     /** Where a run's program asked for the project to be made or changed: the run's name and variables are the validation's, and the two journals point at each other. */
     label?: string; env?: Record<string, string>; askedFor?: Pick<AskedFor, "parent" | "started">;
@@ -1277,9 +1272,9 @@ export async function validateProgram(
     says?: string;
   },
 ): Promise<{ source: string; repairedError?: string; alone?: string }> {
-  const { journalRuns = 0, signal, as = projectDir, timeout, maxRepairAttempts, maxIterations, label, env, askedFor } = options;
+  const { journalRuns = 0, signal, as = projectDir, timeout, maxRepairAttempts, label, env, askedFor } = options;
   // (What is written down, and handed on, is what a validation is known to take: nothing else that came with it.)
-  const limits = { timeout, maxRepairAttempts, maxIterations };
+  const limits = { timeout, maxRepairAttempts };
   // Recorded with the project, though run in a copy of it. `budget` is for the record: the backend is what holds to it.
   const journal = openJournal(projectDir, journalRuns, {
     purpose: "validate", label, parent: askedFor?.parent, ...limits, budget: options.budget, env: env && Object.keys(env),
@@ -1550,7 +1545,6 @@ async function replayOf(recording: Recording, options: Omit<ReplayOptions, "run"
       projectDir: copy,
       backend: noBackend(),
       timeout,
-      maxIterations: config.defaultMaxIterations,
       argsOverride: recording.args,
       ...(says && { says }),
       workspaceDir: recording.workspace,
@@ -2099,7 +2093,6 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
       making,
       maxRepairAttempts,
       timeout,
-      maxIterations: config.defaultMaxIterations,
       argsOverride: options.args,
       ...(beside && { entry: beside.entry }),
       ...(says && { says }),

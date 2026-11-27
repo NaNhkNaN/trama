@@ -28,7 +28,6 @@ test("createContext sets resumed=true and yieldReason from yield marker", async 
   createProjectFixture(projectDir);
 
   const state = {
-    __trama_iteration: 3,
     __trama_yield: { reason: "waiting for approval" },
     userKey: "preserved",
   };
@@ -36,7 +35,6 @@ test("createContext sets resumed=true and yieldReason from yield marker", async 
 
   assert.equal(ctx.resumed, true);
   assert.equal(ctx.yieldReason, "waiting for approval");
-  assert.equal(ctx.iteration, 3);
 });
 
 // --- ctx.yield() ---
@@ -55,7 +53,7 @@ test("createContext yield persists state with yield marker", async (t) => {
   const saved = readJson(join(projectDir, "state.json"));
   assert.deepEqual(saved.__trama_yield, { reason: "waiting for counterparty" });
   assert.equal(saved.pendingWork, "analysis");
-  assert.equal(saved.__trama_iteration, 1);
+  assert.deepEqual(Object.keys(saved).sort(), ["__trama_yield", "pendingWork"]);
 });
 
 test("createContext yield logs the yield event", async (t) => {
@@ -115,7 +113,6 @@ test("createContext checkpoint clears yield marker", async (t) => {
 
   // Start with a yield marker (as if resumed from a previous yield)
   const state = {
-    __trama_iteration: 1,
     __trama_yield: { reason: "old reason" },
     data: "kept",
   };
@@ -128,8 +125,7 @@ test("createContext checkpoint clears yield marker", async (t) => {
 
   const saved = readJson(join(projectDir, "state.json"));
   assert.equal(saved.__trama_yield, undefined);
-  assert.equal(saved.data, "kept");
-  assert.equal(saved.__trama_iteration, 2);
+  assert.deepEqual(saved, { data: "kept" });
 });
 
 test("createContext done clears yield marker and writes no marker of its own", async (t) => {
@@ -139,7 +135,6 @@ test("createContext done clears yield marker and writes no marker of its own", a
 
   // Start with a yield marker
   const state = {
-    __trama_iteration: 1,
     __trama_yield: { reason: "old" },
   };
   const ctx = createContext(projectDir, state);
@@ -149,8 +144,8 @@ test("createContext done clears yield marker and writes no marker of its own", a
   const saved = readJson(join(projectDir, "state.json"));
   assert.equal(saved.__trama_yield, undefined);
   // Completion is reported to the runner in memory — state.json carries only
-  // the program's state and the iteration counter.
-  assert.deepEqual(Object.keys(saved), ["__trama_iteration"]);
+  // the program's state.
+  assert.deepEqual(saved, {});
 });
 
 test("createContext a failed done settles nothing — yield is still available", async (t) => {
