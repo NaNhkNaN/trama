@@ -184,10 +184,18 @@ function loopOver(t, first, candidates, judge = JUDGE) {
   llm.ask = async (prompt) => { prompts.push(prompt); return candidates[prompts.length - 1] ?? assert.fail("the model was asked once more than the test provided for"); };
   t.after(() => { llm.ask = original; });
   const words = home.at("words");
-  const round = (args) => withEnv({ HOME: home.fakeHome }, () => quietly(() =>
-    runProgram({ projectDir: home.at("improve"), args: { project: "words", check: "judge", ...args }, label: "improve", timeout: 60_000 })));
+  // (What a round says of each input — `each` — is kept apart here: the tests that hold a round's result whole hold the
+  // rest of it, and what is said of each input has a test of its own, and a place in those where it matters.)
+  let each;
+  const round = async (args) => {
+    const went = await withEnv({ HOME: home.fakeHome }, () => quietly(() =>
+      runProgram({ projectDir: home.at("improve"), args: { project: "words", check: "judge", ...args }, label: "improve", timeout: 60_000 })));
+    each = went.result?.result?.each;
+    if (each !== undefined) delete went.result.result.each;
+    return went;
+  };
   return {
-    ...home, words, prompts, round,
+    ...home, words, prompts, round, each: () => each,
     program: () => readFileSync(join(words, "program.ts"), "utf-8"),
     versions: () => indexOf(words).filter((line) => line.version).map(({ version, reason, from }) => [version, reason, ...(from ? [from] : [])]),
     lines: () => (existsSync(join(words, "history", "runs.jsonl")) ? linesOf(words) : []),
@@ -285,6 +293,33 @@ test("inputs held back decide, and are never shown: a version written to the inp
   assert.equal((await shown.round({ inputs: [A, B] })).result.result.kept, true);
 });
 
+test("a round says how each input went, beside what decided: in the order they were given, those held back marked as that — what the program came to on it, and the version that was tried where one was", async (t) => {
+  const it = loopOver(t, SAYS(["a"]), [SAYS(["a", "b", "c"])]);
+  const { result: ran } = await it.round({ inputs: [A, B], heldBack: [C], runs: 2 });
+  // What decides is the one held back; what is said of each is of all three.
+  assert.deepEqual([ran.result.kept, ran.result.before, ran.result.after], [true, { ok: 0, of: 2, score: 0 }, { ok: 2, of: 2, score: 1 }]);
+  const good = { ok: 2, of: 2, score: 1 }, not = { ok: 0, of: 2, score: 0 };
+  assert.deepEqual(it.each(), [
+    { input: A, heldBack: false, before: good, after: good },
+    { input: B, heldBack: false, before: not, after: good },
+    { input: C, heldBack: true, before: not, after: good },
+  ]);
+  // It is in what the loop says it gives (its meta.json): held to that, it is not left out — and no writer was told it.
+  assert.deepEqual(LOOP_SAYS.returns["each?"], [{ input: "json: what its runs were started with", heldBack: "boolean: whether it was held back from whoever writes", before: LOOP_SAYS.returns["before?"], "after?": LOOP_SAYS.returns["after?"] }]);
+  assert.doesNotMatch(it.prompts[0], /heldBack|"word":"c"/);
+
+  // A round that asks for nothing says it too, of the program as it is: from the record, with no run made.
+  const lines = it.lines().length;
+  const { result: again } = await it.round({ inputs: [A, B], heldBack: [C], runs: 2 });
+  assert.match(again.result.why, /^Nothing was asked for/);
+  assert.deepEqual([it.each(), it.lines().length], [[A, B, C].map((input, n) => ({ input, heldBack: n === 2, before: good })), lines]);
+
+  // And a version that is not kept: what it came to on each is there all the same.
+  const worse = loopOver(t, SAYS(["a", "b"]), [SAYS(["b"])]);
+  assert.equal((await worse.round({ inputs: [A, B], ask: "Say less." })).result.result.kept, false);
+  assert.deepEqual(worse.each().map((one) => [one.input.word, one.heldBack, one.before.ok, one.after.ok]), [["a", false, 1, 0], ["b", false, 1, 1]]);
+});
+
 test("the loop stops without deciding where there is nothing to decide by — no update came of the asking, or a check could not be made — and the project's program is the one it was", async (t) => {
   // The model writes a program that does not run: the update comes to nothing.
   const unwritten = loopOver(t, SAYS(["a"]), [`throw new Error("not a program that runs");`]);
@@ -292,6 +327,10 @@ test("the loop stops without deciding where there is nothing to decide by — no
   const { why, ...rest } = failed.result;
   assert.deepEqual(rest, { kept: false, from: 1, before: { ok: 1, of: 2, score: 0.5 } });
   assert.match(why, /^No update came of the asking: .*Update failed — the program is unchanged\./s);
+  // What it failed of is there to be read, and not where in the code each thing was said: a `why` is for whoever runs the loop.
+  assert.match(why, /^Error: not a program that runs$/m);
+  assert.doesNotMatch(why, /^\s+at \S|^Node\.js v/m);
+  assert.deepEqual(unwritten.each(), [{ input: A, heldBack: false, before: { ok: 1, of: 1, score: 1 } }, { input: B, heldBack: false, before: { ok: 0, of: 1, score: 0 } }]);
   assert.deepEqual([unwritten.program(), unwritten.versions()], [SAYS(["a"]), [[1, "found"]]]);
 
   // The judge is at a loss over the new version: the one before stays, and it is said why.
@@ -299,12 +338,19 @@ test("the loop stops without deciding where there is nothing to decide by — no
   const { result: back } = await unjudged.round({ inputs: [A, B] });
   assert.deepEqual({ ...back.result, why: "" }, { kept: false, from: 1, to: 2, before: { ok: 1, of: 2, score: 0.5 }, why: "" });
   assert.match(back.result.why, /^Version 1 stays: a check of version 2 could not be made — The project asked for the check failed: /);
+  assert.match(back.result.why, /^Error: the judge has a fault of its own$/m);
+  assert.doesNotMatch(back.result.why, /^\s+at \S|^Node\.js v/m);
+  assert.deepEqual(unjudged.each().map((one) => [one.input.word, one.before.ok, "after" in one]), [["a", 1, false], ["b", 0, false]]);
   assert.deepEqual([unjudged.program(), unjudged.versions()], [SAYS(["a"]), [[1, "found"], [2, "update"]]]);
 
   // The judge is at a loss over the program as it is: nothing is asked for, and nothing changed.
   const never = loopOver(t, SAYS([], '"BOOM"'), []);
   const { result: none } = await never.round({ inputs: [A] });
   assert.match(none.result.why, /^Nothing was changed: a check could not be made — The project asked for the check failed: /);
+  assert.match(none.result.why, /^Error: the judge has a fault of its own$/m);
+  assert.doesNotMatch(none.result.why, /^\s+at \S|^Node\.js v/m);
+  // (Nothing was found of any input: nothing is said of each.)
+  assert.equal(never.each(), undefined);
   assert.deepEqual([none.result.kept, never.prompts.length, never.versions()], [false, 0, [[1, "found"]]]);
 
   // What it is to be told: which project, which judge — by what it says it takes (its meta.json), a round without them
@@ -433,7 +479,12 @@ await ctx.done({ task: (ctx.input.args as any).task });
   writeFileSync(join(at("improve"), "work", "v2-0-0", "stale.txt"), "left by a round that was stopped");
 
   const { result: ran, messages } = await round({});
-  assert.deepEqual({ ...ran.result, why: "" }, { kept: true, from: 1, to: 2, before: { ok: 0, of: 4, score: 0 }, after: { ok: 4, of: 4, score: 1 }, why: "" }, messages.join("\n"));
+  assert.deepEqual({ ...ran.result, why: "" }, {
+    kept: true, from: 1, to: 2, before: { ok: 0, of: 4, score: 0 }, after: { ok: 4, of: 4, score: 1 },
+    // (Task by task: which is what a history, which is by version, does not say.)
+    each: ["a", "b"].map((task) => ({ input: { task }, heldBack: false, before: { ok: 0, of: 2, score: 0 }, after: { ok: 2, of: 2, score: 1 } })),
+    why: "",
+  }, messages.join("\n"));
   // Every run was the worker's, in a place of its own — eight runs, eight places — and each was judged where it had worked.
   const runs = journalsOf(at("worker")).filter((journal) => journal[0].purpose === "run");
   assert.deepEqual([runs.length, new Set(runs.map((journal) => journal[0].workspace)).size, linesOf(at("worker")).map((line) => [line.version, line.check.ok])],
@@ -765,6 +816,7 @@ test("a run that failed is made again, once, and what the second comes to is wha
   const { result: undecided } = await twice.round({ inputs: two });
   assert.deepEqual({ ...undecided.result, why: "" }, { kept: false, from: 1, to: 2, before: { ok: 1, of: 2, score: 0.5 }, remade: 1, why: "" });
   assert.match(undecided.result.why, /^Version 1 stays, and nothing is decided: a run of version 2 failed, and failed when it was made again — whether that is the version's doing is not known\. [^]*the model could not be reached/);
+  assert.doesNotMatch(undecided.result.why, /^\s+at \S/m);
   assert.deepEqual([twice.program(), twice.versions(), statuses(twice, 2)], [first, [[1, "found"], [2, "update"]], ["done", "failed", "failed"]]);
   // The round after is told of it as what it is — written, and not judged, with what the run said as it failed and
   // what the version changed — and not as tried.
@@ -840,7 +892,11 @@ else await ctx.done({ program: program.replace('["a"]', '["a","b"]') + "// asked
   t.after(() => { llm.ask = original; });
   const { result: ran } = await withEnv({ HOME: home.fakeHome }, () => quietly(() =>
     runProgram({ projectDir: home.at("improve"), args: { project: "words", check: "judge", inputs: [A, B], write: "writer" }, label: "improve", timeout: 60_000 })));
-  assert.deepEqual({ ...ran.result, why: "" }, { kept: true, from: 1, to: 2, before: { ok: 1, of: 2, score: 0.5 }, after: { ok: 2, of: 2, score: 1 }, why: "" });
+  assert.deepEqual({ ...ran.result, why: "" }, {
+    kept: true, from: 1, to: 2, before: { ok: 1, of: 2, score: 0.5 }, after: { ok: 2, of: 2, score: 1 },
+    each: [{ input: A, heldBack: false, before: { ok: 1, of: 1, score: 1 }, after: { ok: 1, of: 1, score: 1 } }, { input: B, heldBack: false, before: { ok: 0, of: 1, score: 0 }, after: { ok: 1, of: 1, score: 1 } }],
+    why: "",
+  });
   assert.equal(readFileSync(join(home.at("words"), "program.ts"), "utf-8"), `${SAYS(["a"]).replace('["a"]', '["a","b"]')}// asked: Runs of the program as it is were checked, and these were found wanting:\n`);
   assert.deepEqual(linesOf(home.at("writer")).map((line) => [line.for, line.status]), [["update", "done"]]);
 });

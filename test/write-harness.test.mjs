@@ -85,7 +85,13 @@ test("the writer says what it is for, what it is handed and what it gives; with 
   // A harness that there is none of.
   await it.inHome(() => runProgram({ projectDir: it.at("words"), timeout: 30_000 }));
   writeJson(join(it.at("write-by-harness"), "meta.json"), { ...readJson(join(it.at("write-by-harness"), "meta.json")), input: { prompt: "p", args: { harness: "nobody" } } });
-  await assert.rejects(it.inHome(() => updateProject("words", "x", { updateWith: "write-by-harness" })), /The project asked for the update failed: [^]*"nobody" not found/);
+  // (Said in the writer's own words, with what to do about it: a harness copied under another name is not found by the one the writer has for it.)
+  await assert.rejects(it.inHome(() => updateProject("words", "x", { updateWith: "write-by-harness" })),
+    /The project asked for the update failed: [^]*Error: The harness that is to do the writing is not among your projects: "nobody"\. Copy one there — trama examples coding-harness — or say which project it is: "harness", among this project's own arguments in its meta\.json \(\{ "input": \{ "args": \{ "harness": "…" \} \} \}\)\.\n/);
+  assert.equal(it.requests.length, 0);
+  // And with nothing to write it does not look for one: a validation of the writer is none of the harness.
+  assert.deepEqual((await it.inHome(() => runProgram({ projectDir: it.at("write-by-harness"), timeout: 30_000 }))).result, { nothing: "to write: it was not handed what is asked, or where to work" });
+  assert.match(readFileSync(join(WRITER, "README.md"), "utf-8"), /copied under another name \(`trama examples coding-harness --as my-harness`\) is to be named to the writer: `"args": \{ "harness": "my-harness" \}`/);
   // A harness that is there, and fails: no update — the program it left where it was is not handed back as one.
   createProjectFixture(it.at("faulty"), { programSource: 'throw new Error("the harness has a fault of its own");\n' });
   writeJson(join(it.at("write-by-harness"), "meta.json"), { ...readJson(join(it.at("write-by-harness"), "meta.json")), input: { prompt: "p", args: { harness: "faulty" } } });

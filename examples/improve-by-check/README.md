@@ -15,7 +15,7 @@ trama run improve --arg project=my-project --arg check=my-judge \
   --arg ask="Say every word in capitals."
 ```
 
-It ends with what it did, and why: `{ kept, from, to, before, after, why }`. Run again, it is the next round. (`to` is the version that was written and judged. Where it is kept it is made the program as a version more, of its text: `trama history` shows both.)
+It ends with what it did, and why: `{ kept, from, to, before, after, each, why }`. `before` and `after` count the runs that decide — of the inputs held back, where there are any — and `each` says the same of every input by itself, in the order they were given (`{ input, heldBack, before, after }`): which input it was that went wrong is not in a project's history, which is by version. Run again, it is the next round. (`to` is the version that was written and judged. Where it is kept it is made the program as a version more, of its text: `trama history` shows both.)
 
 What it takes and gives is said in its `meta.json`, and held: a round with an argument it does not take, or without `project` and `check`, is refused before anything is run.
 
@@ -32,7 +32,7 @@ What it is told:
 - `confirm` — how many times the runs that decide are made again where a version passes (0), and counted with the first. A version is chosen by the runs in which it looked best; it is to be kept for more than those.
 - `tell` — which runs the writer is told of: `wanting`, or `all` — what the judge said of the runs found good too. Where what is wanted is not that they be good, that is all a writer has to go by.
 - `write` — who writes the update: a project, by its name (`examples/write-by-harness` is one) — else whoever the configuration names (`updateWith`), or pi's agent. It is told what this loop tells its writer, in those words, and no more: what more a writer may read — the project's history, the records of its runs — is for the loop to say there, and with that what of the inputs held back it can reach.
-- `from` — what a run works on, where that is not the project itself: a directory, copied afresh for every run and handed to it as its workspace. `{name}` in it stands for the input's argument of that name: `--arg from=/tasks/{task}`, for inputs that say which task.
+- `from` — what a run works on, where that is not the project itself: a directory, copied afresh for every run and handed to it as its workspace. `{name}` in it stands for the input's argument of that name: `--arg from=/tasks/{task}`, for inputs that say which task. (An argument an input has for this alone, which the project does not say it takes, is left out of what its run is given, and said: the project need not be changed for it.)
 
 What to know of it:
 
@@ -49,6 +49,6 @@ What to know of it:
 - **A round is told what the rounds before it tried.** A version that is not kept leaves the program as it was, and the next round begins from that again: its writer is told of each version that was written from this very program, judged, and not kept — what its runs came to, on what decides, and what it changed (a diff, from the project's history). Where inputs are held back, that is one count and one mean of them a round: it is the reason the version was not kept, and it is all of them a writer ever hears.
   It is read from the project's history, and the loop keeps no list of it: a version's line says which it was written from, and its runs say what the judge found. A version is told as tried where it was judged whole — as many verdicts of this judge as a round makes, of every input; one a check of which could not be made, or whose round fell over, was never found no better, and is not told as if it had been. (Of each text its latest version; and the latest 500 runs are read — of a version whose runs are older than those, nothing is told.)
 - **What the judge said is told whole.** A project's history keeps the beginning of a verdict's notes. The loop keeps the rest itself (in its state: of the program as it is, of the inputs that may be shown), so that a round whose verdicts come from the record tells its writer as much as the round that made the runs did. The same of what a run said as it failed twice: a line of history has its first line. Words are all the loop keeps.
-- **It stops without deciding**, and says so, where the update came to nothing, or a check could not be made.
+- **It stops without deciding**, and says so, where the update came to nothing, or a check could not be made. Its `why` has what the failure said without the stack it was said with: all of it is on the record of what failed (`trama journal <project>`, or the writer's, or the judge's).
 - **An update costs what an update costs**: the model writes the program, and the program is run once to validate it.
 - What each version used, and took, is not part of the rule here. `trama history <project>` shows it, version by version.

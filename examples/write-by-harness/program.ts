@@ -33,6 +33,14 @@ if (prompt === undefined || copy === undefined) {
   // (Run by itself — as it is when a new version of it is validated — it has nothing to write.)
   await ctx.done({ nothing: "to write: it was not handed what is asked, or where to work" });
 } else {
+  // The harness, found before anything is asked of it — and where it is not there, said in this writer's own words:
+  // a harness copied under another name is not found by the one this writer has for it.
+  let its: string;
+  try {
+    its = resolveProject(harness);
+  } catch {
+    throw new Error(`The harness that is to do the writing is not among your projects: ${JSON.stringify(harness)}. Copy one there — trama examples coding-harness — or say which project it is: "harness", among this project's own arguments in its meta.json ({ "input": { "args": { "harness": "…" } } }).`);
+  }
   // With no program handed, it is a project's first that is asked for: its making.
   const making = program === undefined;
   // What the harness is told. This wording is the policy of a making and of an update, and is this program's to change.
@@ -58,7 +66,7 @@ if (prompt === undefined || copy === undefined) {
   ].join("\n\n");
 
   const ran = await runProgram({
-    projectDir: resolveProject(harness),
+    projectDir: its,
     workspaceDir: copy,
     maxRepairAttempts: 0,
     ...(seconds !== undefined && { timeout: seconds * 1000 }),

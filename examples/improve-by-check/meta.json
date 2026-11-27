@@ -28,6 +28,22 @@
       "of": "number: of how many",
       "score": "number: their mean score"
     },
+    "each?": [
+      {
+        "input": "json: what its runs were started with",
+        "heldBack": "boolean: whether it was held back from whoever writes",
+        "before": {
+          "ok": "number: how many runs were found good",
+          "of": "number: of how many",
+          "score": "number: their mean score"
+        },
+        "after?": {
+          "ok": "number: how many runs were found good",
+          "of": "number: of how many",
+          "score": "number: their mean score"
+        }
+      }
+    ],
     "all?": {
       "before": {
         "ok": "number",

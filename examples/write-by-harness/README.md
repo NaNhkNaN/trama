@@ -16,6 +16,8 @@ trama update my-project "also count the points" --with write-by-harness
 # or by a program: createProject("my-project", "…", { createWith: "write-by-harness" })
 ```
 
+The writer looks for its harness by the name `coding-harness`. One copied under another name (`trama examples coding-harness --as my-harness`) is to be named to the writer: `"args": { "harness": "my-harness" }`, under `"input"` in the writer's own `meta.json`. Where it finds none, it says so before anything is asked of a model.
+
 What it is, and is not:
 
 - **What trama does round the writing is trama's, whoever writes**: the copy, the validation of what comes back, the version on record, what is installed and what is kept. A writer answers with a program; it does not install one.

@@ -284,6 +284,21 @@ const partGood = (each: Verdict[][]): number => {
 };
 /** What decides: the inputs held back, where there are any — else all there are. */
 const deciding = (each: Verdict[][]): Tally => tally(each.filter((_, n) => decides(n)));
+/**
+ * How each input went, in the order they were given — those held back after the others, and marked: what the
+ * program came to on it, and the version that was tried where one was. For whoever runs the loop: what decides is
+ * one count, a project's history is by version, and neither says which input it was that went wrong. (No writer
+ * is told it: of the inputs held back a writer hears the one count, as before.)
+ */
+const eachOf = (before: Verdict[][], after?: Verdict[][]) =>
+  all.map((input, n) => ({ input, heldBack: n >= inputs.length, before: tally([before[n]]), ...(after && { after: tally([after[n]]) }) }));
+/**
+ * What a failure said, for a round's `why`: without where in the code each thing was said. A program that failed
+ * is told with all it printed as it died — a stack, and what it died of one line in it — and a `why` is read by
+ * whoever runs the loop, for what to do next. (The whole of it is on record where it happened: `trama journal`.)
+ */
+const told = (message: string): string =>
+  message.split("\n").filter((line) => !/^\s+at \S/.test(line) && !/^Node\.js v\d/.test(line)).join("\n").trim();
 
 async function round(): Promise<Record<string, unknown>> {
   // Before: how the program as it is does.
@@ -292,7 +307,7 @@ async function round(): Promise<Record<string, unknown>> {
     before = await verdicts();
   } catch (err) {
     if (!(err instanceof NoVerdict)) throw err;
-    return { kept: false, why: `Nothing was changed: a check could not be made — ${err.message}` };
+    return { kept: false, why: `Nothing was changed: a check could not be made — ${told(err.message)}` };
   }
   const was = deciding(before), wasAll = tally(before), wasGood = partGood(before);
   const from = (await readHistory(dir, { runs: 0 })).current;
@@ -303,7 +318,7 @@ async function round(): Promise<Record<string, unknown>> {
   const said = (ok: boolean) => inputs.flatMap((input, n) => before[n].filter((verdict) => verdict.ok === ok).slice(-1).map((verdict) => `- started with ${JSON.stringify(input)}: ${verdict.notes ?? (ok ? "found good" : "found not good")}`));
   const wanting = said(false), good = tell === "all" ? said(true) : [];
   if (wanting.length === 0 && !ask) {
-    return { kept: false, from, before: was, why: "Nothing was asked for: no run that may be shown was found wanting, and no `ask` says what else is wanted." };
+    return { kept: false, from, before: was, each: eachOf(before), why: "Nothing was asked for: no run that may be shown was found wanting, and no `ask` says what else is wanted." };
   }
   const checked = "Runs of the program as it is were checked, and these";
   const { tried, notJudged } = await writtenBefore(was);
@@ -318,7 +333,7 @@ async function round(): Promise<Record<string, unknown>> {
       notJudged.length > 0 && `Written before, from the program as it is, and not judged: a run of each failed, and failed when it was made again. Whether that was the version's doing is not known — where it was, do not write that again:\n${notJudged.join("\n")}`,
     ].filter(Boolean).join("\n\n"), { install: false, ...(write !== undefined && { updateWith: write }) }));
   } catch (err) {
-    return { kept: false, from, before: was, why: `No update came of the asking: ${(err as Error).message}` };
+    return { kept: false, from, before: was, each: eachOf(before), why: `No update came of the asking: ${told((err as Error).message)}` };
   }
 
   // After: how the new one does — run by its number, from beside the program. Decide — and where it passes and is to
@@ -338,10 +353,10 @@ async function round(): Promise<Record<string, unknown>> {
   } catch (err) {
     if (err instanceof RunFailed) {
       if (err.shown) saidAsItFailed = { version: to, said: `started with ${JSON.stringify(err.on)}: ${err.message}` };
-      return { kept: false, from, to, before: was, remade, why: `Version ${from} stays, and nothing is decided: a run of version ${to} failed, and failed when it was made again — whether that is the version's doing is not known. ${err.message}` };
+      return { kept: false, from, to, before: was, each: eachOf(before), remade, why: `Version ${from} stays, and nothing is decided: a run of version ${to} failed, and failed when it was made again — whether that is the version's doing is not known. ${told(err.message)}` };
     }
     if (!(err instanceof NoVerdict)) throw err;
-    return { kept: false, from, to, before: was, why: `Version ${from} stays: a check of version ${to} could not be made — ${err.message}` };
+    return { kept: false, from, to, before: was, each: eachOf(before), why: `Version ${from} stays: a check of version ${to} could not be made — ${told(err.message)}` };
   }
   // It is the better: it is made the program. It is not: it stays where it is, on record with what its runs came to —
   // which is all that the rounds to come need to know that it was tried.
@@ -364,7 +379,7 @@ async function round(): Promise<Record<string, unknown>> {
   if (remade > 0) why += ` ${remade} run${remade === 1 ? "" : "s"} failed and ${remade === 1 ? "was" : "were"} made again: what came of ${remade === 1 ? "it" : "them"} then is what is counted.`;
   if (confirmed > 0) why += kept ? ` The runs that decide were made again to be sure of it: ${confirmed} more, counted here.` : ` It had passed by its first runs; with the ${confirmed} made again, it does not.`;
   return {
-    kept, from, to, before: was, after: is,
+    kept, from, to, before: was, after: is, each: eachOf(before, after),
     ...(by === "score" && { all: { before: { ok: wasAll.ok, of: wasAll.of }, after: { ok: isAll.ok, of: isAll.of } } }),
     ...(confirmed > 0 && { confirmed }),
     ...(remade > 0 && { remade }),
