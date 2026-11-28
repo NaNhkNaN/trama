@@ -3508,7 +3508,7 @@ test("what the agent asked for a fix puts right in the project arrives with a fi
   const [journal] = readdirSync(join(projectDir, "logs", "journal"));
   assert.deepEqual(told, {
     kept: true, discarded: false, journal: join(realpathSync(projectDir), "logs", "journal", journal), recorded: true,
-    asked: "Output ONLY the fixed program: the whole of it, also where it is the project that needed fixing. No explanation.",
+    asked: "Output ONLY the fixed program: the whole of it, also where it is the project that needed fixing. No explanation. (Or, where you fixed program.ts where it is, one line that begins \"IN THE FILE:\" and says what was wrong: the fixed program is then that file as you left it.)",
   });
   // In the project: what the agent made, changed and removed — and the program, as it was and allowing what it allowed.
   assert.equal(readFileSync(join(projectDir, "helper.mjs"), "utf-8"), 'export const greeting = "from the agent";\n');
@@ -3637,7 +3637,7 @@ test("where what an agent changes is to be discarded, a fix is the program alone
   const unchanged = await withEnv({ HOME: fakeHome }, () => runProgram({ projectDir, maxRepairAttempts: 2, timeout: 20_000 }));
   assert.equal(unchanged.status, "failed");
   assert.match(unchanged.reason, /Failed after 1 repair attempt\(s\)[\s\S]*The repair returned the program unchanged\.$/);
-  assert.deepEqual([told.kept, told.discarded, told.asked], [false, true, "Output ONLY the fixed program. No explanation."]);
+  assert.deepEqual([told.kept, told.discarded, told.asked], [false, true, "Output ONLY the fixed program. No explanation. (Or, where you fixed program.ts where it is, one line that begins \"IN THE FILE:\" and says what was wrong: the fixed program is then that file as you left it.)"]);
   assert.deepEqual(state(), asItWas);
 
   // A program that leans on what the agent did where it worked does not find it where it is tried.

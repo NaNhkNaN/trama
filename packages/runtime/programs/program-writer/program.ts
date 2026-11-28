@@ -16,6 +16,11 @@
 // What it answers with: `{ program }`, the whole of the program — or
 // `{ unwritable }`, why there is none to be written.
 //
+// The program is what the agent answers with — or program.ts in the copy as
+// the agent left it, where its answer says so ("IN THE FILE:"): an agent with
+// tools for files changes a line of a long program where it is, and is not
+// to write six hundred lines out again to say that it did.
+//
 // Everything here is the policy of a writing, and is this program's to
 // change: what the agent is told, the programs it is shown to go by
 // (example-programs.txt, beside this), which model is asked, how its answer
@@ -27,6 +32,8 @@ const { prompt, program, kept, types } = ctx.input.args as { prompt?: string; pr
 
 /** How an answer begins that says there is no program to be written. */
 const NO_PROGRAM = "NO PROGRAM:";
+/** How an answer begins that says the program is program.ts, where the agent worked, as it left it — and is itself no program. */
+const IN_THE_FILE = "IN THE FILE:";
 /** What a project says of itself for whoever is to choose it: the three things, and what each is. */
 const CONTRACT = ["description", "parameters", "returns"] as const;
 const WHAT_EACH_IS: Record<(typeof CONTRACT)[number], string> = {
@@ -65,8 +72,9 @@ if (prompt === undefined) {
     (kept
       ? `What the program needs beside it — a package installed, a module it imports, a file it reads — ` +
         `you can make here: it is kept, with the program, if the program then passes its validation. ` +
-        `The program itself is what you answer with, whatever you wrote to program.ts here.\n\n`
-      : `Nothing you write here is kept — only the program you answer with.\n\n`) +
+        `The program itself is what you answer with, whatever you wrote to program.ts here. `
+      : `Nothing you write here is kept — only the program you answer with. `) +
+    `Unless your answer is one line that begins "${IN_THE_FILE}" and says what you did: the program is then program.ts here, as you left it — written there, or changed where it was.\n\n` +
     `If the program cannot be written as it is asked for — what is asked goes against what the project says it takes and gives, or cannot be done with what there is — ` +
     `then there is no program, and you are not to hand over one that does something else: answer instead with one line that begins "${NO_PROGRAM}" and says why.\n\n` +
     `Runtime API:\n${types}\n\n` +
@@ -86,8 +94,8 @@ if (prompt === undefined) {
       `\n\nCurrent program.ts:\n${program}` +
       (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : ""));
   const ask = making
-    ? `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation.`
-    : `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`;
+    ? `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation. (Or the one line that begins "${IN_THE_FILE}", where the program is in program.ts as you left it.)`
+    : `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation. (Or the one line that begins "${IN_THE_FILE}", where the change is made in program.ts as you left it.)`;
 
   // The agent is asked once, at work in the copy — by the model the project is made with, where it says one.
   const reply = await agent.instruct(ask, {
@@ -95,9 +103,17 @@ if (prompt === undefined) {
     ...(meta.provider && meta.model && { model: `${meta.provider}/${meta.model}` }),
   });
 
-  // Its answer is the program — out of its fences, where it came in some — or that there is none.
+  // Its answer is the program — out of its fences, where it came in some — or says that there is none; or that
+  // the program is in program.ts, which is then read as it was left.
   if (reply.trimStart().startsWith(NO_PROGRAM)) {
     await ctx.done({ unwritable: reply.trimStart().slice(NO_PROGRAM.length).trim() });
+  } else if (reply.trimStart().startsWith(IN_THE_FILE)) {
+    let left: string | undefined;
+    try { left = await workspace.read("program.ts"); } catch { /* (None is there.) */ }
+    if (left === undefined || left.trim() === "") throw new Error("The model said that the program is in program.ts, and there is none there.");
+    // (An update is another program in the place of the one there was: a file that is as it was is none.)
+    if (left === program) throw new Error("The model said that the change is made in program.ts, and that file is as it was.");
+    await ctx.done({ program: left });
   } else {
     const written = stripCodeFences(reply);
     if (written === "") throw new Error("The model answered with no program.");

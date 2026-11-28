@@ -151,7 +151,7 @@ test("where nobody is named to write a program, the runtime's own writer writes 
   // What the agent was asked is what the writer's program says: once, at work in a copy of the project, by the model the project is made with.
   assert.equal(asked.length, 1);
   assert.match(asked[0].system, /^You are generating a TypeScript program for the trama runtime\.\n\n[^]*\n\nWhat the project says it takes and gives \(its meta\.json\): the program is held to it/);
-  assert.match(asked[0].prompt, /^say a number\n\nOutput ONLY the TypeScript program\. No markdown fences\. No explanation\.$/);
+  assert.match(asked[0].prompt, /^say a number\n\nOutput ONLY the TypeScript program\. No markdown fences\. No explanation\. \(Or the one line that begins "IN THE FILE:", /);
   assert.notEqual(asked[0].cwd, realpathSync(it.at("one")));
   const made = readJson(join(it.at("one"), "meta.json"));
   assert.equal(asked[0].model, `${made.provider}/${made.model}`);
@@ -178,7 +178,7 @@ test("where nobody is named to write a program, the runtime's own writer writes 
   // An update is told what the project says, what it was first asked for, the program as it is and what it has kept — and nothing of saying what is said.
   assert.match(asked[2].system, /\n\nWhat the project says it takes and gives \(its meta\.json\): [^]*\n\nOriginal prompt: say a number\n\nCurrent program\.ts:\n[^]*\n\nCurrent state:\n\{\n  "count": 2\n\}$/);
   assert.doesNotMatch(asked[2].system, /Say in meta\.json/);
-  assert.match(asked[2].prompt, /^say a third\n\nOutput the complete updated program\.ts\. No partial patches\. No markdown fences\. No explanation\.$/);
+  assert.match(asked[2].prompt, /^say a third\n\nOutput the complete updated program\.ts\. No partial patches\. No markdown fences\. No explanation\. \(Or the one line that begins "IN THE FILE:", /);
 
   // It is the user's: changed, the changed one is who writes — and the runtime has no words of its own to fall back on (no model is asked).
   writeText(join(it.at("program-writer"), "program.ts"), BY_LENGTH);
@@ -321,6 +321,87 @@ test("the two come with the runtime: they are in what is packed of it — and ea
     it.project(name, readFileSync(join(dir, "program.ts"), "utf-8"));
     assert.equal(typeof (await it.inHome(() => runProgram({ projectDir: it.at(name), timeout: 30_000 }))).result.nothing, "string", name);
   }
+});
+
+test("the program is program.ts as the agent left it, where its answer says so — \"IN THE FILE:\" — and is then no program itself; any other answer is the program, whatever was done to the file", async (t) => {
+  const it = scene(t, { maxRepairAttempts: 1 });
+  const programOf = (name) => readFileSync(join(it.at(name), "program.ts"), "utf-8");
+  it.project("words", GOOD(1));
+  // The agent changes the file where it works, and says so in a line — as a model with tools for files does, of a
+  // long program (2026-11-27: thirteen times of thirteen it answered with a note, and the note was taken for the program).
+  const asked = [];
+  let does = (cwd) => { writeText(join(cwd, "program.ts"), GOOD(5)); return "\nIN THE FILE: I changed the number in `program.ts` to 5. I didn't run the program."; };
+  llm.ask = async (prompt, call) => { asked.push({ prompt, system: call.system }); return does(call.cwd); };
+  llm.repair = async () => { throw new Error("no fix was to be asked for: the program is the file"); };
+  await it.inHome(() => updateProject("words", "say five"));
+  assert.equal(programOf("words"), GOOD(5));
+  // It is told of that way — beside what it was told, of which no word is changed.
+  assert.match(asked[0].system, /The program itself is what you answer with, whatever you wrote to program\.ts here\. Unless your answer is one line that begins "IN THE FILE:" and says what you did: the program is then program\.ts here, as you left it — written there, or changed where it was\.\n\n/);
+  assert.match(asked[0].prompt, /^say five\n\nOutput the complete updated program\.ts\. No partial patches\. No markdown fences\. No explanation\. \(Or the one line that begins "IN THE FILE:", where the change is made in program\.ts as you left it\.\)$/);
+  // So of a project's first program: there was no file, and there is one.
+  await it.inHome(() => createProject("made", "say five"));
+  assert.equal(programOf("made"), GOOD(5));
+  assert.match(asked[1].prompt, /^say five\n\nOutput ONLY the TypeScript program\. No markdown fences\. No explanation\. \(Or the one line that begins "IN THE FILE:", where the program is in program\.ts as you left it\.\)$/);
+  // Any other answer is the program, whatever was done to the file: a draft tried in place is not what was handed over.
+  does = (cwd) => { writeText(join(cwd, "program.ts"), GOOD(6)); return "```ts\n" + GOOD(7) + "```\n"; };
+  await it.inHome(() => updateProject("words", "say seven"));
+  assert.equal(programOf("words").trim(), GOOD(7).trim());
+  // (Nor is a program that speaks of the words an answer that begins with them.)
+  does = (cwd) => { writeText(join(cwd, "program.ts"), GOOD(6)); return "// IN THE FILE: is how an agent says where the program is.\n" .replace(/^/, GOOD(8)); };
+  await it.inHome(() => updateProject("words", "say eight, and of the words"));
+  assert.equal(programOf("words").trim(), (GOOD(8) + "// IN THE FILE: is how an agent says where the program is.").trim());
+  does = (cwd) => { writeText(join(cwd, "program.ts"), GOOD(6)); return "```ts\n" + GOOD(7) + "```\n"; };
+  await it.inHome(() => updateProject("words", "say seven again"));
+  // It says so of a file that is as it was, or is not there, or has nothing in it: no update, and said in words — nothing is validated.
+  const validations = () => it.journals("words").filter((journal) => journal[0].purpose === "validate").length;
+  const before = validations();
+  does = () => "IN THE FILE: I changed it.";
+  await assert.rejects(it.inHome(() => updateProject("words", "say eight")), /The project asked for the update failed: [^]*The model said that the change is made in program\.ts, and that file is as it was\./);
+  does = (cwd) => { writeText(join(cwd, "program.ts"), "  \n"); return "IN THE FILE: I emptied it."; };
+  await assert.rejects(it.inHome(() => updateProject("words", "say nothing")), /The model said that the program is in program\.ts, and there is none there\./);
+  does = () => "IN THE FILE: it is written.";
+  await assert.rejects(it.inHome(() => createProject("unmade", "say nine")), /The model said that the program is in program\.ts, and there is none there\./);
+  assert.deepEqual([validations(), existsSync(it.at("unmade")), programOf("words").trim()], [before, false, GOOD(7).trim()]);
+  // An answer that says there is none is that, whatever was done to the file.
+  does = (cwd) => { writeText(join(cwd, "program.ts"), GOOD(9)); return "NO PROGRAM: it cannot be said."; };
+  await assert.rejects(it.inHome(() => updateProject("words", "say what cannot be said")), /It was said that there is none to be written: it cannot be said\.$/);
+  // Where nothing made beside the program is kept, the file that is the program is the program all the same.
+  writeJson(join(it.fakeHome, ".trama", "config.json"), { maxRepairAttempts: 1, agentChanges: "discard" });
+  does = (cwd) => { writeText(join(cwd, "program.ts"), GOOD(10)); writeText(join(cwd, "beside.txt"), "x"); return "IN THE FILE: done."; };
+  await it.inHome(() => updateProject("words", "say ten"));
+  assert.deepEqual([programOf("words"), existsSync(join(it.at("words"), "beside.txt"))], [GOOD(10), false]);
+  assert.match(asked.at(-1).system, /Nothing you write here is kept — only the program you answer with\. Unless your answer is one line that begins "IN THE FILE:"/);
+  writeJson(join(it.fakeHome, ".trama", "config.json"), { maxRepairAttempts: 1 });
+
+  // The fixer the same: the agent fixes the file where it works and says so in a line.
+  const BROKEN = `import { ctx } from "@trama-dev/runtime";\nthrow new Error("the answer is not known");\n`;
+  it.project("fails", BROKEN);
+  const fixes = [];
+  let fixing = (cwd) => { writeText(join(cwd, "program.ts"), GOOD(11)); return "IN THE FILE: I fixed the typo in `program.ts`. I haven't re-run the program."; };
+  llm.repair = async (prompt, call) => { fixes.push(prompt); return fixing(call.cwd); };
+  const fixed = await it.inHome(() => runProgram({ projectDir: it.at("fails"), timeout: 30_000 }));
+  assert.deepEqual([fixed.status, fixed.result, programOf("fails")], ["done", { n: 11 }, GOOD(11)]);
+  assert.match(fixes[0], /\n\nOutput ONLY the fixed program: the whole of it, also where it is the project that needed fixing\. No explanation\. \(Or, where you fixed program\.ts where it is, one line that begins "IN THE FILE:" and says what was wrong: the fixed program is then that file as you left it\.\)$/);
+  // Any other answer is the fix, whatever was done to the file.
+  writeText(join(it.at("fails"), "program.ts"), BROKEN);
+  fixing = (cwd) => { writeText(join(cwd, "program.ts"), GOOD(12)); return "```ts\n" + GOOD(13) + "```"; };
+  assert.deepEqual((await it.inHome(() => runProgram({ projectDir: it.at("fails"), timeout: 30_000 }))).result, { n: 13 });
+  // Said of a file that is as it was, with nothing else changed: no fix — as the runner says it of any.
+  writeText(join(it.at("fails"), "program.ts"), BROKEN);
+  fixing = () => "IN THE FILE: it is fixed.";
+  assert.match((await it.inHome(() => runProgram({ projectDir: it.at("fails"), timeout: 30_000 }))).reason, /The repair returned the program unchanged, and changed nothing else in the project\./);
+  // ...and a fix where what was wrong was in the project, and the program is as it was.
+  const NEEDS = `import { ctx, tools } from "@trama-dev/runtime";\nawait ctx.done({ said: (await tools.read("data.txt")).trim() });\n`;
+  it.project("needs", NEEDS);
+  fixing = (cwd) => { writeText(join(cwd, "data.txt"), "there now\n"); return "IN THE FILE: data.txt was missing; program.ts needed no change."; };
+  const beside = await it.inHome(() => runProgram({ projectDir: it.at("needs"), timeout: 30_000 }));
+  assert.deepEqual([beside.status, beside.result, programOf("needs")], ["done", { said: "there now" }, NEEDS]);
+  // An answer that says there is no fix is that, whatever was done to the file: nothing of it is tried, or kept.
+  writeText(join(it.at("fails"), "program.ts"), BROKEN);
+  fixing = (cwd) => { writeText(join(cwd, "program.ts"), GOOD(14)); return "NO FIX: the answer is nowhere to be had."; };
+  const none = await it.inHome(() => runProgram({ projectDir: it.at("fails"), timeout: 30_000 }));
+  assert.match(none.reason, /No fix came back: It was said that there is none to be had: the answer is nowhere to be had\.$/);
+  assert.equal(programOf("fails"), BROKEN);
 });
 
 test("the two type-check against the API a program has, as they are written", (t) => {

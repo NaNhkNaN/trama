@@ -3,6 +3,7 @@
 
 import { readFileSync } from "fs";
 import { Agent, request } from "http";
+import { fileURLToPath } from "url";
 import type { Workspace } from "./types.js";
 import { onAbort } from "./abort.js";
 import { messageOf } from "./errors.js";
@@ -19,6 +20,29 @@ export interface Bridge {
 }
 
 let cached: { port: string; initPath: string; bridge: Bridge | null } | undefined;
+
+/** Where the runtime's own code is, as a stack names it: its frames are no part of where a program made a call. */
+const OWN_CODE = [new URL(".", import.meta.url).href, fileURLToPath(new URL(".", import.meta.url))];
+
+/**
+ * Where a call is being made, to be said of it should it fail: the stack as
+ * it is now, without the runtime's own frames. A call fails when its answer
+ * comes — in the handler of a response, which no line of a program is on: an
+ * error made there says nothing of where the program made the call, and one
+ * that a program dies of is then printed with the runtime's lines and none
+ * of its own. So the place is taken as the call is made (some microsecond),
+ * and a failure of the call is given it: `failed` hands an error back as one
+ * made here.
+ */
+function madeHere(): (err: Error) => Error {
+  const here: { stack?: string } = {};
+  Error.captureStackTrace(here, madeHere);
+  return (err) => {
+    const frames = String(here.stack ?? "").split("\n").slice(1).filter(line => !OWN_CODE.some(own => line.includes(own)));
+    err.stack = [`${err.name}: ${err.message}`, ...frames].join("\n");
+    return err;
+  };
+}
 
 /**
  * How calls reach the runner: straight to it. Not by way of a proxy that the
@@ -72,8 +96,11 @@ export function openBridge(port: string, initPath: string): Bridge {
   // A call lasts as long as the work behind it — an agent run, or the whole
   // run of another program — so this uses node:http, which sets no deadline
   // for the response. (fetch gives up after five minutes without response headers.)
-  const call = (endpoint: string, body: unknown, signal?: AbortSignal): Promise<any> =>
-    new Promise((resolve, reject) => {
+  const call = (endpoint: string, body: unknown, signal?: AbortSignal): Promise<any> => {
+    // (However the call fails, its error says where the program made it.)
+    const failed = madeHere();
+    return new Promise((resolve, fail) => {
+      const reject = (err: Error) => fail(failed(err));
       const payload = encode(endpoint, body);
       if (signal?.aborted) return reject(new Error(`${endpoint} was given up`));
       const req = request({
@@ -108,6 +135,7 @@ export function openBridge(port: string, initPath: string): Bridge {
       req.on("close", off);
       req.end(payload);
     });
+  };
 
   const bridge: Bridge = { init, call };
   cached = { port, initPath, bridge };

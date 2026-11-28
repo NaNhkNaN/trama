@@ -10,6 +10,6 @@ What it is, and is not:
 - **What is here is who fixes, whatever comes with a later trama.** A newer runtime does not lay its fixer over yours: move this directory away to have the one that came with it, or put its `program.ts` on record as a version.
 - **What trama does round a fix is trama's, whoever fixes**: the copy, the trial of what comes back, what is kept of it. A fixer is not itself fixed where it fails, and a project is not asked to fix itself.
 - **A run cannot change what fixes it**: a run that may be fixed by this project cannot have it changed through its runner, nor can a run that one started. It is changed by the command line, by hand, or from a run that is not to be fixed (`maxRepairAttempts: 0`).
-- **It asks pi's agent, once, at work in the copy** (`agent.instruct(…, { workspace: true })`). `examples/repair-harness` keeps the conversation with the model itself instead, with tools of its own.
+- **It asks pi's agent, once, at work in the copy** (`agent.instruct(…, { workspace: true })`). **The fixed program is the agent's answer — or `program.ts` in the copy as the agent left it, where its answer says so**: one line that begins "IN THE FILE:". `examples/repair-harness` keeps the conversation with the model itself instead, with tools of its own.
 - **It can say that there is no fix**: where the agent's answer begins "NO FIX:", it answers `{ unfixable }` with the reason, and the run failed as it had.
 - **Run with nothing to fix it says so and ends**: that is how a new version of it is validated.

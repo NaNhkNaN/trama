@@ -15,6 +15,9 @@
 // What it answers with: `{ program }`, the whole of the fixed program — or
 // `{ unfixable }`, why there is no fix.
 //
+// The fixed program is what the agent answers with — or program.ts in the
+// copy as the agent left it, where its answer says so ("IN THE FILE:").
+//
 // Everything here is the policy of a fix, and is this program's to change:
 // what the agent is told, which model is asked, how its answer is read. What
 // is round a fix is trama's, whoever fixes: the copy, the trial of what
@@ -25,6 +28,8 @@ const { program, error, journal, kept, types } = ctx.input.args as { program?: s
 
 /** How an answer begins that says there is no fix. */
 const NO_FIX = "NO FIX:";
+/** How an answer begins that says the fixed program is program.ts, where the agent worked, as it left it — and is itself no program. */
+const IN_THE_FILE = "IN THE FILE:";
 
 if (program === undefined || error === undefined) {
   // (Run by itself — as it is when a new version of it is validated — it has nothing to fix.)
@@ -43,7 +48,8 @@ if (program === undefined || error === undefined) {
     `\nRuntime types:\n${types}\n\n` +
     `Broken program:\n${program}\n\n` +
     `Error:\n${error}\n\n` +
-    `Output ONLY the fixed program${kept ? ": the whole of it, also where it is the project that needed fixing" : ""}. No explanation.`;
+    `Output ONLY the fixed program${kept ? ": the whole of it, also where it is the project that needed fixing" : ""}. No explanation. ` +
+    `(Or, where you fixed program.ts where it is, one line that begins "${IN_THE_FILE}" and says what was wrong: the fixed program is then that file as you left it.)`;
 
   // By the model the failing project is made with, where it says one.
   let model: string | undefined;
@@ -55,9 +61,13 @@ if (program === undefined || error === undefined) {
   // The agent is asked once, at work in the copy.
   const answer = await agent.instruct(ask, { system: "You are a TypeScript repair tool.", workspace: true, ...(model !== undefined && { model }) });
 
-  // Its answer is the program — out of its fences, where it came in some — or that there is no fix.
+  // Its answer is the program — out of its fences, where it came in some — or says that there is no fix; or
+  // that the fixed program is in program.ts, which is then read as it was left. (As it was, too: where what was
+  // wrong was in the project. Whether anything was fixed at all is the runner's to say.)
   if (answer.trimStart().startsWith(NO_FIX)) {
     await ctx.done({ unfixable: answer.trimStart().slice(NO_FIX.length).trim() });
+  } else if (answer.trimStart().startsWith(IN_THE_FILE)) {
+    await ctx.done({ program: await workspace.read("program.ts") });
   } else {
     await ctx.done({ program: stripCodeFences(answer) });
   }
