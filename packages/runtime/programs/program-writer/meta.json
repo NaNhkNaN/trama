@@ -1,5 +1,5 @@
 {
-  "description": "A writer: asks the runtime's own agent, once, for a project's program — its first, or its next — in the copy of the project it is handed, in the words trama itself has for it. Named as a making's createWith, or an update's updateWith.",
+  "description": "A writer: asks the runtime's own agent, once, for a project's program — its first, or its next — in the copy of the project it is handed. It comes with trama, and is who writes where nobody else is named (createWith, updateWith).",
   "parameters": {
     "prompt?": "string: what is asked of the program — handed by the runner to whoever writes one, as the three that follow are",
     "program?": "string: the program it is written from, whole (it is program.ts in the copy, too) — none, at a project's making",

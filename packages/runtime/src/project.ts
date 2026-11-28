@@ -3,9 +3,10 @@
 // its last run left.
 
 import {
-  readFileSync, writeFileSync, mkdirSync, existsSync,
+  readFileSync, writeFileSync, mkdirSync, existsSync, cpSync, lstatSync,
   symlinkSync, rmSync, renameSync, readlinkSync, accessSync, constants,
 } from "fs";
+import { randomBytes } from "crypto";
 import { join, dirname, resolve, sep } from "path";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
@@ -245,6 +246,57 @@ export function projectNamed(given: string): string {
   if (given === "~" || given.startsWith("~/")) return join(homedir(), given.slice(2));
   if (namesAPath(given)) return resolve(given);
   return join(homedir(), ".trama", "projects", given);
+}
+
+// --- The programs that come with the runtime ---
+
+/** Where the runtime's own programs are: with the package, beside its dist/. */
+const OWN_PROGRAMS = join(RUNTIME_PACKAGE_DIR, "programs");
+
+/**
+ * Who writes a project's program, and who fixes one that failed, where
+ * nobody is named — by a call, a run or the configuration: a program that
+ * comes with the runtime, by its name among the user's projects.
+ */
+export const OWN_WRITER = "program-writer", OWN_FIXER = "program-fixer";
+const DOES = {
+  [OWN_WRITER]: ["writes a project's program", "who is to write (createWith, updateWith)"],
+  [OWN_FIXER]: ["fixes a program that failed", "who is to fix (repairWith)"],
+} as const;
+
+/**
+ * The project one of the runtime's own programs is: among the user's, by its
+ * name — put there as it came with the runtime, the first time it is wanted,
+ * which is said (`say`). From then on it is the user's: on record from its
+ * first run, changed and gone back from as any project is; and what is there
+ * is who is asked, whatever comes with a later runtime. The runtime has no
+ * words of its own to a model for either role: they are these programs'.
+ *
+ * It is put there whole or not at all — made beside, then moved to its name
+ * — and where another runner put it there meanwhile, that one is it. What
+ * has its name and is no project is in the way, and is said to be: nothing
+ * is laid over it.
+ */
+export function ownProgram(name: typeof OWN_WRITER | typeof OWN_FIXER, say: (line: string) => void): string {
+  const projects = join(homedir(), ".trama", "projects"), dir = join(projects, name);
+  const [does, whoElse] = DOES[name];
+  const there = (): boolean => existsSync(join(dir, "meta.json"));
+  if (there()) return dir;
+  if (lstatSync(dir, { throwIfNoEntry: false })) {
+    throw new Error(`${name} ${does} where nobody else is named, and is to be a project among yours: what is at ${dir} is none. Move it away, or name ${whoElse}.`);
+  }
+  mkdirSync(projects, { recursive: true });
+  const coming = join(dirname(projects), `.${name}-${randomBytes(6).toString("hex")}`);
+  try {
+    cpSync(join(OWN_PROGRAMS, name), coming, { recursive: true });
+    renameSync(coming, dir);
+  } catch (err) {
+    rmSync(coming, { recursive: true, force: true });
+    if (there()) return dir;
+    throw new Error(`${name} ${does} where nobody else is named, and could not be put among your projects (${dir}): ${messageOf(err)}`);
+  }
+  say(`[trama] ${name} is among your projects (${dir}): it ${does} where nobody else is named, and is yours to change.`);
+  return dir;
 }
 
 /** Whether what names a project names it by a path, and not by its name among the user's projects. */

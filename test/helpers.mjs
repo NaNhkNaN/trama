@@ -6,6 +6,14 @@ import { fileURLToPath, pathToFileURL } from "url";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 
+// A home of this test process's own. A run looks among the user's projects for who writes and who fixes — and puts the
+// runtime's own there where they are not — and reads the user's configuration: a test that gives its runs no home
+// of their own is not to read, or write, the home of whoever runs the suite. (A test that has a home for its runs
+// sets it over this one for as long as it needs it: see withEnv.)
+const OWN_HOME = mkdtempSync(join(tmpdir(), "trama-test-home-"));
+process.env.HOME = OWN_HOME;
+process.on("exit", () => { try { rmSync(OWN_HOME, { recursive: true, force: true }); } catch { /* (Left for the system to clear.) */ } });
+
 export const REPO_ROOT = dirname(TEST_DIR);
 
 export const DEFAULT_PROGRAM = `import { ctx, tools } from "@trama-dev/runtime";

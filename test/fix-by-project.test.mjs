@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { existsSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "fs";
-import { join } from "path";
+import { basename, join } from "path";
 import { llm } from "./fake-llm.mjs";
 import { runProgram } from "../packages/runtime/dist/runner.js";
 import { loadConfig } from "../packages/runtime/dist/project.js";
@@ -152,7 +152,7 @@ test("what comes back that is no fix is said as none: no program, the program as
     return it;
   };
   await failed("same", /No fix came back: The repair returned the program unchanged, and changed nothing else in the project\./);
-  // (The fixer's own failure: no fix is asked for it — of pi's agent, or of itself.)
+  // (The fixer's own failure: no fix is asked for it — of the runtime's own fixer, or of itself.)
   const it = await failed("fail", /No fix came back: The project asked for the fix failed: [^]*the fixer has a fault of its own/, { maxRepairAttempts: 3 });
   assert.equal(it.seen().length, 1);
   assert.equal(journalsOf(it.fixer)[0].some((record) => record.kind === "fix-request"), false);
@@ -169,7 +169,7 @@ test("what comes back that is no fix is said as none: no program, the program as
   assert.match(result.reason, /No fix came back: A project is not asked to fix itself: repairWith names the project that failed\./);
   assert.deepEqual(own.seen(), []);
 
-  // Without one named, the fix is asked of pi's agent as it always was.
+  // Without one named, the fix is asked of the runtime's own fixer: a project too, among the user's.
   const plain = projects(t);
   let asked = 0, prompted = "";
   const original = llm.repair;
@@ -179,8 +179,8 @@ test("what comes back that is no fix is said as none: no program, the program as
   assert.equal(asked, 1);
   assert.deepEqual(plain.seen(), []);
 
-  // And pi's agent has the same way out: an answer that begins "NO FIX:" is that — not a program to install
-  // and try, and not something to ask for again.
+  // And the agent that one asks has the same way out: an answer that begins "NO FIX:" is that — not a program to
+  // install and try, and not something to ask for again.
   assert.match(prompted, /there is no fix, and you are not to hand over such a program: answer instead with one line that begins "NO FIX:" and says why\.\n/);
   const hopeless = projects(t);
   asked = 0;
@@ -191,7 +191,7 @@ test("what comes back that is no fix is said as none: no program, the program as
   assert.equal(asked, 1);
   assert.equal(readFileSync(join(hopeless.projectDir, "program.ts"), "utf-8"), BROKEN);
   const [fix] = journalsOf(hopeless.projectDir)[0].filter((record) => record.kind === "fix");
-  assert.deepEqual({ ok: fix.ok, none: fix.none, used: fix.used }, { ok: false, none: true, used: undefined });
+  assert.deepEqual({ ok: fix.ok, none: fix.none, by: basename(fix.by), used: fix.used }, { ok: false, none: true, by: "program-fixer", used: { calls: 1, tokens: 0, cost: 0 } });
 });
 
 test("a fix by a project is the failing run's own: what its model is asked is counted in that run's budget, and it is stopped with the run", async (t) => {

@@ -164,7 +164,8 @@ test("an update by a project that a program asked for is that program's run's ow
   assert.deepEqual(it.journals("writer").at(-1)[0].parent.run, it.journals("asker").at(-1)[0].run);
   // Held to its budget: a run that may ask a model once has a writer that is refused its second request.
   const capped = await it.run("asker", { label: "asker", budget: { calls: 1 } });
-  assert.match(capped.result.failed, /The project asked for the update failed: /);
+  // (Why no update came is said as the runner knows it first: nothing more may be asked of a model under that budget.)
+  assert.match(capped.result.failed, /Update failed — the program is unchanged\.\nThe budget of a run this one is part of is spent: 1 of 1 calls to a model made\.$/);
   assert.deepEqual([it.index("words").length, it.lines("writer").map((line) => line.status)], [2, ["done", "failed"]]);
 });
 

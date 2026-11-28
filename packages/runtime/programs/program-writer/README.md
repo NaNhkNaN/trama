@@ -1,0 +1,14 @@
+# program-writer
+
+Who writes a project's program where nobody else is named: a program, some hundred lines with their comments, to be read and changed.
+
+Where a project's program is to be written — its first (`trama create`, `createProject`) or its next (`trama update`, `updateProject`) — trama asks a project for it: the one the call names (`--with`, `createWith`, `updateWith`) or the configuration does, and where none is named, this one. It comes with the runtime, and is put among your projects the first time it is wanted — which is said, once. From then on it is yours: trama has no words of its own to a model for a writing; what the agent is asked is what `program.ts` here says.
+
+What it is, and is not:
+
+- **Its wording is the policy, and is yours to change** — what the agent is told (`system` and `ask`, in `program.ts`), the programs a first program is shown to go by (`example-programs.txt`, beside it), which model is asked (the one the project was made with, where its `meta.json` says one), how the answer is read. It is a project like any: `trama history program-writer` has its versions and its runs, a change to it is validated and on record, and `trama rollback` goes back from one. It writes its own next version too: `trama update program-writer "…"`.
+- **What is here is who writes, whatever comes with a later trama.** A newer runtime does not lay its writer over yours. To have the one that came with it: move this directory away (it is put there anew), or put its `program.ts` on record as a version (`trama add-version program-writer <file>`).
+- **What trama does round the writing is trama's, whoever writes**: the copy, the validation of what comes back, the version on record, what is installed and what is kept.
+- **It asks pi's agent, once, at work in the copy** (`agent.instruct(…, { workspace: true })`), and takes the program from its answer (`stripCodeFences`). `examples/write-by-harness` has a harness do the work instead — which looks before it writes, and changes a line of a long program where this has the whole written out again.
+- **It can say that there is no program to be written**: where the agent's answer begins "NO PROGRAM:", it answers `{ unwritable }` with the reason, and whoever asked is told why. Nothing is validated, and nobody mends that into a program.
+- **Run with nothing to write it says so and ends**: that is how a new version of it is validated, which shows that it loads and no more. Whether a writer writes well is for a judge to say, over programs it was asked for (see `examples/improve-by-check`, with `from`).

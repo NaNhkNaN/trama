@@ -131,7 +131,8 @@ await ctx.done({ fixed: true });`,
 
   const records = onlyJournal(projectDir);
   assert.deepEqual(records.filter(record => record.kind !== "call" && record.kind !== "result").map(record => record.kind), [
-    "run", "attempt", "exit", "fix-request", "fix", "attempt", "exit", "fix-request", "fix", "attempt", "exit", "end",
+    // (Each fix is asked of a project — the runtime's own fixer, where nobody is named: a run of its own, named here.)
+    "run", "attempt", "exit", "fix-request", "child", "fix", "attempt", "exit", "fix-request", "child", "fix", "attempt", "exit", "end",
   ]);
   assert.deepEqual(records.filter(record => record.kind === "attempt").map(record => record.attempt), [0, 1, 2]);
   assert.deepEqual(records.filter(record => record.kind === "exit").map(record => record.outcome?.status ?? null), [null, null, "done"]);
@@ -968,7 +969,7 @@ await ctx.done({ first, second, third, fourth, fifth, sixth, seventh, eighth, ni
   assert.match(listed.messages.join("\n"), /^\S+  run +10 calls  done  90 tokens  \$1\.2500$/m);
 });
 
-test("what asking for a fix used is on record with the run, whether or not a fix came back", async (t) => {
+test("what asking for a fix used is on record with the run, whether or not a fix came back: with the fix, as what the project asked for it took — whose own record has each request", async (t) => {
   const mended = makeTempDir("trama-journal-");
   const unmended = makeTempDir("trama-journal-");
   for (const projectDir of [mended, unmended]) {
@@ -982,13 +983,17 @@ test("what asking for a fix used is on record with the run, whether or not a fix
     return `import { ctx } from "@trama-dev/runtime";\nawait ctx.done({ fixed: true });`;
   };
   t.after(() => { llm.repair = originalRepair; cleanupTempDir(mended); cleanupTempDir(unmended); });
-  const used = { kind: "usage", for: "fix", model: "p/m", input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.5 };
+  const used = { kind: "usage", model: "p/m", input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.5 };
   const shapeOf = (records) => records.map(record => record.kind).filter(kind => kind !== "call" && kind !== "result");
-  const usageIn = (records) => records.filter(record => record.kind === "usage").map(({ at, ...record }) => record);
+  // What the fix took: said with it, on the failing run's record — and request by request on the record of the fixer's own run, which the failing run's names.
+  const tookOf = (records) => records.filter(record => record.kind === "fix").map(record => record.used);
+  const fixersOwn = (records) => records.filter(record => record.kind === "child" && record.purpose === "fix").flatMap(child => readRecords(child.journal));
+  const usageIn = (records) => fixersOwn(records).filter(record => record.kind === "usage").map(({ at, seq, ...record }) => record);
 
   assert.deepEqual(await runProgram({ projectDir: mended, maxRepairAttempts: 3, timeout: 20_000 }), { status: "done", result: { fixed: true } });
   let records = onlyJournal(mended);
-  assert.deepEqual(shapeOf(records), ["run", "attempt", "exit", "fix-request", "usage", "fix", "attempt", "exit", "end"]);
+  assert.deepEqual(shapeOf(records), ["run", "attempt", "exit", "fix-request", "child", "fix", "attempt", "exit", "end"]);
+  assert.deepEqual(tookOf(records), [{ calls: 1, tokens: 120, cost: 0.5 }]);
   assert.deepEqual(usageIn(records), [used]);
 
   // What is said that is no report at all is written down as that, and the run goes on as it would have.
@@ -997,7 +1002,7 @@ test("what asking for a fix used is on record with the run, whether or not a fix
   createProjectFixture(garbled, { scaffold: false, programSource: `throw new Error("the original fails");` });
   writeText(join(garbled, "garbled"), "x");
   assert.equal((await runProgram({ projectDir: garbled, maxRepairAttempts: 3, timeout: 20_000 })).status, "done");
-  const odd = onlyJournal(garbled).filter(record => record.kind === "usage");
+  const odd = fixersOwn(onlyJournal(garbled)).filter(record => record.kind === "usage");
   assert.deepEqual(odd.map(record => typeof record.unrecordable), ["undefined", "string"]);
 
   // A run that asked no model anything says nothing of what it used.
@@ -1011,13 +1016,14 @@ test("what asking for a fix used is on record with the run, whether or not a fix
   const { result: failed } = await captureConsole("error", () => runProgram({ projectDir: unmended, maxRepairAttempts: 3, timeout: 20_000 }));
   assert.equal(failed.status, "failed");
   records = onlyJournal(unmended);
-  assert.deepEqual(shapeOf(records), ["run", "attempt", "exit", "fix-request", "usage", "fix", "end"]);
+  assert.deepEqual(shapeOf(records), ["run", "attempt", "exit", "fix-request", "child", "fix", "end"]);
+  assert.deepEqual(tookOf(records), [{ calls: 1, tokens: 120, cost: 0.5 }]);
   assert.deepEqual(usageIn(records), [used]);
   assert.equal(records.find(record => record.kind === "fix").ok, false);
 
   const { messages } = await captureConsole("log", async () => printJournals(unmended, "it", {}));
   const shown = messages.join("\n");
-  assert.match(shown, /asking for the fix used 120 tokens  \$0\.5000$/m);
+  assert.match(shown, /^ +\d+\.\d+s  fix not returned: .*  120 tokens  \$0\.5000$/m);
   assert.match(shown, /end: failed  \(120 tokens  \$0\.5000 in all\)$/m);
 });
 
@@ -1038,8 +1044,13 @@ test("a run's journal ends after the calls it cut off have said what they used �
   assert.equal((await quietly(() => runProgram({ projectDir, maxRepairAttempts: 1, timeout: 300 }))).status, "failed");
   assert.ok(Date.now() - started < 3000, "it is waited for no longer than it takes");
   let records = lastJournal();
-  assert.deepEqual(records.map(record => record.kind).slice(-4), ["fix-request", "fix", "usage", "end"]);
-  assert.deepEqual(records.at(-2), { at: records.at(-2).at, kind: "usage", for: "fix", ...used });
+  // (The call that was cut off is the fixer's: its own run's record ends after what the call then said it used —
+  // and so the failing run, which waited for that run, has it with the fix that did not come.)
+  assert.deepEqual(records.map(record => record.kind).slice(-4), ["fix-request", "child", "fix", "end"]);
+  assert.deepEqual(records.at(-2).used, { calls: 1, tokens: 120, cost: 0.5 });
+  const fixers = readRecords(records.at(-3).journal);
+  assert.deepEqual(fixers.map(record => record.kind).slice(-2), ["usage", "end"]);
+  assert.deepEqual((({ at, seq, ...said }) => said)(fixers.at(-2)), { kind: "usage", ...used });
 
   // One that never lets go is waited for as long as a program that ignores being asked to stop — and then no more:
   // what it says afterwards finds the journal closed, and the next run has nothing of it to wait for.
@@ -1051,7 +1062,7 @@ test("a run's journal ends after the calls it cut off have said what they used �
   assert.ok(waited > 4500 && waited < 9000, `the run ended ${waited}ms after it began`);
   sayLate();
   records = lastJournal();
-  assert.deepEqual(records.map(record => record.kind).slice(-3), ["fix-request", "fix", "end"]);
+  assert.deepEqual(records.map(record => record.kind).slice(-4), ["fix-request", "child", "fix", "end"]);
 
   llm.repair = async () => { throw new Error("no fix today"); };
   started = Date.now();

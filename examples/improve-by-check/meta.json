@@ -12,7 +12,7 @@
     "margin?": "number: by how much a mean score has to be higher (0)",
     "confirm?": "number: how many times the runs that decide are made again where a version passes (0)",
     "tell?": "string: which runs the writer is told of — wanting, or all",
-    "write?": "string: the project that writes the update, by its name (see examples/write-by-harness) — else whoever the configuration names, or pi's agent"
+    "write?": "string: the project that writes the update, by its name (see examples/write-by-harness) — else whoever the configuration names, or the writer that comes with trama (program-writer)"
   },
   "returns": {
     "kept": "boolean: whether a new version was made the program",

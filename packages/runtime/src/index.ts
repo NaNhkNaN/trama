@@ -5,13 +5,11 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, statSy
 import { join, resolve } from "path";
 import { homedir } from "os";
 import { piVersion } from "./pi-adapter.js";
-import { stripCodeFences } from "./agent.js";
 import { onAbort, throwIfAborted } from "./abort.js";
-import type { AgentUsage } from "./agent-backend.js";
 import { createMeter, type Meter } from "./budget.js";
 import { LATEST_LOG_PATH } from "./context.js";
 import { readProjectMeta } from "./meta.js";
-import { ensureProjectScaffold, loadConfig, loadProjectConfig, loadState, namesAPath, projectNamed } from "./project.js";
+import { ensureProjectScaffold, loadConfig, loadProjectConfig, loadState, namesAPath, ownProgram, OWN_FIXER, OWN_WRITER, projectNamed } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import {
   validateProgram, installValidatedProgram, keepBeside, writtenFrom, writtenBy, META_PUT_BACK,
@@ -22,7 +20,7 @@ import {
 import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspace.js";
 import { parentBridge, remoteWorkspace, withOptions, type Bridge } from "./bridge-client.js";
 import { guardPath, identityOf, realRootOf, sameProjectAs } from "./path-guard.js";
-import { printJournals, spentIn } from "./journal-view.js";
+import { printJournals } from "./journal-view.js";
 import { openJournal } from "./journal.js";
 import { messageOf } from "./errors.js";
 
@@ -431,35 +429,6 @@ process.on("SIGINT", () => {
 await new Promise<void>(() => {});`;
 
 /**
- * How whoever is asked for a program begins an answer that says there is
- * none to be written — as whoever is asked for a fix says there is none to
- * be had (the runner's "NO FIX:"). An answer, and no program: it is not
- * tried as one.
- */
-const NO_PROGRAM = "NO PROGRAM:";
-
-function getSystemPrompt(kept: boolean): string {
-  return (
-    `You are generating a TypeScript program for the trama runtime.\n\n` +
-    `If the program is long-running (for example an HTTP server), call ctx.ready(...) after startup completes and handle SIGTERM/SIGINT for clean shutdown.\n\n` +
-    `The workspace object is there where a run is given a directory to work in beside its project (a codebase, or what several runs share): workspace.read, write, list, shell. ` +
-    `ctx.yield(reason) suspends the program cooperatively — persists state and exits. ` +
-    `ctx.resumed is true if this run follows a yield; ctx.yieldReason has the reason.\n\n` +
-    `You are working in a copy of the project's directory, which is where the program will run: ` +
-    `where the task speaks of the project's files, look at them. ` +
-    (kept
-      ? `What the program needs beside it — a package installed, a module it imports, a file it reads — ` +
-        `you can make here: it is kept, with the program, if the program then passes its validation. ` +
-        `The program itself is what you answer with, whatever you wrote to program.ts here.\n\n`
-      : `Nothing you write here is kept — only the program you answer with.\n\n`) +
-    `If the program cannot be written as it is asked for — what is asked goes against what the project says it takes and gives, or cannot be done with what there is — ` +
-    `then there is no program, and you are not to hand over one that does something else: answer instead with one line that begins "${NO_PROGRAM}" and says why.\n\n` +
-    `Runtime API:\n${RUNTIME_TYPES}\n\n` +
-    `Examples:\n${EXAMPLE_PROGRAMS}`
-  );
-}
-
-/**
  * What whoever writes a program themselves is to know, and a writer that is
  * a model is told as it is asked: where a project is and what is in it, what
  * a program has and how it takes and gives, how what a project takes and
@@ -484,36 +453,7 @@ export function programGuide(): string {
 
 /** What a project says of itself that is its contract: what it is for, what a run of it takes and gives. */
 const CONTRACT = ["description", "parameters", "returns"] as const;
-const WHAT_EACH_IS: Record<(typeof CONTRACT)[number], string> = {
-  description: `"description" is what the project is for, in a sentence`,
-  parameters: `"parameters" is what a run of it is given — its arguments — as an object of fields`,
-  returns: `"returns" is what the program ends with: what it hands to ctx.done`,
-};
 const VALIDATED_WITH = `A project is validated by a run of it with the arguments it is made with: what it requires is to be among them, or written as what may be absent ("name?").`;
-
-/**
- * What pi's agent is told, where it writes a project's program, of what the
- * project says of itself: what the program is held to, where the project
- * says — and, at a project's making, what it is to say there itself
- * (`proposes`: what of the three whoever asked for the project did not say).
- * A writer that is a project has the project's meta.json in its copy, and
- * its own words for this.
- */
-function saysOfItself(meta: ProjectMeta, proposes: readonly (typeof CONTRACT)[number][] = []): string {
-  const says = { description: meta.description, parameters: meta.parameters, returns: meta.returns };
-  return (
-    (says.parameters !== undefined || says.returns !== undefined
-      ? `\n\nWhat the project says it takes and gives (its meta.json): the program is held to it — a run's arguments are these and no others, and what the program ends with is to be of this shape — and it is not the program's to change.\n${JSON.stringify(says, null, 2)}`
-      : "") +
-    (proposes.length > 0
-      ? `\n\nSay in meta.json, here, what the project does not say of itself yet — ${proposes.map((field) => `"${field}"`).join(", ")} — for whoever is to choose this program among others, and call it: ` +
-        `${proposes.map((field) => WHAT_EACH_IS[field]).join("; ")}. ` +
-        `What is taken and given is written as a Schema is (see the API): a field by its kind — "string", "number", "boolean", "object" for an object whatever its fields, "json" for any value — with what it is after a colon, an object by its fields, a list by the shape of its items in brackets, and a field that may be absent with a "?" at the end of its name. ` +
-        `Add them to the file and change nothing else of it. This is kept, whatever else of what you make here is; and the program is held to it from its first run.\n` +
-        `The project is made with these arguments, and is validated by a run of it with them: ${JSON.stringify(meta.input.args ?? {})}. An argument a run need not be given is written as one that may be absent.`
-      : "")
-  );
-}
 
 /**
  * What whoever wrote a new project's program said, in the meta.json of the
@@ -586,50 +526,25 @@ export function resolveProject(name: string): string {
 
 // --- Helpers ---
 
-/**
- * Ask for a program for a project — in a copy of the project (see Prepared),
- * so that the agent can look at what the program is to work with and make
- * what it needs, and its tools do not write into the real one — and take
- * what comes back for a program only if something does: no program is not a
- * program that does nothing. Nor is an answer that says there is none to be
- * written (see NO_PROGRAM): whoever asked is told why, in its words, and
- * nothing is validated, or mended into a program by whoever fixes.
- */
-async function generateProgram(
-  backend: Backend, prepared: Prepared, prompt: string, system: string, wrote: AgentUsage[], signal?: AbortSignal,
-  label?: string,
-): Promise<string> {
-  let reply: string;
-  try {
-    reply = await backend.ask(prompt, { cwd: prepared.copy, system, signal, used: (usage) => { wrote.push(usage); } });
-  } finally {
-    // What it took is said whatever came of it: it is on record only with a validation, and there may be none.
-    // (A call that was cut off — stopped, or by the budget — says what it took once its backend has let go of it.)
-    await backend.letGo();
-    if (wrote.length > 0) console.log(tagged(label, `[trama] writing the program used ${spentIn(wrote)}`));
-  }
-  const program = stripCodeFences(reply);
-  throwIfAborted(signal);
-  if (reply.trimStart().startsWith(NO_PROGRAM)) {
-    throw new Error(`It was said that there is none to be written: ${reply.trimStart().slice(NO_PROGRAM.length).trim() || "no reason was given"}`);
-  }
-  if (program === "") throw new Error("The model answered with no program.");
-  return program;
-}
+/** Who wrote a candidate — the project that was asked — and what that took of a model, by the count it was made under. */
+type Written = { by: string; used: { calls: number; tokens: number; cost: number }; run?: string; journal?: string; what?: "create" | "update" };
 
 /**
- * Leave on a project's record what writing a program for it used, where
- * nothing came of the writing — no program, or none that came to be
- * validated — and why: a journal of its own (its purpose "write"), where a
- * journal is looked for. What writing a candidate used is otherwise on
- * record with the candidate's validation, and here there is none: it was
- * said as it was spent, and was on no record. (A writing that used nothing
- * leaves nothing.)
+ * Leave on a project's record that a program was asked for it and nothing
+ * came of the asking — no program, or none that came to be validated — and
+ * why: a journal of its own (its purpose "write"), where a journal is looked
+ * for. It names the run of whoever was asked (that run's own record has
+ * what it did), who that was, and what the writing took. What writing a
+ * candidate took is otherwise on record with the candidate's validation,
+ * and here there is none. (Where nobody came to be asked — no run of a
+ * writer's was begun — nothing is left.)
  */
-function writtenForNothing(projectDir: string, config: TramaConfig, wrote: AgentUsage[], why: string, asked: Asked): void {
-  if (wrote.length === 0) return;
+function writtenForNothing(projectDir: string, config: TramaConfig, by: Written | undefined, why: string, asked: Asked): void {
+  if (by?.run === undefined) return;
+  const { run, journal: its, what, ...written } = by;
   const journal = openJournal(projectDir, config.journalRuns, { purpose: "write", label: asked.label, parent: asked.parent });
-  for (const usage of wrote) journal.used("generate", usage);
+  if (run) journal.note("child", { run, journal: its, purpose: what });
+  journal.note("written", written);
   journal.note("end", { result: { status: "failed", reason: why } });
   journal.close();
 }
@@ -654,18 +569,34 @@ const budgetOf = (config: TramaConfig, asked: Asked) => (asked.above ? undefined
  * run, in the run's own words: a program may ask for many projects.
  */
 function backendFor(config: TramaConfig, asked: Asked, meter: Meter = meterFor(config, asked)) {
+  // (Asked for by a run's program, the project is validated by a backend of that run: with the run's variables.)
+  return createBackend(config, meter, saysSpent(asked, meter), asked.env);
+}
+
+/**
+ * How it is said that the budget a create or an update is held to is spent:
+ * once for the budget — the asking run's, where a run's program asked; else
+ * the making's own — and in the words of whoever has that budget, whoever
+ * came up against it: the backend that validates, or the run of the project
+ * that writes (which does not say it in words of its own: see `writtenBy`).
+ */
+function saysSpent(asked: Asked, meter: Meter): (why: string) => void {
   const say = (why: string) => console.warn(tagged(asked.label, `[trama] ${why}`));
-  const { above } = asked;
-  // (Asked for by a run's program, the project is written by an agent of that run: with the run's variables.)
-  return createBackend(config, meter, above ? saysOnce(above, (why) => say(above.spent() ?? why)) : say, asked.env);
+  const held = asked.above ?? meter;
+  return saysOnce(held, (why) => say(held.spent() ?? why));
 }
 
 /** The count a create or an update is made under: writing the program, validating it, and a fix of it in between — whoever is asked for each. */
 const meterFor = (config: TramaConfig, asked: Asked): Meter => createMeter(budgetOf(config, asked), asked.above);
 
-/** Who fixes a candidate that fails its validation, where the configuration names a project for it: found before anything is written. */
-function fixerOf(config: TramaConfig): string | undefined {
-  if (config.repairWith === undefined || config.maxRepairAttempts <= 0) return undefined;
+/**
+ * Who fixes a candidate that fails its validation: the project the
+ * configuration names — or, where it names none, the runtime's own fixer
+ * (see `ownProgram`). Nobody, where a candidate is not to be fixed.
+ */
+function fixerOf(config: TramaConfig, attempts: number, say: (line: string) => void): string | undefined {
+  if (attempts <= 0) return undefined;
+  if (config.repairWith === undefined) return ownProgram(OWN_FIXER, say);
   const fixer = projectNamed(config.repairWith);
   if (!existsSync(join(fixer, "meta.json"))) throw new Error(`repairWith names no project: there is none at ${fixer}`);
   return fixer;
@@ -703,7 +634,7 @@ function keepPrepared(prepared: Prepared, label?: string): void {
  */
 async function validateCandidate(
   projectDir: string, backend: Backend, candidate: string, config: TramaConfig, prepared: Prepared,
-  wrote: AgentUsage[], signal: AbortSignal | undefined, asked: Asked, byItself = false,
+  signal: AbortSignal | undefined, asked: Asked, byItself = false,
   more: { meter?: Meter; writtenBy?: { by: string; used: { calls: number; tokens: number; cost: number } }; says?: string; maxRepairAttempts?: number } = {},
 ): Promise<{ validated: Awaited<ReturnType<typeof validateProgram>>; kept: boolean }> {
   let as: string | undefined, alone: string | undefined;
@@ -724,12 +655,11 @@ async function validateCandidate(
     as,
     alone,
     budget: budgetOf(config, asked),
-    wrote,
     label: asked.label,
     env: asked.env,
     askedFor: asked.parent && asked.started && { parent: asked.parent, started: asked.started },
-    // (A candidate that fails is fixed by whoever the configuration names to fix: a project, where it names one.)
-    repairWith: fixerOf(config),
+    // (A candidate that fails is fixed by whoever the configuration names to fix — or the runtime's own fixer.)
+    repairWith: fixerOf(config, more.maxRepairAttempts ?? config.maxRepairAttempts, shownUnder(asked.label).log),
     ...more,
   });
   return { validated, kept: as !== undefined && validated.alone === undefined };
@@ -753,9 +683,6 @@ async function writeValidateInstall(projectDir: string, how: {
   reason: "create" | "update";
   /** What was asked for, as it is kept on record with the version. */
   prompt: string;
-  /** What the agent is asked, and what it is told beside. */
-  ask: string;
-  system: string;
   /** What is said as the validation begins. */
   validating: string;
   config: TramaConfig;
@@ -771,7 +698,7 @@ async function writeValidateInstall(projectDir: string, how: {
   beside?: { parent: number | null };
   /** The count all of it is made under (the backend's). */
   meter?: Meter;
-  /** The project that writes the program, in the place of pi's agent — and, of an update, the program it writes from (see `writtenBy`). */
+  /** The project that writes the program — and, of an update, the program it writes from (see `writtenBy`). Nobody, where the program is handed over. */
   writer?: { project: string; program?: string };
   /**
    * Of a making: the program, where whoever asks for the project hands it
@@ -797,25 +724,33 @@ async function writeValidateInstall(projectDir: string, how: {
   said?: (proposal: Record<string, unknown>) => string;
 }): Promise<number> {
   const { config, backend, stillTheProject, signal, asked } = how;
-  const wrote: AgentUsage[] = [];
-  // Whether what the writing used is on record: with the candidate's validation, once there is one.
+  // Whether what the writing took is on record: with the candidate's validation, once there is one.
   let onRecord = false;
+  // Who wrote, what that took, and which run of the writer's it was: for the record, whatever comes of it.
+  let by: Written | undefined, writing: { run: string; journal: string } | undefined;
   return withTempDir("trama-gen-", async (privateDir) => {
     const prepared = prepareProject(projectDir, privateDir, how.from?.text);
     if (how.says) prepared.says(how.says.text);
-    // Who writes: a project, where one is named — or pi's agent, at work in the copy with its own tools.
-    let candidate: string, by: { by: string; used: { calls: number; tokens: number; cost: number } } | undefined;
+    // Who writes: the project that was found for it, at work in the copy — a run of its own, on its own record. The
+    // runtime has no words of its own for a writing: what a model is asked is the writer's. (Nobody, where the
+    // program is handed over.)
+    let candidate: string;
     if (how.handed !== undefined) candidate = how.handed;
-    else if (how.writer) {
+    else {
+      const writer = how.writer;
+      if (!writer) throw new Error("A program is written by the project that is asked for it, and none was found.");
       const meter = how.meter ?? meterFor(config, asked), before = meter.counted();
-      // (What it makes beside the program is kept where an agent's would be: not of a version that is kept beside the program.)
-      candidate = await writtenBy(how.writer.project, {
-        prompt: how.prompt, ...(how.writer.program !== undefined && { program: how.writer.program }), kept: config.agentChanges === "keep" && !how.beside, copy: prepared.copy,
-      }, { ...asked, signal, meter }, how.reason);
-      const now = meter.counted();
-      by = { by: how.writer.project, used: { calls: now.calls - before.calls, tokens: now.tokens - before.tokens, cost: now.cost - before.cost } };
-    } else {
-      candidate = await generateProgram(backend, prepared, how.ask, how.system, wrote, signal, asked.label);
+      try {
+        // (What it makes beside the program is kept where that is kept: not of a version that is kept beside the program.)
+        candidate = await writtenBy(writer.project, {
+          prompt: how.prompt, ...(writer.program !== undefined && { program: writer.program }), kept: config.agentChanges === "keep" && !how.beside, copy: prepared.copy,
+        }, { ...asked, signal, meter, spent: saysSpent(asked, meter), writing: (run, journal) => { if (run) writing = { run, journal }; asked.writing?.(run, journal); } }, how.reason);
+      } finally {
+        // What it took is said whatever came of it, and is for the record: with the candidate's validation, or by itself.
+        const now = meter.counted();
+        by = { by: writer.project, used: { calls: now.calls - before.calls, tokens: now.tokens - before.tokens, cost: now.cost - before.cost }, ...(writing && { ...writing, what: how.reason }) };
+        if (by.used.tokens > 0) shownUnder(asked.label).log(`[trama] writing the program used ${by.used.tokens} tokens  $${by.used.cost.toFixed(4)}`);
+      }
     }
     stillTheProject();
     // What the project says of itself is not its writer's to change: the candidate is validated under what the project
@@ -843,7 +778,7 @@ async function writeValidateInstall(projectDir: string, how: {
     onRecord = true;
     // (A version that is to be kept beside the program is the program's text and no more: it is validated in the
     // project as it is, where it will be run — not with what its writer made beside it, which is not kept.)
-    const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, wrote, signal, asked, how.beside !== undefined, { meter: how.meter, ...(by && { writtenBy: by }), ...(how.says && { says: how.says.text }), ...(how.handed !== undefined && { maxRepairAttempts: 0 }) });
+    const { validated, kept } = await validateCandidate(projectDir, backend, candidate, config, prepared, signal, asked, how.beside !== undefined, { meter: how.meter, ...(by && { writtenBy: by }), ...(how.says && { says: how.says.text }), ...(how.handed !== undefined && { maxRepairAttempts: 0 }) });
     stillTheProject();
     if (how.beside) return keepBeside(projectDir, validated, how.prompt, how.beside.parent, how.says?.held);
     const version = installValidatedProgram(projectDir, validated, how.reason, how.prompt, how.from?.version, how.says);
@@ -851,7 +786,7 @@ async function writeValidateInstall(projectDir: string, how: {
     return version;
   }).catch((err) => {
     // (Of a project that is being made there is no record to leave it on: where the making fails, the project is not.)
-    if (!onRecord && how.reason !== "create") writtenForNothing(projectDir, config, wrote, messageOf(err), asked);
+    if (!onRecord && how.reason !== "create") writtenForNothing(projectDir, config, by, messageOf(err), asked);
     throw err;
   });
 }
@@ -871,9 +806,10 @@ async function writeValidateInstall(projectDir: string, how: {
  * meta.json of the copy it works in — once: from then on what the project
  * says of itself is the project's, and no writer's or fixer's to change.
  *
- * `createWith`: the project that writes the program, in the place of pi's
- * agent — by its name among the user's projects, or a path; without one,
- * the configuration's. It is run with a copy of the new project as its
+ * `createWith`: the project that writes the program — by its name among the
+ * user's projects, or a path; without one, the configuration's; and with
+ * neither, the runtime's own writer, a project among the user's (see
+ * `ownProgram`). It is run with a copy of the new project as its
  * workspace — its meta.json, and no program — handed `{ prompt, kept,
  * types, copy }`, and answers `{ program }` (see examples/write-by-harness).
  *
@@ -908,9 +844,10 @@ export async function createProject(
  * (`rollbackProject`) — and not made the program: the project is as it was.
  * So a version is tried before anything is put in the program's place.
  *
- * `updateWith`: the project that writes the program, in the place of pi's
- * agent — by its name among the user's projects, or a path. Without one,
- * the configuration's `updateWith`; without that, pi's agent. It is run
+ * `updateWith`: the project that writes the program — by its name among the
+ * user's projects, or a path. Without one, the configuration's
+ * `updateWith`; without that, the runtime's own writer, a project among
+ * the user's (see `ownProgram`). It is run
  * with a copy of the project as its workspace, handed `{ prompt, program,
  * kept, types, copy }`, and answers `{ program }` (see
  * examples/write-by-harness). What is done round the writing — the copy,
@@ -980,7 +917,6 @@ async function addVersionHere(
       agents: config.agents,
       signal: options?.signal,
       budget: budgetOf(config, asked),
-      wrote: [],
       label: asked.label,
       env: asked.env,
       askedFor: asked.parent && asked.started && { parent: asked.parent, started: asked.started },
@@ -1025,6 +961,15 @@ async function createHere(
   contractOf(projectDir, first, `What ${JSON.stringify(name)} is to take and give cannot be read`);
   fitsItsOwn(projectDir, first);
 
+  const config = loadConfig();
+  if (options?.model) config.model = options.model;
+  // Who writes it: the project the call names, or the configuration — or, with neither, the runtime's own writer, a
+  // project among the user's (put there where it is not: see `ownProgram`). Nobody, where the program is handed
+  // over — whoever the configuration names. Found before anything is made.
+  const named = handed !== undefined ? undefined : options?.createWith ?? config.createWith;
+  const writer = handed !== undefined ? undefined : named === undefined ? ownProgram(OWN_WRITER, say.log) : projectNamed(named);
+  if (writer !== undefined && !existsSync(join(writer, "meta.json"))) throw new Error(`createWith names no project: there is none at ${writer}`);
+
   mkdirSync(projectsDir(), { recursive: true });
   try {
     // Made here, and only here: whatever bears the name already — a project, a file, a link to nothing — is in the way.
@@ -1040,9 +985,6 @@ async function createHere(
   try {
     ensureProjectScaffold(projectDir);
 
-    const config = loadConfig();
-    if (options?.model) config.model = options.model;
-
     const meta = {
       ...first,
       createdAt: new Date().toISOString(),
@@ -1054,20 +996,12 @@ async function createHere(
 
     const meter = meterFor(config, asked);
     const backend = backendFor(config, asked, meter);
-    // Who writes it: the project the call names, or the configuration — or, with neither, pi's agent.
-    // (Nobody, where the program is handed over — whoever the configuration names.)
-    const named = handed !== undefined ? undefined : options?.createWith ?? config.createWith;
-    const writer = named === undefined ? undefined : projectNamed(named);
-    if (writer !== undefined && !existsSync(join(writer, "meta.json"))) throw new Error(`createWith names no project: there is none at ${writer}`);
-
     say.log(handed === undefined ? `Generating program for "${name}"...` : `Making "${name}" of the program that was handed over...`);
     // (What the agent is given to look at is the project made here, and no other directory that is at its path by now.)
     stillTheProject();
     await writeValidateInstall(projectDir, {
       reason: "create",
       prompt,
-      ask: `${prompt}\n\nOutput ONLY the TypeScript program. No markdown fences. No explanation.`,
-      system: getSystemPrompt(config.agentChanges === "keep") + saysOfItself(meta, proposes),
       validating: "Validating program...",
       config, backend, stillTheProject, signal: options?.signal, asked, meter,
       ...(writer !== undefined && { writer: { project: writer } }),
@@ -1135,27 +1069,21 @@ async function updateHere(
     const from = options?.from === undefined ? undefined : { version: writtenFrom(projectDir, options.from)!, text: textOfVersion(projectDir, options.from) };
     const parent = beside ? from?.version ?? writtenFrom(projectDir) : undefined;
     const originalSource = from?.text ?? readFileSync(guardPath(projectDir, "program.ts"), "utf-8");
-    const state = loadState(projectDir);
+    // (A state that cannot be read is said now, and nothing is asked for: whoever writes is shown what the program has kept.)
+    loadState(projectDir);
     const meta = readProjectMeta(projectDir);
     // What the project is to take and give from this version on, where whoever asks says.
-    const { meta: toBe, says } = saidFor(projectDir, name, meta, options);
+    const { says } = saidFor(projectDir, name, meta, options);
     otherwise = says !== undefined && markOfHeld(projectDir, says.held) !== heldNow(projectDir)?.mark;
     const config = loadProjectConfig(projectDir, meta);
     const meter = meterFor(config, asked);
     const backend = backendFor(config, asked, meter);
-    // Who writes it: the project the call names, or the configuration — or, with neither, pi's agent.
+    // Who writes it: the project the call names, or the configuration — or, with neither, the runtime's own writer, a
+    // project among the user's (see `ownProgram`). What the project says it takes and gives, its first prompt, its
+    // state: whoever writes has them in the copy it works in, and what it tells a model of them is its own to say.
     const named = options?.updateWith ?? config.updateWith;
-    const writer = named === undefined ? undefined : projectNamed(named);
-    if (writer !== undefined && !existsSync(join(writer, "meta.json"))) throw new Error(`updateWith names no project: there is none at ${writer}`);
-
-    // What the project says it takes and gives is told to whoever writes its program: a writer that is a project has
-    // it in its copy (meta.json); pi's agent is told here. The program is held to it, and it is not the program's to change.
-    const systemPrompt =
-      getSystemPrompt(config.agentChanges === "keep") +
-      saysOfItself(toBe) +
-      `\n\nOriginal prompt: ${meta.input.prompt}` +
-      `\n\nCurrent program.ts:\n${originalSource}` +
-      (Object.keys(state).length > 0 ? `\n\nCurrent state:\n${JSON.stringify(state, null, 2)}` : "");
+    const writer = named === undefined ? ownProgram(OWN_WRITER, say.log) : projectNamed(named);
+    if (!existsSync(join(writer, "meta.json"))) throw new Error(`updateWith names no project: there is none at ${writer}`);
 
     say.log(`Updating "${name}"...`);
     version = await writeValidateInstall(projectDir, {
@@ -1163,11 +1091,9 @@ async function updateHere(
       ...(parent !== undefined && { beside: { parent } }),
       reason: "update",
       prompt,
-      ask: `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation.`,
-      system: systemPrompt,
       validating: "Validating updated program...",
       config, backend, stillTheProject, signal: options?.signal, asked, meter,
-      ...(writer !== undefined && { writer: { project: writer, program: originalSource } }),
+      writer: { project: writer, program: originalSource },
       ...(says && { says }),
     });
   } catch (err) {

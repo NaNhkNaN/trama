@@ -15,14 +15,17 @@
 // the model's library would make it.
 
 import { PiAdapter } from "../packages/runtime/dist/pi-adapter.js";
-import { REPAIR_SYSTEM_PROMPT } from "../packages/runtime/dist/runner.js";
+
+// What the runtime's own fixer (packages/runtime/programs/program-fixer) tells the agent it asks for a fix: how a
+// request for a fix is told from any other, by a test that has the fixer as it came.
+const ASKED_FOR_A_FIX = "You are a TypeScript repair tool.";
 
 const unexpected = (what) => async () => { throw new Error(`the test did not expect ${what}`); };
 
 export const llm = { ask: unexpected("a call to the LLM"), repair: unexpected("a request for a fix"), complete: unexpected("a request to the model") };
 
 PiAdapter.prototype.ask = async function ask(prompt, call) {
-  return (call.system === REPAIR_SYSTEM_PROMPT ? llm.repair : llm.ask).call(this, prompt, call);
+  return (call.system === ASKED_FOR_A_FIX ? llm.repair : llm.ask).call(this, prompt, call);
 };
 
 PiAdapter.prototype.complete = async function complete(request, call) {

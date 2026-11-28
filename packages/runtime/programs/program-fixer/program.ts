@@ -1,10 +1,11 @@
 // A fixer of programs, by one asking of the runtime's own agent — and a
 // program itself.
 //
-// Where a run's program fails, trama asks for a fix: of whoever the run or
-// the configuration names (`repairWith`), and where nobody is named, of its
-// agent, in words of its own. This is that, written as a program: the same
-// words, the same one asking, in the same place — to be read, and changed.
+// Where a run's program fails, trama asks a project for a fix: the one the run
+// or the configuration names (`repairWith`), and where nobody is named, this
+// one. It comes with the runtime and is put among the user's projects the
+// first time it is wanted; from then on it is theirs, to be read and changed.
+// The runtime has no words of its own to a model for a fix: they are these.
 //
 // What it is handed, by the runner: `program` (the one that failed, whole),
 // `error` (how it failed), `journal` (the path of the failed run's record),
@@ -56,7 +57,7 @@ if (program === undefined || error === undefined) {
 
   // Its answer is the program — out of its fences, where it came in some — or that there is no fix.
   if (answer.trimStart().startsWith(NO_FIX)) {
-    await ctx.done({ unfixable: answer.trimStart().slice(NO_FIX.length).trim() || "no reason was given" });
+    await ctx.done({ unfixable: answer.trimStart().slice(NO_FIX.length).trim() });
   } else {
     await ctx.done({ program: stripCodeFences(answer) });
   }

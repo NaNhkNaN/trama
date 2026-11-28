@@ -200,7 +200,7 @@ cli
   .description("Make a project: have its program written from a prompt — or hand over one you wrote yourself (--program), with the prompt for what it is for")
   .option("--model <model>", "LLM model to use")
   .option("--arg <key=value>", "An argument of the project's own (repeatable): what a run of it has where the run gives none — and what the new program is validated with, so a parameter the project requires is to be given here", collectArg, [])
-  .option("--with <project>", "Have a project write the program, and not pi's agent: its name, or a path")
+  .option("--with <project>", "The project that writes the program — its name, or a path — where it is not to be program-writer, the one that comes with trama")
   .option("--contract <file>", "What the project is to take and give: a file of JSON — {\"description\": \"…\", \"parameters\": {\"text\": \"string: what it is\", \"n?\": \"number\"}, \"returns\": {\"words\": \"number\"}} — written as `trama api` says (what is not said there, whoever writes the program says)")
   .option("--program <file>", "Make the project of a program you wrote yourself, and ask nobody to write one: it is validated as it is, and is the project's first version — or, where it does not run, no project is made (- for standard input; what a program is: trama api)")
   .action(command(async (name: string, prompt: string, opts: { model?: string; arg: string[]; with?: string; contract?: string; program?: string }) => {
@@ -261,7 +261,7 @@ cli
   .description("Update an existing program with new requirements")
   .option("--from <number>", "Write it from that version of the program, and not from the program as it is (see: trama history)")
   .option("--beside", "Keep the new version beside the program, on record, and do not make it the program: run it with --at-version, go to it with rollback")
-  .option("--with <project>", "Have a project write it, and not pi's agent: its name, or a path")
+  .option("--with <project>", "The project that writes it — its name, or a path — where it is not to be program-writer, the one that comes with trama")
   .option("--contract <file>", "What the project is to take and give from this version on, where that is to change — as it is to for a run to give a field more, or one fewer: what a run gives beside what its project says is left out. A file of JSON as of create: each of \"description\", \"parameters\", \"returns\" that it says takes the place of the project's, whole, and what it does not say is as it is. The program is validated under it, and the two are the project's together; trama rollback goes back to both")
   .action(command(async (name: string, prompt: string, opts: { from?: string; beside?: boolean; with?: string; contract?: string }) => {
     const from = versionOf("--from", opts.from);

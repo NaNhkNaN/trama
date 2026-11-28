@@ -90,9 +90,8 @@ export interface RunOptions {
    */
   budget?: Budget;
   /**
-   * The project that is asked for a fix where the run's program fails, in
-   * place of pi's agent: by its name among the user's projects, or by a
-   * path. Its program is run with a copy of the failing project as its
+   * The project that is asked for a fix where the run's program fails: by
+   * its name among the user's projects, or by a path. Its program is run with a copy of the failing project as its
    * workspace, is handed as arguments `program` (the program that failed),
    * `error`, `journal` (the path of the failed run's record), `kept`
    * (whether what it changes in the copy beside the program reaches the
@@ -101,8 +100,10 @@ export interface RunOptions {
    * `{ unfixable }`, saying why there is no fix: the run then fails with
    * that, and nobody is asked again.) It is a run
    * of the failing run's own: counted in its budget, stopped with it, and
-   * not itself fixed where it fails. Without it, the config's `repairWith`,
-   * if that has one.
+   * not itself fixed where it fails. Without it, the config's `repairWith`;
+   * and without that, the runtime's own fixer: `program-fixer`, a project
+   * among the user's — put there as it came with the runtime where it is
+   * not, and the user's to change from then on.
    */
   repairWith?: string;
   /**
@@ -330,11 +331,11 @@ export interface TramaConfig extends ModelConfig {
    * is taken from the agent.
    */
   agentChanges: "keep" | "discard";
-  /** The project asked for a fix, in place of pi's agent, where a run is not given one of its own (see RunOptions). */
+  /** The project asked for a fix where a run is not given one of its own (see RunOptions): without it, the runtime's own, `program-fixer` among the user's projects. */
   repairWith?: string;
-  /** The project asked to write an update, in place of pi's agent, where the update names none (see `updateProject`): by its name, or a path. */
+  /** The project asked to write an update where the update names none (see `updateProject`): by its name, or a path. Without it, the runtime's own, `program-writer` among the user's projects. */
   updateWith?: string;
-  /** The project asked to write a new project's first program, in place of pi's agent, where the making names none (see `createProject`). */
+  /** The project asked to write a new project's first program where the making names none (see `createProject`). Without it, the runtime's own, `program-writer`. */
   createWith?: string;
   /**
    * The agents from outside a program may name in `tools.agent`: each by a

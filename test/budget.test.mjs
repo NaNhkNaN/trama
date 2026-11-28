@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test, { after } from "node:test";
 import { existsSync as isThere, readdirSync, readFileSync } from "fs";
-import { join } from "path";
+import { basename, join } from "path";
 import { llm } from "./fake-llm.mjs";
 import { checkedBudget, createMeter } from "../packages/runtime/dist/budget.js";
 import { runProgram, validateProgram } from "../packages/runtime/dist/runner.js";
@@ -527,7 +527,7 @@ await ctx.done({ went: run.result.went });
   });
 });
 
-test("what writing a program used is said, and is on record with its validation — or, where nothing came of the writing, in a journal of its own that says why; and writing and validating are held to the config's budget together", async (t) => {
+test("what writing a program used is said, and is on record with its validation — as what the project that wrote it took — or, where nothing came of the writing, in a journal of its own that says why; and writing and validating are held to the config's budget together", async (t) => {
   const fakeHome = makeTempDir("trama-budget-home-");
   t.after(() => cleanupTempDir(fakeHome));
   const config = (more) => writeJson(join(fakeHome, ".trama", "config.json"), { maxRepairAttempts: 1, ...more });
@@ -549,12 +549,15 @@ await ctx.done({ said: await agent.instruct("a question of the program's") });
     config({});
     const made = await captureConsole("log", () => createProject("made", "make it"));
     assert.ok(made.messages.includes("[trama] writing the program used 1234 tokens  $1.2340"), made.messages.join("\n"));
-    // The validation's journal has it, before anything the candidate did; and adds it up with the rest.
+    // The validation's journal has it, before anything the candidate did — who wrote (the runtime's own writer, a
+    // project among the user's), which run of its that was, and what it took — and adds it up with the rest.
     const [records] = journalsOf(projectDir);
-    assert.deepEqual(records.slice(0, 2).map((record) => [record.kind, record.purpose ?? record.for, record.input]), [["run", "validate", undefined], ["usage", "generate", 1234]]);
+    const whoWrote = (record) => [record.kind, record.purpose ?? (record.by && basename(record.by)) ?? record.result?.reason, record.used?.tokens];
+    assert.deepEqual(records.slice(0, 3).map(whoWrote), [["run", "validate", undefined], ["child", "create", undefined], ["written", "program-writer", 1234]]);
+    assert.equal(journalsOf(join(fakeHome, ".trama", "projects", "program-writer"))[0][0].run, records[1].run);
     assert.equal(records[0].budget, undefined);
     const shown = (await captureConsole("log", async () => printJournals(projectDir, "made", {}))).messages.join("\n");
-    assert.match(shown, /^ +\d+\.\d+s  writing the program used 1234 tokens  \$1\.2340$/m);
+    assert.match(shown, /^ +\d+\.\d+s  the program is asked of a project: run \S+\n +\d+\.\d+s  the program was asked of \S+\/program-writer  1234 tokens  \$1\.2340$/m);
     assert.match(shown, /end: done  \(1284 tokens  \$1\.2840 in all\)$/m);
 
     // An update the same. Under a budget of one call, writing the program is that call: the candidate's own is refused,
@@ -587,30 +590,33 @@ await ctx.done({ said: await agent.instruct("a question of the program's") });
     // And it is on the project's record all the same: in a journal of its own, which says why nothing came of the writing.
     const forNothing = journalsOf(projectDir);
     assert.equal(forNothing.length, 5);
-    assert.deepEqual(forNothing.at(-1).map((record) => [record.kind, record.purpose ?? record.for ?? record.result?.status, record.input]),
-      [["run", "write", undefined], ["usage", "generate", 77], ["end", "failed", undefined]]);
-    assert.match(forNothing.at(-1).at(-1).result.reason, /^the model is away$/);
+    assert.deepEqual(forNothing.at(-1).map((record) => [record.kind, record.purpose ?? (record.by && basename(record.by)) ?? record.result?.status, record.used?.tokens]),
+      [["run", "write", undefined], ["child", "update", undefined], ["written", "program-writer", 77], ["end", "failed", undefined]]);
+    // (Whoever was asked failed — its agent could not be asked — and that is said as its run said it.)
+    assert.match(forNothing.at(-1).at(-1).result.reason, /^The project asked for the update failed: [^]*the model is away/);
     const told = (await captureConsole("log", async () => printJournals(projectDir, "made", {}))).messages.join("\n");
     assert.match(told, /^\S+  write  failed$/m);
-    assert.match(told, /^ +\d+\.\d+s  writing the program used 77 tokens  \$0\.0770$/m);
-    assert.match(told, /^ +\d+\.\d+s  no program came of the writing: the model is away$/m);
+    assert.match(told, /^ +\d+\.\d+s  the program was asked of \S+\/program-writer  77 tokens  \$0\.0770$/m);
+    assert.match(told, /^ +\d+\.\d+s  no program came of the writing: The project asked for the update failed: /m);
     assert.match(told, /end: failed  \(77 tokens  \$0\.0770 in all\)$/m);
 
     // So of an answer that says there is no program to be written: what it took to say so, and what it said.
     standIn(t, { ask: async (_prompt, call) => { call.used(took(30)); call.used(took(3)); return "NO PROGRAM: what is asked goes against what the project says it gives."; } });
     const saidNone = await captureConsole("log", () => updateProject("made", "give more than it says").catch((err) => err));
     assert.match(saidNone.result.message, /It was said that there is none to be written: what is asked goes against/);
-    assert.deepEqual(journalsOf(projectDir).at(-1).map((record) => [record.kind, record.purpose ?? record.for ?? record.result?.reason, record.input]),
-      [["run", "write", undefined], ["usage", "generate", 30], ["usage", "generate", 3], ["end", "It was said that there is none to be written: what is asked goes against what the project says it gives.", undefined]]);
+    assert.deepEqual(journalsOf(projectDir).at(-1).map(whoWrote),
+      [["run", "write", undefined], ["child", "update", undefined], ["written", "program-writer", 3], ["end", "It was said that there is none to be written: what is asked goes against what the project says it gives.", undefined]]);
+    // (Three, as the count has it: what a call says it used is what it has used in all, and what it says again is said in the place of the first.)
     assert.equal(journalsOf(projectDir).length, 6);
 
-    // A writing that used nothing leaves nothing; and one that was validated is on record once, with its validation.
+    // A writing that used nothing is on record too — a project was asked, and why nothing came of it is its to say —
+    // and one that was validated is on record once, with its validation.
     standIn(t, { ask: async () => "NO PROGRAM: again." });
     await captureConsole("log", () => updateProject("made", "give more than it says").catch((err) => err));
-    assert.equal(journalsOf(projectDir).length, 6);
+    assert.deepEqual(journalsOf(projectDir).slice(6).map((records) => records.map(whoWrote)), [[["run", "write", undefined], ["child", "update", undefined], ["written", "program-writer", 0], ["end", "It was said that there is none to be written: again.", undefined]]]);
     standIn(t, { ask: async (prompt, call) => { if (prompt.startsWith("a question")) return "an answer"; call.used(took(9)); return wrote + "// once more\n"; } });
     await captureConsole("log", () => updateProject("made", "change it and be validated"));
-    assert.deepEqual(journalsOf(projectDir).slice(6).map((records) => [records[0].purpose, records.filter((record) => record.kind === "usage" && record.for === "generate").length]), [["validate", 1]]);
+    assert.deepEqual(journalsOf(projectDir).slice(7).map((records) => [records[0].purpose, records.filter((record) => record.kind === "written").map((record) => record.used.tokens)]), [["validate", [9]]]);
 
     // A project that was not made has no record to keep it in: what it took is said where it was asked for, and no directory is left for it.
     standIn(t, { ask: async (_prompt, call) => { call.used(took(11)); return "NO PROGRAM: nor this."; } });
@@ -621,32 +627,42 @@ await ctx.done({ said: await agent.instruct("a question of the program's") });
 
   // A writing that is stopped — by whoever asked for it, or by the budget — says what it took once its backend has let go of it.
   await withEnv({ HOME: fakeHome }, async () => {
+    let whenAsked = () => {};
     const lateToSay = (prompt, call) => new Promise((_resolve, reject) => {
       const stopped = () => setTimeout(() => { call.used(took(4321)); reject(new Error("stopped")); }, 40);
       call.signal.addEventListener("abort", stopped);
       call.sofar(took(3000));
+      whenAsked();
     });
     standIn(t, { ask: lateToSay });
     config({});
+    // (Stopped once the model is being asked: whoever writes is a project, whose run takes a moment to come to that.)
     const stop = new AbortController();
-    setTimeout(() => stop.abort(), 30);
+    whenAsked = () => setTimeout(() => stop.abort(), 30);
     const cancelled = await captureConsole("log", () => updateProject("made", "change it", { signal: stop.signal }).catch((err) => err));
+    whenAsked = () => {};
     assert.match(cancelled.result.message, /Aborted/);
     assert.ok(cancelled.messages.includes("[trama] writing the program used 4321 tokens  $4.3210"), cancelled.messages.join("\n"));
     config({ budget: { cost: 2 } });
     const capped = await captureConsole("warn", () => captureConsole("log", () => updateProject("made", "change it").catch((err) => err)));
-    assert.match(capped.result.result.message, /The budget is spent: \$3\.0000 used of \$2\./);
+    // (Why no program came: the budget is spent — as the count stands once the writing has let go, with what the call
+    // that was cut off then said it had used. What was said aloud was said when the cap was reached.)
+    assert.match(capped.result.result.message, /^Update failed — the program is unchanged\.\nThe budget is spent: \$4\.3210 used of \$2\.$/);
     assert.deepEqual(capped.messages, ["[trama] The budget is spent: $3.0000 used of $2."]);
     assert.ok(capped.result.messages.includes("[trama] writing the program used 4321 tokens  $4.3210"));
   });
 
-  // A validation asked for directly says what it is told was used, and no more.
+  // A validation asked for directly puts on record who it is told wrote, and what that took — and says nothing of it aloud.
   const { messages } = await captureConsole("log", () => validateProgram(projectDir, createBackend({ provider: "fake", model: "plain" }), `import { ctx } from "@trama-dev/runtime";\nawait ctx.done();\n`, {
-    timeout: 20_000, maxRepairAttempts: 0, journalRuns: 20, budget: {}, wrote: [took(5), took(6)],
+    timeout: 20_000, maxRepairAttempts: 0, journalRuns: 20, budget: {},
+    writtenBy: { by: "/somewhere/a-writer", used: { calls: 2, tokens: 11, cost: 0.011 }, run: "its-run", journal: "/somewhere/its-journal.jsonl", what: "update" },
   }));
   assert.deepEqual(messages.filter((line) => /used/.test(line)), []);
   const last = journalsOf(projectDir).at(-1);
-  assert.deepEqual(last.filter((record) => record.kind === "usage").map((record) => [record.for, record.input]), [["generate", 5], ["generate", 6]]);
+  assert.deepEqual(last.slice(1, 3).map(({ at, ...record }) => record), [
+    { kind: "child", run: "its-run", journal: "/somewhere/its-journal.jsonl", purpose: "update" },
+    { kind: "written", by: "/somewhere/a-writer", used: { calls: 2, tokens: 11, cost: 0.011 } },
+  ]);
   assert.deepEqual(last[0].budget, {}, "a budget is written down as it was given: one with no caps says that none was set");
 });
 

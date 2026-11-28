@@ -1,5 +1,5 @@
 {
-  "description": "A fixer: asks the runtime's own agent, once, for a fix of a program that failed, in the copy of the failing project it is handed, in the words trama itself has for it. Named as a run's repairWith.",
+  "description": "A fixer: asks the runtime's own agent, once, for a fix of a program that failed, in the copy of the failing project it is handed. It comes with trama, and is who fixes where nobody else is named (repairWith).",
   "parameters": {
     "program?": "string: the program that failed, whole — handed by the runner to whoever is asked for a fix, as all of these are",
     "error?": "string: what it failed with",

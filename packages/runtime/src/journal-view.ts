@@ -130,7 +130,8 @@ const asUsage = (used: { tokens?: number; cost?: number }) => ({ input: used.tok
 function spentInAll(records: JournalRecord[], inAll = ""): string {
   // (A fix is part of the run it is for, whoever made it: what a project used for one is counted with the rest.)
   // (And so is a check: what a project asked for one used is counted with the rest.)
-  const counted = spentIn([...usageIn(records), ...records.filter(record => (record.kind === "fix" || record.kind === "check") && record.used).map(record => asUsage(record.used))]);
+  // (And the writing of the program a validation is of: what the project asked for it used.)
+  const counted = spentIn([...usageIn(records), ...records.filter(record => (record.kind === "fix" || record.kind === "check" || record.kind === "written") && record.used).map(record => asUsage(record.used))]);
   if (!records.some(record => record.kind === "full")) return counted && counted + inAll;
   return `${counted || "no usage"} on record — the journal was full`;
 }
@@ -189,8 +190,10 @@ function printJournal(path: string, records: JournalRecord[]): void {
         break;
       case "usage":
         // (What a call used is shown with the call.)
-        if (record.for === "fix") console.log(`${at}  asking for the fix used ${spentIn([record])}`);
-        if (record.for === "generate") console.log(`${at}  writing the program used ${spentIn([record])}`);
+        break;
+      case "written":
+        // (Who wrote the program this is the validation of — or was asked to, where nothing came of it — and what that took.)
+        console.log(`${at}  the program was asked of ${record.by}${record.used ? `  ${spentIn([asUsage(record.used)])}` : ""}`);
         break;
       case "budget":
         console.log(`${at}  ${oneLine(record.spent, 100)}`);
@@ -206,6 +209,7 @@ function printJournal(path: string, records: JournalRecord[]): void {
         // (A run a call of the program's started — or, for a fix, one the run itself started.)
         console.log(record.purpose === "fix"
           ? `${at}  the fix is asked of a project: run ${record.run}`
+          : (record.purpose === "create" || record.purpose === "update") && record.seq === undefined ? `${at}  the program is asked of a project: run ${record.run}`
           : record.purpose === "check" ? `${at}  the check is asked of a project: run ${record.run}`
           : `${at}  #${String(record.seq).padEnd(3)} started ${record.purpose === "validate" ? "validation" : "run"} ${record.run}`);
         break;
@@ -213,7 +217,7 @@ function printJournal(path: string, records: JournalRecord[]): void {
         console.log(`${at}  fix asked for: ${oneLine(record.error, 80)}`);
         break;
       case "fix":
-        // (What a project that was asked for it used is said with it: what pi's agent used is in the lines of `usage`.)
+        // (What the project that was asked for it used is said with it.)
         console.log(`${at}  fix ${record.ok ? "returned" : `not returned: ${oneLine(record.error, 80)}`}${record.used ? `  ${spentIn([asUsage(record.used)])}` : ""}`);
         break;
       case "check": {

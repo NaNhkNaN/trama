@@ -14,11 +14,10 @@ import type { Beyond, Check, MakeRequest, RunOptions, ProgramResult, ReplayAllRe
 import { readProjectMeta } from "./meta.js";
 import { describeProject, describeProjects, fitted, withHeld, type Held } from "./contract.js";
 import { createReplay, readRecording, runsToReplay, saysTheSame, type Recording, type Replay } from "./replay.js";
-import { onAbort, rejectOnAbort } from "./abort.js";
-import type { AgentUsage } from "./agent-backend.js";
+import { onAbort, rejectOnAbort, throwIfAborted } from "./abort.js";
 import { checkedBudget, createMeter, type Budget, type Meter } from "./budget.js";
 import { LATEST_LOG_PATH, appendLogEntry, createContext } from "./context.js";
-import { createAgent, stripCodeFences } from "./agent.js";
+import { createAgent } from "./agent.js";
 import { createTools } from "./tools.js";
 import { createWorkspace, type WorkspaceWithAgents } from "./workspace.js";
 import { guardPath, identityOf, projectAt, realRootOf, sameProjectAs, wayTo } from "./path-guard.js";
@@ -30,7 +29,7 @@ import { removeTempDir, removeWithThisProcess, requireWatchdog, stopGroups, stop
 import { createIPCServer, listen, closeServer } from "./ipc-server.js";
 import { journalEntriesOf, openJournal, type Journal } from "./journal.js";
 import { messageOf } from "./errors.js";
-import { checkedRepairAttempts, checkedTimeout, ensureProjectScaffold, loadProjectConfig, loadState, namesAPath, projectNamed, saveState } from "./project.js";
+import { checkedRepairAttempts, checkedTimeout, ensureProjectScaffold, loadProjectConfig, loadState, namesAPath, ownProgram, OWN_FIXER, projectNamed, saveState } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import { copyToHistory, heldNow, heldOfVersion, noteRun, programHashOf, readHistory, recordAsFound, recordVersion, textIsOf, textOfVersion, versionWith, versionsOf } from "./history.js";
 
@@ -753,7 +752,7 @@ interface ExecuteOptions extends RunOnceOptions {
   maxRepairAttempts: number;
   /** Whether what the agent asked for a fix changes beside the program is tried, and kept, with the fix (see TramaConfig). Kept, unless said otherwise. */
   agentChanges?: "keep" | "discard";
-  /** The project a fix is asked of, where it is one and not pi's agent: its directory (see RunOptions.repairWith). */
+  /** The project a fix is asked of: its directory (see RunOptions.repairWith) — without one, the runtime's own fixer (see `ownProgram`). */
   repairWith?: string;
 }
 
@@ -763,9 +762,6 @@ interface Execution {
   repair?: { attempt: number; error: string };
 }
 
-/** How whoever is asked for a fix begins an answer that says there is none (see `NoFix`). */
-const NO_FIX = "NO FIX:";
-
 /**
  * There is no fix, by whoever was asked for one: the program cannot be made
  * to run and still be the program it was. Not a fix that failed to come —
@@ -773,23 +769,6 @@ const NO_FIX = "NO FIX:";
  * be had.
  */
 class NoFix extends Error {}
-
-/** The instructions a request for a fix is made under. (Exported so the tests' stand-in LLM can tell one from any other call.) */
-export const REPAIR_SYSTEM_PROMPT = "You are a TypeScript repair tool.";
-
-const repairPrompt = (input: { programSource: string; error: string; journal: string; kept: boolean }) =>
-  `Fix this program so it runs.\n\n` +
-  `You are working in a copy of the project's directory, where the program is program.ts. ` +
-  (input.kept
-    ? `If what is wrong is in the project and not in the program — a package that is not installed, a file the program needs that is missing or wrong — put it right here: ` +
-      `what you change in this directory is kept, with the program you answer with, if that program then runs. If it does not, none of it is.\n`
-    : `Nothing you change in this directory is kept: the program you answer with is all that is taken from you.\n`) +
-  (input.journal ? `The record of the run that failed — each call the program made, and what came back — is at ${input.journal}, a line of JSON for each.\n` : "") +
-  `If the program cannot be made to run without having it say what is not so, or leave out what it is there to do — a check taken out, a failure handed back as if it were a result — then there is no fix, and you are not to hand over such a program: answer instead with one line that begins "${NO_FIX}" and says why.\n` +
-  `\nRuntime types:\n${RUNTIME_TYPES}\n\n` +
-  `Broken program:\n${input.programSource}\n\n` +
-  `Error:\n${input.error}\n\n` +
-  `Output ONLY the fixed program${input.kept ? ": the whole of it, also where it is the project that needed fixing" : ""}. No explanation.`;
 
 /**
  * A question to ask of a copy an agent has worked in: whether what is at its
@@ -865,7 +844,8 @@ const MAX_PATHS_SHOWN = 10;
 export const shownPaths = (paths: string[]): string => paths.slice(0, MAX_PATHS_SHOWN).join(", ") + (paths.length > MAX_PATHS_SHOWN ? ", …" : "");
 
 /**
- * Ask the LLM for a fix. The agent has tools, so it works in a copy of the
+ * Ask for a fix: of the project that fixes — the one that is named, or the
+ * runtime's own (see `fixedBy`, `ownProgram`). It works in a copy of the
  * project that holds the program it is asked to fix. What it reads there is
  * as the project has it. Bounded by its own timeout.
  *
@@ -892,13 +872,14 @@ async function requestRepair(
   privateDir: string,
 ): Promise<{ fixed: string; staged?: Staged; unusable?: string } | { error: string }> {
   options.journal.note("fix-request", { error: input.error });
-  // What a project that is asked for the fix uses is on its own record, as any run's is — and is said here too,
-  // with the fix: what a fix took is then read where the fix was asked for, whoever made it. (What pi's agent
-  // uses for one is on this record anyway, as `usage`.) Counted as the run's count grew while it was asked.
-  const before = options.repairWith !== undefined ? options.meter?.counted() : undefined;
+  // What the project that is asked for the fix uses is on its own record, as any run's is — and is said here too,
+  // with the fix: what a fix took is then read where the fix was asked for. Counted as the run's count grew while
+  // it was asked.
+  let fixer = options.repairWith;
+  const before = options.meter?.counted();
   const usedByAProject = (): { by?: string; used?: { calls: number; tokens: number; cost: number } } => {
     const now = before && options.meter?.counted();
-    return before && now ? { by: options.repairWith, used: { calls: now.calls - before.calls, tokens: now.tokens - before.tokens, cost: now.cost - before.cost } } : {};
+    return before && now && fixer !== undefined ? { by: fixer, used: { calls: now.calls - before.calls, tokens: now.tokens - before.tokens, cost: now.cost - before.cost } } : {};
   };
   const timedOut = new AbortController();
   const limit = createAllowance(options.timeout);
@@ -907,19 +888,10 @@ async function requestRepair(
     const kept = options.agentChanges !== "discard" && !options.validating;
     const staged = stageProject(options.projectDir, privateDir, input.programSource);
     limit.start(() => timedOut.abort());
-    // Who is asked: a project, where one is named — or pi's agent, at work in the copy with its own tools.
-    let fixed: string;
-    if (options.repairWith !== undefined) {
-      fixed = await fixedBy(options.repairWith, options, { ...input, kept, copy: staged.copy }, signal);
-    } else {
-      const answer = await options.backend.ask(repairPrompt({ ...input, journal: options.journal.path, kept }), {
-        cwd: staged.copy, system: REPAIR_SYSTEM_PROMPT, signal,
-        used: (usage) => options.journal.used("fix", usage),
-      });
-      // (An answer that says there is no fix is that, and no program: it is not installed and tried as one.)
-      if (answer.trimStart().startsWith(NO_FIX)) throw new NoFix(answer.trimStart().slice(NO_FIX.length).trim() || "no reason was given");
-      fixed = stripCodeFences(answer);
-    }
+    // Who is asked: the project that is named — or, where none is, the runtime's own fixer, a project among the
+    // user's (see `ownProgram`). The runtime has no words of its own for a fix: what a model is asked is the fixer's.
+    fixer ??= ownProgram(OWN_FIXER, (line) => console.log(tagged(options.label, line)));
+    const fixed = await fixedBy(fixer, options, { ...input, kept, copy: staged.copy }, signal);
     if (fixed.trim() === "") throw new Error("The repair returned an empty program.");
     if (!kept) {
       if (fixed === input.programSource) throw new Error("The repair returned the program unchanged.");
@@ -1256,15 +1228,15 @@ export async function validateProgram(
   candidate: string,
   options: {
     timeout: number; maxRepairAttempts: number; journalRuns?: number; signal?: AbortSignal;
-    as?: string; alone?: string; budget?: Budget; wrote?: AgentUsage[];
+    as?: string; alone?: string; budget?: Budget;
     /** Where a run's program asked for the project to be made or changed: the run's name and variables are the validation's, and the two journals point at each other. */
     label?: string; env?: Record<string, string>; askedFor?: Pick<AskedFor, "parent" | "started">;
     /** The agents from outside the program may name (the configuration's). */
     agents?: Record<string, OutsideAgent>;
-    /** The project a fix of the candidate is asked of, where the configuration names one: else pi's agent. With the count it is made under. */
+    /** The project a fix of the candidate is asked of: the one the configuration names — else the runtime's own fixer. With the count it is made under. */
     repairWith?: string; meter?: Meter;
-    /** Who wrote the candidate, where a project did, and what that took: said on the validation's record, as what pi's agent took for it is. */
-    writtenBy?: { by: string; used: { calls: number; tokens: number; cost: number } };
+    /** Who wrote the candidate — the project that was asked — and what that took: said on the validation's record, with which run of that project's it was (`what`: a project's first program, or its next). */
+    writtenBy?: { by: string; used: { calls: number; tokens: number; cost: number }; run?: string; journal?: string; what?: "create" | "update" };
     /**
      * The project's meta.json as it is to be with the candidate, where
      * whoever asked for it says what the project is to take and give from
@@ -1282,9 +1254,12 @@ export async function validateProgram(
     purpose: "validate", label, parent: askedFor?.parent, ...limits, budget: options.budget, env: env && Object.keys(env),
   });
   askedFor?.started(journal.run, journal.path);
-  // What writing the candidate used is on record with its validation: it happened in no run, and has no journal of its own.
-  for (const usage of options.wrote ?? []) journal.used("generate", usage);
-  if (options.writtenBy) journal.note("written", options.writtenBy);
+  // Who wrote the candidate, and what that took, is on record with its validation.
+  if (options.writtenBy) {
+    const { run, journal: its, what, ...written } = options.writtenBy;
+    if (run) journal.note("child", { run, journal: its, purpose: what });
+    journal.note("written", written);
+  }
   let alone: string | undefined;
   const byItself = (why: string) => {
     alone = why;
@@ -1923,11 +1898,18 @@ interface AskedFor {
   purpose?: "fix" | "check" | "create" | "update";
   /** What is out of the reach of the run that asked: it is out of this one's too. */
   beyond?: Beyond;
+  /**
+   * How it is said that the budget above is spent, where whoever the run is
+   * for says that itself: a project that is being made says it once for its
+   * budget, in its own words — and the run of whoever writes its program
+   * says nothing of it in words of its own.
+   */
+  spent?(why: string): void;
 }
 
 /**
- * Ask a project for a program, where an update is to be written by one and
- * not by pi's agent (see `updateProject`'s `updateWith`): its program is run
+ * Ask a project for a program: the one an update names to write it (see
+ * `updateProject`'s `updateWith`), or the runtime's own writer: its program is run
  * with the copy of the project that is being updated as its workspace —
  * the project as it is, what it says of itself and its state with it, its
  * program the one that is written from — and what it ends with is the
@@ -1958,7 +1940,7 @@ interface AskedFor {
 export async function writtenBy(
   writer: string,
   given: { prompt: string; program?: string; kept: boolean; copy: string },
-  asked: Partial<AskedToMake> & { meter: Meter },
+  asked: Partial<AskedToMake> & { meter: Meter; spent?: (why: string) => void },
   what: "create" | "update" = "update",
 ): Promise<string> {
   const asking = what === "create" ? "program" : "update";
@@ -1976,8 +1958,14 @@ export async function writtenBy(
     started: (run, path) => asked.writing?.(run, path),
     above: asked.meter,
     purpose: what,
+    ...(asked.spent && { spent: asked.spent }),
   });
   if (result.status !== "done") {
+    // Why, as the runner knows it first: whoever asked stopped it; or nothing more may be asked of a model under the
+    // count it was made under. Else it is the writer's own failure, in the words its run failed with.
+    throwIfAborted(asked.signal);
+    const spent = asked.meter.spent();
+    if (spent !== undefined) throw new Error(spent);
     throw new Error(`The project asked for the ${asking} ${result.status === "failed" ? "failed" : "did not end its work"}: ${result.reason ?? result.status}`);
   }
   const { program, unwritable } = (result.result ?? {}) as { program?: unknown; unwritable?: unknown };
@@ -2037,10 +2025,14 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   // (Such a run is not fixed where it fails, whatever the run is allowed: a fix would be a version nobody asked for.)
   const maxRepairAttempts = ofVersion !== undefined ? 0 : checkedRepairAttempts(options.maxRepairAttempts ?? config.maxRepairAttempts);
   const env = options.env == null ? undefined : checkedEnv(options.env);
-  // Who is asked for a fix, where it is a project: found now, and not when the program has failed — a run that
-  // could not have been fixed as it was to be is not begun. (Where no fix is to be asked for, nobody is looked for.)
+  // Who is asked for a fix: the project the run names, or the configuration — or, with neither, the runtime's own
+  // fixer, a project among the user's (put there where it is not: see `ownProgram`). Found now, and not when the
+  // program has failed — a run that could not have been fixed as it was to be is not begun, and what fixes a run is
+  // known before the run can do anything. (Where no fix is to be asked for, nobody is looked for.)
   const namedToFix = options.repairWith ?? config.repairWith;
-  const repairWith = namedToFix !== undefined && maxRepairAttempts > 0 ? projectNamed(namedToFix) : undefined;
+  const repairWith = maxRepairAttempts <= 0 ? undefined
+    : namedToFix !== undefined ? projectNamed(namedToFix)
+    : ownProgram(OWN_FIXER, (line) => console.log(tagged(options.label, line)));
   if (repairWith !== undefined && !existsSync(join(repairWith, "meta.json"))) {
     throw new Error(`repairWith names no project: there is none at ${repairWith}`);
   }
@@ -2063,7 +2055,7 @@ async function runProject(options: RunOptions, depth: number, askedFor?: AskedFo
   // Its own budget — the config's, for a run nobody's program asked for and that was given none — under the budgets above it.
   const budget = options.budget != null ? checkedBudget(options.budget) : askedFor ? undefined : config.budget;
   const meter = createMeter(budget, askedFor?.above);
-  const outOfBudget = (why: string) => console.warn(tagged(options.label, `[trama] ${why}`));
+  const outOfBudget = askedFor?.spent ?? ((why: string) => console.warn(tagged(options.label, `[trama] ${why}`)));
   // (Before the journal is opened: once it is, nothing stands between that and the run that ends it — a
   // journal with a beginning and no end is a run that died, and is not to be one that never began.)
   const stillTheProject = sameProjectAs(projectDir);

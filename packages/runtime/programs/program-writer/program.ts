@@ -3,10 +3,11 @@
 //
 // Where a project's program is to be written — its first (`trama create`,
 // `createProject`) or its next (`trama update`, `updateProject`) — trama asks
-// for it: of whoever the call or the configuration names (`createWith`,
-// `updateWith`), and where nobody is named, of its agent, in words of its
-// own. This is that, written as a program: the same words, the same one
-// asking, in the same place — to be read, and changed.
+// a project for it: the one the call or the configuration names
+// (`createWith`, `updateWith`), and where nobody is named, this one. It comes
+// with the runtime and is put among the user's projects the first time it is
+// wanted; from then on it is theirs, to be read and changed. The runtime has
+// no words of its own to a model for a writing: they are these.
 //
 // What it is handed, by the runner: `prompt` (what is asked), `program` (the
 // one it is written from — none, at a project's making), `kept` (whether what
@@ -96,7 +97,7 @@ if (prompt === undefined) {
 
   // Its answer is the program — out of its fences, where it came in some — or that there is none.
   if (reply.trimStart().startsWith(NO_PROGRAM)) {
-    await ctx.done({ unwritable: reply.trimStart().slice(NO_PROGRAM.length).trim() || "no reason was given" });
+    await ctx.done({ unwritable: reply.trimStart().slice(NO_PROGRAM.length).trim() });
   } else {
     const written = stripCodeFences(reply);
     if (written === "") throw new Error("The model answered with no program.");

@@ -2,7 +2,7 @@
 
 A harness that fixes programs, written as a program: about a hundred lines, to be read and changed.
 
-Where a run's program fails, trama asks for a fix — of pi's agent, unless the run or the configuration names a project to ask instead. This is such a project. It keeps the conversation with the model itself (`agent.complete`), runs the tools the model calls in a copy of the failing project (`workspace.read`, `write`, `list`, `shell`), asks again where the provider failed, and hands the fixed program back.
+Where a run's program fails, trama asks a project for a fix: the one the run or the configuration names — and where none is named, `program-fixer`, which comes with trama and asks pi's agent once. This is one to name in its place. It keeps the conversation with the model itself (`agent.complete`), runs the tools the model calls in a copy of the failing project (`workspace.read`, `write`, `list`, `shell`), asks again where the provider failed, and hands the fixed program back.
 
 To use it, copy it among your projects and name it:
 

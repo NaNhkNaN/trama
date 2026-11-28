@@ -2,8 +2,8 @@
 //
 // Where a project's program is to be written — its first (`trama create`,
 // `createProject`) or its next (`trama update`, `updateProject`) — trama asks
-// for it: of pi's agent, unless the call or the configuration names a project
-// to ask instead (`createWith`, `updateWith`). This is such a project. It
+// a project for it: the one the call or the configuration names (`createWith`,
+// `updateWith`) — else the writer that comes with trama. This is one to name. It
 // writes nothing itself: it words what is asked, has a harness do the work,
 // and hands back what the harness left.
 //

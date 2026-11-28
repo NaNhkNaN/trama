@@ -102,7 +102,11 @@ test("a program has a project made, and changed, by its runner: under the run's 
   assert.deepEqual(calls.slice(0, 4), [[1, "/project/create", "made"], [2, "/project/create", "made"], [3, "/project/update", "made"], [4, "/project/update", "never-made"]]);
   const validations = journalsOf(join(projects, "made")).filter((journal) => journal[0].purpose === "validate");
   assert.deepEqual(validations.map((journal) => [journal[0].label, journal[0].parent.run, journal[0].parent.seq]), [["maker", run[0].run, 1], ["maker", run[0].run, 3]]);
-  assert.deepEqual(run.filter((record) => record.kind === "child").slice(0, 2).map((record) => [record.seq, record.run]), [[1, validations[0][0].run], [3, validations[1][0].run]]);
+  assert.deepEqual(run.filter((record) => record.kind === "child" && record.purpose === "validate").slice(0, 2).map((record) => [record.seq, record.run]), [[1, validations[0][0].run], [3, validations[1][0].run]]);
+  // (And which run wrote each program: the runtime's own writer's, a project among the user's — named by the asking run, and by the validation.)
+  const writings = journalsOf(join(projects, "program-writer")).map((journal) => [journal[0].purpose, journal[0].run]);
+  assert.deepEqual(run.filter((record) => record.kind === "child" && (record.purpose === "create" || record.purpose === "update")).slice(0, 2).map((record) => [record.seq, record.purpose, record.run]), [[1, "create", writings[0][1]], [3, "update", writings[1][1]]]);
+  assert.deepEqual(validations.map((journal) => journal.filter((record) => record.kind === "child").map((record) => [record.purpose, record.run])), [[["create", writings[0][1]]], [["update", writings[1][1]]]]);
   const shown = (await captureConsole("log", async () => printJournals(makerDir, "maker", {}))).messages.join("\n");
   assert.match(shown, /#1 +project\/create +made: write the first +ok/);
   assert.match(shown, new RegExp(`#1 +started validation ${validations[0][0].run}$`, "m"));
@@ -378,8 +382,9 @@ test("outside a program a project is made, and changed, where it is asked for �
       await updateProject("plain", "write otherwise");
     });
     assert.deepEqual(messages.filter((line) => !line.startsWith("[trama]")), [
-      'Generating program for "plain"...', "Validating program...", "Created plain. Run with: trama run plain",
-      'Updating "plain"...', "Validating updated program...", "Updated plain. Run with: trama run plain",
+      // (Whoever writes is a project, and its run says how it ended, under what it was for.)
+      'Generating program for "plain"...', "[create] [trama] done", "Validating program...", "Created plain. Run with: trama run plain",
+      'Updating "plain"...', "[update] [trama] done", "Validating updated program...", "Updated plain. Run with: trama run plain",
     ]);
     const [first] = journalsOf(join(projects, "plain"));
     assert.deepEqual(["label" in first[0], "parent" in first[0], "env" in first[0]], [false, false, false]);
@@ -484,10 +489,10 @@ const ahead = await post("/project/create", { name: "never", prompt: "write", id
 const again = await post("/project/create", { name: "quick", prompt: "write quickly", id: "one" });
 await ctx.done({ second, third, nameless, stopped, ended, ahead, again });
 `);
-  let asked = 0;
+  const asked = [];
   standIn(t, {
     ask: (prompt, call) => new Promise((resolve, reject) => {
-      asked += 1;
+      asked.push(prompt.split("\n")[0]);
       if (prompt.startsWith("write quickly")) return resolve(WRITES("quick"));
       call.signal.addEventListener("abort", () => reject(new Error("stopped")));
     }),
@@ -500,7 +505,9 @@ await ctx.done({ second, third, nameless, stopped, ended, ahead, again });
   assert.deepEqual([stopped[0], ended[0], /Aborted/.test(ended[1])], [200, 500, true]);
   assert.deepEqual([ahead[0], /Aborted/.test(ahead[1])], [500, true]);
   assert.equal(again[0], 200);
-  // The model was asked for the first and for the last: never for the one whose name was taken, nor for the one stopped ahead.
-  assert.equal(asked, 2);
+  // The model was asked for the last — and for the first, where whoever writes had come to ask before it was stopped
+  // (a writer is a project, and its run takes a moment to begin): never for the one whose name was taken, nor for
+  // the one stopped ahead.
+  assert.deepEqual([...new Set(asked)].filter((prompt) => prompt !== "write slowly"), ["write quickly"]);
   assert.deepEqual(["slow", "other", "never", "quick"].map((name) => existsSync(join(projects, name))), [false, false, false, true]);
 });
