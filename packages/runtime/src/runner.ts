@@ -1331,17 +1331,25 @@ export async function validateProgram(
  */
 function checkerOf(options: RunOptions): string | undefined {
   const { projectDir } = options;
-  let checker: string;
-  if (options.checkWith != null) checker = projectNamed(options.checkWith);
-  else {
-    const named: unknown = readProjectMeta(projectDir).checkWith;
-    if (named == null) return undefined;
-    if (typeof named !== "string" || named.trim() === "") {
-      throw new Error(`Malformed meta.json in ${projectDir} — "checkWith" is to name a project: by a path, or by its name among the user's projects.`);
-    }
-    // (A path the project says is said from where the project is: not from wherever its runner happens to be.)
-    checker = namesAPath(named) && !named.startsWith("~") ? resolve(projectAt(projectDir), named) : projectNamed(named);
+  if (options.checkWith != null) return checkerAt(projectDir, projectNamed(options.checkWith));
+  const named: unknown = readProjectMeta(projectDir).checkWith;
+  return named == null ? undefined : standingChecker(projectDir, named);
+}
+
+/**
+ * Where the project is that a project names to check its runs (`checkWith`,
+ * in its meta.json): held to what such a name is, a project that is there,
+ * and another than the one that names it.
+ */
+export function standingChecker(projectDir: string, named: unknown): string {
+  if (typeof named !== "string" || named.trim() === "") {
+    throw new Error(`Malformed meta.json in ${projectDir} — "checkWith" is to name a project: by a path, or by its name among the user's projects.`);
   }
+  // (A path the project says is said from where the project is: not from wherever its runner happens to be.)
+  return checkerAt(projectDir, namesAPath(named) && !named.startsWith("~") ? resolve(projectAt(projectDir), named) : projectNamed(named));
+}
+
+function checkerAt(projectDir: string, checker: string): string {
   if (!existsSync(join(checker, "meta.json"))) throw new Error(`checkWith names no project: there is none at ${checker}`);
   if (realRootOf(checker) === realRootOf(projectDir)) throw new Error("A project is not asked to check itself: checkWith names the project that is run.");
   return checker;

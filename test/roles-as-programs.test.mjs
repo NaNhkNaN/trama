@@ -6,7 +6,8 @@ import { llm } from "./fake-llm.mjs";
 import { createProject, runProgram, updateProject } from "../packages/runtime/dist/index.js";
 import { RUNTIME_TYPES } from "../packages/runtime/dist/runner.js";
 import { execFile, execFileSync } from "node:child_process";
-import { cpSync, mkdirSync, symlinkSync } from "node:fs";
+import { cpSync, mkdirSync, renameSync, rmSync, symlinkSync } from "node:fs";
+import { ownMark } from "../packages/runtime/dist/project.js";
 import { REPO_ROOT, captureConsole, cleanupTempDir, createProjectFixture, makeTempDir, readJson, withEnv, writeJson, writeText } from "./helpers.mjs";
 
 // Who writes a project's program, and who fixes one that failed, where nobody is named: two programs that come with
@@ -402,6 +403,71 @@ test("the program is program.ts as the agent left it, where its answer says so �
   const none = await it.inHome(() => runProgram({ projectDir: it.at("fails"), timeout: 30_000 }));
   assert.match(none.reason, /No fix came back: It was said that there is none to be had: the answer is nowhere to be had\.$/);
   assert.equal(programOf("fails"), BROKEN);
+});
+
+test("where a later runtime comes with another writer than the one among the user's projects, it is said once — whether the user's is as it came, and what to do — and the user's is left as it is, and is who writes", async (t) => {
+  const it = scene(t);
+  llm.ask = async () => GOOD(1);
+  const NOTES = join(it.fakeHome, ".trama", "came-with.json");
+  const version = readJson(join(REPO_ROOT, "packages", "runtime", "package.json")).version;
+  const said = async (name) => (await it.heard(() => createProject(name, "say a number"))).said.filter((line) => /comes with another/.test(line));
+  await it.inHome(() => createProject("one", "say a number"));
+  // On record, beside the projects: what was put there, and by which runtime — the mark of its files.
+  const came = { runtime: version, mark: ownMark("program-writer") };
+  assert.deepEqual(readJson(NOTES), { "program-writer": { came, seen: came } });
+  // (The mark is of what the program does: a README of the user's own, and a package.json written over, make it no
+  // other. A file of it that is gone does — and is told from one with nothing in it.)
+  writeText(join(it.at("program-writer"), "README.md"), "mine\n");
+  writeJson(join(it.at("program-writer"), "package.json"), { type: "module", name: "mine" });
+  assert.equal(ownMark("program-writer", it.at("program-writer")), came.mark);
+  const apart = makeTempDir("trama-mark-");
+  t.after(() => cleanupTempDir(apart));
+  cpSync(it.at("program-writer"), apart, { recursive: true });
+  rmSync(join(apart, "example-programs.txt"));
+  const gone = ownMark("program-writer", apart);
+  writeText(join(apart, "example-programs.txt"), "");
+  assert.equal(new Set([came.mark, gone, ownMark("program-writer", apart)]).size, 3);
+  // Nothing more is said while the runtime is the one that was last looked under — whatever is done to the project.
+  writeText(join(it.at("program-writer"), "program.ts"), BY_LENGTH);
+  assert.deepEqual(await said("two"), []);
+  assert.notEqual(ownMark("program-writer", it.at("program-writer")), came.mark);
+
+  // As an earlier runtime left things: the copy as it came then, untouched since — and this runtime comes with another.
+  const earlier = { runtime: "0.0.1", mark: ownMark("program-writer", it.at("program-writer")) };
+  writeJson(NOTES, { "program-writer": { came: earlier, seen: earlier } });
+  const told = await said("three");
+  assert.equal(told.length, 1, told.join("\n"));
+  assert.match(told[0], new RegExp(`^\\[trama\\] program-writer among your projects \\(.*/\\.trama/projects/program-writer\\) is as it came with trama 0\\.0\\.1, and trama ${version.replace(/\./g, "\\.")} comes with another \\(.*/programs/program-writer\\)\\. Yours is still the one that writes a project's program: to have the new one, move yours away — it is put there anew\\.$`));
+  // The user's is who wrote, and is as it was. And it is said once: looked at under this runtime, from here on.
+  assert.deepEqual([readFileSync(join(it.at("three"), "program.ts"), "utf-8"), readFileSync(join(it.at("program-writer"), "program.ts"), "utf-8")], [GOOD(12), BY_LENGTH]);
+  assert.deepEqual(readJson(NOTES), { "program-writer": { came: earlier, seen: came } });
+  assert.deepEqual(await said("four"), []);
+
+  // Changed by the user since it came: said as that.
+  const other = { runtime: "0.0.1", mark: "the mark of other files" };
+  writeJson(NOTES, { "program-writer": { came: other, seen: other } });
+  const changed = await said("five");
+  assert.equal(changed.length, 1, changed.join("\n"));
+  assert.match(changed[0], new RegExp(`^\\[trama\\] trama ${version.replace(/\./g, "\\.")} comes with another program-writer \\(.*/programs/program-writer\\) than the one among your projects \\(.*/\\.trama/projects/program-writer\\), which is not as it came\\. Yours is the one that writes a project's program, and is left as you have it\\.$`));
+  // Where what this runtime comes with is what the one before came with, there is nothing new to say of.
+  writeJson(NOTES, { "program-writer": { came: other, seen: { runtime: "0.0.1", mark: came.mark } } });
+  assert.deepEqual(await said("six"), []);
+  assert.deepEqual(readJson(NOTES)["program-writer"].seen, came);
+  // With no note of it (the file gone), one that is not the runtime's own is said to be not as it came, once; nothing is noted as come.
+  rmSync(NOTES);
+  assert.equal((await said("seven")).length, 1);
+  assert.deepEqual([readJson(NOTES), await said("eight")], [{ "program-writer": { seen: came } }, []]);
+  // Moved away, it is put there anew, as this runtime has it — and noted so; the one moved away is a project still.
+  renameSync(it.at("program-writer"), it.at("writer-of-mine"));
+  await it.inHome(() => createProject("nine", "say a number"));
+  assert.deepEqual([filesOf(it.at("program-writer")), readJson(NOTES)], [filesOf(WRITER), { "program-writer": { came, seen: came } }]);
+  await it.inHome(() => createProject("ten", "say a number", { createWith: "writer-of-mine" }));
+  assert.equal(readFileSync(join(it.at("ten"), "program.ts"), "utf-8"), GOOD(12));
+  // (A note that cannot be read is no note: nothing fails for it.)
+  // (And one that is as this runtime has it, of which nothing is noted, is spoken of to nobody: it is noted as come.)
+  writeText(NOTES, "{ not json");
+  assert.deepEqual(await said("eleven"), []);
+  assert.deepEqual(readJson(NOTES), { "program-writer": { came, seen: came } });
 });
 
 test("the two type-check against the API a program has, as they are written", (t) => {

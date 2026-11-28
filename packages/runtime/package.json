@@ -18,7 +18,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "description": "Runtime and client library for trama — an agentic runtime for agent-authored TypeScript programs",
+  "description": "The runtime of trama, and what a program imports — a runtime in which an agent's behaviour lives as programs",
   "license": "MIT",
   "repository": {
     "type": "git",

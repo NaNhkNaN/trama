@@ -10,11 +10,12 @@ import { createMeter, type Meter } from "./budget.js";
 import { LATEST_LOG_PATH } from "./context.js";
 import { readProjectMeta } from "./meta.js";
 import { ensureProjectScaffold, loadConfig, loadProjectConfig, loadState, namesAPath, ownProgram, OWN_FIXER, OWN_WRITER, projectNamed } from "./project.js";
+export { setConfig } from "./project.js";
 import { createBackend, saysOnce, type Backend } from "./runner-backend.js";
 import {
   validateProgram, installValidatedProgram, keepBeside, writtenFrom, writtenBy, META_PUT_BACK,
   withTempDir, prepareProject, shownPaths, type Prepared, RUNTIME_TYPES, runProgram as runHere, replayProgram as replayHere, replayAll as replayAllHere, rollbackTo, whyNotReplaceable,
-  inputMarkOf as markHere,
+  inputMarkOf as markHere, standingChecker,
   tagged, failureOf, type AskedToMake, type Making,
 } from "./runner.js";
 import { createWorkspace as workspaceHere, ensureWorkspaceDir } from "./workspace.js";
@@ -501,6 +502,56 @@ function fitsItsOwn(projectDir: string, meta: ProjectMeta): void {
 }
 
 /** Where a user's projects are: each a directory there, by its name. */
+// --- What stands where a command says nothing: the user's configuration, and a project's own (`trama config`) ---
+
+/** The user's configuration as it holds: what its file says, over what holds where it says nothing. */
+export const configuration = (): TramaConfig => loadConfig();
+
+/** What stands for a project beside its program and what it says it takes and gives: who checks its runs, its model, its own arguments. */
+export function projectSettings(name: string): Record<string, unknown> {
+  const meta = readProjectMeta(resolveProject(name));
+  return {
+    ...(meta.checkWith != null && { checkWith: meta.checkWith }),
+    ...(meta.provider != null && { provider: meta.provider }),
+    ...(meta.model != null && { model: meta.model }),
+    args: meta.input.args ?? {},
+  };
+}
+
+/**
+ * Set one of those for a project, or take it out (no `text`) — said as a
+ * command line says it: `checkWith`, `model`, `provider`, or an argument of
+ * its own by its name (args.<name>), as text. An argument is held to what
+ * the project says it takes, and kept as what it is read as there; who
+ * checks is to be a project that is there, and another than this one.
+ * Written only where the project, with it, is one that can be run.
+ */
+export function setForProject(name: string, key: string, text?: string): void {
+  const projectDir = resolveProject(name);
+  const meta = readProjectMeta(projectDir) as ProjectMeta & Record<string, unknown>;
+  const [top, arg, ...more] = key.split(".");
+  let next: ProjectMeta & Record<string, unknown>;
+  if (top === "args" && arg !== undefined && arg !== "" && more.length === 0) {
+    const args = { ...(meta.input.args ?? {}) };
+    if (text === undefined) delete args[arg]; else args[arg] = text;
+    next = { ...meta, input: { ...meta.input, args } };
+    const held = fitted(projectDir, undefined, next);
+    if (text !== undefined && held.leftOut.includes(arg)) {
+      const takes = Object.keys(isJsonObject(meta.parameters) ? meta.parameters : {}).map((each) => each.replace(/\?$/, ""));
+      throw new Error(`${name} does not take ${JSON.stringify(arg)}: it takes ${takes.join(", ") || "no arguments"}.`);
+    }
+    next.input = { ...next.input, args: held.args ?? {} };
+  } else if ((top === "checkWith" || top === "model" || top === "provider") && arg === undefined) {
+    next = { ...meta };
+    if (text === undefined) delete next[top]; else next[top] = text;
+    if (top === "checkWith" && text !== undefined) standingChecker(projectDir, text);
+    loadProjectConfig(projectDir, next);
+  } else {
+    throw new Error(`${JSON.stringify(key)} names nothing of a project's that is set here: checkWith, model, provider, and an argument of its own (args.<name>).`);
+  }
+  writeFileSync(guardPath(projectDir, "meta.json"), JSON.stringify(next, null, 2));
+}
+
 export function projectsDir(): string {
   return join(homedir(), ".trama", "projects");
 }

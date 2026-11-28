@@ -2,60 +2,102 @@
 
 > Agents don't need frameworks. They need a runtime.
 
-The command line of [trama](https://github.com/NaNhkNaN/trama): a runtime in which an agent's behaviour lives as programs. A program is TypeScript, in a project of its own. It is run, recorded call by call, held to a budget and to what it says it takes and gives, checked, kept as versions, and gone back from.
+The command-line interface for [trama](https://github.com/NaNhkNaN/trama) — a TypeScript runtime for programmable, self-bootstrapping agents. Every piece of agent behavior (task scripts, coding harnesses, writers, crash fixers, judges, and evolution loops) lives as a versioned `program.ts` project backed by [`@trama-dev/runtime`](https://www.npmjs.com/package/@trama-dev/runtime).
 
 ```bash
 npm install -g @trama-dev/cli
 ```
 
-Node 22.19 or later, on macOS or Linux. Models are asked through [pi](https://github.com/earendil-works/pi), which needs a provider's key as pi takes one: in the environment, or in `~/.pi/agent/auth.json`.
+Requires Node 22.19+ on macOS or Linux. Models are called through [pi](https://github.com/earendil-works/pi) using your provider API key in the environment (`ANTHROPIC_API_KEY`, etc.) or `~/.pi/agent/auth.json`.
 
-## A program that is kept
+---
+
+## Quick Start
+
+Projects live in `~/.trama/projects/<name>/` with `program.ts`, `meta.json` (contract and default args), `history/`, and `logs/journal/`.
 
 ```bash
-trama create digest "fetch the top ten Hacker News stories and write digest.md"   # a model writes program.ts
-trama run digest                  # run it; one that crashes is fixed in a copy, and the fix installed only if it works
-trama update digest "also say how many comments each story has"
-trama history digest              # the versions it has had, and how the runs of each went
-trama rollback digest 1           # go back to one
+# Generate a program from a prompt (validated by running it)
+trama create digest "fetch the top 10 Hacker News stories and write digest.md"
+
+# Run it (crashes are repaired in a temporary copy and installed only if fixed)
+trama run digest
+
+# Rewrite it as real code, inspect history/journal, dry-run replay, or roll back
+trama update digest "also include the comment count for each story"
+trama history digest --runs
+trama journal digest
+trama replay digest
+trama rollback digest 1
 ```
 
-A project is a directory under `~/.trama/projects`: its `program.ts`, a `meta.json` that says what a run of it takes and gives, its history, and the record of its runs.
-
-## Programs that come with it
-
-What has a policy in trama is a program: the harness a model works in, the judge of a run, whoever fixes a program or writes one, the loop that improves one. Each comes as an example, to copy, read, run and change.
+Or register a `program.ts` you wrote by hand:
 
 ```bash
-trama examples                                    # what there is
-trama examples coding-harness --as my-harness     # copy one among your projects
+trama create summarise "Summarise text and list risks" \
+  --program summarise.ts --contract summarise.json --arg text="$(cat notes.md)"
+```
+
+---
+
+## Programmable Harnesses & Evolution
+
+In trama, every policy is a program you can copy, inspect, customize, and replace. Six ready-to-use projects ship with the CLI:
+
+- **`coding-harness`** — A ~500-line programmable coding agent built on `agent.complete()`.
+- **`harness-by-agent`** — Wraps an external ACP coding agent (e.g. Claude Code) in the same harness slot.
+- **`check-by-command`** — Evaluates a run by executing a command (e.g. `npm test`) in a temporary copy.
+- **`improve-by-check`** — Runs evolutionary improvement rounds with held-back test inputs.
+- **`write-by-harness`** / **`repair-harness`** — Harness-driven alternatives to the bundled `program-writer` and `program-fixer`.
+
+```bash
+trama examples                                  # list included programs
+trama examples coding-harness --as my-harness   # copy into ~/.trama/projects/my-harness
 trama examples check-by-command
-trama run my-harness --workspace ./code --arg task="make the failing test pass" --check check-by-command
+
+# Point your harness at any codebase and grade the result independently
+trama run my-harness \
+  --workspace ./code \
+  --arg task="Make the failing tests pass. Do not change the tests." \
+  --check check-by-command \
+  --budget cost=2
 ```
 
-The last line has a harness work on a codebase, and its work judged by a command (`npm test`, unless the judge is told another) in a copy of what it left. With `--arg programs=true` the model at work in the harness has your projects as tools too: it runs them, makes one of a program it wrote, and changes one — the harness itself among them — by a version more.
+Add `--arg programs=true` to give the model inside `coding-harness` access to your trama projects as tools — letting it run existing programs, create new ones, and add or switch versions of any project (including the harness itself).
+
+---
 
 ## Commands
 
-| | |
+| Command | Purpose |
 |---|---|
-| `create <name> <prompt>` | Have a program written from a prompt — or make the project of one you wrote (`--program <file>`): `--with <project>` says who writes it, `--contract <file>` what it is to take and give, `--arg` its own arguments. |
-| `run <name>` | Run it: `--arg`, `--workspace <dir>`, `--budget cost=2` (or `tokens=`, `calls=`), `--check <project>`, `--at-version <n>`, `--no-making`, `--timeout <ms>`, `--json`. |
-| `update <name> <prompt>` | Have it rewritten: `--from <n>`, `--beside` (kept as a version, not installed), `--with`, `--contract`. |
-| `add-version <name> <file>` | Put a program you wrote yourself on record as a version: validated, not installed. |
-| `history <name>` | Its versions, and how the runs of each went (`--runs`, `--json`). |
-| `rollback <name> <version>` | Go back to a version. |
-| `describe [name]` | What a project says of itself: what it is for, what a run takes and gives (`--json`). |
-| `journal <name> [run]` | What a run did, call by call, and what it used. |
-| `replay <name> [run]` | Run a program again with its calls answered from the record of a run: nothing is carried out. |
-| `examples [name]` | List the programs that come with trama, or copy one (`--as`). |
-| `api` | What a program is, for whoever writes one: where a project is, how a contract is written, the runtime's API, programs to go by. |
-| `list`, `logs <name>` | The projects; what the last run of one logged. |
+| `trama create <name> <prompt>` | Generate a project from a prompt or register your own (`--program <file>`, `--contract <file>`, `--arg`, `--with`, `--model`). |
+| `trama run <name>` | Execute a project (`--arg`, `--workspace <dir>`, `--budget cost=\|tokens=\|calls=`, `--check <project>`, `--fix-with <project>`, `--at-version <n>`, `--no-making`, `--timeout <ms>`, `--json`). |
+| `trama update <name> <prompt>` | Rewrite a project (`--from <n>`, `--beside` to record without installing, `--with`, `--contract`). |
+| `trama add-version <name> <file>` | Validate and archive a hand-written program file as a candidate version (`--parent`, `--detail`, `--contract`). |
+| `trama history <name>` | View version history and per-version run outcomes (`--runs`, `--json`). |
+| `trama rollback <name> <version>` | Restore an earlier version (code and contract) as the active program. |
+| `trama describe [name]` | Inspect project descriptions and I/O contracts (`--json` includes JSON Schema). |
+| `trama journal <name> [run]` | View every call, response, and token/cost usage of a run (`--list`). |
+| `trama replay <name> [run]` | Re-run a program answering bridge calls from recorded journals without spending model calls (`--all`, `--loose`). |
+| `trama config [key] [value]` | View or edit global `~/.trama/config.json` (`createWith`, `updateWith`, `repairWith`, `provider`, `model`, `budget.*`, `agents.*`, etc.) or per-project settings (`--project <name>` for `checkWith`, `provider`, `model`, `args.<name>`). Use `--unset` to remove a key. |
+| `trama examples [name]` | List bundled examples or copy one into `~/.trama/projects/` (`--as <name>`). |
+| `trama api` | Print the full program authoring guide, TypeScript API, and schema syntax. |
+| `trama list` / `trama logs <name>` | List all projects; print structured `ctx.log()` output from the last run. |
 
-`trama <command> --help` says each in full.
+Run `trama <command> --help` for full details on any command.
 
-## For an agent, or a script
+---
 
-`trama describe --json` says what every project takes and gives, as JSON Schema. `trama run <name> --json` puts one document on standard output — the run's status, its result, its check — and everything said as the run goes on standard error. `trama history <name> --json` is a project's versions and runs. `trama api` is all that is needed to write a program without having trama write it.
+## Script & Agent Integration
 
-Who fixes, who writes and who judges by default, the budget of a run, and the agents from outside a program may call are said in `~/.trama/config.json`.
+Every core inspection and execution command supports structured JSON output:
+
+- `trama describe --json` — Lists all projects with their contracts as JSON Schema.
+- `trama run <name> --json` — Emits a single JSON result document (`status`, `result`, `check`) on `stdout` while streaming live run logs to `stderr`.
+- `trama history <name> --json` — Returns full version lineage and run records as JSON.
+- `trama api` — Outputs everything a human or agent needs to author a valid `program.ts` and contract from scratch.
+
+## License
+
+MIT

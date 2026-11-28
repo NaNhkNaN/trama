@@ -23,6 +23,10 @@ import {
   failureOf,
   projectsDir,
   validateProjectName,
+  configuration,
+  setConfig,
+  projectSettings,
+  setForProject,
 } from "@trama-dev/runtime/runner";
 
 // The trama command is always a runner of its own, even when a program starts
@@ -192,7 +196,7 @@ const { version } = JSON.parse(
 
 const cli = new Command()
   .name("trama")
-  .description("A minimal runtime for agent-authored programs")
+  .description("A runtime in which an agent's behaviour lives as programs: each is run, recorded call by call, held to a budget and to what it says it takes and gives, checked, kept as versions, and gone back from")
   .version(version);
 
 cli
@@ -217,11 +221,12 @@ cli
   .option("--arg <key=value>", "Pass argument to the program (repeatable)", collectArg, [])
   .option("--budget <cap=number>", "Cap what the run may use of a model: cost (US dollars), tokens or calls (repeatable)", collectArg, [])
   .option("--check <project>", "Have the run checked, once it is done, by a project: its name, or a path")
+  .option("--fix-with <project>", "The project that is asked for a fix where the program fails — its name, or a path — where it is not to be the one the configuration names, or program-fixer, which comes with trama")
   .option("--at-version <number>", "Run a version of the program from the project's history, and not the program as it is (see: trama history)")
   .option("--workspace <dir>", "Where the run works, where that is not in its project: a directory the program has as its workspace (workspace.read, workspace.shell and the rest) — the codebase a harness is to work on, say. It is worked in as it is: nothing is copied")
   .option("--no-making", "Give the run no way to make projects, or change them — nor any run it starts: for a run whose program, or the model at work in it, is not to touch what else there is")
   .option("--json", "Say what the run came to as JSON on standard output — its status, its result, its check — and nothing else there: what is said as the run goes is on standard error")
-  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[]; check?: string; atVersion?: string; workspace?: string; making: boolean; json?: boolean }) => {
+  .action(command(async (name: string, opts: { timeout?: string; arg: string[]; budget: string[]; check?: string; fixWith?: string; atVersion?: string; workspace?: string; making: boolean; json?: boolean }) => {
     let timeout: number | undefined;
     if (opts.timeout !== undefined) {
       timeout = Number(opts.timeout);
@@ -242,7 +247,7 @@ cli
     if (workspaceDir !== undefined && !isDirectory(workspaceDir)) throw new Error(`--workspace takes a directory, and there is none at ${workspaceDir}`);
     // (With --json, from here on: a run that is not begun — no such project, arguments that do not fit — has no document.)
     const say = opts.json ? theResultAlone() : undefined;
-    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, checkWith: opts.check, ...(version !== undefined && { version }), ...(workspaceDir !== undefined && { workspaceDir }), ...(opts.making === false && { making: false }), signal }));
+    const result = await stoppable((signal) => runProgram({ projectDir, timeout, args, budget, checkWith: opts.check, ...(opts.fixWith !== undefined && { repairWith: opts.fixWith }), ...(version !== undefined && { version }), ...(workspaceDir !== undefined && { workspaceDir }), ...(opts.making === false && { making: false }), signal }));
     if (say) await say(result);
     // (Without --json: what the run gave, after what was said as it went — for whoever is looking on.)
     else if (result.status === "done" && result.result !== undefined) console.log(JSON.stringify(result.result, null, 2));
@@ -382,6 +387,25 @@ cli
   .action(command(async (name: string, version: string) => {
     // (A version is named by its number, as `trama history` shows it — with or without the v.)
     await rollbackProject(name, Number(/^v?(\d+)$/.exec(version)?.[1] ?? NaN));
+  }));
+
+cli
+  .command("config [key] [value]")
+  .description("What stands where a command says nothing — who writes (createWith, updateWith), who fixes (repairWith), the model, how many fixes are tried, what a run may use (budget.cost), the agents from outside (agents.<name>, as JSON): yours, in ~/.trama/config.json. With nothing, all of it as it holds; with a key, that; with a value, it is set")
+  .option("--project <name>", "Of a project, and not yours: who checks its runs (checkWith), its model and provider, and its own arguments (args.<name>) — what a run of it has where the run gives none")
+  .option("--unset", "Take the key out")
+  .action(command(async (key: string | undefined, value: string | undefined, opts: { project?: string; unset?: boolean }) => {
+    if (opts.unset && value !== undefined) throw new Error("--unset takes a thing out: it is given no value.");
+    if (opts.unset && key === undefined) throw new Error("--unset takes a thing out: say which.");
+    if (key !== undefined && (value !== undefined || opts.unset)) {
+      if (opts.project !== undefined) setForProject(opts.project, key, value);
+      else setConfig(key, value);
+      return;
+    }
+    // (Shown as it holds: of yours, what the file says over what holds where it says nothing.)
+    let shown: unknown = opts.project !== undefined ? projectSettings(opts.project) : configuration();
+    for (const part of key?.split(".") ?? []) shown = shown !== null && typeof shown === "object" ? (shown as Record<string, unknown>)[part] : undefined;
+    if (shown !== undefined) console.log(typeof shown === "string" ? shown : JSON.stringify(shown, null, 2));
   }));
 
 cli.parse();

@@ -13,7 +13,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "description": "CLI for trama — an agentic runtime for agent-authored TypeScript programs",
+  "description": "The command line of trama — a runtime in which an agent's behaviour lives as programs",
   "license": "MIT",
   "repository": {
     "type": "git",

@@ -3,10 +3,10 @@
 // its last run left.
 
 import {
-  readFileSync, writeFileSync, mkdirSync, existsSync, cpSync, lstatSync,
+  readFileSync, writeFileSync, mkdirSync, existsSync, cpSync, lstatSync, readdirSync,
   symlinkSync, rmSync, renameSync, readlinkSync, accessSync, constants,
 } from "fs";
-import { randomBytes } from "crypto";
+import { createHash, randomBytes } from "crypto";
 import { join, dirname, resolve, sep } from "path";
 import { homedir } from "os";
 import { fileURLToPath } from "url";
@@ -170,21 +170,24 @@ export function ensureProjectScaffold(projectDir: string): void {
 
 // --- Config & state loaders ---
 
-export function loadConfig(): TramaConfig {
-  const configPath = join(homedir(), ".trama", "config.json");
-  const defaults: TramaConfig = {
-    provider: "anthropic",
-    model: "claude-opus-5-5",
-    maxRepairAttempts: 3,
-    defaultTimeout: 300_000,
-    journalRuns: 20,
-    agentChanges: "keep",
-  };
+/** What holds where the user's configuration says nothing. */
+const CONFIG_DEFAULTS: TramaConfig = {
+  provider: "anthropic",
+  model: "claude-opus-5-5",
+  maxRepairAttempts: 3,
+  defaultTimeout: 300_000,
+  journalRuns: 20,
+  agentChanges: "keep",
+};
+const configPath = (): string => join(homedir(), ".trama", "config.json");
+
+/** The user's configuration file as it is written: an object — an empty one, where there is no file. */
+function writtenConfig(): Record<string, unknown> {
   let raw: string;
   try {
-    raw = readFileSync(configPath, "utf-8");
+    raw = readFileSync(configPath(), "utf-8");
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return defaults;
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
     throw err;
   }
   let parsed: unknown;
@@ -192,18 +195,81 @@ export function loadConfig(): TramaConfig {
     parsed = JSON.parse(raw);
   } catch (err) {
     throw new Error(
-      `Malformed config at ${configPath} — fix or delete it.\n` +
+      `Malformed config at ${configPath()} — fix or delete it.\n` +
       `Parse error: ${messageOf(err)}`
     );
   }
   if (!isJsonObject(parsed)) {
     throw new Error(
-      `Malformed config at ${configPath} — expected a JSON object but got ${describeJson(parsed)}. Fix or delete it to proceed.`
+      `Malformed config at ${configPath()} — expected a JSON object but got ${describeJson(parsed)}. Fix or delete it to proceed.`
     );
   }
+  return parsed;
+}
+
+/** What a written configuration comes to: over what holds where it says nothing, and held to what a configuration is. */
+function configOf(written: Record<string, unknown>): TramaConfig {
   // null is how JSON says a field is not there.
-  const given = Object.fromEntries(Object.entries(parsed).filter(([, value]) => value !== null));
-  return checkedConfig({ ...defaults, ...given }, "config");
+  const given = Object.fromEntries(Object.entries(written).filter(([, value]) => value !== null));
+  return checkedConfig({ ...CONFIG_DEFAULTS, ...given }, "config");
+}
+
+export function loadConfig(): TramaConfig {
+  return configOf(writtenConfig());
+}
+
+/** What the user's configuration holds, by name. */
+const HOLDS = ["provider", "model", "maxRepairAttempts", "defaultTimeout", "journalRuns", "agentChanges", "repairWith", "updateWith", "createWith", "agents", "budget"];
+const NUMBERS = ["maxRepairAttempts", "defaultTimeout", "journalRuns", "budget"];
+const ROLES = ["repairWith", "updateWith", "createWith"] as const;
+
+/**
+ * Set one thing of the user's configuration, or take it out (no `text`) —
+ * said as a command line says it: by its name, a part of `agents` or of
+ * `budget` by the name of the part too (agents.claude, budget.cost), and as
+ * text — which is read as a number where the thing is one, and as JSON
+ * where it is an object (an agent, or `agents` or `budget` whole). Written
+ * only where what it then comes to is a configuration; and who writes or
+ * fixes is to be a project that is there. What else the file says is kept.
+ */
+export function setConfig(key: string, text?: string): void {
+  const [top, part, ...more] = key.split(".");
+  if (!HOLDS.includes(top)) throw new Error(`The configuration has no ${JSON.stringify(top)}: it holds ${HOLDS.join(", ")}.`);
+  if (more.length > 0 || part === "" || (part !== undefined && top !== "agents" && top !== "budget")) {
+    throw new Error(`${JSON.stringify(key)} names nothing the configuration holds: a part is named of agents (agents.<name>) and of budget (budget.cost, budget.tokens, budget.calls) alone.`);
+  }
+  let value: unknown;
+  if (text !== undefined) {
+    if (top === "agents" || (top === "budget" && part === undefined)) {
+      try { value = JSON.parse(text); } catch (err) { throw new Error(`${JSON.stringify(key)} is written as JSON, and this is none: ${messageOf(err)}`); }
+    } else if (NUMBERS.includes(top)) {
+      value = text.trim() === "" ? NaN : Number(text);
+      if (Number.isNaN(value)) throw new Error(`${JSON.stringify(key)} is a number, and ${JSON.stringify(text)} is none.`);
+    } else value = text;
+  }
+  const written = writtenConfig();
+  if (part === undefined) {
+    if (value === undefined) delete written[top]; else written[top] = value;
+  } else {
+    const whole = written[top];
+    const parts: Record<string, unknown> = isJsonObject(whole) ? { ...whole } : {};
+    if (value === undefined) delete parts[part]; else parts[part] = value;
+    if (Object.keys(parts).length === 0) delete written[top]; else written[top] = parts;
+  }
+  const held = configOf(written);
+  for (const role of ROLES) {
+    const named = top === role ? held[role] : undefined;
+    if (named !== undefined && !existsSync(join(projectNamed(named), "meta.json"))) throw new Error(`${role} names no project: there is none at ${projectNamed(named)}`);
+  }
+  const coming = `${configPath()}.${randomBytes(6).toString("hex")}`;
+  mkdirSync(dirname(configPath()), { recursive: true });
+  try {
+    writeFileSync(coming, JSON.stringify(written, null, 2) + "\n");
+    renameSync(coming, configPath());
+  } catch (err) {
+    rmSync(coming, { force: true });
+    throw err;
+  }
 }
 
 /** A config that holds what the runtime can work with — or an error naming what does not, and where it came from. */
@@ -281,7 +347,10 @@ export function ownProgram(name: typeof OWN_WRITER | typeof OWN_FIXER, say: (lin
   const projects = join(homedir(), ".trama", "projects"), dir = join(projects, name);
   const [does, whoElse] = DOES[name];
   const there = (): boolean => existsSync(join(dir, "meta.json"));
-  if (there()) return dir;
+  if (there()) {
+    anotherSaid(name, dir, does, say);
+    return dir;
+  }
   if (lstatSync(dir, { throwIfNoEntry: false })) {
     throw new Error(`${name} ${does} where nobody else is named, and is to be a project among yours: what is at ${dir} is none. Move it away, or name ${whoElse}.`);
   }
@@ -295,8 +364,82 @@ export function ownProgram(name: typeof OWN_WRITER | typeof OWN_FIXER, say: (lin
     if (there()) return dir;
     throw new Error(`${name} ${does} where nobody else is named, and could not be put among your projects (${dir}): ${messageOf(err)}`);
   }
+  const came = { runtime: runtimeVersion(), mark: ownMark(name) };
+  noteOf(name, { came, seen: came });
   say(`[trama] ${name} is among your projects (${dir}): it ${does} where nobody else is named, and is yours to change.`);
   return dir;
+}
+
+/** The runtime's own version, as its package says it. */
+const runtimeVersion = (): string => String(JSON.parse(readFileSync(join(RUNTIME_PACKAGE_DIR, "package.json"), "utf-8")).version);
+
+/**
+ * What tells one of the runtime's own programs from another: the files the
+ * runtime has for it, each by its name and its text — as they are in `dir`,
+ * or as the runtime has them. But for what says nothing of what it does (its
+ * README), and what a run of it may write over (package.json).
+ */
+export function ownMark(name: string, dir = join(OWN_PROGRAMS, name)): string {
+  const hash = createHash("sha256");
+  for (const file of readdirSync(join(OWN_PROGRAMS, name)).filter((each) => each !== "README.md" && each !== "package.json").sort()) {
+    let text: string | null;
+    try { text = readFileSync(join(dir, file), "utf-8"); } catch { text = null; }
+    hash.update(JSON.stringify([file, text]));
+  }
+  return hash.digest("hex");
+}
+
+/** A program of the runtime's own, by which runtime it was, and the mark of its files (see `ownMark`). */
+type Came = { runtime: string; mark: string };
+/** What is noted of one that is among the user's projects: as what it came there, where the runtime put it; and what the runtime had for it when it was last looked at. */
+type Note = { came?: Came; seen?: Came };
+
+/** Where that is noted: beside the user's projects, and in none of them — it is the runtime's account, and the projects are the user's. */
+const notesPath = (): string => join(homedir(), ".trama", "came-with.json");
+function notes(): Record<string, Note> {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(notesPath(), "utf-8"));
+    return isJsonObject(parsed) ? parsed as Record<string, Note> : {};
+  } catch {
+    return {}; // (None, or none that can be read: nothing is noted.)
+  }
+}
+function noteOf(name: string, note: Note): void {
+  try {
+    const path = notesPath(), coming = `${path}.${randomBytes(6).toString("hex")}`;
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(coming, JSON.stringify({ ...notes(), [name]: note }, null, 2) + "\n");
+    renameSync(coming, path);
+  } catch { /* (Not noted: what there is to say is said again another time.) */ }
+}
+
+/**
+ * Say, once, that this runtime comes with another of its own programs than
+ * the one among the user's projects — where it does, and has not been said
+ * of this one: a release changes nothing of the user's, and so is to say
+ * that it would have. Whether the user's is still as it came is said with
+ * it (then the new one is had by moving it away); one that was changed is
+ * left as it is, and said to be. Looked at once for a runtime: from then on
+ * nothing is read but the note.
+ */
+function anotherSaid(name: string, dir: string, does: string, say: (line: string) => void): void {
+  const had = notes()[name];
+  let now: Came, theirs: string;
+  try {
+    if (had?.seen?.runtime === runtimeVersion()) return;
+    now = { runtime: runtimeVersion(), mark: ownMark(name) };
+    theirs = ownMark(name, dir);
+  } catch {
+    return; // (What cannot be looked at is not spoken of.)
+  }
+  if (theirs !== now.mark && had?.seen?.mark !== now.mark) {
+    const own = join(OWN_PROGRAMS, name);
+    say(had?.came !== undefined && theirs === had.came.mark
+      ? `[trama] ${name} among your projects (${dir}) is as it came with trama ${had.came.runtime}, and trama ${now.runtime} comes with another (${own}). Yours is still the one that ${does}: to have the new one, move yours away — it is put there anew.`
+      : `[trama] trama ${now.runtime} comes with another ${name} (${own}) than the one among your projects (${dir}), which is not as it came. Yours is the one that ${does}, and is left as you have it.`);
+  }
+  // (One that is the runtime's own, and of which nothing is noted, is noted as come: it is as this runtime has it.)
+  noteOf(name, { ...(had?.came !== undefined ? { came: had.came } : theirs === now.mark ? { came: now } : {}), seen: now });
 }
 
 /** Whether what names a project names it by a path, and not by its name among the user's projects. */
