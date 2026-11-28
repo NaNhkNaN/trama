@@ -414,18 +414,18 @@ async function sumUp(): Promise<void> {
   const before = messages.slice(1, from), latest = messages.slice(from);
   // Where there is nothing before it, or it is too much by itself, no summing-up will do: said now, and not at every turn from here on.
   const least = whole([{ role: "user", content: task }, ...latest]);
-  if (before.length === 0 || least > FORGET_AT) throw new Error(`The conversation cannot be kept within ${FORGET_AT} tokens: the task and the latest of the work alone come to some ${least}.`);
+  if (before.length === 0 || least > FORGET_AT) await ctx.fail(`The conversation cannot be kept within ${FORGET_AT} tokens: the task and the latest of the work alone come to some ${least}.`);
   const soFar = [`[The task]: ${task}`, ...(summary === undefined ? [] : [`[Summed up before]: ${summary}`]), written(before)].join("\n\n");
   for (let tries = 1; ; tries += 1) {
     const reply = await agent.complete({ system: SUMMING, messages: [{ role: "user", content: `${soFar}\n\n---\n\n${TO_SUM_UP}` }], ...MODEL });
     const said = reply.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("").trim();
     if (reply.stopReason !== "error" && said) { summary = said; break; }
-    if (tries >= TRIES) throw new Error(`The conversation outgrew what may be read, and could not be summed up: ${reply.stopReason === "error" ? reply.errorMessage : "the model answered with nothing"}`);
+    if (tries >= TRIES) await ctx.fail(`The conversation outgrew what may be read, and could not be summed up: ${reply.stopReason === "error" ? reply.errorMessage : "the model answered with nothing"}`);
     await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** tries));
   }
   const goesOn = [await opening(), ...latest];
   // (A summing-up that is itself too long would be made again at every turn: that is said, too.)
-  if (whole(goesOn) > FORGET_AT) throw new Error(`The conversation cannot be kept within ${FORGET_AT} tokens: summed up, with the latest of the work, it still comes to some ${whole(goesOn)}.`);
+  if (whole(goesOn) > FORGET_AT) await ctx.fail(`The conversation cannot be kept within ${FORGET_AT} tokens: summed up, with the latest of the work, it still comes to some ${whole(goesOn)}.`);
   messages.splice(0, messages.length, ...goesOn);
 }
 
@@ -446,7 +446,7 @@ const messages: ModelMessage[] = [{ role: "user", content: task }];
 const FIXED = system.length + JSON.stringify(mine).length;
 let asked = 0, failures = 0, forgotten = 0, summed = 0, sent = 0, perToken = 4;
 while (finished === undefined) {
-  if (asked >= TURNS) throw new Error(`The model was asked ${TURNS} times and did not say it was done.`);
+  if (asked >= TURNS) await ctx.fail(`The model was asked ${TURNS} times and did not say it was done.`);
   asked += 1;
   sent = FIXED + JSON.stringify(messages).length;
   const reply = await agent.complete({ system, messages, tools: mine, ...MODEL });
@@ -454,7 +454,7 @@ while (finished === undefined) {
   // The provider failed: asked again, a little later each time — and given up on where it goes on failing.
   if (reply.stopReason === "error") {
     failures += 1;
-    if (failures >= TRIES) throw new Error(`The model could not be asked, ${TRIES} times in a row: ${reply.errorMessage}`);
+    if (failures >= TRIES) await ctx.fail(`The model could not be asked, ${TRIES} times in a row: ${reply.errorMessage}`);
     // (Too long for the model, by the provider's word for it — which does not say by how much: it is made shorter by half, and asked again.)
     if (/context|too long|too large|maximum.*tokens/i.test(reply.errorMessage ?? "")) { await shorten(sent / 2); continue; }
     await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** failures));

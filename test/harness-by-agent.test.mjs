@@ -78,7 +78,8 @@ test("the harness that is somebody else's hands its task to the agent that is na
   assert.equal((await it.run("harness-by-agent", { workspaceDir: it.codebase, args: { task: "x", agent: "models", model: "large" } })).result.summary, "served by large");
   const slow = await it.run("harness-by-agent", { workspaceDir: it.codebase, args: { task: "x", agent: "slow", seconds: "1" } });
   assert.equal(slow.status, "failed");
-  assert.match(slow.reason, /The agent did not do the work \(timed-out\): It was not done after the 1000ms it was given/);
+  // (Said by the harness itself — ctx.fail — as how its run ended: its words are the run's reason from the first.)
+  assert.match(slow.reason, /^The agent did not do the work \(timed-out\): It was not done after the 1000ms it was given/);
   // With no workspace it works in its own project, as examples/coding-harness does; with no task, on the project's own prompt.
   const alone = await it.run("harness-by-agent", {});
   assert.equal(alone.status, "done", JSON.stringify(alone));
@@ -91,7 +92,7 @@ test("the harness that is somebody else's hands its task to the agent that is na
   }
   // A call that did not go through is a run that failed, and says what stood in its way: an agent that is not there,
   // one that refuses the work, one that ends in the middle of it. And so is an agent the configuration does not name.
-  for (const [agent, why] of [["absent", /The agent did not do the work \(not-installed\): /], ["refuses", /The agent did not do the work \(refused\): The agent refused the work\./], ["dies", /The agent did not do the work \(failed\): /]]) {
+  for (const [agent, why] of [["absent", /^The agent did not do the work \(not-installed\): /], ["refuses", /^The agent did not do the work \(refused\): The agent refused the work\.$/], ["dies", /^The agent did not do the work \(failed\): /]]) {
     const failed = await it.run("harness-by-agent", { workspaceDir: it.codebase, args: { task: "Fix the sum.", agent } });
     assert.equal(failed.status, "failed", agent);
     assert.match(failed.reason, why, agent);

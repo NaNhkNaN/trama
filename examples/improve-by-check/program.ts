@@ -59,26 +59,30 @@ const betterByScore = (is: Tally, was: Tally, isGood: number, wasGood: number, m
 //             configuration names, or the writer that comes with trama. (Who writes is told what this loop tells, in the words it tells it:
 //             what more a writer may read — the project's history, the records of its runs — is for it to be told there.)
 const given = ctx.input.args as { project?: unknown; check?: unknown; inputs?: unknown; heldBack?: unknown; runs?: unknown; ask?: unknown; from?: unknown; by?: unknown; margin?: unknown; confirm?: unknown; tell?: unknown; write?: unknown };
-const listOf = (what: unknown, name: string): Input[] => {
-  const list: unknown = typeof what === "string" ? JSON.parse(what) : what ?? [];
-  if (!Array.isArray(list) || list.some((each) => each === null || typeof each !== "object" || Array.isArray(each))) throw new Error(`"${name}" is to be a list of arguments: [{ … }, { … }].`);
+// (What it is told that will not do ends the run as failed, in these words — ctx.fail: nothing is wrong with the
+// loop, and a fix of it is not what is wanted.)
+const listOf = async (what: unknown, name: string): Promise<Input[]> => {
+  let list: unknown;
+  try { list = typeof what === "string" ? JSON.parse(what) : what ?? []; } catch { /* (No JSON: no list.) */ }
+  if (!Array.isArray(list) || list.some((each) => each === null || typeof each !== "object" || Array.isArray(each))) return ctx.fail(`"${name}" is to be a list of arguments: [{ … }, { … }].`);
   return list as Input[];
 };
-const { project, check } = given;
-const inputs = listOf(given.inputs, "inputs"), heldBack = listOf(given.heldBack, "heldBack");
+const inputs = await listOf(given.inputs, "inputs"), heldBack = await listOf(given.heldBack, "heldBack");
 const runs = Number(given.runs ?? 1);
 const ask = typeof given.ask === "string" && given.ask.trim() !== "" ? given.ask.trim() : undefined;
 const from = typeof given.from === "string" && given.from.trim() !== "" ? given.from.trim() : undefined;
-if (typeof project !== "string" || typeof check !== "string") throw new Error('It is not said which project to improve, or which checks it: "project" and "check", each by its name.');
-if (inputs.length + heldBack.length === 0) throw new Error('It is not said what to run the project on: "inputs", a list of arguments.');
-if (!Number.isInteger(runs) || runs < 1) throw new Error('"runs" is how many runs of each input: 1 or more.');
+const { project, check } = typeof given.project === "string" && typeof given.check === "string"
+  ? { project: given.project, check: given.check }
+  : await ctx.fail('It is not said which project to improve, or which checks it: "project" and "check", each by its name.');
+if (inputs.length + heldBack.length === 0) await ctx.fail('It is not said what to run the project on: "inputs", a list of arguments.');
+if (!Number.isInteger(runs) || runs < 1) await ctx.fail('"runs" is how many runs of each input: 1 or more.');
 const by = given.by ?? "good", tell = given.tell ?? "wanting";
 const write = typeof given.write === "string" && given.write.trim() !== "" ? given.write.trim() : undefined;
 const margin = Number(given.margin ?? 0), confirm = Number(given.confirm ?? 0);
-if (by !== "good" && by !== "score") throw new Error('"by" is how a version is found the better: good, or score.');
-if (!(margin >= 0) || !Number.isFinite(margin)) throw new Error('"margin" is by how much a mean score is to be higher: 0 or more.');
-if (!Number.isInteger(confirm) || confirm < 0) throw new Error('"confirm" is how many times the runs that decide are made again: 0 or more.');
-if (tell !== "wanting" && tell !== "all") throw new Error('"tell" is which runs the writer is told of: wanting, or all.');
+if (by !== "good" && by !== "score") await ctx.fail('"by" is how a version is found the better: good, or score.');
+if (!(margin >= 0) || !Number.isFinite(margin)) await ctx.fail('"margin" is by how much a mean score is to be higher: 0 or more.');
+if (!Number.isInteger(confirm) || confirm < 0) await ctx.fail('"confirm" is how many times the runs that decide are made again: 0 or more.');
+if (tell !== "wanting" && tell !== "all") await ctx.fail('"tell" is which runs the writer is told of: wanting, or all.');
 
 const dir = resolveProject(project), judge = resolveProject(check);
 const all = [...inputs, ...heldBack];
@@ -129,13 +133,11 @@ const quoted = (text: string) => `'${text.replaceAll("'", `'\\''`)}'`;
  */
 async function fresh(input: Input, name: string): Promise<string | undefined> {
   if (from === undefined) return undefined;
-  const source = from.replace(/\{(\w+)\}/g, (_, key: string) => {
-    const value = input[key];
-    if (typeof value !== "string" && typeof value !== "number") throw new Error(`"from" has {${key}}, and an input has no such argument to put there.`);
-    return String(value);
-  });
+  const lacks = [...from.matchAll(/\{(\w+)\}/g)].map(([, key]) => key).find((key) => typeof input[key] !== "string" && typeof input[key] !== "number");
+  if (lacks !== undefined) await ctx.fail(`"from" has {${lacks}}, and an input has no such argument to put there.`);
+  const source = from.replace(/\{(\w+)\}/g, (_, key: string) => String(input[key]));
   const made = await tools.shell(`rm -rf ${quoted(name)} && mkdir -p work && cp -R ${quoted(source)} ${quoted(name)}`, { timeout: 600_000 });
-  if (made.exitCode !== 0) throw new Error(`A fresh copy of ${source} could not be made: ${made.stderr.trim()}`);
+  if (made.exitCode !== 0) await ctx.fail(`A fresh copy of ${source} could not be made: ${made.stderr.trim()}`);
   return join(process.cwd(), name);
 }
 
@@ -311,8 +313,8 @@ async function round(): Promise<Record<string, unknown>> {
     return { kept: false, why: `Nothing was changed: a check could not be made — ${told(err.message)}` };
   }
   const was = deciding(before), wasAll = tally(before), wasGood = partGood(before);
-  const from = (await readHistory(dir, { runs: 0 })).current;
-  if (from === undefined) throw new Error(`The program of ${project} is on no record as it is: there would be no version to go back to.`);
+  const from = (await readHistory(dir, { runs: 0 })).current
+    ?? await ctx.fail(`The program of ${project} is on no record as it is: there would be no version to go back to.`);
 
   // Ask for an update: with what is wanted, and what was found wanting — of the inputs that may be shown, the latest of
   // each. (And, where it is asked for, what the judge said of the latest that was found good.)

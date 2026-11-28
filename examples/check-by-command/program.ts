@@ -16,10 +16,11 @@ const MOST = 2000;
 // checks — `result` (what the program ended with), `args` (what the run was started with), `journal` and `run`
 // (the run's record, and its id), `used` (what it had used of a model) — which a command has no use for, and
 // another checker would — and `workspace`: where the run worked, where that was not in its project.
-const { command, seconds = 600, workspace: where } = ctx.input.args as { command?: string; seconds?: number; workspace?: string };
-if (typeof command !== "string" || command.trim() === "") {
-  throw new Error('It is not said what command checks: "command", among the arguments in the meta.json of this project.');
-}
+const { command: given, seconds = 600, workspace: where } = ctx.input.args as { command?: string; seconds?: number; workspace?: string };
+// (Where it is not said, the run has failed with that, in these words — ctx.fail: nothing is wrong with this program.)
+const command = typeof given === "string" && given.trim() !== ""
+  ? given
+  : await ctx.fail('It is not said what command checks: "command", among the arguments in the meta.json of this project.');
 
 // Its workspace is a copy of the project as the run left it. A run that had a workspace of its own left its work
 // there, and not in the project: that place is copied too, into this one. Either way the command is run in a
@@ -27,7 +28,7 @@ if (typeof command !== "string" || command.trim() === "") {
 let at: string | undefined;
 if (typeof where === "string") {
   const copied = await workspace.shell('at=$(mktemp -d .work-XXXXXX) && cp -R "$WHERE/." "$at" && printf %s "$at"', { env: { WHERE: where }, timeout: seconds * 1000 });
-  if (copied.exitCode !== 0) throw new Error(`Where the run worked could not be copied, to be checked: ${where}\n${copied.stderr}`);
+  if (copied.exitCode !== 0) await ctx.fail(`Where the run worked could not be copied, to be checked: ${where}\n${copied.stderr}`);
   at = copied.stdout;
 }
 const ran = await workspace.shell(command, { timeout: seconds * 1000, cwd: at });

@@ -387,6 +387,8 @@ function buildRoutes({ ctx, agent, tools, workspace, workspaceAt, run, make, rep
     "/ctx/done": route({ state: "object", result: "optional any" }, b => ctx.done(b.state, b.result)),
     // Persists the yield marker and returns; the program exits itself once it is answered.
     "/ctx/yield": route({ state: "object", reason: "string" }, b => ctx.yield(b.state, b.reason)),
+    // Settles the run as failed, in the program's words, and returns; the program exits itself once it is answered.
+    "/ctx/fail": route({ reason: "string" }, b => ctx.fail(b.reason)),
 
     // A program never runs another program: it asks its runner to. The call
     // lasts as long as the run does, repairs included.

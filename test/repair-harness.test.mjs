@@ -150,13 +150,13 @@ test("the harness gives up where it is to: a provider that goes on failing, and 
   const down = await scene(t, () => "fail");
   const failed = await down.run();
   assert.equal(failed.result.status, "failed");
-  assert.match(failed.result.reason, /No fix came back: The project asked for the fix failed: [^]*The model could not be asked, 4 times in a row: 500/);
+  assert.match(failed.result.reason, /No fix came back: The project asked for the fix failed: The model could not be asked, 4 times in a row: 500/);
   assert.equal(down.requests.length, 4);
   assert.equal(readFileSync(join(down.projectDir, "program.ts"), "utf-8"), BROKEN);
 
   const idle = await scene(t, () => ({ name: "list", args: { pattern: "*.txt" } }));
   const never = await idle.run();
-  assert.match(never.result.reason, /No fix came back: The project asked for the fix failed: [^]*The model was asked 40 times and handed no program over\./);
+  assert.match(never.result.reason, /No fix came back: The project asked for the fix failed: The model was asked 40 times and handed no program over\.$/);
   assert.equal(idle.requests.length, 40);
 
   // A model that says there is no fix is taken at its word: the run fails with why, and nobody is asked again.

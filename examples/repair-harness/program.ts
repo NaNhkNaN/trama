@@ -115,14 +115,14 @@ async function use(call: ToolCallPart): Promise<{ said: string; failed: boolean 
 const messages: ModelMessage[] = [{ role: "user", content: `The program, program.ts:\n\n${program}\n\nHow it failed:\n\n${error}` }];
 let asked = 0, failures = 0;
 while (fixed === undefined && unfixable === undefined) {
-  if (asked >= TURNS) throw new Error(`The model was asked ${TURNS} times and handed no program over.`);
+  if (asked >= TURNS) await ctx.fail(`The model was asked ${TURNS} times and handed no program over.`);
   asked += 1;
   const reply = await agent.complete({ system, messages, tools });
 
   // The provider failed: asked again, a little later each time — and given up on where it goes on failing.
   if (reply.stopReason === "error") {
     failures += 1;
-    if (failures >= TRIES) throw new Error(`The model could not be asked, ${TRIES} times in a row: ${reply.errorMessage}`);
+    if (failures >= TRIES) await ctx.fail(`The model could not be asked, ${TRIES} times in a row: ${reply.errorMessage}`);
     await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** failures));
     continue;
   }

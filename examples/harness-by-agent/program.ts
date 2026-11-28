@@ -35,11 +35,12 @@ const done = await there.agent(task, {
   ...(system !== undefined && { system }),
   ...(seconds !== undefined && { timeout: seconds * 1000 }),
 });
-// A call that did not go through — the agent not installed, not logged in, too slow, refusing — is a run that failed.
+// A call that did not go through — the agent not installed, not logged in, too slow, refusing — is a run that failed:
+// said so by this program (ctx.fail), for nothing is wrong with it, and no fix of it would make the agent answer.
 // But a turn that ended at a limit of the agent's own is the run's result, with `ok` false — as a harness that runs
 // out of turns ends its run: the work may have been done, and whoever judges it looks at what was left.
 const atALimit = done.stopReason === "max_tokens" || done.stopReason === "max_turn_requests";
-if (done.failure && !(done.failure.kind === "failed" && atALimit)) throw new Error(`The agent did not do the work (${done.failure.kind}): ${done.failure.message}`);
+if (done.failure && !(done.failure.kind === "failed" && atALimit)) await ctx.fail(`The agent did not do the work (${done.failure.kind}): ${done.failure.message}`);
 
 await ctx.done({
   ...(done.messages.length > 0 && { summary: done.messages.at(-1) }),

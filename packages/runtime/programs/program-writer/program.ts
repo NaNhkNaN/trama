@@ -98,10 +98,12 @@ if (prompt === undefined) {
     : `${prompt}\n\nOutput the complete updated program.ts. No partial patches. No markdown fences. No explanation. (Or the one line that begins "${IN_THE_FILE}", where the change is made in program.ts as you left it.)`;
 
   // The agent is asked once, at work in the copy — by the model the project is made with, where it says one.
+  // (Where it cannot be asked — no key, a provider that fails — this run has failed with why, in those words:
+  // nothing is wrong with this program, and it is not to die of it.)
   const reply = await agent.instruct(ask, {
     system, workspace: true,
     ...(meta.provider && meta.model && { model: `${meta.provider}/${meta.model}` }),
-  });
+  }).catch((err: Error) => ctx.fail(err.message));
 
   // Its answer is the program — out of its fences, where it came in some — or says that there is none; or that
   // the program is in program.ts, which is then read as it was left.
@@ -110,13 +112,13 @@ if (prompt === undefined) {
   } else if (reply.trimStart().startsWith(IN_THE_FILE)) {
     let left: string | undefined;
     try { left = await workspace.read("program.ts"); } catch { /* (None is there.) */ }
-    if (left === undefined || left.trim() === "") throw new Error("The model said that the program is in program.ts, and there is none there.");
+    if (left === undefined || left.trim() === "") await ctx.fail("The model said that the program is in program.ts, and there is none there.");
     // (An update is another program in the place of the one there was: a file that is as it was is none.)
-    if (left === program) throw new Error("The model said that the change is made in program.ts, and that file is as it was.");
-    await ctx.done({ program: left });
+    else if (left === program) await ctx.fail("The model said that the change is made in program.ts, and that file is as it was.");
+    else await ctx.done({ program: left });
   } else {
     const written = stripCodeFences(reply);
-    if (written === "") throw new Error("The model answered with no program.");
-    await ctx.done({ program: written });
+    if (written === "") await ctx.fail("The model answered with no program.");
+    else await ctx.done({ program: written });
   }
 }

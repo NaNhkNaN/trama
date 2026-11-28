@@ -32,7 +32,7 @@ export interface RunContext {
   /** Whether this run takes up from a yield, and the reason that yield gave. */
   readonly resumed: boolean;
   readonly yieldReason: string | null;
-  /** How the program ended the run: null until it has called done() or yield(). */
+  /** How the program ended the run: null until it has called done(), yield() or fail(). */
   readonly ended: ProgramResult | null;
 
   log(message: string, data?: unknown): void;
@@ -44,6 +44,13 @@ export interface RunContext {
   done(state: Record<string, unknown>, result?: unknown): void;
   /** Persist the state, with the mark the next run resumes from, and end the run as yielded. */
   yield(state: Record<string, unknown>, reason: string): void;
+  /**
+   * End the run as failed, in the program's words: what was asked cannot be
+   * done, and nothing is wrong with the program. Nothing is persisted: the
+   * state is as the program last had it kept — as where a program dies —
+   * and so is the mark of a yield the run took up from.
+   */
+  fail(reason: string): void;
 }
 
 /**
@@ -107,9 +114,12 @@ export function createContext(
     (options?.print ?? console.log)(`[trama] ${message}`);
   };
 
+  /** The call that ended a run so. */
+  const endedBy = (how: ProgramResult) => (how.status === "done" ? "done" : how.status === "yielded" ? "yield" : "fail");
+
   /**
    * The one way a state reaches the state file, and the one place the rules of
-   * a run's ending are kept. A run ends once, by done() or by yield(). After
+   * a run's ending are kept. A run ends once, by done(), by yield() or by fail(). After
    * that its state is settled: the same ending said again does nothing, and
    * any other call that would write the state is refused — it would take back
    * what the run ended on, the mark the next run resumes from included.
@@ -120,8 +130,7 @@ export function createContext(
   const persist = (call: "checkpoint" | "done" | "yield", state: Record<string, unknown>, ending?: ProgramResult): boolean => {
     if (ended) {
       if (ending?.status === ended.status) return false;
-      const endedBy = ended.status === "done" ? "done" : "yield";
-      throw new Error(`Cannot call ctx.${call}() after ctx.${endedBy}() — the run has ended, and its state is settled.`);
+      throw new Error(`Cannot call ctx.${call}() after ctx.${endedBy(ended)}() — the run has ended, and its state is settled.`);
     }
     assertSerializable(state, "ctx.state");
     const { __trama_iteration: _counted, ...record }: Record<string, unknown> = state;
@@ -170,6 +179,16 @@ export function createContext(
     // Exiting is the program's job: this returns so that the call can be answered first.
     yield(state, reason) {
       if (persist("yield", state, { status: "yielded", reason })) logEnding("yield", { reason });
+    },
+
+    // (Exiting is the program's job here too. Nothing is written but the log: a run that failed keeps what it had kept.)
+    fail(reason) {
+      if (ended) {
+        if (ended.status === "failed") return;
+        throw new Error(`Cannot call ctx.fail() after ctx.${endedBy(ended)}() — the run has ended, and its state is settled.`);
+      }
+      ended = { status: "failed", reason: reason.trim() === "" ? "The program ended its run as failed, and did not say why." : reason };
+      logEnding("failed", { reason: ended.reason });
     },
   };
 }

@@ -87,7 +87,7 @@ test("the writer says what it is for, what it is handed and what it gives; with 
   writeJson(join(it.at("write-by-harness"), "meta.json"), { ...readJson(join(it.at("write-by-harness"), "meta.json")), input: { prompt: "p", args: { harness: "nobody" } } });
   // (Said in the writer's own words, with what to do about it: a harness copied under another name is not found by the one the writer has for it.)
   await assert.rejects(it.inHome(() => updateProject("words", "x", { updateWith: "write-by-harness" })),
-    /The project asked for the update failed: [^]*Error: The harness that is to do the writing is not among your projects: "nobody"\. Copy one there — trama examples coding-harness — or say which project it is: "harness", among this project's own arguments in its meta\.json \(\{ "input": \{ "args": \{ "harness": "…" \} \} \}\)\.\n/);
+    /The project asked for the update failed: The harness that is to do the writing is not among your projects: "nobody"\. Copy one there — trama examples coding-harness — or say which project it is: "harness", among this project's own arguments in its meta\.json \(\{ "input": \{ "args": \{ "harness": "…" \} \} \}\)\.$/);
   assert.equal(it.requests.length, 0);
   // And with nothing to write it does not look for one: a validation of the writer is none of the harness.
   assert.deepEqual((await it.inHome(() => runProgram({ projectDir: it.at("write-by-harness"), timeout: 30_000 }))).result, { nothing: "to write: it was not handed what is asked, or where to work" });

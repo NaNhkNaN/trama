@@ -17,7 +17,7 @@ await tools.write("report.md", report);
 await ctx.done({ words: report.split(/\s+/).length });
 ```
 
-- `ctx` is the run: its arguments (`ctx.input.args`), a state that is kept from one run to the next (`ctx.state`, `checkpoint`), how it ends (`done` with a result, or `yield`), `log`, `ready`.
+- `ctx` is the run: its arguments (`ctx.input.args`), a state that is kept from one run to the next (`ctx.state`, `checkpoint`), how it ends (`done` with a result, `yield`, or `fail` with why — what was asked cannot be done, and no fix of the program is asked for), `log`, `ready`.
 - `agent` is a model. `instruct` and `generate` have pi's agent do a piece of work, with the model, the thinking and the tools the call names — functions of the program's own among them. `complete` is one request to a model and one reply: a program that loops on it is a harness of its own.
 - `tools` is the project's directory and the world: `read`, `write`, `shell`, `fetch` — and `agent`, which hands a task to an agent from outside, over ACP.
 - `workspace` is a directory the run is given to work in beside its project — a codebase, or what several runs share: `read`, `write`, `list`, `observe`, `shell`, `agent`.

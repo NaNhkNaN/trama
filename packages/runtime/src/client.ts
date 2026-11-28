@@ -60,6 +60,12 @@ export const ctx: Ctx = {
     // The runner has recorded the yield; suspending means ending this process.
     process.exit(0);
   },
+  async fail(reason) {
+    await call("/ctx/fail", { reason });
+    // The runner has what the run failed with: the program goes no further. (How the run ended is what it said,
+    // and not how this process ends.)
+    process.exit(0);
+  },
 };
 
 /** What kind of image bytes are, told by how they begin: of the kinds a model is shown. */

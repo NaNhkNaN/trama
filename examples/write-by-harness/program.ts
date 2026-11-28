@@ -39,7 +39,7 @@ if (prompt === undefined || copy === undefined) {
   try {
     its = resolveProject(harness);
   } catch {
-    throw new Error(`The harness that is to do the writing is not among your projects: ${JSON.stringify(harness)}. Copy one there — trama examples coding-harness — or say which project it is: "harness", among this project's own arguments in its meta.json ({ "input": { "args": { "harness": "…" } } }).`);
+    its = await ctx.fail(`The harness that is to do the writing is not among your projects: ${JSON.stringify(harness)}. Copy one there — trama examples coding-harness — or say which project it is: "harness", among this project's own arguments in its meta.json ({ "input": { "args": { "harness": "…" } } }).`);
   }
   // With no program handed, it is a project's first that is asked for: its making.
   const making = program === undefined;
@@ -72,7 +72,7 @@ if (prompt === undefined || copy === undefined) {
     ...(seconds !== undefined && { timeout: seconds * 1000 }),
     args: { task, ...(model !== undefined && { model }), ...(turns !== undefined && { turns }) },
   });
-  if (ran.status !== "done") throw new Error(`The harness ${ran.status === "failed" ? "failed" : "did not end its work"}: ${ran.reason ?? ran.status}`);
+  if (ran.status !== "done") await ctx.fail(`The harness ${ran.status === "failed" ? "failed" : "did not end its work"}: ${ran.reason ?? ran.status}`);
 
   // The program is what the harness left where the program is.
   const said = (ran.result as { summary?: unknown } | undefined)?.summary;

@@ -394,7 +394,9 @@ test("the loop stops without deciding where there is nothing to decide by — no
   ]) {
     const { result: refused } = await never.round({ inputs: [A], ...args });
     assert.equal(refused.status, "failed", JSON.stringify(args));
-    assert.match(journalsOf(never.at("improve")).at(-1).findLast((record) => record.kind === "exit").stderr, why, JSON.stringify(args));
+    // (Said by the loop itself, as how its run ended — ctx.fail: it is the run's reason, and no process died.)
+    assert.match(refused.reason, why, JSON.stringify(args));
+    assert.equal(journalsOf(never.at("improve")).at(-1).findLast((record) => record.kind === "exit").stderr, "", JSON.stringify(args));
   }
   // And where the loop's project does not say what it takes — the program copied without its meta.json's word, or that
   // word taken out — the program says that too: a round is begun, and fails for it, with nothing asked for or changed.
@@ -405,7 +407,9 @@ test("the loop stops without deciding where there is nothing to decide by — no
   for (const args of [{ project: undefined }, { check: undefined }, { project: 1 }]) {
     const { result: refused } = await bare.round({ inputs: [A], ...args });
     assert.equal(refused.status, "failed", JSON.stringify(args));
-    assert.match(journalsOf(bare.at("improve")).at(-1).findLast((record) => record.kind === "exit").stderr, /It is not said which project to improve, or which checks it: "project" and "check", each by its name\./, JSON.stringify(args));
+    // (Said by the loop itself — ctx.fail — as how its run ended: nothing of a process that died, and no fix of the loop asked for.)
+    assert.equal(refused.reason, 'It is not said which project to improve, or which checks it: "project" and "check", each by its name.', JSON.stringify(args));
+    assert.deepEqual((({ code, stderr, outcome }) => [code, stderr, outcome.status])(journalsOf(bare.at("improve")).at(-1).findLast((record) => record.kind === "exit")), [0, "", "failed"], JSON.stringify(args));
   }
   // (Nothing was asked of a model, and the project it was to improve was not so much as run: it has no history.)
   assert.deepEqual([bare.prompts.length, existsSync(join(bare.words, "history", "index.jsonl")), bare.program()], [0, false, SAYS(["a"])]);
@@ -528,7 +532,7 @@ await ctx.done({ task: (ctx.input.args as any).task });
     writeFileSync(join(at("worker"), "program.ts"), DOES(false)); // (another program: nothing of it is on record)
     const { result: refused } = await round({ from });
     assert.equal(refused.status, "failed", from);
-    assert.match(journalsOf(at("improve")).at(-1).findLast((record) => record.kind === "exit").stderr, why);
+    assert.match(refused.reason, why);
   }
 });
 
@@ -648,7 +652,7 @@ test("confirm: a version that passes is not kept for the runs that chose it alon
   ]) {
     const { result: refused } = await plain.round({ inputs: [A], ...args });
     assert.equal(refused.status, "failed", JSON.stringify(args));
-    assert.match(journalsOf(plain.at("improve")).at(-1).findLast((record) => record.kind === "exit").stderr, why, JSON.stringify(args));
+    assert.match(refused.reason, why, JSON.stringify(args));
   }
   // (What is no number at all is refused before that, by what the loop says it takes.)
   await assert.rejects(plain.round({ inputs: [A], margin: "much" }), /improve takes — margin: expected number, got string\./);

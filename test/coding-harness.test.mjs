@@ -437,12 +437,14 @@ test("the harness gives up where it is to: a provider that goes on failing, and 
   const down = await scene(t, () => 500);
   const failed = await down.run();
   assert.equal(failed.result.status, "failed");
-  assert.match(failed.result.reason, /The model could not be asked, 4 times in a row: 500/);
+  // (Said by the harness itself — ctx.fail — as how its run ended: its words are the run's reason from the first, and no process died.)
+  assert.match(failed.result.reason, /^The model could not be asked, 4 times in a row: 500/);
+  assert.doesNotMatch(failed.result.reason, /exited with code|Node\.js v/);
   assert.equal(down.requests.length, 4);
 
   const idle = await scene(t, () => ({ name: "files" }));
   const never = await idle.run({ turns: 5 });
-  assert.match(never.result.reason, /The model was asked 5 times and did not say it was done\./);
+  assert.equal(never.result.reason, "The model was asked 5 times and did not say it was done.");
   assert.equal(idle.requests.length, 5);
 });
 

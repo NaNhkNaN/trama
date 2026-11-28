@@ -365,6 +365,8 @@ interface RunOnceResult {
   outcome: ProgramResult | null;
   /** A description of the failure, for the repair prompt and for the user. */
   failure: string;
+  /** Of a fix that was tried: what its program ended the run as failed with, in its own words (see tryFix). */
+  said?: string;
 }
 
 /** The end of a long output — where the error is — with a note of how much was dropped. */
@@ -451,7 +453,10 @@ function toChildResult(exit: ChildExit): ShellResult {
 /**
  * Decide how a finished run ended. A terminal signal the program completed
  * takes precedence over its exit code: a program that called ctx.done() and
- * then crashed is done. Returns null for a failure (non-zero exit, no signal).
+ * then crashed is done. So of a run its program ended as failed (ctx.fail):
+ * that is how it ended, in the program's words — an outcome, and no fault
+ * of the program's to be fixed. Returns null for a failure nobody said
+ * (non-zero exit, no signal): the program broke.
  */
 function settle(projectDir: string, child: ShellResult, ended: ProgramResult | null): ProgramResult | null {
   // Read state first: if the program left state.json corrupt, say so now
@@ -1013,6 +1018,10 @@ async function tryFix(options: ExecuteOptions, staged: Staged, fixed: string, at
     failure: `The repaired program could not be run: ${messageOf(err)}`,
   }));
   if (trial.outcome === null) return trial;
+  // A fix whose program then ends the run as failed — in its own words: what was asked cannot be done — has not
+  // worked. A program that says so, in the place of one that broke, is no fix of that one: nothing of it reaches
+  // the project. (Said apart from a fix that broke in its turn: no other is asked for — see executeProgram.)
+  if (trial.outcome.status === "failed") return { outcome: null, failure: trial.failure, said: trial.outcome.reason ?? "" };
 
   // The fix worked, and becomes the project's program — as it ran, first,
   // and in one move; only then is what its run did merged in. What the run
@@ -1089,8 +1098,9 @@ async function tryFix(options: ExecuteOptions, staged: Staged, fixed: string, at
 }
 
 /**
- * Run a program to an outcome. If it crashes, ask the LLM to repair it and try
- * the fix — up to maxRepairAttempts times.
+ * Run a program to an outcome. If it crashes, ask for a fix of it and try
+ * the fix — up to maxRepairAttempts times. (A run its program ended as
+ * failed, by ctx.fail, has an outcome: nothing crashed, and nothing is fixed.)
  */
 async function executeProgram(options: ExecuteOptions): Promise<Execution> {
   const { projectDir, maxRepairAttempts } = options;
@@ -1155,6 +1165,10 @@ async function executeProgram(options: ExecuteOptions): Promise<Execution> {
 
     if (tried.run.outcome) return { result: tried.run.outcome, repair: { attempt, error: lastError } };
     if (stopped()) return wasStopped();
+    // The fix ran, and its program said that the run had failed: asking again would be asking for a program that does not say so.
+    if (tried.run.said !== undefined) {
+      return failed(`Failed after ${attempt} repair attempt(s): ${lastError}\nThe fix was tried, and its program ended the run as failed: ${tried.run.said}`);
+    }
     lastError = tried.run.failure;
   }
 

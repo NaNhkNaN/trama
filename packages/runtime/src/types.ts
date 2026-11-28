@@ -33,7 +33,7 @@ export interface Ctx {
 
   /**
    * Persist current ctx.state to disk.
-   * Throws once done() or yield() has been called: the run has ended, and its state is settled.
+   * Throws once done(), yield() or fail() has been called: the run has ended, and its state is settled.
    */
   checkpoint(): Promise<void>;
 
@@ -54,6 +54,17 @@ export interface Ctx {
    * fix the problem and call either one.
    */
   yield(reason: string): Promise<never>;
+
+  /**
+   * End the run as failed, in the program's own words, and exit: what was asked cannot be done — an argument
+   * that is missing or no good, a model that could not be asked, work that came to nothing — and nothing is
+   * wrong with the program. The run has failed with `reason`, and with nothing else.
+   * No fix of the program is asked for: one is where a program throws, or dies — that is a fault of the
+   * program's, and is told as one. So: fail() for what the program foresaw, throw for what it did not.
+   * Persists nothing: ctx.state is on disk as it was last kept (checkpoint() first, to keep it as it is).
+   * Mutually exclusive with done() and yield() — throws if either was already called.
+   */
+  fail(reason: string): Promise<never>;
 }
 
 /** How much a model is to think before it answers. */

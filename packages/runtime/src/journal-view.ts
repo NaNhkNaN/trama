@@ -235,7 +235,10 @@ function printJournal(path: string, records: JournalRecord[]): void {
           : record.stopped ? "stopped"
           : record.signal ? `killed by ${record.signal}`
           : `exit code ${record.code}`;
-        const verdict = record.error ? `unusable: ${oneLine(record.error, 60)}` : record.outcome ? record.outcome.status : "failed";
+        // (A failure the program said — ctx.fail — is told from one of a program that broke: by its words.)
+        const verdict = record.error ? `unusable: ${oneLine(record.error, 60)}`
+          : record.outcome?.status === "failed" ? `failed, as its program said: ${oneLine(record.outcome.reason, 100)}`
+          : record.outcome ? record.outcome.status : "failed";
         console.log(`${at}  attempt ${record.attempt} over: ${how} → ${verdict}`);
         break;
       }

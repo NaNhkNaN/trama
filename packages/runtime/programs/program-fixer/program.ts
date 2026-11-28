@@ -58,8 +58,10 @@ if (program === undefined || error === undefined) {
     if (meta.provider && meta.model) model = `${meta.provider}/${meta.model}`;
   } catch { /* (It says none that can be read: the model is this project's own.) */ }
 
-  // The agent is asked once, at work in the copy.
-  const answer = await agent.instruct(ask, { system: "You are a TypeScript repair tool.", workspace: true, ...(model !== undefined && { model }) });
+  // The agent is asked once, at work in the copy. (Where it cannot be asked, this run has failed with why, in
+  // those words: nothing is wrong with this program.)
+  const answer = await agent.instruct(ask, { system: "You are a TypeScript repair tool.", workspace: true, ...(model !== undefined && { model }) })
+    .catch((err: Error) => ctx.fail(err.message));
 
   // Its answer is the program — out of its fences, where it came in some — or says that there is no fix; or
   // that the fixed program is in program.ts, which is then read as it was left. (As it was, too: where what was
